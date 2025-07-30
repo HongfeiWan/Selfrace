@@ -1,0 +1,139 @@
+# Default configuration for the TeraFlow replication project
+simulator:
+  # 设备配置
+  device: "cuda:0"
+
+  num_envs: 38400       # 并行环境数量
+  sim_dt: 0.3           # 模拟时间步长
+
+  max_agents_num: 150   # 最大车辆数量,定义每个环境中最大可能的智能体数量
+  #必须满足：num_npc_vehicles <= max_agents_num，否则会报错
+  num_npc_vehicles: 2   # NPC车辆数量,定义每个环境中实际生成的智能体数量
+
+  # 地图配置  
+  map_path: "./maps/processed_map_Town01_stitched.json" # 地图路径
+
+  # Dynamics model configuration
+  dynamics:
+    # Action space configuration
+    use_discrete_actions: true  # 是否使用离散动作空间 (12个动作)
+    action_space_size: 12
+
+    # Vehicle physical parameters
+    vehicle_length: 4.5 # 车辆长度 (m)
+    vehicle_width: 2.0 # 车辆宽度 (m)
+    vehicle_wheelbase: 2.9  # 车辆轴距 (L)，前后轮轴心之间的距离 (m)
+    vehicle_max_steer_angle: 35.0  # 最大前轮转向角 (度)
+
+    # Control coefficients for driving style
+    Cthrottle: 1.0  # 油门控制系数，用于调节加速度响应
+    Csteer: 1.0     # 转向控制系数，用于调节转向响应
+    Cacc: 1.0       # 加速度控制系数，用于调节加速度约束
+    Cvel: 1.0       # 速度控制系数，用于调节速度约束
+    
+    # Steering control parameters
+    max_steering_rate: 0.6  # 最大转向角变化率 (rad/s)
+    
+    # Acceleration constraints
+    max_longitudinal_accel: 2.5  # 最大纵向加速度 (m/s²)
+    min_longitudinal_accel: -5.0  # 最小纵向加速度 (m/s²)
+    max_lateral_accel: 4.0       # 最大横向加速度 (m/s²)
+    min_lateral_accel: -4.0      # 最小横向加速度 (m/s²)
+    
+    # Velocity constraints
+    max_velocity: 20.0  # 最大速度 (m/s)
+    min_velocity: -2.0  # 最小速度 (m/s)
+    
+    # Jerk constraints (for discrete action space)
+    max_longitudinal_jerk: 4  # 最大纵向jerk (m/s³)
+    min_longitudinal_jerk: -15.0 # 最小纵向jerk (m/s³)
+    max_lateral_jerk: 4.0        # 最大横向jerk (m/s³)
+    min_lateral_jerk: -4.0       # 最小横向jerk (m/s³)
+    
+    # Numerical stability parameters
+    curvature_epsilon: 1e-8      # 曲率计算的数值稳定性参数
+    steering_epsilon: 1e-5       # 转向角计算的数值稳定性参数
+    straight_motion_threshold: 1e-5  # 直线运动判断阈值 (rad)
+  
+  observation:
+    # Observation space config
+    # 定义观测空间
+    local_state_dim: 4 # (vel_x, vel_y, acc_x, acc_y)
+    neighbor_feature_dim: 5 # (dx, dy, vx, vy, active)
+    waypoint_feature_dim: 2 # (dx, dy) for each point
+
+    # 定义视野
+    num_neighbors: 20     # 邻居数量
+    num_w_lanes: 25       # 车道数量, 25个车道
+    num_w_boundaries: 26  # 边界数量, 26个边界
+    horizon: 100.0        # 视野范围, 100mx100m
+    
+  hash:
+    # Spatial hash config
+    hash_cell_size: 20.0 # 20m，哈希方形网格单元大小，
+    # Further simulator-specific configs...
+# Reward parameters based on Appendix B.3 and GIGAFLOW paper
+reward:
+  # Goal reward parameters (Rgoal)
+  delta_goal_min: 2.0         # 目标距离阈值最小值
+  delta_goal_max: 12.0        # 目标距离阈值最大值
+  v_goal: 3.0                 # 目标速度阈值
+  goal_reward: 1.0            # 目标奖励值
+  
+  # Collision penalty parameters (Rcollision)
+  collision_alpha_min: 0.0    # 碰撞惩罚系数最小值
+  collision_alpha_max: 3.0    # 碰撞惩罚系数最大值
+  collision_speed_mult: 0.1   # 碰撞速度乘数
+  
+  # Off-road penalty parameters (Roff-road)
+  boundary_alpha_min: 0.0     # 边界惩罚系数最小值
+  boundary_alpha_max: 3.0     # 边界惩罚系数最大值
+  
+  # Comfort penalty parameters (Rcomfort)
+  comfort_alpha_min: 0.0      # 舒适度惩罚系数最小值
+  comfort_alpha_max: 0.1      # 舒适度惩罚系数最大值
+  
+  # Lane alignment reward parameters (R_{l-align})
+  l_align_alpha_min: 2.5e-4   # 车道对齐奖励系数最小值
+  l_align_alpha_max: 2.5e-2   # 车道对齐奖励系数最大值
+  vel_align_alpha_min: 0.0    # 速度对齐奖励系数最小值
+  vel_align_alpha_max: 1.0    # 速度对齐奖励系数最大值
+  
+  # Lane center reward parameters (R_{l-center})
+  l_center_alpha_min: 2.5e-4  # 车道中心对齐奖励系数最小值
+  l_center_alpha_max: 7.5e-3  # 车道中心对齐奖励系数最大值
+  center_bias_alpha_min: -0.5 # 中心偏置系数最小值
+  center_bias_alpha_max: 0.5  # 中心偏置系数最大值
+  
+  # Velocity reward parameters (Rvelocity)
+  velocity_alpha: 2.5e-3      # 速度奖励系数
+  
+  # Reverse penalty parameters (Rreverse)
+  reverse_alpha_min: 2.5e-4   # 倒车惩罚系数最小值
+  reverse_alpha_max: 7.5e-3   # 倒车惩罚系数最大值
+  
+  # Stop line penalty parameters (Rstop-line)
+  stop_line_alpha_min: 0.0    # 停止线违规惩罚系数最小值
+  stop_line_alpha_max: 1.0    # 停止线违规惩罚系数最大值
+  
+  # Timestep penalty parameters (Rtimestep)
+  timestep_alpha: 2.5e-5      # 时间步惩罚系数
+
+policy:
+  # agent_feature_dim and local_state_dim are now part of simulator config
+  # Further network architecture configs...
+
+training:
+  total_timesteps: 1_000_000_000_000 # As per paper
+  rollout_steps: 128
+  learning_rate: 0.0001 # Placeholder, should be tuned
+  ppo_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.01
+  max_grad_norm: 0.5
+  advantage_filter_fraction: 0.8 # Filter out 80% of samples
+
+traffic:
