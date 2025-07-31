@@ -1,7 +1,8 @@
 {
     "python.analysis.extraPaths": [
         "./simulator",
-        "./utils"
+        "./utils",
+        "./training"
     ],
     "python.analysis.autoImportCompletions": true
 } 

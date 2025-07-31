@@ -18,12 +18,19 @@ if simulator_dir not in sys.path:
 utils_dir = os.path.join(parent_dir, 'utils')
 if utils_dir not in sys.path:
     sys.path.insert(0, utils_dir)
+# 添加training目录到路径
+training_dir = os.path.join(parent_dir, 'training')
+if training_dir not in sys.path:
+    sys.path.insert(0, training_dir)
+
 from reward import RewardCalculator
-from randomize_components import RewardParameterSampler
 from road import RoadNetwork
 from offroad import OffroadChecker
 from spatial_hash import SpatialHash
 from dynamics import KinematicBicycleModel, DiscreteActionSpace
+from network import FeatureEncoder,SharedNetwork
+from collision import CollisionChecker
+from world_init import WorldInitializer
 
 # 每个step按0.3s计算运动学以及reward，显示按一秒60step(帧数)显示
 class Car:
@@ -69,20 +76,24 @@ class Car:
             # 保存当前动作
             self.current_action = action_idx
     
-    def get_state(self) -> np.ndarray:
+    def get_state(self, action_idx: int = None) -> np.ndarray:
         """获取汽车状态向量"""
-        # 计算jerk
-        along_jerk = (self.acceleration - self.prev_acceleration) / 0.3  # 假设dt=0.3
-        alat_jerk = (self.steering - self.prev_steering) / 0.3
-        # 计算横向加速度
-        alat = self.speed * self.speed * math.tan(self.steering) / self.length
+        # 如果提供了action_idx，通过离散动作空间查询jerk值
+        # 获取当前动作对应的jerk值
+        action_tensor = torch.tensor([action_idx], device=self.device)
+        jerk_actions = self.dynamics_model.discrete_action_space.get_action(action_tensor)
+        along_jerk = jerk_actions[0, 0].item()  # 纵向jerk
+        alat_jerk = jerk_actions[0, 1].item()   # 横向jerk
+        current_along = self.dynamics_model.current_along[0].item()
+        current_alat = self.dynamics_model.current_alat[0].item()
+
         # 计算Frenet坐标系信息（简化版本）
         theta_f = 0.0  # 车道角度误差，这里简化处理
         d = 0.0  # 横向距离，这里简化处理
         return np.array([
             self.x, self.y,           # 位置
             self.heading, self.speed,  # 运动学信息
-            self.acceleration, alat,   # 动力学信息
+            current_along, current_alat,   # 动力学信息（使用动力学模型的值）
             along_jerk, alat_jerk,     # jerk信息
             theta_f, d                 # Frenet坐标系信息
         ])
@@ -93,31 +104,27 @@ class Car:
         return torch.tensor([[self.x, self.y, self.heading, self.length, self.width]], 
                            dtype=torch.float32)
 
-class Goal:
-    """目标点类"""
-    def __init__(self, x: float, y: float, radius: float = 10.0):
-        self.x = x
-        self.y = y
-        self.radius = radius
-    def is_reached(self, x: float, y: float) -> bool:
-        """检查是否到达目标"""
-        distance = math.sqrt((x - self.x)**2 + (y - self.y)**2)
-        return distance < self.radius
-
 class CarGame:
-    """汽车游戏主类"""
-    def __init__(self, config_path: str = None):
-        # 初始化pygame
-        pygame.init()
-        
-        # 游戏设置
-        self.width = 1200
-        self.height = 800
-        self.screen = pygame.display.set_mode((self.width, self.height))
-        pygame.display.set_caption("汽车驾驶游戏 - GIGAFLOW奖励系统")
-        
+    def __init__(self, config_path: str = None, training_mode: bool = False):
+        # 训练模式标志
+        self.training_mode = training_mode
         # 加载配置
         self.config = self.load_config(config_path)
+        # 从配置中获取车辆数量
+        self.num_cars = self.config.get('simulator', {}).get('num_npc_vehicles', 10)
+        if not training_mode:
+            # 初始化pygame
+            pygame.init()
+            # 游戏设置
+            self.width = 1200
+            self.height = 800
+            self.screen = pygame.display.set_mode((self.width, self.height))
+            pygame.display.set_caption("汽车驾驶游戏 - GIGAFLOW奖励系统")
+        else:
+            # 训练模式下不初始化pygame
+            self.width = 1200
+            self.height = 800
+            self.screen = None
         
         # 初始化奖励计算器
         self.device = torch.device('cpu')
@@ -129,14 +136,7 @@ class CarGame:
         # 初始化RoadNetwork
         self.road_network = self._initialize_road_network()
         
-        # 初始化游戏对象
-        # 移除self.road的初始化，因为现在完全依赖RoadNetwork
-        
-        # 初始化汽车位置
-        self.player_car = self._initialize_car_position()
-        self.goal = self._initialize_goal_position()
-        
-        # 初始化OffroadChecker
+        # 初始化OffroadChecker和CollisionChecker
         # 创建SpatialHash实例
         # 获取道路网络的边界
         if hasattr(self.road_network, 'quads_vertices') and self.road_network.quads_vertices.shape[0] > 0:
@@ -150,14 +150,51 @@ class CarGame:
             max_bounds = torch.tensor([1000, 1000], device=self.device)
         
         # 创建SpatialHash
-        cell_size = 10.0  # 10米的网格单元
+        cell_size = 20.0  # 20米的网格单元
         self.spatial_hash = SpatialHash(cell_size, min_bounds, max_bounds, self.device)
         
-        # 创建OffroadChecker
+        # 创建OffroadChecker和CollisionChecker
         self.offroad_checker = OffroadChecker(self.road_network, self.spatial_hash)
+        self.collision_checker = CollisionChecker(self.config, self.spatial_hash)
+        
+        # 初始化WorldInitializer
+        # 动态设置num_npc_vehicles以匹配请求的车辆数量
+        if 'simulator' not in self.config:
+            self.config['simulator'] = {}
+        self.config['simulator']['num_npc_vehicles'] = self.num_cars
+        
+        self.world_initializer = WorldInitializer(self.road_network, self.offroad_checker, self.collision_checker, self.config)
+        
+        # 使用WorldInitializer初始化车辆
+        self.initialize_vehicles()
+        
+        # 为每个agent分配独立的目标和状态跟踪
+        self.agent_goals = []
+        self.agent_collisions = []
+        self.agent_off_road = []
+        self.agent_rewards = []
+        self.agent_goal_reached = []  # 新增：跟踪每个agent的目标达成状态
+        self.current_step_rewards = []  # 新增：跟踪当前步骤的奖励
+        
+        # 初始化每个agent的目标和状态
+        actual_num_cars = len(self.cars)
+        for i in range(actual_num_cars):
+            self.agent_goals.append(self._initialize_agent_goal())
+            self.agent_collisions.append(False)
+            self.agent_off_road.append(False)
+            self.agent_rewards.append(0.0)
+            self.agent_goal_reached.append(False)  # 新增：初始化目标达成状态
+            self.current_step_rewards.append(0.0)  # 新增：初始化当前步骤奖励
+        
+        # 保持玩家车辆的目标作为主目标（用于UI显示）
+        if self.agent_goals:
+            self.goal = self.agent_goals[0]
         
         # 游戏状态
-        self.clock = pygame.time.Clock()
+        if not training_mode:
+            self.clock = pygame.time.Clock()
+        else:
+            self.clock = None
         self.dt = 0.3  # 时间步长（每个step对应0.3秒）
         self.running = True
         self.score = 0.0
@@ -169,15 +206,20 @@ class CarGame:
         self.collision_occurred = False
         self.off_road = False
         
-        # 字体
-        self.font = pygame.font.Font(None, 36)
-        self.small_font = pygame.font.Font(None, 24)
+        # 字体（仅在非训练模式下初始化）
+        if not training_mode:
+            self.font = pygame.font.Font(None, 36)
+            self.small_font = pygame.font.Font(None, 24)
+        else:
+            self.font = None
+            self.small_font = None
 
         # 颜色定义
         self.colors = {
             'road': (100, 100, 100),
             'grass': (34, 139, 34),
             'car': (255, 0, 0),
+            'other_car': (0, 0, 255),  # 蓝色表示其他车辆
             'goal': (0, 255, 0),
             'text': (255, 255, 255),
             'lane_markings': (255, 255, 255)
@@ -223,100 +265,175 @@ class CarGame:
         print(f"道路边界点数量: {road_network.global_w_boundary_points.shape[0]}")
         return road_network
     
-    def handle_events(self):
-        """处理游戏事件"""
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_r:
-                    self.reset_episode()
-                elif event.key == pygame.K_ESCAPE:
-                    self.running = False
+    def initialize_vehicles(self):
+        """使用WorldInitializer初始化车辆"""
+        # 使用WorldInitializer生成无碰撞的车辆状态
+        # 这里我们只生成一个环境，但WorldInitializer支持批量生成
+        agents_state, ego_agents_idx, agents_start_quad_ids = self.world_initializer.initialize_world(num_envs=1)
+        
+        # 从生成的状态中创建Car对象
+        self.cars = []
+        env_states = agents_state[0]  # 获取第一个环境的状态 (max_agents, 7)
+        
+        # 只处理激活的车辆
+        active_mask = env_states[:, 6] == 1.0
+        active_states = env_states[active_mask]
+        
+        # 确保至少有num_cars辆车
+        num_active = active_states.shape[0]
+        if num_active < self.num_cars:
+            print(f"警告: WorldInitializer只生成了{num_active}辆车，少于请求的{self.num_cars}辆")
+            # 如果车辆不够，使用现有的车辆
+            self.num_cars = num_active
+        
+        # 创建Car对象
+        for i in range(min(self.num_cars, num_active)):
+            state = active_states[i]
+            x, y, yaw, speed, length, width, active = state.cpu().numpy()
+            
+            # 创建Car对象
+            car = Car(x, y, yaw, self.device, self.dynamics_model)
+            car.speed = speed
+            car.length = length
+            car.width = width
+            car.current_action = 7  # 默认停止动作
+            self.cars.append(car)
+        # 设置玩家车辆
+        self.player_car = self.cars[0] if self.cars else None
+        print(f"成功初始化{len(self.cars)}辆车")
+    
+    def _initialize_agent_goal(self) -> Dict:
+        """统一的agent目标初始化方法"""
+        # 获取所有quad的中心点
+        quad_centers = self.road_network.quad_centerlines.mean(dim=1)  # (num_quads, 2)
+        
+        # 随机选择一个quad作为目标位置
+        goal_quad_idx = random.randint(0, quad_centers.shape[0] - 1)
+        goal_point = quad_centers[goal_quad_idx]
+        
+        return {'x': goal_point[0].item(), 'y': goal_point[1].item()}
+    
+    def get_agent_random_action(self) -> int:
+        """统一的agent随机动作方法"""
+        return random.randint(0, 11)  # 12个离散动作
     
     def get_random_action(self) -> int:
         """随机从12个离散动作空间中抽样动作"""
-        # 12个离散动作：
-        # 0-2: 最大减速 + 左转/直行/右转
-        # 3-5: 减速 + 左转/直行/右转  
-        # 6-8: 直行 + 左转/直行/右转
-        # 9-11: 加速 + 左转/直行/右转
-        return random.randint(0, 11)
+        return self.get_agent_random_action()
     
     def update_game_state(self, action_idx: int):
         """更新游戏状态"""
-        # 更新汽车状态
-        self.player_car.update(self.dt, action_idx)
+        # 更新所有车辆状态
+        for i, car in enumerate(self.cars):
+            if i == 0:
+                # 玩家车辆使用传入的动作
+                car.update(self.dt, action_idx)
+            else:
+                # 其他车辆使用统一的随机动作方法
+                random_action = self.get_agent_random_action()
+                car.update(self.dt, random_action)
         
-        # 检查碰撞和离路
-        self.check_collisions()
-        self.check_off_road()
+        # 检查所有车辆的碰撞和离路状态
+        self.check_all_agent_collisions()
+        self.check_all_agent_off_road()
         
-        # 检查是否到达目标
-        goal_reached = self.goal.is_reached(self.player_car.x, self.player_car.y)
+        # 为每个agent计算reward
+        for i, car in enumerate(self.cars):
+            reward, goal_reached = self.calculate_agent_reward(
+                car, 
+                car.current_action, 
+                self.agent_goals[i], 
+                self.agent_collisions[i], 
+                self.agent_off_road[i]
+            )
+            self.agent_rewards[i] += reward
+            self.current_step_rewards[i] = reward  # 保存当前步骤的奖励
+            
+            # 更新agent的目标达成状态
+            if i < len(self.agent_goal_reached):
+                self.agent_goal_reached[i] = goal_reached
+            
+            # 如果任何agent到达目标，重置episode
+            if goal_reached:
+                self.reset_episode()
+                return
         
-        # 计算奖励
-        reward = self.calculate_reward(goal_reached)
-        self.episode_reward += reward
-        self.score += reward
+        # 更新玩家车辆的奖励（用于UI显示）
+        if self.cars:
+            self.episode_reward = self.agent_rewards[0]
+            self.score = self.agent_rewards[0]
         
         # 更新步数
         self.step_count += 1
         
-        # 检查episode是否结束
-        if goal_reached or self.step_count >= self.max_steps:
+        # 检查episode是否结束（任何agent离路或达到最大步数）
+        if any(self.agent_off_road) or self.step_count >= self.max_steps:
             self.reset_episode()
     
-    def check_collisions(self):
-        """检查碰撞（简化版本）"""
-        # 这里简化处理，实际游戏中需要更复杂的碰撞检测
-        self.collision_occurred = False
+    def check_all_agent_collisions(self):
+        """检查所有agent的碰撞状态"""
+        if len(self.cars) < 2:
+            # 重置所有agent的碰撞状态
+            for i in range(len(self.agent_collisions)):
+                self.agent_collisions[i] = False
+            self.collision_occurred = False
+            return
+        
+        # 准备车辆状态张量
+        # 状态格式: [x, y, heading, speed, length, width, active]
+        states_t0 = torch.zeros(1, len(self.cars), 7, device=self.device)
+        states_t1 = torch.zeros(1, len(self.cars), 7, device=self.device)
+        
+        for i, car in enumerate(self.cars):
+            # 当前状态
+            states_t1[0, i, 0] = float(car.x)
+            states_t1[0, i, 1] = float(car.y)
+            states_t1[0, i, 2] = float(car.heading)
+            states_t1[0, i, 3] = float(car.speed)
+            states_t1[0, i, 4] = float(car.length)
+            states_t1[0, i, 5] = float(car.width)
+            states_t1[0, i, 6] = 1.0  # 激活状态
+            
+            # 前一状态（简化处理，使用当前状态）
+            states_t0[0, i, :] = states_t1[0, i, :]
+        
+        # 使用CollisionChecker检测碰撞
+        collision_results = self.collision_checker.check(states_t0, states_t1)
+        
+        # 更新每个agent的碰撞状态
+        for i in range(len(self.cars)):
+            if i < len(self.agent_collisions):
+                self.agent_collisions[i] = collision_results[0, i].item()
+        
+        # 更新玩家车辆的碰撞状态（用于兼容性）
+        if self.cars:
+            self.collision_occurred = self.agent_collisions[0] if len(self.agent_collisions) > 0 else False
+        
+        # 打印碰撞信息（调试用）
+        if any(self.agent_collisions):
+            print(f"🚗 碰撞检测到！车辆数量: {len(self.cars)}")
+            for i, car in enumerate(self.cars):
+                if i < len(self.agent_collisions) and self.agent_collisions[i]:
+                    print(f"  车辆 {i} 发生碰撞，位置: ({car.x:.1f}, {car.y:.1f})")
     
-    def check_off_road(self):
-        """检查是否离路"""
-        # 使用OffroadChecker进行精确的离路检测
-        car_state = self.player_car.get_offroad_state()
-        # 检查是否离路（返回True表示离路）
-        is_offroad = self.offroad_checker.check_offroad(car_state)
-        self.off_road = is_offroad[0].item()  # 取第一个（也是唯一）结果
-    
-    def _initialize_car_position(self) -> Car:
-        """根据道路网络初始化汽车位置在quad上"""
-        # 获取所有quad的中心点
-        quad_centers = self.road_network.quad_centerlines.mean(dim=1)  # (num_quads, 2)
-        # 随机选择一个quad作为起始位置
-        quad_idx = random.randint(0, quad_centers.shape[0] - 1)
-        start_point = quad_centers[quad_idx]
-        # 获取该quad的方向向量
-        quad_direction = self.road_network.quad_directions[quad_idx]
-        heading = math.atan2(quad_direction[1].item(), quad_direction[0].item())
-        return Car(start_point[0].item(), start_point[1].item(), heading, self.device, self.dynamics_model)
-    
-    def _initialize_goal_position(self) -> Goal:
-        """根据道路网络初始化目标位置在quad上"""
-        # 获取所有quad的中心点
-        quad_centers = self.road_network.quad_centerlines.mean(dim=1)  # (num_quads, 2)
-        # 随机选择一个quad作为目标位置（与汽车位置不同）
-        available_quads = list(range(quad_centers.shape[0]))
-        if hasattr(self, 'player_car') and self.player_car is not None:
-            # 找到汽车所在的quad
-            car_pos = torch.tensor([[self.player_car.x, self.player_car.y]], 
-                                 dtype=torch.float32, device=self.device)
-            distances = torch.norm(quad_centers.unsqueeze(0) - car_pos.unsqueeze(1), dim=2)
-            car_quad_idx = torch.argmin(distances).item()
-            # 排除汽车所在的quad
-            if car_quad_idx in available_quads:
-                available_quads.remove(car_quad_idx)
-        if available_quads:
-            goal_quad_idx = random.choice(available_quads)
-            goal_point = quad_centers[goal_quad_idx]
-            return Goal(goal_point[0].item(), goal_point[1].item())
+    def check_all_agent_off_road(self):
+        """检查所有agent的离路状态"""
+        for i, car in enumerate(self.cars):
+            # 使用OffroadChecker进行精确的离路检测
+            car_state = car.get_offroad_state()
+            # 检查是否在道路上（返回True表示在道路上）
+            is_on_road = self.offroad_checker.check_on_road(car_state)
+            # 如果不在道路上，则为离路
+            is_offroad = ~is_on_road
+            if i < len(self.agent_off_road):
+                self.agent_off_road[i] = is_offroad[0].item()
+        
+        # 更新玩家车辆的离路状态（用于兼容性）
+        if self.cars and len(self.agent_off_road) > 0:
+            self.off_road = self.agent_off_road[0]
         else:
-            # 如果没有可用的quad，选择最远的quad
-            goal_quad_idx = random.randint(0, quad_centers.shape[0] - 1)
-            goal_point = quad_centers[goal_quad_idx]
-            return Goal(goal_point[0].item(), goal_point[1].item())
-
+            self.off_road = False
+    
     def get_boundary_points_info(self) -> str:
         """获取边界点信息"""
         boundary_points = self.road_network.global_w_boundary_points
@@ -331,19 +448,18 @@ class CarGame:
         
         return f"边界点数量: {boundary_points.shape[0]}, 范围: X[{min_x:.1f},{max_x:.1f}] Y[{min_y:.1f},{max_y:.1f}]"
     
-    def calculate_reward(self, goal_reached: bool) -> float:
-        """计算奖励"""
-        # 准备状态张量
-        car_state = self.player_car.get_state()
+    def calculate_agent_reward(self, car: Car, action_idx: int, goal: Dict, collision_occurred: bool, off_road: bool) -> Tuple[float, bool]:
+        """统一的agent reward计算方法"""
+        # 准备状态张量，传递当前动作索引以获取正确的jerk值
+        car_state = car.get_state(action_idx)
         
         # 转换为torch张量
-        agents_state = torch.tensor([car_state], dtype=torch.float32).unsqueeze(0)  # (1, 1, 10)
-        
+        agents_state = torch.tensor(car_state, dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # (1, 1, 10)
         # 准备其他输入
-        all_collisions = torch.tensor([[self.collision_occurred]], dtype=torch.bool)
-        offroad_mask = torch.tensor([[self.off_road]], dtype=torch.bool)
-        goal_positions = torch.tensor([[[self.goal.x, self.goal.y]]], dtype=torch.float32)
-        waypoint_reached = torch.tensor([[goal_reached]], dtype=torch.bool)
+        all_collisions = torch.tensor([[collision_occurred]], dtype=torch.bool)
+        offroad_mask = torch.tensor([[off_road]], dtype=torch.bool)
+        goal_positions = torch.tensor([[[goal['x'], goal['y']]]], dtype=torch.float32)
+        waypoint_reached = torch.tensor([[False]], dtype=torch.bool)  # 初始化为False，由reward_calculator判断
         stop_line_violation = torch.tensor([[False]], dtype=torch.bool)  # 简化处理
         
         # 计算奖励
@@ -357,13 +473,38 @@ class CarGame:
             stop_line_violation=stop_line_violation
         )
         
-        return reward[0, 0].item()
+        return reward[0, 0].item(), goal_reached_tensor[0, 0].item()
+    
+    def calculate_reward(self, action_idx: int = None) -> Tuple[float, bool]:
+        """计算玩家车辆的奖励（保持兼容性）"""
+        return self.calculate_agent_reward(self.player_car, action_idx, self.goal, self.collision_occurred, self.off_road)
     
     def reset_episode(self):
         """重置episode"""
-        # 重置汽车位置
-        self.player_car = self._initialize_car_position()
-        self.goal = self._initialize_goal_position()
+        # 使用WorldInitializer重新初始化车辆
+        self.initialize_vehicles()
+        
+        # 重置每个agent的目标和状态跟踪
+        self.agent_goals = []
+        self.agent_collisions = []
+        self.agent_off_road = []
+        self.agent_rewards = []
+        self.agent_goal_reached = []  # 重置目标达成状态跟踪
+        self.current_step_rewards = []  # 重置当前步骤奖励跟踪
+        
+        # 根据实际车辆数量初始化状态跟踪
+        actual_num_cars = len(self.cars)
+        for i in range(actual_num_cars):
+            self.agent_goals.append(self._initialize_agent_goal())
+            self.agent_collisions.append(False)
+            self.agent_off_road.append(False)
+            self.agent_rewards.append(0.0)
+            self.agent_goal_reached.append(False)  # 重置目标达成状态
+            self.current_step_rewards.append(0.0)  # 重置当前步骤奖励
+        
+        # 保持玩家车辆的目标作为主目标（用于UI显示）
+        if self.agent_goals:
+            self.goal = self.agent_goals[0]
         
         # 重置游戏状态
         self.collision_occurred = False
@@ -378,6 +519,9 @@ class CarGame:
     
     def draw(self):
         """绘制游戏画面"""
+        if self.training_mode:
+            return  # 训练模式下跳过绘制
+
         # 清屏
         self.screen.fill(self.colors['grass'])
         
@@ -386,20 +530,24 @@ class CarGame:
         
         # 绘制目标
         # 将目标位置转换为屏幕坐标
-        goal_screen_pos = self.convert_world_to_screen(torch.tensor([[self.goal.x, self.goal.y]]))
+        goal_screen_pos = self.convert_world_to_screen(torch.tensor([[self.goal['x'], self.goal['y']]]))
         if goal_screen_pos:
             pygame.draw.circle(self.screen, self.colors['goal'], 
-                             goal_screen_pos[0], int(self.goal.radius))
+                             goal_screen_pos[0], int(10.0)) # 使用固定的半径
         else:
             # 如果目标不在视野范围内，在屏幕边缘显示一个指示器
             self.draw_goal_indicator()
         
-        # 绘制汽车
-        self.draw_car(self.player_car)
-        
+        # 绘制所有汽车
+        for i, car in enumerate(self.cars):
+            if i == 0:
+                # 玩家车辆用红色
+                self.draw_car(car, is_player=True)
+            else:
+                # 其他车辆用蓝色
+                self.draw_car(car, is_player=False)
         # 绘制UI
         self.draw_ui()
-        
         # 更新显示
         pygame.display.flip()
     
@@ -412,92 +560,8 @@ class CarGame:
             return
         # 将边界点转换为屏幕坐标
         screen_points = self.convert_world_to_screen(visible_boundary_points)
-
         # 绘制边界点作为散点
         self.draw_boundary_points(screen_points)
-        
-        # 绘制道路中心线
-        self.draw_road_centerlines()
-    
-    def draw_road_centerlines(self):
-        """绘制道路中心线（绿色小箭头）"""
-        try:
-            # 获取所有quad的中心线
-            quad_centerlines = self.road_network.quad_centerlines  # (num_quads, 2, 2)
-            quad_directions = self.road_network.quad_directions    # (num_quads, 2)
-            
-            if quad_centerlines.shape[0] == 0:
-                return
-            
-            # 获取汽车位置用于视野筛选
-            car_pos = torch.tensor([[self.player_car.x, self.player_car.y]], 
-                                 dtype=torch.float32, device=self.device)
-            
-            # 视野范围（米）
-            vision_radius = 100.0
-            
-            # 计算每个quad中心点到汽车的距离
-            quad_centers = quad_centerlines.mean(dim=1)  # (num_quads, 2)
-            diff = quad_centers - car_pos.squeeze(0)
-            distances_squared = torch.sum(diff * diff, dim=1)
-            visible_mask = distances_squared <= (vision_radius * vision_radius)
-            
-            # 获取可见的quad
-            visible_centerlines = quad_centerlines[visible_mask]
-            visible_directions = quad_directions[visible_mask]
-            
-            # 绘制中心线箭头
-            arrow_color = (0, 255, 0)  # 绿色
-            arrow_length = 5  # 箭头长度（像素）
-            arrow_width = 1   # 箭头宽度（像素）
-            
-            # 稀疏绘制箭头：每隔几个quad绘制一个箭头
-            arrow_spacing =30  # 每隔3个quad绘制一个箭头
-            
-            for i in range(0, visible_centerlines.shape[0], arrow_spacing):
-                # 获取当前quad的中心线（两个端点）
-                centerline = visible_centerlines[i]  # (2, 2)
-                direction = visible_directions[i]    # (2,)
-                
-                # 将中心线端点转换为屏幕坐标
-                screen_points = self.convert_world_to_screen(centerline)
-                
-                if len(screen_points) >= 2:
-                    # 绘制中心线线段
-                    start_point = screen_points[0]
-                    end_point = screen_points[1]
-                    pygame.draw.line(self.screen, arrow_color, start_point, end_point, 2)
-                    
-                    # 在中心点绘制方向箭头
-                    center_x = (start_point[0] + end_point[0]) // 2
-                    center_y = (start_point[1] + end_point[1]) // 2
-                    
-                    # 计算箭头方向
-                    arrow_angle = math.atan2(direction[1].item(), direction[0].item())
-                    
-                    # 绘制箭头
-                    arrow_end_x = center_x + arrow_length * math.cos(arrow_angle)
-                    arrow_end_y = center_y + arrow_length * math.sin(arrow_angle)
-                    
-                    # 绘制箭头头部
-                    head_angle1 = arrow_angle + math.pi * 0.75
-                    head_angle2 = arrow_angle - math.pi * 0.75
-                    head_length = 10
-                    
-                    head1_x = arrow_end_x - head_length * math.cos(head_angle1)
-                    head1_y = arrow_end_y - head_length * math.sin(head_angle1)
-                    head2_x = arrow_end_x - head_length * math.cos(head_angle2)
-                    head2_y = arrow_end_y - head_length * math.sin(head_angle2)
-                    
-                    pygame.draw.line(self.screen, arrow_color,
-                                   (int(arrow_end_x), int(arrow_end_y)),
-                                   (int(head1_x), int(head1_y)), arrow_width)
-                    pygame.draw.line(self.screen, arrow_color,
-                                   (int(arrow_end_x), int(arrow_end_y)),
-                                   (int(head2_x), int(head2_y)), arrow_width)
-            
-        except Exception as e:
-            print(f"警告: 绘制道路中心线失败: {e}")
     
     def get_visible_boundary_points(self) -> torch.Tensor:
         """获取汽车视野范围内的边界点（优化版本）"""
@@ -544,8 +608,8 @@ class CarGame:
         """在屏幕边缘绘制目标指示器"""
         try:
             # 计算目标相对于汽车的方向
-            dx = self.goal.x - self.player_car.x
-            dy = self.goal.y - self.player_car.y
+            dx = self.goal['x'] - self.player_car.x
+            dy = self.goal['y'] - self.player_car.y
             
             # 计算方向角度
             angle = math.atan2(dy, dx)
@@ -619,7 +683,7 @@ class CarGame:
             self._cached_scale_params = (scale_x, scale_y, car_x, car_y)
             self._last_scale_car_pos = current_car_pos
         
-        # 转换坐标（使用向量化操作）
+        # 转换坐标（使用向量化操作）地图翻转
         screen_points = []
         for point in world_points:
             # 将世界坐标相对于汽车位置进行偏移
@@ -633,16 +697,26 @@ class CarGame:
                 screen_points.append((screen_x, screen_y))
         return screen_points
     
-    def draw_car(self, car: Car):
+    def draw_car(self, car: Car, is_player: bool = True):
         """绘制汽车"""
-        # 汽车在视野中心显示
-        screen_x = self.width // 2
-        screen_y = self.height // 2
+        # 将汽车世界坐标转换为屏幕坐标
+        car_screen_pos = self.convert_world_to_screen(torch.tensor([[car.x, car.y]]))
+        if not car_screen_pos:
+            return  # 如果汽车不在视野范围内，不绘制
+        
+        screen_x, screen_y = car_screen_pos[0]
         
         # 绘制汽车（方形版本）
         car_size = 16  # 方形边长
         car_rect = pygame.Rect(screen_x - car_size // 2, screen_y - car_size // 2, car_size, car_size)
-        pygame.draw.rect(self.screen, self.colors['car'], car_rect)
+        
+        # 根据是否为玩家车辆选择颜色
+        if is_player:
+            car_color = self.colors['car']  # 红色
+        else:
+            car_color = self.colors['other_car']  # 蓝色
+        
+        pygame.draw.rect(self.screen, car_color, car_rect)
         
         # 绘制汽车朝向指示器（从中心到前方的线）
         front_x = screen_x + car_size // 2 * math.cos(car.heading)
@@ -653,14 +727,20 @@ class CarGame:
     
     def draw_ui(self):
         """绘制用户界面"""
-        # 显示奖励和步数
-        reward_text = self.font.render(f"episode reward: {self.episode_reward:.4f}", True, self.colors['text'])
+        # 安全检查
+        if not self.cars or not self.player_car or not self.agent_rewards:
+            return
+        
+        # 显示玩家车辆的奖励和步数
+        current_reward = self.current_step_rewards[0] if len(self.current_step_rewards) > 0 else 0.0
+        total_reward = self.agent_rewards[0] if len(self.agent_rewards) > 0 else 0.0
+        reward_text = self.font.render(f"current reward: {current_reward:.4f}, total: {total_reward:.4f}", True, self.colors['text'])
         step_text = self.font.render(f"step: {self.step_count}/{self.max_steps}", True, self.colors['text'])
         
         self.screen.blit(reward_text, (10, 10))
         self.screen.blit(step_text, (10, 50))
         
-        # 显示汽车状态
+        # 显示玩家车辆状态
         speed_text = self.small_font.render(f"speed: {self.player_car.speed:.2f} m/s", True, self.colors['text'])
         accel_text = self.small_font.render(f"acceleration: {self.player_car.acceleration:.2f} m/s²", True, self.colors['text'])
         heading_text = self.small_font.render(f"heading: {math.degrees(self.player_car.heading):.1f}°", True, self.colors['text'])
@@ -670,65 +750,77 @@ class CarGame:
         current_action = action_names[self.player_car.current_action]
         action_text = self.small_font.render(f"current action: {current_action} (idx: {self.player_car.current_action})", True, self.colors['text'])
         
-        self.screen.blit(speed_text, (10, 90))
-        self.screen.blit(accel_text, (10, 110))
-        self.screen.blit(heading_text, (10, 130))
-        self.screen.blit(action_text, (10, 150))
+        self.screen.blit(speed_text, (10, 200))
+        self.screen.blit(accel_text, (10, 220))
+        self.screen.blit(heading_text, (10, 240))
+        self.screen.blit(action_text, (10, 260))
         
         # 显示汽车世界坐标
         car_world_pos = f"car world pos: ({self.player_car.x:.1f}, {self.player_car.y:.1f})"
         car_pos_text = self.small_font.render(car_world_pos, True, self.colors['text'])
-        self.screen.blit(car_pos_text, (10, 190))
+        self.screen.blit(car_pos_text, (10, 300))
         
         # 显示目标世界坐标
-        goal_world_pos = f"goal world pos: ({self.goal.x:.1f}, {self.goal.y:.1f})"
-        goal_pos_text = self.small_font.render(goal_world_pos, True, self.colors['text'])
-        self.screen.blit(goal_pos_text, (10, 210))
+        if hasattr(self, 'goal') and self.goal:
+            goal_world_pos = f"goal world pos: ({self.goal['x']:.1f}, {self.goal['y']:.1f})"
+            goal_pos_text = self.small_font.render(goal_world_pos, True, self.colors['text'])
+            self.screen.blit(goal_pos_text, (10, 320))
         
         # 显示视野信息
         vision_info = f"vision radius: 100m, visible points: {len(self.get_visible_boundary_points())}"
         vision_text = self.small_font.render(vision_info, True, self.colors['text'])
-        self.screen.blit(vision_text, (10, 230))
+        self.screen.blit(vision_text, (10, 340))
+        
+        # 显示车辆信息
+        car_info = f"total cars: {len(self.cars)}, player car: red, others: blue"
+        car_text = self.small_font.render(car_info, True, self.colors['text'])
+        self.screen.blit(car_text, (10, 360))
         
         # 显示游戏状态
         status_text = ""
-        if self.collision_occurred:
+        if any(self.agent_collisions):
             status_text = "collision!"
-        elif self.off_road:
+        elif any(self.agent_off_road):
             status_text = "off road!"
-        elif self.goal.is_reached(self.player_car.x, self.player_car.y):
+        # 检查是否到达目标（使用reward返回的goal_reached标志）
+        elif len(self.agent_goal_reached) > 0 and self.agent_goal_reached[0]:  # 检查玩家车辆（索引0）的目标达成状态
             status_text = "goal reached!"
         if status_text:
             status_surface = self.font.render(status_text, True, (255, 0, 0))
-            self.screen.blit(status_surface, (10, 260))
-        
-
+            self.screen.blit(status_surface, (10, 380))
+    
     def run(self):
         """运行游戏主循环"""
-        print("游戏开始！")
-        print("使用随机动作控制汽车：")
-        print("每个step随机从12个离散动作中抽样")
-        print("按R重置episode，按ESC退出")
+        if self.training_mode:
+            print("训练模式开始！")
+            print("使用随机动作控制汽车（无图形界面）：")
+            print("每个step随机从12个离散动作中抽样")
+        else:
+            print("可视化模式")
+            print("每个step随机从12个离散动作中抽样")
+
         while self.running:
-            # 处理事件
-            self.handle_events()
             # 获取随机动作
             action_idx = self.get_random_action()
             # 更新游戏状态
             self.update_game_state(action_idx)
-            # 绘制画面
+            # 绘制画面（训练模式下跳过）
             self.draw()
-            # 控制帧率
-            self.clock.tick(60)
-        pygame.quit()
-        print("游戏结束！")
-
+    
 def main():
     """主函数"""
-    # 创建游戏实例
-    game = CarGame()
-    # 运行游戏
-    game.run()
+    import sys
+    # 检查命令行参数
+    if len(sys.argv) > 1 and sys.argv[1] == "--training":
+        # 训练模式
+        print("启动训练模式...")
+        game = CarGame(training_mode=True)
+        game.run()
+    else:
+        # 正常可视化模式
+        print("启动可视化模式...")
+        game = CarGame(training_mode=False)
+        game.run()
 
 if __name__ == "__main__":
     main()

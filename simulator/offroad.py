@@ -119,9 +119,4 @@ class OffroadChecker:
         is_on_road = torch.all(on_road_mask_per_point, dim=1)
         return is_on_road
     
-    def check_offroad(self, states: Tensor) -> Tensor:
-        """
-        批量检测车辆是否偏离道路。
-        """
-        return ~self.check_on_road(states)
 

@@ -61,18 +61,14 @@ class RoadNetwork:
     
     def _compute_road_geometry(self, vertices):
         """计算道路几何信息"""
-
-        
         p0, p1, p2, p3 = vertices
         # (num_quads, 2) -> (num_quads, 4, 2)
         self.quads_vertices = torch.stack([p0, p1, p2, p3], dim=1)
         self.num_quads = self.quads_vertices.shape[0]
-
         # 计算道路中心点和方向向量
         front_center = (p1 + p2) / 2.0  # 前中心点
         back_center = (p0 + p3) / 2.0   # 后中心点
         # 计算车道中心线 (从后中心点到前中心点)
-
         self.quad_centerlines = torch.stack([back_center, front_center], dim=1)
         # 计算车道边界
         self.left_boundaries = torch.stack([p0, p1], dim=1)
@@ -87,7 +83,6 @@ class RoadNetwork:
             torch.tensor([1.0, 0.0], device=self.device), 
             self.quad_directions / direction_norms
         )
-    
     def _store_metadata(self, quads_data):
         """存储元数据"""
         self.quad_ids = torch.tensor([q['polyId'] for q in quads_data], dtype=torch.int64, device=self.device)
@@ -246,62 +241,146 @@ class RoadNetwork:
 
 # 为了让这个文件可以独立测试，添加一个 main block
 if __name__ == '__main__':
-    import yaml
+    import matplotlib.pyplot as plt
+    import numpy as np
     import os
     
-    # 从配置文件读取地图路径
-    config_path = os.path.join(os.path.dirname(__file__), '../configs/default_config.yaml')
-    if not os.path.exists(config_path):
-        print(f"错误: 配置文件不存在: {config_path}")
-        exit(1)
-        
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
+    print("RoadNetwork 可视化测试")
     
-    map_file_path = config.get('simulator', {}).get('map_path')
-    if not map_file_path:
-        print("错误: 配置文件中未找到simulator.map_path字段")
-        exit(1)
+    # 设置中文字体
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
+    plt.rcParams['axes.unicode_minus'] = False
     
-    # 构建完整路径
-    if os.path.isabs(map_file_path):
-        map_file_path_full = map_file_path
+    # 检查地图文件是否存在
+    map_files = [
+        'maps/processed_map_Town01_stitched.json',
+    ]
+    map_path = None
+    for file_path in map_files:
+        if os.path.exists(file_path):
+            map_path = file_path
+            print(f"使用地图文件: {map_path}")
+            break
+    if map_path is None:
+        print("未找到可用的地图文件，创建示例数据")
+        # 创建示例数据用于演示
+        device = torch.device('cpu')
+        road_network = None
     else:
-        # 相对于项目根目录的路径
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-        map_file_path_full = os.path.normpath(os.path.join(project_root, map_file_path.lstrip('./')))
+        device = torch.device('cpu')
+        try:
+            road_network = RoadNetwork(map_path, device)
+            print(f"成功加载道路网络，包含 {road_network.num_quads} 个道路段")
+        except Exception as e:
+            print(f"加载地图文件失败: {e}")
+            road_network = None
     
-    if not os.path.exists(map_file_path_full):
-        print(f"错误: 地图文件不存在: {map_file_path_full}")
-        exit(1)
+    if road_network is not None:
+        # 创建可视化图表
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle('RoadNetwork 可视化', fontsize=16)
+        
+        # 1. 道路四边形可视化
+        ax1 = axes[0, 0]
+        ax1.set_title('道路四边形 (Quads)')
+        num_quads = road_network.num_quads
+        indices = torch.arange(num_quads)
+        for i in indices:
+            quad = road_network.quads_vertices[i].cpu().numpy()
+            # 绘制四边形
+            ax1.plot([quad[0, 0], quad[1, 0], quad[2, 0], quad[3, 0], quad[0, 0]], 
+                     [quad[0, 1], quad[1, 1], quad[2, 1], quad[3, 1], quad[0, 1]], 
+                     'b-', alpha=0.3, linewidth=0.5)
+        ax1.set_aspect('equal')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xlabel('X 坐标')
+        ax1.set_ylabel('Y 坐标')
+        
+        # 2. 道路中心线可视化
+        ax2 = axes[0, 1]
+        ax2.set_title('道路中心线')
+        
+        centerlines = road_network.get_all_lanes_centerlines()[indices].cpu().numpy()
+        for centerline in centerlines:
+            ax2.plot(centerline[:, 0], centerline[:, 1], 'r-', linewidth=1, alpha=0.7)
+        ax2.set_aspect('equal')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xlabel('X 坐标')
+        ax2.set_ylabel('Y 坐标')
+        
+        # 3. 道路边界线可视化
+        ax3 = axes[1, 0]
+        ax3.set_title('道路边界线')
+        left_boundaries = road_network.get_all_lanes_left_boundaries()[indices].cpu().numpy()
+        right_boundaries = road_network.get_all_lanes_right_boundaries()[indices].cpu().numpy()
+        for left_boundary in left_boundaries:
+            ax3.plot(left_boundary[:, 0], left_boundary[:, 1], 'g-', linewidth=1, alpha=0.7)
+        for right_boundary in right_boundaries:
+            ax3.plot(right_boundary[:, 0], right_boundary[:, 1], 'orange', linewidth=1, alpha=0.7)
+        ax3.set_aspect('equal')
+        ax3.grid(True, alpha=0.3)
+        ax3.set_xlabel('X 坐标')
+        ax3.set_ylabel('Y 坐标')
+        ax3.legend(['左边界', '右边界'])
+        
+        # 4. 全局航点可视化
+        ax4 = axes[1, 1]
+        ax4.set_title('全局航点')
+        # 绘制车道航点
+        if road_network.global_w_lane_waypoints.numel() > 0:
+            lane_waypoints = road_network.global_w_lane_waypoints.cpu().numpy()
+            ax4.scatter(lane_waypoints[:, 0], lane_waypoints[:, 1], 
+                       c='blue', s=10, alpha=0.6, label='车道航点')
+        
+        # 绘制边界航点
+        if road_network.global_w_boundary_points.numel() > 0:
+            boundary_waypoints = road_network.global_w_boundary_points.cpu().numpy()
+            ax4.scatter(boundary_waypoints[:, 0], boundary_waypoints[:, 1], 
+                       c='red', s=10, alpha=0.6, label='边界航点')
+        ax4.set_aspect('equal')
+        ax4.grid(True, alpha=0.3)
+        ax4.set_xlabel('X 坐标')
+        ax4.set_ylabel('Y 坐标')
+        ax4.legend()
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # 5. Frenet 坐标系测试
+        print("\n测试 Frenet 坐标系计算:")
+        # 创建一些测试车辆位置和朝向
+        test_positions = torch.tensor([
+            [0.0, 0.0],
+            [10.0, 5.0],
+            [-5.0, 3.0]
+        ], device=device)
+        
+        test_headings = torch.tensor([0.0, np.pi/4, -np.pi/6], device=device)
+        
+        try:
+            d, theta_f = road_network.calculate_frenet_coordinates(test_positions, test_headings)
+            print(f"车辆位置: {test_positions.cpu().numpy()}")
+            print(f"车辆朝向: {test_headings.cpu().numpy()}")
+            print(f"横向距离 d: {d.cpu().numpy()}")
+            print(f"角度误差 theta_f: {theta_f.cpu().numpy()}")
+        except Exception as e:
+            print(f"Frenet 坐标系计算失败: {e}")
+        
+        # 6. 最近车道查找测试
+        print("\n测试最近车道查找:")
+        try:
+            test_points = torch.tensor([[0.0, 0.0], [10.0, 10.0]], device=device)
+            distances, indices = road_network.find_nearest_lanes(test_points, k=3)
+            print(f"测试点: {test_points.cpu().numpy()}")
+            print(f"最近车道距离: {distances.cpu().numpy()}")
+            print(f"最近车道索引: {indices.cpu().numpy()}")
+        except Exception as e:
+            print(f"最近车道查找失败: {e}")
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        print("无法创建道路网络，跳过可视化")
+    
+    print("RoadNetwork 测试完成")
 
-    # 1. 初始化 RoadNetwork
-    road_network = RoadNetwork(map_path=map_file_path_full, device=device)
 
-    # 2. 打印一些基本信息
-    print(f"Device: {road_network.device}")
-    print(f"Number of quads: {road_network.num_quads}")
-    print(f"Quads vertices shape: {road_network.quads_vertices.shape}")
-    print(f"Quad centerlines shape: {road_network.quad_centerlines.shape}")
-
-    # 3. 测试 find_nearest_lanes 功能
-    # 创建一批测试点 (例如，10个随机点)
-    test_points = torch.randn(10, 2, device=device) * 100 # 随机生成一些点
-    # 查找最近的 3 个车道
-    k = 3
-    distances, indices = road_network.find_nearest_lanes(test_points, k=k)
-    print("\n--- Testing find_nearest_lanes ---")
-    print(f"Test points shape: {test_points.shape}")
-    print(f"Found nearest {k} lanes.")
-    print(f"Distances shape: {distances.shape}")
-    print(f"Indices shape: {indices.shape}")
-    # 打印第一个点的结果
-    print(f"\nResults for the first point ({test_points[0].cpu().numpy()}):")
-    for i in range(k):
-        lane_idx = indices[0, i].item()
-        dist = distances[0, i].item()
-        lane_id = road_network.lane_ids[lane_idx].item()
-        print(f"  {i+1}. Nearest lane index: {lane_idx}, Lane ID: {lane_id}, Distance: {dist:.2f}")
 

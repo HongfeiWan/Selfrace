@@ -26,6 +26,7 @@ class DiscreteActionSpace:
                 self.actions.append([along, alat])
         self.num_actions = len(self.actions)  # 12个动作
         self.actions_tensor = torch.tensor(self.actions, dtype=torch.float32, device=device)
+
     def get_action(self, action_idx: torch.Tensor) -> torch.Tensor:
         """
         根据动作索引获取实际动作值
@@ -39,6 +40,7 @@ class DiscreteActionSpace:
             return self.actions_tensor[action_idx]
         else:  # 批量
             return self.actions_tensor[action_idx]
+        
     def get_all_actions(self) -> torch.Tensor:
         """获取所有动作"""
         return self.actions_tensor
@@ -120,7 +122,6 @@ class KinematicBicycleModel:
         Returns:
             torch.Tensor: 形状为 (N, 4) 的下一时刻状态张量。
         """
-        
         # 检查输入维度
         assert states.ndim == 2 and states.shape[1] == 4, f"States shape must be (N, 4), but got {states.shape}"
         # 获取批次大小
@@ -147,10 +148,6 @@ class KinematicBicycleModel:
         
         # 检测纵向加速度符号变化：a(t-1)_long * a(t)_long < 0
         accel_sign_change = (self.current_along * new_along) < 0
-        
-        # 调试信息
-        if batch_size == 1:  # 只在单车辆时打印调试信息
-            print(f"Step: current_along={self.current_along[0]:.3f}, new_along={new_along[0]:.3f}, accel_sign_change={accel_sign_change[0]}")
         
         # 如果纵向加速度改变符号，将横向加速度设置为0,纵向加速度设置为0
         if torch.any(accel_sign_change):
@@ -298,7 +295,7 @@ class KinematicBicycleModel:
 
 # 为了让这个文件可以独立测试，添加一个 main block
 if __name__ == '__main__':
-    test=DiscreteActionSpace(torch.device('cpu'), config={})
+    test=DiscreteActionSpace(torch.device('cuda'), config={})
     print(test.get_all_actions())
     print(test.get_action(torch.tensor([0])))
 
