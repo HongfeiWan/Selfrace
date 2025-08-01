@@ -11,7 +11,7 @@ class DiscreteActionSpace:
     """
     def __init__(self, device: torch.device, config: Dict = None):
         # 定义12个离散动作
-        # along: [min_long_jerk, -4, 0, 4] m/s³ (纵向jerk)
+        # along: [-15, -4, 0, 4] m/s³ (纵向jerk)
         # alat: [-4, 0, 4] m/s³ (横向jerk)
         min_long_jerk = config.get('min_longitudinal_jerk', -15.0)
         max_long_jerk = config.get('max_longitudinal_jerk', 4.0)

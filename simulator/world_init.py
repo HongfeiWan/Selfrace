@@ -467,3 +467,80 @@ if __name__ == '__main__':
         print(f"Error during visualization: {e}")
         print("Vehicle visualization failed.")
 
+    # 7. 绘制 quads 的方向箭头
+    print("\n--- Visualizing quads direction arrows ---")
+    try:
+        # 创建新的图形来显示 quads 方向
+        fig, ax = plt.subplots(figsize=(20, 20))
+        
+        # 绘制地图
+        with open(map_file_path, 'r') as f:
+            data = json.load(f)
+        quads_data = data.get('quads', [])
+        traffic_data = data.get('traffic_controls', [])
+        map_name = data.get('map_name', 'Unknown')
+        
+        plot_quads(ax, quads_data)
+        plot_traffic_controls(ax, traffic_data)
+        
+        # 绘制 quads 方向箭头
+        def plot_quad_direction_arrows(ax, road_network):
+            """绘制 quads 的方向箭头"""
+            # 获取所有 quads 的中心点和方向
+            centerlines = road_network.quad_centerlines  # (num_quads, 2, 2)
+            directions = road_network.quad_directions    # (num_quads, 2)
+            
+            # 计算每个 quad 的中心点（中心线的中点）
+            quad_centers = (centerlines[:, 0] + centerlines[:, 1]) / 2.0  # (num_quads, 2)
+            
+            # 设置箭头参数
+            arrow_length = 8.0  # 箭头长度
+            arrow_width = 2.0   # 箭头宽度
+            arrow_head_width = 3.0  # 箭头头部宽度
+            arrow_head_length = 2.0  # 箭头头部长度
+            
+            # 每隔几个 quad 绘制一个箭头，避免过于密集
+            step = max(1, len(quad_centers) // 200)  # 最多显示200个箭头
+            
+            for i in range(0, len(quad_centers), step):
+                center = quad_centers[i].cpu().numpy()
+                direction = directions[i].cpu().numpy()
+                
+                # 计算箭头终点
+                arrow_end = center + direction * arrow_length
+                
+                # 绘制箭头
+                ax.arrow(center[0], center[1], 
+                        direction[0] * arrow_length, direction[1] * arrow_length,
+                        head_width=arrow_head_width, head_length=arrow_head_length,
+                        fc='blue', ec='blue', alpha=0.7, linewidth=arrow_width, zorder=5)
+            
+            print(f"Plotted {len(quad_centers) // step} direction arrows for {len(quad_centers)} quads")
+        
+        # 绘制方向箭头
+        plot_quad_direction_arrows(ax, road_network)
+        
+        ax.autoscale_view()
+        ax.set_aspect('equal', adjustable='box')
+        title = f'Quads Direction Visualization on {map_name}'
+        ax.set_title(title, fontsize=16)
+        ax.set_xlabel('X Coordinate (m)')
+        ax.set_ylabel('Y Coordinate (m)')
+        ax.grid(True, alpha=0.3)
+        
+        # 添加图例
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Line2D([0], [0], color='blue', linewidth=2, label='Quad Direction'),
+            Line2D([0], [0], color='red', linewidth=2.5, label='Stop Line'),
+            Line2D([0], [0], marker='o', color='red', label='Traffic Light', markersize=8)
+        ]
+        
+        ax.legend(handles=legend_elements, loc='upper right')
+        plt.tight_layout()
+        plt.show()
+        
+    except Exception as e:
+        print(f"Error during quads direction visualization: {e}")
+        print("Quads direction visualization failed.")
+
