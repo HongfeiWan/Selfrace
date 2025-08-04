@@ -219,6 +219,7 @@ if __name__ == '__main__':
 ```
 
 **测试功能包括**:
+
 - 地图数据加载和验证
 - 道路几何信息计算
 - 最近道路段查找
@@ -547,34 +548,7 @@ OffroadChecker 模块存储了以下主要变量及其内容：
 
 ---
 
-### 性能优化
-
-#### 1. 空间哈希索引
-- 使用空间哈希将道路多边形按空间位置分组
-- 显著减少需要测试的多边形数量
-- 时间复杂度从 O(n*m) 降低到 O(log n*m)，其中 n 是多边形数量，m 是测试点数量
-
-#### 2. 批量化处理
-- 支持同时检测多个车辆的状态
-- 利用 GPU 并行计算能力
-- 减少内存分配和数据传输开销
-
-#### 3. 射线投射算法
-- 使用高效的射线投射算法进行点在多边形内测试
-- 数值稳定的交点计算
-- 支持复杂的道路几何形状
-
----
-
-### 测试功能
-
-模块包含完整的测试功能，可以独立运行：
-
-```python
-if __name__ == '__main__':
-    # 测试离路检测功能
-    # 包括地图加载、车辆位置生成、离路检测、可视化等
-```
+### 测试函数
 
 **测试功能包括**:
 - 地图数据加载和验证
@@ -588,31 +562,5 @@ if __name__ == '__main__':
 - 道路网络地图显示
 - 车辆位置和朝向的可视化
 - 在道路/离路状态的视觉区分
-- Frenet坐标计算结果展示
-
----
-
-### 使用示例
-
-```python
-# 初始化检测器
-road_network = RoadNetwork(map_path, device)
-spatial_hash = SpatialHash(cell_size=20.0, min_bounds=min_bounds, max_bounds=max_bounds, device=device)
-offroad_checker = OffroadChecker(road_network, spatial_hash, points_per_vehicle_edge=3)
-
-# 准备车辆状态数据
-vehicle_states = torch.tensor([
-    [x1, y1, heading1, length1, width1],
-    [x2, y2, heading2, length2, width2],
-    # ... 更多车辆
-], dtype=torch.float32, device=device)
-
-# 批量检测离路状态
-is_on_road = offroad_checker.check_on_road(vehicle_states)
-# 返回布尔张量，True表示在道路上，False表示离路
-```
-
-
-
-
+- Frenet坐标计算结果
 
