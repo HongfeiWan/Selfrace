@@ -133,7 +133,6 @@ if __name__ == "__main__":
     import numpy as np
     import os
     import sys
-
     map_path = "maps/processed_map_Town01_stitched.json"
     device = torch.device('cuda')
     road_network = RoadNetwork(map_path, device)
@@ -149,7 +148,6 @@ if __name__ == "__main__":
         print(f"随机选择quad索引: {random_quad_idx}")
         # 获取选中quad的顶点
         selected_quad = quads_vertices_np[random_quad_idx]
-
         # 在quad范围内随机生成车辆位置
         # 使用重心坐标法在quad内随机生成点
         def random_point_in_quad(quad_vertices):
@@ -319,8 +317,6 @@ if __name__ == "__main__":
         by_label = dict(zip(labels, handles))
         ax.legend(by_label.values(), by_label.keys())
 
-        
-
         # 设置图形属性
         ax.set_xlabel('X Coordinate')
         ax.set_ylabel('Y Coordinate')
@@ -341,6 +337,6 @@ if __name__ == "__main__":
         print(f"测试过程中发生错误: {e}")
         import traceback
         traceback.print_exc()
-
-
+    
+    
    

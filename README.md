@@ -434,6 +434,184 @@ RewardCalculator 类提供了完整的奖励计算功能，包括目标奖励、
 
 每个测试函数都会生成相应的可视化图表，帮助分析奖励组件的分布和特性。
 
+---
+
+## OffroadChecker 模块
+OffroadChecker 是 GIGAFLOW 项目中的离路检测模块，负责高效地检测车辆是否在道路上。该模块使用基于 GPU 加速的批量化算法，结合空间哈希索引来快速判断车辆位置是否在道路边界内。
+### 模块概述
+OffroadChecker 类提供了高性能的离路检测功能，通过将车辆边界框离散化为多个采样点，并使用射线投射法（Ray Casting）来判断这些点是否在道路多边形内。该模块是自动驾驶系统中安全性和合规性检查的重要组成部分。
+### 主要函数
+#### 1. `__init__(map_data: RoadNetwork, spatial_hash: SpatialHash, points_per_vehicle_edge: int = 3)`
+**功能**: 初始化离路检测器
+**输入**:
+- `map_data` (RoadNetwork): 包含路面几何信息的 RoadNetwork 对象
+- `spatial_hash` (SpatialHash): 预初始化的空间哈希对象
+- `points_per_vehicle_edge` (int): 沿着车辆边界框每条边采样的点数，默认为3
+
+**说明**: 初始化检测器，构建静态路面索引，创建本地边界框点模板。使用共享的 spatial_hash 来提高查询效率。
+
+---
+
+#### 2. `_create_local_bbox_points() -> Tensor`
+**功能**: 为单位尺寸的边界框创建点模板
+**输入**: 无
+**输出**: `torch.Tensor` - 形状为 (num_points, 2) 的点模板张量
+
+**说明**: 创建单位尺寸边界框（范围从-0.5到0.5）的点模板，包括边界上的采样点和中心点。这些点将在后续计算中被缩放和旋转到实际的车辆位置。
+
+---
+
+#### 3. `_get_discretized_bounding_boxes(states: Tensor) -> Tensor`
+**功能**: 将本地边界框点集根据车辆状态转换到世界坐标系
+**输入**:
+- `states` (torch.Tensor): 车辆状态张量，形状为 (N, 5)
+  - [0]: x - 车辆x坐标
+  - [1]: y - 车辆y坐标
+  - [2]: heading - 车辆朝向角度（弧度）
+  - [3]: length - 车辆长度
+  - [4]: width - 车辆宽度
+
+**输出**: `torch.Tensor` - 形状为 (N, num_points, 2) 的世界坐标点张量
+
+**算法说明**:
+1. **缩放**: 根据车辆尺寸缩放点模板
+2. **旋转**: 根据车辆朝向旋转点集
+3. **平移**: 将点集平移到车辆实际位置
+
+---
+
+#### 4. `_batch_point_in_polygon_test(points: Tensor) -> Tensor`
+**功能**: 使用射线投射法执行并行的"点在多边形内"测试
+**输入**:
+- `points` (torch.Tensor): 待测试的点坐标，形状为 (M, 2)
+
+**输出**: `torch.Tensor` - 形状为 (M,) 的布尔张量，True表示点在道路内
+
+**算法说明**:
+1. **空间查询**: 使用空间哈希快速找到候选道路多边形
+2. **射线投射**: 对每个点向任意方向发射射线，统计与多边形边界的交点数
+3. **奇偶判断**: 如果交点数为奇数，则点在多边形内；否则在多边形外
+
+**数学原理**: 基于射线投射定理，从点向任意方向发射射线，统计与多边形边界的交点数。奇数个交点表示点在多边形内部。
+
+---
+
+#### 5. `check_on_road(states: Tensor) -> Tensor`
+**功能**: 批量检测车辆是否在道路上
+**输入**:
+- `states` (torch.Tensor): 车辆状态张量，形状为 (N, 5)
+  - [0]: x - 车辆x坐标
+  - [1]: y - 车辆y坐标
+  - [2]: heading - 车辆朝向角度（弧度）
+  - [3]: length - 车辆长度
+  - [4]: width - 车辆宽度
+
+**输出**: `torch.Tensor` - 形状为 (N,) 的布尔张量，True表示车辆在道路上
+
+**算法流程**:
+1. **边界框离散化**: 将车辆边界框转换为世界坐标系中的采样点
+2. **批量点测试**: 对所有采样点执行"点在多边形内"测试
+3. **整体判断**: 只有当车辆边界框的所有采样点都在道路内时，才认为车辆在道路上
+
+**说明**: 这是主要的检测函数，整合了所有子步骤，返回每个车辆的离路状态。
+
+---
+
+### 数据结构
+
+OffroadChecker 模块存储了以下主要变量及其内容：
+
+#### 主要属性
+
+##### 几何信息
+- `self.road_polygons` (torch.Tensor): 道路多边形顶点，形状为 (num_polygons, num_vertices, 2)
+  - 存储所有道路多边形的顶点坐标
+  - 用于射线投射算法的几何计算
+
+- `self.local_bbox_points` (torch.Tensor): 本地边界框点模板，形状为 (num_points, 2)
+  - 存储单位尺寸边界框的采样点
+  - 包括边界上的采样点和中心点
+
+##### 配置参数
+- `self.points_per_vehicle_edge` (int): 每条边的采样点数
+  - 控制边界框离散化的精度
+  - 默认值为3，可根据需要调整
+
+- `self.device` (torch.device): 计算设备
+  - 存储张量所在的设备（CPU或GPU）
+
+##### 空间索引
+- `self.spatial_hash` (SpatialHash): 空间哈希对象
+  - 用于快速查询候选道路多边形
+  - 提高大规模场景下的查询效率
+
+---
+
+### 性能优化
+
+#### 1. 空间哈希索引
+- 使用空间哈希将道路多边形按空间位置分组
+- 显著减少需要测试的多边形数量
+- 时间复杂度从 O(n*m) 降低到 O(log n*m)，其中 n 是多边形数量，m 是测试点数量
+
+#### 2. 批量化处理
+- 支持同时检测多个车辆的状态
+- 利用 GPU 并行计算能力
+- 减少内存分配和数据传输开销
+
+#### 3. 射线投射算法
+- 使用高效的射线投射算法进行点在多边形内测试
+- 数值稳定的交点计算
+- 支持复杂的道路几何形状
+
+---
+
+### 测试功能
+
+模块包含完整的测试功能，可以独立运行：
+
+```python
+if __name__ == '__main__':
+    # 测试离路检测功能
+    # 包括地图加载、车辆位置生成、离路检测、可视化等
+```
+
+**测试功能包括**:
+- 地图数据加载和验证
+- 随机车辆位置生成
+- 多朝向车辆状态测试
+- 离路检测结果验证
+- Frenet坐标计算
+- 地图可视化（包括quads、车辆位置、检测结果等）
+
+**可视化输出**:
+- 道路网络地图显示
+- 车辆位置和朝向的可视化
+- 在道路/离路状态的视觉区分
+- Frenet坐标计算结果展示
+
+---
+
+### 使用示例
+
+```python
+# 初始化检测器
+road_network = RoadNetwork(map_path, device)
+spatial_hash = SpatialHash(cell_size=20.0, min_bounds=min_bounds, max_bounds=max_bounds, device=device)
+offroad_checker = OffroadChecker(road_network, spatial_hash, points_per_vehicle_edge=3)
+
+# 准备车辆状态数据
+vehicle_states = torch.tensor([
+    [x1, y1, heading1, length1, width1],
+    [x2, y2, heading2, length2, width2],
+    # ... 更多车辆
+], dtype=torch.float32, device=device)
+
+# 批量检测离路状态
+is_on_road = offroad_checker.check_on_road(vehicle_states)
+# 返回布尔张量，True表示在道路上，False表示离路
+```
+
 
 
 
