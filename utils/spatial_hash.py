@@ -22,7 +22,6 @@ class SpatialHash:
         self.min_bounds = min_bounds.to(device)
         self.max_bounds = max_bounds.to(device)
         self.device = device
-        
         grid_dim = torch.ceil((self.max_bounds - self.min_bounds) / self.cell_size).long()
         self.grid_size = torch.max(grid_dim, torch.tensor([1, 1], device=device, dtype=torch.long))
         self.grid_total_cells = self.grid_size[0] * self.grid_size[1]

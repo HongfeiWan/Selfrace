@@ -1,13 +1,9 @@
 # Gigaflow
-
 ## RoadNetwork 模块
 RoadNetwork 是 GIGAFLOW 项目中的道路网络管理模块，负责加载和管理从预处理的 CARLA 地图数据中提取的道路网络。该模块将地图数据（主要是四边形路块 'quads'）加载到 PyTorch 张量中，以便于在 GPU 上进行高效的批量化计算。
-
 ### 模块概述
 RoadNetwork 类提供了查询地图几何信息（如车道中心线、边界线）的核心功能，并实现了 Frenet 坐标系的计算，包括横向距离 d 和角度误差 θ_f。该模块是自动驾驶系统中路径规划和车辆定位的重要组成部分。
-
 ### 主要函数
-
 #### 1. `__init__(map_path: str, device: torch.device)`
 **功能**: 初始化道路网络
 **输入**:
@@ -159,16 +155,56 @@ RoadNetwork 类提供了查询地图几何信息（如车道中心线、边界�
 
 ### 数据结构
 
+RoadNetwork 模块存储了以下主要变量及其内容：
+
 #### 主要属性
-- `quads_vertices` (torch.Tensor): 所有 quads 的顶点坐标 (num_quads, 4, 2)
-- `quad_centerlines` (torch.Tensor): 所有 quads 的中心线 (num_quads, 2, 2)
-- `left_boundaries` (torch.Tensor): 所有 quads 的左边界 (num_quads, 2, 2)
-- `right_boundaries` (torch.Tensor): 所有 quads 的右边界 (num_quads, 2, 2)
-- `quad_directions` (torch.Tensor): 所有 quads 的方向向量 (num_quads, 2)
-- `quad_ids` (torch.Tensor): 所有 quads 的ID (num_quads,)
-- `lane_ids` (torch.Tensor): 所有 quads 的车道ID (num_quads,)
-- `global_w_lane_waypoints` (torch.Tensor): 全局车道航点
-- `global_w_boundary_points` (torch.Tensor): 全局边界航点
+
+##### 几何信息
+- `self.quads_vertices` (torch.Tensor): 所有 quads 的顶点坐标 (num_quads, 4, 2)
+  - 存储每个quad的四个顶点坐标
+  - 顶点顺序: p0 (left_start) -> vertices[2], p1 (left_end) -> vertices[1], p2 (right_end) -> vertices[0], p3 (right_start) -> vertices[3]
+
+- `self.quad_centerlines` (torch.Tensor): 所有 quads 的中心线 (num_quads, 2, 2)
+  - 存储每个quad的中心线起点和终点坐标
+  - 用于计算道路方向和Frenet坐标
+
+- `self.left_boundaries` (torch.Tensor): 所有 quads 的左边界 (num_quads, 2, 2)
+  - 存储每个quad的左边界线段起点和终点
+
+- `self.right_boundaries` (torch.Tensor): 所有 quads 的右边界 (num_quads, 2, 2)
+  - 存储每个quad的右边界线段起点和终点
+
+- `self.quad_directions` (torch.Tensor): 所有 quads 的方向向量 (num_quads, 2)
+  - 存储每个quad的归一化方向向量
+  - 用于计算Frenet坐标系中的角度误差
+
+##### 标识信息
+- `self.quad_ids` (torch.Tensor): 所有 quads 的ID (num_quads,)
+  - 存储每个quad的唯一标识符
+
+- `self.lane_ids` (torch.Tensor): 所有 quads 的车道ID (num_quads,)
+  - 存储每个quad所属的车道标识
+
+##### 航点信息
+- `self.global_w_lane_waypoints` (torch.Tensor): 全局车道航点
+  - 存储地图中所有车道航点的坐标
+  - 用于路径规划和导航
+
+- `self.global_w_boundary_points` (torch.Tensor): 全局边界航点
+  - 存储地图中所有边界航点的坐标
+  - 用于边界检测和离路判断
+
+##### 关联信息
+- `self.quad_w_lane_ids_assoc` (List): 每个quad关联的车道航点ID列表
+  - 存储每个quad与车道航点的关联关系
+- `self.quad_w_boundary_ids_assoc` (List): 每个quad关联的边界航点ID列表
+  - 存储每个quad与边界航点的关联关系
+
+##### 统计信息
+- `self.num_quads` (int): quads的总数量
+  - 记录地图中quad的总数
+- `self.device` (torch.device): 计算设备
+  - 存储张量所在的设备（CPU或GPU）
 
 ---
 

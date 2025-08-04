@@ -2,7 +2,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 class FeatureEncoder(nn.Module):
     """
@@ -100,7 +99,6 @@ class FeatureEncoder(nn.Module):
         final_features = torch.cat([maxpool_output, direct_output], dim=-1)
         return final_features
 
-
 class SharedNetwork(nn.Module):
     """
     共享网络（同时输出策略和值函数）
@@ -176,12 +174,11 @@ class SharedNetwork(nn.Module):
         
         return action_logits, value
 
-
 def create_network(network_type="shared", feature_dims=None, num_actions=4, network_dim=64):
     """
     创建网络实例的工厂函数
     Args:
-        network_type: 网络类型 ("shared", "separate")
+        network_type: 网络类型 ("shared")
         feature_dims: 特征维度字典
         num_actions: 动作数量
         network_dim: 网络隐藏层维度
