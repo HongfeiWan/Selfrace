@@ -83,11 +83,12 @@ class RoadNetwork:
             torch.tensor([1.0, 0.0], device=self.device), 
             self.quad_directions / direction_norms
         )
+
     def _store_metadata(self, quads_data):
         """存储元数据"""
         self.quad_ids = torch.tensor([q['polyId'] for q in quads_data], dtype=torch.int64, device=self.device)
         self.lane_ids = torch.tensor([q['lane_id'] for q in quads_data], dtype=torch.int32, device=self.device)
-        
+
         # 加载并存储每个 quad 关联的航点 ID
         self.quad_w_lane_ids_assoc = [q.get('w_lane_ids', []) for q in quads_data]
         self.quad_w_boundary_ids_assoc = [q.get('w_boundary_ids', []) for q in quads_data]
@@ -123,7 +124,6 @@ class RoadNetwork:
         Args:
             points (torch.Tensor): 形状为 (N, 2) 的点坐标张量。
             k (int): 需要为每个点找到的最近车道的数量。
-
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
             - distances: 形状为 (N, k) 的距离张量。
@@ -139,7 +139,6 @@ class RoadNetwork:
         dist_sq = torch.sum(diff ** 2, dim=-1) # (N, num_quads)
         # 找到最近的 k 个
         distances, indices = torch.topk(dist_sq, k=k, dim=1, largest=False)
-        
         return torch.sqrt(distances), indices
 
     def get_global_waypoints_by_ids(self, ids: torch.Tensor, point_type: str) -> torch.Tensor:
@@ -149,26 +148,24 @@ class RoadNetwork:
             'w_lane': self.global_w_lane_waypoints,
             'w_boundary': self.global_w_boundary_points
         }
-        
+    
         source_points = point_type_map.get(point_type)
         if source_points is None:
             return torch.empty((0, 2), device=self.device)
-        
+    
         # 过滤掉无效的ID (例如，填充的-1)
         valid_ids = ids[ids >= 0]
         if valid_ids.numel() == 0:
             return torch.empty((0, 2), device=self.device)
-            
+        
         return source_points[valid_ids]
 
     def calculate_frenet_coordinates(self, vehicle_positions: torch.Tensor, vehicle_headings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         计算车辆在Frenet坐标系中的横向距离d和角度误差theta_f。
-        
         Args:
             vehicle_positions (torch.Tensor): 车辆位置，形状为 (B, M, 2) 或 (N, 2)
             vehicle_headings (torch.Tensor): 车辆朝向角度（弧度），形状为 (B, M) 或 (N,)
-            
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
             - d: 横向距离，正值表示在道路右侧，负值表示在道路左侧
@@ -178,7 +175,6 @@ class RoadNetwork:
         if vehicle_positions.ndim == 2:
             vehicle_positions = vehicle_positions.unsqueeze(0)  # (N, 2) -> (1, N, 2)
             vehicle_headings = vehicle_headings.unsqueeze(0)    # (N,) -> (1, N)
-        
         B, M, _ = vehicle_positions.shape
         
         # 为每个车辆找到最近的道路段
@@ -187,7 +183,6 @@ class RoadNetwork:
         
         # 重塑回原始形状
         nearest_indices = nearest_indices.view(B, M)  # (B, M)
-        
         # 获取最近道路段的方向向量
         road_directions = self.quad_directions[nearest_indices]  # (B, M, 2)
         
@@ -197,190 +192,174 @@ class RoadNetwork:
             torch.sin(vehicle_headings)
         ], dim=-1)  # (B, M, 2)
         
-        # 计算角度误差 theta_f
-        theta_f = self._calculate_heading_error(road_directions, vehicle_directions)
-        # 计算横向距离 d
-        d = self._calculate_lateral_distance(vehicle_positions, nearest_indices, road_directions)
-        return d, theta_f
-    
-    def _calculate_heading_error(self, road_directions, vehicle_directions):
-        """计算车辆朝向与道路方向的夹角误差"""
-        # 使用叉积的符号来确定角度方向
-        cross_product = (road_directions[:, :, 0] * vehicle_directions[:, :, 1] - 
-                        road_directions[:, :, 1] * vehicle_directions[:, :, 0])
-        dot_product = torch.sum(road_directions * vehicle_directions, dim=-1)
-        return torch.atan2(cross_product, dot_product)  # (B, M)
-    
-    def _calculate_lateral_distance(self, vehicle_positions, nearest_indices, road_directions):
-        """计算车辆到道路的横向距离"""
-        # 获取最近道路段的起点和终点
+        # 获取最近道路段的起点
         nearest_centerlines = self.quad_centerlines[nearest_indices]  # (B, M, 2, 2)
         road_starts = nearest_centerlines[:, :, 0, :]  # (B, M, 2) - 道路起点
-        road_ends = nearest_centerlines[:, :, 1, :]    # (B, M, 2) - 道路终点
-        
-        # 计算道路向量和长度
-        road_vectors = road_ends - road_starts  # (B, M, 2)
-        road_lengths = torch.norm(road_vectors, dim=-1, keepdim=True)  # (B, M, 1)
-        road_lengths = torch.clamp(road_lengths, min=1e-8)
-        
-        # 计算投影参数
-        to_start = vehicle_positions - road_starts  # (B, M, 2)
-        t = torch.sum(to_start * road_vectors, dim=-1, keepdim=True) / (road_lengths ** 2)  # (B, M, 1)
-        t = torch.clamp(t, 0, 1)
-        
-        # 计算投影点
-        projection_points = road_starts + t * road_vectors  # (B, M, 2)
-        to_projection = vehicle_positions - projection_points  # (B, M, 2)
-        
-        # 计算横向距离
-        road_perpendicular = torch.stack([
-            -road_directions[:, :, 1],
-            road_directions[:, :, 0]
-        ], dim=-1)  # (B, M, 2)
-        return torch.sum(to_projection * road_perpendicular, dim=-1)  # (B, M)
+        # 计算从道路起点到车辆位置的向量 AP = P - A
+        AP = vehicle_positions - road_starts  # (B, M, 2)
+        # 计算二维叉积 cross = (Px - Ax) * dy - (Py - Ay) * dx
+        # 这等价于 AP × road_directions 的z分量
+        cross = (AP[:, :, 0] * road_directions[:, :, 1] - 
+                AP[:, :, 1] * road_directions[:, :, 0])  # (B, M)
+        # 计算角度误差 theta_f
+        # 使用叉积的符号来确定角度方向
+        # 注意：这里计算的是 vehicle_directions 相对于 road_directions 的角度
+        cross_product = (vehicle_directions[:, :, 0] * road_directions[:, :, 1] - 
+                        vehicle_directions[:, :, 1] * road_directions[:, :, 0])
+        dot_product = torch.sum(road_directions * vehicle_directions, dim=-1)
+        theta_f = torch.atan2(cross_product, dot_product)  # (B, M)
+        # 横向距离就是叉积值（带符号）
+        # cross > 0: 车辆在道路左侧
+        # cross < 0: 车辆在道路右侧  
+        # cross = 0: 车辆在道路中心线上
+        d = cross  # (B, M)
+        return d, theta_f
+    
 
 # 为了让这个文件可以独立测试，添加一个 main block
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
     import numpy as np
-    import os
-    
-    print("RoadNetwork 可视化测试")
-    
-    # 设置中文字体
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
-    plt.rcParams['axes.unicode_minus'] = False
-    
-    # 检查地图文件是否存在
-    map_files = [
-        'maps/processed_map_Town01_stitched.json',
-    ]
-    map_path = None
-    for file_path in map_files:
-        if os.path.exists(file_path):
-            map_path = file_path
-            print(f"使用地图文件: {map_path}")
-            break
-    if map_path is None:
-        print("未找到可用的地图文件，创建示例数据")
-        # 创建示例数据用于演示
-        device = torch.device('cpu')
-        road_network = None
-    else:
-        device = torch.device('cpu')
-        try:
-            road_network = RoadNetwork(map_path, device)
-            print(f"成功加载道路网络，包含 {road_network.num_quads} 个道路段")
-        except Exception as e:
-            print(f"加载地图文件失败: {e}")
-            road_network = None
-    
-    if road_network is not None:
-        # 创建可视化图表
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle('RoadNetwork 可视化', fontsize=16)
+    import random
+    print("RoadNetwork 测试")
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    # 加载地图数据
+    map_path = "maps/processed_map_Town01_stitched.json"
+    print(f"加载地图: {map_path}")
+    try:
+        # 创建RoadNetwork实例
+        road_network = RoadNetwork(map_path, device)
+        # 获取quads顶点数据
+        quads_vertices_np = road_network.quads_vertices.cpu().numpy()
+        # 随机选择一个quad并在其中生成车辆位置
+        random_quad_idx = random.randint(0, road_network.num_quads - 1)
+        print(f"随机选择quad索引: {random_quad_idx}")
+
+        # 获取选中quad的顶点
+        selected_quad = quads_vertices_np[random_quad_idx]
+
+        # 在quad范围内随机生成车辆位置
+        # 使用重心坐标法在quad内随机生成点
+        def random_point_in_quad(quad_vertices):
+            # 生成随机重心坐标
+            r1, r2 = np.random.random(2)
+            sqrt_r1 = np.sqrt(r1)
+            u = 1 - sqrt_r1
+            v = r2 * sqrt_r1
+            # 计算随机点
+            point = (1-u-v) * quad_vertices[0] + u * quad_vertices[1] + v * quad_vertices[2]
+            return point
+        vehicle_pos = random_point_in_quad(selected_quad)
+        vehicle_yaw = random.uniform(0, 2 * np.pi)  # 随机朝向
         
-        # 1. 道路四边形可视化
-        ax1 = axes[0, 0]
-        ax1.set_title('道路四边形 (Quads)')
-        num_quads = road_network.num_quads
-        indices = torch.arange(num_quads)
-        for i in indices:
-            quad = road_network.quads_vertices[i].cpu().numpy()
-            # 绘制四边形
-            ax1.plot([quad[0, 0], quad[1, 0], quad[2, 0], quad[3, 0], quad[0, 0]], 
-                     [quad[0, 1], quad[1, 1], quad[2, 1], quad[3, 1], quad[0, 1]], 
-                     'b-', alpha=0.3, linewidth=0.5)
-        ax1.set_aspect('equal')
-        ax1.grid(True, alpha=0.3)
-        ax1.set_xlabel('X 坐标')
-        ax1.set_ylabel('Y 坐标')
+        # 绘制地图
+        print("绘制地图...")
+        fig, ax = plt.subplots(figsize=(12, 8))
         
-        # 2. 道路中心线可视化
-        ax2 = axes[0, 1]
-        ax2.set_title('道路中心线')
+        # 只绘制车辆周围的quads
+        vehicle_pos_array = np.array([vehicle_pos], dtype=np.float32)
+        vehicle_pos_tensor = torch.tensor(vehicle_pos_array, dtype=torch.float32, device=device)
         
-        centerlines = road_network.get_all_lanes_centerlines()[indices].cpu().numpy()
-        for centerline in centerlines:
-            ax2.plot(centerline[:, 0], centerline[:, 1], 'r-', linewidth=1, alpha=0.7)
-        ax2.set_aspect('equal')
-        ax2.grid(True, alpha=0.3)
-        ax2.set_xlabel('X 坐标')
-        ax2.set_ylabel('Y 坐标')
+        # 找到距离车辆最近的200个quads
+        distances, nearest_indices = road_network.find_nearest_lanes(vehicle_pos_tensor, k=200)
+        nearest_indices = nearest_indices.cpu().numpy().flatten()
+        nearest_quad_idx = nearest_indices[0]  # 最近的quad索引
+        print(f"距离车辆最近的quad索引: {nearest_quad_idx}")
         
-        # 3. 道路边界线可视化
-        ax3 = axes[1, 0]
-        ax3.set_title('道路边界线')
-        left_boundaries = road_network.get_all_lanes_left_boundaries()[indices].cpu().numpy()
-        right_boundaries = road_network.get_all_lanes_right_boundaries()[indices].cpu().numpy()
-        for left_boundary in left_boundaries:
-            ax3.plot(left_boundary[:, 0], left_boundary[:, 1], 'g-', linewidth=1, alpha=0.7)
-        for right_boundary in right_boundaries:
-            ax3.plot(right_boundary[:, 0], right_boundary[:, 1], 'orange', linewidth=1, alpha=0.7)
-        ax3.set_aspect('equal')
-        ax3.grid(True, alpha=0.3)
-        ax3.set_xlabel('X 坐标')
-        ax3.set_ylabel('Y 坐标')
-        ax3.legend(['左边界', '右边界'])
+        # 使用找到的最近200个quads作为附近quads
+        nearby_quads = nearest_indices.tolist()
+        print(f"车辆周围最近200个quads")
         
-        # 4. 全局航点可视化
-        ax4 = axes[1, 1]
-        ax4.set_title('全局航点')
-        # 绘制车道航点
-        if road_network.global_w_lane_waypoints.numel() > 0:
-            lane_waypoints = road_network.global_w_lane_waypoints.cpu().numpy()
-            ax4.scatter(lane_waypoints[:, 0], lane_waypoints[:, 1], 
-                       c='blue', s=10, alpha=0.6, label='车道航点')
+        # 绘制车辆周围的quads
+        for i in nearby_quads:
+            quad = quads_vertices_np[i]
+            # 绘制quad边界
+            quad_x = [quad[0][0], quad[1][0], quad[2][0], quad[3][0], quad[0][0]]
+            quad_y = [quad[0][1], quad[1][1], quad[2][1], quad[3][1], quad[0][1]]
+            # 判断是否为最近的quad，决定颜色
+            if i == nearest_quad_idx:
+                # 最近的quad用红色
+                ax.plot(quad_x, quad_y, 'r-', alpha=0.5, linewidth=2, label='nearest quad')
+                centerline = road_network.quad_centerlines[i].cpu().numpy()
+                ax.plot(centerline[:, 0], centerline[:, 1], 'r-', linewidth=3, alpha=0.8)
+                
+                # 为最近quad的四个顶点添加标注
+                # 顶点顺序: p0 (left_start) -> vertices[2], p1 (left_end) -> vertices[1], 
+                # p2 (right_end) -> vertices[0], p3 (right_start) -> vertices[3]
+                ax.text(quad[2][0], quad[2][1], 'P0', fontsize=12, color='red', weight='bold')
+                ax.text(quad[1][0], quad[1][1], 'P1', fontsize=12, color='red', weight='bold')
+                ax.text(quad[0][0], quad[0][1], 'P2', fontsize=12, color='red', weight='bold')
+                ax.text(quad[3][0], quad[3][1], 'P3', fontsize=12, color='red', weight='bold')
+                
+                # 为最近quad的中线添加箭头
+                start_point = centerline[0]
+                end_point = centerline[1]
+                # 计算箭头位置（在中心线的中点）
+                arrow_pos = (start_point + end_point) / 2
+                # 计算箭头方向
+                arrow_direction = end_point - start_point
+                arrow_length = np.linalg.norm(arrow_direction) * 0.3  # 箭头长度为线段长度的30%
+                arrow_direction_normalized = arrow_direction / np.linalg.norm(arrow_direction)
+                # 绘制箭头
+                ax.arrow(arrow_pos[0], arrow_pos[1], 
+                        arrow_direction_normalized[0] * arrow_length, 
+                        arrow_direction_normalized[1] * arrow_length,
+                        head_width=3, head_length=2, fc='red', ec='red', alpha=0.8)
+                
+            else:
+                # 其他quad用蓝色
+                ax.plot(quad_x, quad_y, 'b-', alpha=0.3, linewidth=0.5)
+                centerline = road_network.quad_centerlines[i].cpu().numpy()
+                ax.plot(centerline[:, 0], centerline[:, 1], 'b-', linewidth=1, alpha=0.5)
         
-        # 绘制边界航点
-        if road_network.global_w_boundary_points.numel() > 0:
-            boundary_waypoints = road_network.global_w_boundary_points.cpu().numpy()
-            ax4.scatter(boundary_waypoints[:, 0], boundary_waypoints[:, 1], 
-                       c='red', s=10, alpha=0.6, label='边界航点')
-        ax4.set_aspect('equal')
-        ax4.grid(True, alpha=0.3)
-        ax4.set_xlabel('X 坐标')
-        ax4.set_ylabel('Y 坐标')
-        ax4.legend()
+        # 在图上标记车辆位置
+        ax.plot(vehicle_pos[0], vehicle_pos[1], 'go', markersize=10, label='vehicle position')
         
-        plt.tight_layout()
+        # 只显示一次图例
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+        
+        # 绘制车辆朝向
+        arrow_length = 5.0
+        arrow_dx = arrow_length * np.cos(vehicle_yaw)
+        arrow_dy = arrow_length * np.sin(vehicle_yaw)
+        ax.arrow(vehicle_pos[0], vehicle_pos[1], arrow_dx, arrow_dy, 
+                head_width=2, head_length=1, fc='green', ec='green', alpha=0.8)
+        # 计算Frenet坐标
+        vehicle_pos_array = np.array([vehicle_pos], dtype=np.float32)
+        vehicle_pos_tensor = torch.tensor(vehicle_pos_array, dtype=torch.float32, device=device)
+        vehicle_yaw_tensor = torch.tensor([vehicle_yaw], dtype=torch.float32, device=device)
+        print("计算Frenet坐标...")
+        d, theta_f = road_network.calculate_frenet_coordinates(vehicle_pos_tensor, vehicle_yaw_tensor)
+        print(f"横向距离 d: {d.item():.2f} (正值表示在道路右侧，负值表示在道路左侧)")
+        print(f"角度误差 theta_f: {theta_f.item():.2f} 弧度 ({np.degrees(theta_f.item()):.1f} 度)")
+        print(f"角度误差解释: 正值表示车辆朝向偏右，负值表示偏左")
+
+        # 设置图形属性
+        ax.set_xlabel('X Coordinate')
+        ax.set_ylabel('Y Coordinate')
+        ax.set_title('RoadNetwork Test - Map Visualization and Frenet Coordinate Calculation')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal')
+        # 保存图片
+        plt.savefig('road_network_test.png', dpi=300, bbox_inches='tight')
+        print("地图已保存为 road_network_test.png")
+        # 显示图形
         plt.show()
-        
-        # 5. Frenet 坐标系测试
-        print("\n测试 Frenet 坐标系计算:")
-        # 创建一些测试车辆位置和朝向
-        test_positions = torch.tensor([
-            [0.0, 0.0],
-            [10.0, 5.0],
-            [-5.0, 3.0]
-        ], device=device)
-        
-        test_headings = torch.tensor([0.0, np.pi/4, -np.pi/6], device=device)
-        
-        try:
-            d, theta_f = road_network.calculate_frenet_coordinates(test_positions, test_headings)
-            print(f"车辆位置: {test_positions.cpu().numpy()}")
-            print(f"车辆朝向: {test_headings.cpu().numpy()}")
-            print(f"横向距离 d: {d.cpu().numpy()}")
-            print(f"角度误差 theta_f: {theta_f.cpu().numpy()}")
-        except Exception as e:
-            print(f"Frenet 坐标系计算失败: {e}")
-        
-        # 6. 最近车道查找测试
-        print("\n测试最近车道查找:")
-        try:
-            test_points = torch.tensor([[0.0, 0.0], [10.0, 10.0]], device=device)
-            distances, indices = road_network.find_nearest_lanes(test_points, k=3)
-            print(f"测试点: {test_points.cpu().numpy()}")
-            print(f"最近车道距离: {distances.cpu().numpy()}")
-            print(f"最近车道索引: {indices.cpu().numpy()}")
-        except Exception as e:
-            print(f"最近车道查找失败: {e}")
+
+    except FileNotFoundError:
+        print(f"错误: 找不到地图文件 {map_path}")
+        print("请确保地图文件存在，或者修改map_path变量指向正确的地图文件")
+    except Exception as e:
+        print(f"测试过程中发生错误: {e}")
+        import traceback
+
+        traceback.print_exc()
     
-    else:
-        print("无法创建道路网络，跳过可视化")
-    
-    print("RoadNetwork 测试完成")
 
 
 

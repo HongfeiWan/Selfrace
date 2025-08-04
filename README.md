@@ -1,6 +1,6 @@
 # GIGAFLOW
 
-## RewardCalculator 模块文档
+## RewardCalculator 模块
 
 RewardCalculator 是 GIGAFLOW 项目中的奖励计算模块，负责为智能体计算各种奖励和惩罚。该模块遵循 GIGAFLOW 论文中描述的奖励结构。
 

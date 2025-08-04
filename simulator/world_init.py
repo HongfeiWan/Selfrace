@@ -17,7 +17,6 @@ parent_dir = os.path.dirname(current_dir)
 simulator_dir = os.path.join(parent_dir, 'simulator')
 if simulator_dir not in sys.path:
     sys.path.insert(0, simulator_dir)
-
 from road import RoadNetwork
 from offroad import OffroadChecker
 from collision import CollisionChecker
