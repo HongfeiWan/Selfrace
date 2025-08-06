@@ -30,11 +30,10 @@ class ObservationGenerator:
         self.num_w_boundaries = config.get('num_w_boundaries', 26) # 边界数量
         self.horizon = config.get('horizon', 100.0) # 视野范围
         # 定义观测空间维度
-        self.local_state_dim = config.get('local_state_dim', 7)            # 修改为7个特征: x,y,yaw,speed,length,width,active       
+        self.local_state_dim = config.get('local_state_dim', 7)            # 修改为7个特征: x, y, yaw, speed, length, width, active       
         self.neighbor_feature_dim = config.get('neighbor_feature_dim', 7)  # 修改为7个特征：dx, dy, vx, vy, length, width, active 
-        self.waypoint_feature_dim = config.get('waypoint_feature_dim', 2) 
-        self.boundary_feature_dim = config.get('boundary_feature_dim', 2)  
-        
+        self.waypoint_feature_dim = config.get('waypoint_feature_dim', 2)  # 修改为2个特征：x,y
+        self.boundary_feature_dim = config.get('boundary_feature_dim', 2)  # 修改为2个特征：x,y
 
     def get_observation_dim(self) -> int:
         """
@@ -85,6 +84,7 @@ class ObservationGenerator:
             agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
         )
         # 3. 展平并拼接成最终的观测向量
+        # 返回：自身绝对状态，邻居相对状态，车道线相对状态，边界线相对状态
         observation = torch.cat([
             agents_state,
             neighbors_local.flatten(start_dim=2),
@@ -147,6 +147,7 @@ class ObservationGenerator:
         K_neighbors = neighbor_states.shape[2]
         ego_pos = ego_states[..., :2] # (B, M, 2)
         ego_yaw = ego_states[..., 2]  # (B, M)
+        ego_vel = ego_states[..., 3] # (B, M)
         cos_yaw, sin_yaw = torch.cos(ego_yaw), torch.sin(ego_yaw)
 
         # 使用标准2D旋转矩阵（车左边为正）
@@ -170,19 +171,31 @@ class ObservationGenerator:
             local_pos_neighbors = torch.bmm(
                 rel_pos_neighbors.view(B*M, K_neighbors, 2), rot_matrix.view(B*M, 2, 2)
             ).view(B, M, K_neighbors, 2)
+            # 速度转换：计算邻居相对于ego的相对速度
+            # 1. 获取邻居的绝对速度
             neighbor_speed = neighbor_states[..., 3]
             neighbor_yaw = neighbor_states[..., 2]
-            vx_world = neighbor_speed * torch.cos(neighbor_yaw)
-            vy_world = neighbor_speed * torch.sin(neighbor_yaw)
-            v_world = torch.stack([vx_world, vy_world], dim=-1) # (B, M, K, 2)
-            v_local = torch.bmm(
-                v_world.view(B*M, K_neighbors, 2), rot_matrix.view(B*M, 2, 2)
-            ).view(B, M, K_neighbors, 2)
+            vx_neighbor_world = neighbor_speed * torch.cos(neighbor_yaw)
+            vy_neighbor_world = neighbor_speed * torch.sin(neighbor_yaw)
+            v_neighbor_world = torch.stack([vx_neighbor_world, vy_neighbor_world], dim=-1)  # (B, M, K, 2)
+            
+            # 2. 获取ego的绝对速度
+            ego_speed = ego_states[..., 3]  # (B, M)
+            ego_yaw = ego_states[..., 2]    # (B, M)
+            vx_ego_world = ego_speed * torch.cos(ego_yaw)
+            vy_ego_world = ego_speed * torch.sin(ego_yaw)
+            v_ego_world = torch.stack([vx_ego_world, vy_ego_world], dim=-1)  # (B, M, 2)
+            
+            # 3. 计算相对速度：v_relative = v_neighbor - v_ego
+            v_relative_world = v_neighbor_world - v_ego_world.unsqueeze(2)  # (B, M, K, 2)
+            
+            # 4. 将相对速度转换到ego的局部坐标系
+            v_local = torch.bmm(v_relative_world.view(B*M, K_neighbors, 2), rot_matrix.view(B*M, 2, 2)).view(B, M, K_neighbors, 2)
             length = neighbor_states[..., 4].unsqueeze(-1)
             width = neighbor_states[..., 5].unsqueeze(-1)
             active_flag = neighbor_states[..., 6].unsqueeze(-1)
             neighbors_local = torch.cat([local_pos_neighbors, v_local, length, width, active_flag], dim=-1)
-            #包含七个特征：dx, dy, vx, vy, length, width, active
+            #包含七个特征：dx, dy, dvx, dvy, length, width, active
         else:
             # 如果没有邻居，创建空的邻居特征张量
             neighbors_local = torch.zeros(B, M, 0, self.neighbor_feature_dim, device=self.device)
@@ -246,6 +259,7 @@ if __name__ == '__main__':
                 head_width=1, head_length=0.5, fc=color, ec=color, alpha=alpha)
         # 标记车辆中心
         ax.plot(x, y, 'o', color=color, markersize=4, alpha=alpha)    
+    
     try:
         # 创建RoadNetwork实例
         road_network = RoadNetwork(map_path, device)
@@ -292,9 +306,8 @@ if __name__ == '__main__':
                 # 在第二个quad中生成随机车辆位置
                 second_vehicle_pos = random_point_in_quad(second_quad)
                 second_vehicle_yaw = random.uniform(0, 2 * np.pi)  # 随机朝向
+
         # 创建agents_state (B=1, M=2, 7个特征)
-        # agents_state[..., 0] = x, agents_state[..., 1] = y, agents_state[..., 2] = yaw
-        # agents_state[..., 3] = speed, agents_state[..., 4] = vehicle_length, agents_state[..., 5] = vehicle_width, agents_state[..., 6] = active
         agents_state = torch.zeros(1, 2, 7, device=device)
         # 第一辆车的信息
         agents_state[0, 0, 0] = float(vehicle_pos[0])  # x
@@ -324,14 +337,14 @@ if __name__ == '__main__':
             'horizon': 100.0,
             'local_state_dim': 7,  # 修改为7个特征：x, y, yaw, speed, length, width, active
             'neighbor_feature_dim': 7,  # 修改为7个特征：dx, dy, vx, vy, length, width, active
-            'waypoint_feature_dim': 2
+            'waypoint_feature_dim': 2,
+            'boundary_feature_dim': 2
         }
         # 创建ObservationGenerator实例
         observation_generator = ObservationGenerator(road_network, config, device)
         print(f"观测维度: {observation_generator.get_observation_dim()}")
         # 生成观测
         observation = observation_generator.generate(agents_state)
-        
         # 从observation中提取w_lanes_local和w_boundaries_local
         # 计算各部分在观测向量中的位置
         local_state_dim = config['local_state_dim']
@@ -340,6 +353,7 @@ if __name__ == '__main__':
         num_w_lanes = config['num_w_lanes']
         num_w_boundaries = config['num_w_boundaries']
         waypoint_feature_dim = config['waypoint_feature_dim']
+        boundary_feature_dim = config['boundary_feature_dim']
         
         # 计算各部分在观测向量中的位置
         local_state_size = local_state_dim
@@ -418,37 +432,57 @@ if __name__ == '__main__':
                     # 1. 逆变换邻居位置：从局部坐标转换回全局坐标
                     neighbor_pos_local = np.array([dx_local, dy_local])
                     neighbor_pos_global = (neighbor_pos_local @ rotation_matrix.T) + ego_pos_global
-                    # 2. 逆变换邻居速度：从局部坐标转换回全局坐标
+                    
+                    # 2. 逆变换邻居相对速度：从局部坐标转换回全局坐标
                     neighbor_vel_local = np.array([vx_local, vy_local])
                     neighbor_vel_global = neighbor_vel_local @ rotation_matrix.T
+
+                    # 在邻居位置旁边显示相对速度文本
+                    ax.text(neighbor_pos_global[0] + 2, neighbor_pos_global[1] + 2, 
+                           f'relative vel: ({vx_local:.1f}, {vy_local:.1f})', 
+                           color='black', fontsize=8, bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+                    
+                    # 3. 计算邻居的绝对速度 = ego绝对速度 + 邻居相对速度
+                    ego_speed = agents_state[0, 0, 3].cpu().numpy()
+                    ego_yaw_rad = agents_state[0, 0, 2].cpu().numpy()
+                    ego_vel_global = np.array([
+                        ego_speed * np.cos(ego_yaw_rad),
+                        ego_speed * np.sin(ego_yaw_rad)
+                    ])
+                    neighbor_vel_absolute_global = ego_vel_global + neighbor_vel_global
+
                     # 3. 绘制邻居位置
-                    ax.scatter(neighbor_pos_global[0], neighbor_pos_global[1], 
-                             c='red', s=10, alpha=0.8, marker='o', label=f'Neighbor_{i}' if i == 0 else "")
-                    # 4. 绘制邻居速度箭头（正交分解）
-                    vel_x_arrow = neighbor_vel_global[0] 
-                    vel_y_arrow = neighbor_vel_global[1] 
-                    # X方向速度箭头（红色）
+                    ax.scatter(neighbor_pos_global[0], neighbor_pos_global[1], c='red', s=10, alpha=0.8, marker='o', label=f'Neighbor_{i}' if i == 0 else "")
+                    # 4. 绘制邻居相对速度箭头（正交分解）
+                    vel_x_arrow = neighbor_vel_absolute_global[0] 
+                    vel_y_arrow = neighbor_vel_absolute_global[1] 
+                    # X方向相对速度箭头（红色）
                     if abs(vel_x_arrow) > 0.1:  # 只绘制有意义的箭头
                         ax.arrow(neighbor_pos_global[0], neighbor_pos_global[1], 
                                 vel_x_arrow, 0, head_width=2, head_length=1, 
                                 fc='red', ec='red', alpha=0.8, zorder=10)
-                    # Y方向速度箭头（蓝色）
+                    # Y方向相对速度箭头（蓝色）
                     if abs(vel_y_arrow) > 0.1:  # 只绘制有意义的箭头
                         ax.arrow(neighbor_pos_global[0], neighbor_pos_global[1], 
                                 0, vel_y_arrow, head_width=2, head_length=1, 
                                 fc='green', ec='green', alpha=0.8, zorder=10)
-                    
-                    # 5. 绘制邻居车辆的矩形（使用复原的长度和宽度）
-                    # 计算邻居的朝向（从速度向量推断）
-                    if np.linalg.norm(neighbor_vel_global) > 0.1:
-                        neighbor_yaw = np.arctan2(neighbor_vel_global[1], neighbor_vel_global[0])
+                    # 5. 绘制邻居绝对速度箭头（紫色）
+                    if np.linalg.norm(neighbor_vel_absolute_global) > 0.1:
+                        ax.arrow(neighbor_pos_global[0], neighbor_pos_global[1], 
+                                neighbor_vel_absolute_global[0], neighbor_vel_absolute_global[1], 
+                                head_width=3, head_length=2, fc='purple', ec='purple', 
+                                alpha=0.9, zorder=11, linewidth=2, label=f'Absolute Vel_{i}' if i == 0 else "")
+                    # 6. 绘制邻居车辆的矩形（使用复原的长度和宽度）
+                    # 计算邻居的朝向（从绝对速度向量推断）
+                    if np.linalg.norm(neighbor_vel_absolute_global) > 0.1:
+                        neighbor_yaw = np.arctan2(neighbor_vel_absolute_global[1], neighbor_vel_absolute_global[0])
                     else:
                         neighbor_yaw = 0.0  # 如果速度很小，假设朝向为0
                     
                     # 绘制邻居车辆矩形
                     draw_vehicle(ax, neighbor_pos_global[0], neighbor_pos_global[1], 
-                               neighbor_yaw, np.linalg.norm(neighbor_vel_global), 
-                               length, width, color='red', alpha=1)
+                               neighbor_yaw, np.linalg.norm(neighbor_vel_absolute_global), 
+                               length, width, color='red', alpha=0.6)    
                     
         else:
             print("没有观测到有效的邻居")

@@ -996,7 +996,7 @@ total_dim = local_state_dim +
 **返回的观测组成**:
 
 - `agents_state`: (B, M, 7) - 智能体自身的全局状态(x, y, yaw, speed, length, width, active)
-- `neighbors_local`: (B, M, K, 7) - 邻居特征 (dx, dy, vx, vy, length, width, active)
+- `neighbors_local`: (B, M, K, 7) - 邻居特征 (dx, dy, dvx, dvy, length, width, active)
 - `w_lanes_local`: (B, M, N_lanes, 2) - 车道航点相对位置
 - `w_boundaries_local`: (B, M, N_boundaries, 2) - 边界点相对位置
 

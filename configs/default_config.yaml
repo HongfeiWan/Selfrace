@@ -70,7 +70,7 @@ simulator:
   observation:
     # Observation space config
     # 定义观测空间
-    local_state_dim: 7 # (x, y, yaw, speed, length, width, active)
+    local_state_dim: 7 # (x, y, yaw, speed, length, width, active) #是全局的目前
     neighbor_feature_dim: 7 # (dx, dy, vx, vy, length, width, active)
     waypoint_feature_dim: 2 # (dx, dy) for each point
     boundary_feature_dim: 2 # (dx, dy) for each point
