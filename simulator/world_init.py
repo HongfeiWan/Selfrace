@@ -44,13 +44,14 @@ class WorldInitializer:
         self.config = config
         # 获取simulator配置，支持嵌套配置结构
         simulator_config = config.get('simulator', config)
-        self.max_agents = simulator_config.get('max_agents_num', 150)
-        self.num_agents_per_env = simulator_config.get('num_npc_vehicles', 150)
+        self.max_agents = simulator_config.get('max_agents_num')
+        self.num_agents_per_env = simulator_config.get('num_npc_vehicles')
         if self.num_agents_per_env > self.max_agents:
             raise ValueError("num_npc_vehicles exceeds max_agents_num")
         self.vehicle_length = simulator_config.get('vehicle_length', 4.5)
         self.vehicle_width = simulator_config.get('vehicle_width', 2.0)
         self.speed_range = simulator_config.get('vehicle_init_speed_range', (0.0, 5.0))
+        self.local_state_dim = simulator_config.get('observation', simulator_config).get('local_state_dim')
 
     def _generate_states_on_quads(self, quad_indices: torch.Tensor) -> torch.Tensor:
         """
@@ -87,7 +88,7 @@ class WorldInitializer:
         采用序贯放置和验证的策略，确保初始化的交通流是有效的。
         """
         logging.info(f"Initializing {num_envs} collision-free environments with up to {self.num_agents_per_env} agents each...")
-        agents_state = torch.zeros(num_envs, self.max_agents, 7, device=self.device)
+        agents_state = torch.zeros(num_envs, self.max_agents, self.local_state_dim, device=self.device)
         # 存储每个智能体的起始quad_id
         agents_start_quad_ids = torch.full((num_envs, self.max_agents), -1, dtype=torch.long, device=self.device)
         
@@ -374,26 +375,16 @@ if __name__ == '__main__':
     if utils_dir not in sys.path:
         sys.path.insert(0, utils_dir)
     from spatial_hash import SpatialHash
+    import yaml
 
     # --- 测试设置 ---
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    map_file_path = 'maps/processed_map_Town01_stitched.json'
-    
-    test_config = {
-        'max_agents_num': 200,
-        'num_npc_vehicles': 200,
-        'vehicle_length': 4.5,
-        'vehicle_width': 2.0,
-        'vehicle_init_speed_range': (0.0, 8.0),
-        # Collision checker and spatial hash arugments needed for test
-        'device': device,
-        'hash_cell_size': 20,  # 与CollisionChecker保持一致
-        'map_extent_m': 4000,
-        'grid_width': 200,
-        'grid_height': 200,
-        'max_neighbors': 20,
-    }
-    
+    config_path = 'configs/default_config.yaml'
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    map_file_path = config['simulator']['map_path']
+    device = config['simulator']['device']
+    test_config = config['simulator']
+
     # 1. 实例化依赖项 RoadNetwork
     try:
         road_network = RoadNetwork(map_path=map_file_path, device=device)
@@ -408,7 +399,7 @@ if __name__ == '__main__':
     max_bounds, _ = torch.max(all_verts, dim=0)
     
     spatial_hash = SpatialHash(
-        cell_size=test_config['hash_cell_size'],
+        cell_size=test_config['hash']['hash_cell_size'],
         min_bounds=min_bounds,
         max_bounds=max_bounds,
         device=device

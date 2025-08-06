@@ -5,6 +5,7 @@ import json
 import os
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional, Any, Union
+import torch.nn.functional as F
 
 # 检查GPU可用性
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -83,7 +84,6 @@ class PathPlanner:
         """预计算GPU张量数据，提高后续计算效率"""
         if not self.quads_data:
             return
-        
         # 预计算所有quad的中心点和方向向量
         num_quads = len(self.quads_data)
         quad_centers = torch.zeros(num_quads, 2, dtype=torch.float32, device=self.device)
@@ -91,7 +91,7 @@ class PathPlanner:
         
         for i, quad in enumerate(self.quads_data):
             # 计算中心点
-            vertices = torch.tensor([[point['x'], -point['y']] for point in quad['vertices']], 
+            vertices = torch.tensor([[point['x'], point['y']] for point in quad['vertices']], 
                                   dtype=torch.float32, device=self.device)
             center = torch.mean(vertices, dim=0)
             quad_centers[i] = center
@@ -134,7 +134,7 @@ class PathPlanner:
             
             for i, wp in enumerate(self.global_w_lane_waypoints):
                 waypoints_tensor[i, 0] = wp['x']
-                waypoints_tensor[i, 1] = -wp['y']  # 翻转Y轴
+                waypoints_tensor[i, 1] = wp['y']  # 移除Y轴翻转
                 waypoints_tensor[i, 2] = wp['carla_waypoint_info']['road_id']
                 waypoints_tensor[i, 3] = wp['carla_waypoint_info']['lane_id']
                 waypoints_tensor[i, 4] = wp['carla_waypoint_info']['s']
@@ -198,6 +198,48 @@ class PathPlanner:
                     cross_waypoint_records[cross_id]['to_start_waypoint'].append(s_id)
         
         return G, cross_waypoint_records
+    
+    def _group_waypoints_by_lane(self, waypoints: List[Dict]) -> Dict:
+        """按车道分组并排序航点，使用缓存避免重复计算"""
+        # 检查缓存是否有效
+        if (self._lanes_cache is not None and 
+            self._lanes_cache_waypoints is not None and 
+            self._lanes_cache_waypoints is waypoints):
+            return self._lanes_cache
+        
+        # 计算并缓存结果
+        lanes = defaultdict(list)
+        for wp in waypoints:
+            lanes[(wp['carla_waypoint_info']['road_id'], wp['carla_waypoint_info']['lane_id'])].append(wp)
+        
+        # 对每个车道内的航点进行排序
+        for lane_id_tuple, wps_in_lane in lanes.items():
+            if wps_in_lane:
+                is_reverse_lane = wps_in_lane[0]['carla_waypoint_info']['lane_id'] < 0
+                wps_in_lane.sort(key=lambda w: w['carla_waypoint_info']['s'], reverse=is_reverse_lane)
+        
+        # 过滤掉首尾waypoint距离太短的车道
+        min_lane_length = 10  # 最小车道长度阈值（米）
+        lanes_to_remove = []
+        for lane_id, wps_in_lane in lanes.items():
+            if len(wps_in_lane) >= 2:
+                # 计算首尾waypoint之间的距离
+                start_wp = wps_in_lane[0]
+                end_wp = wps_in_lane[-1]
+                distance = np.sqrt((end_wp['x'] - start_wp['x'])**2 + (end_wp['y'] - start_wp['y'])**2)
+                
+                if distance < min_lane_length:
+                    lanes_to_remove.append(lane_id)
+        
+        # 从lanes字典中删除太短的车道
+        for lane_id in lanes_to_remove:
+            del lanes[lane_id]
+        
+        # 更新缓存
+        self._lanes_cache = lanes
+        self._lanes_cache_waypoints = waypoints
+        
+        return lanes
     
     def _group_waypoints_by_lane_gpu(self) -> Dict:
         """使用GPU加速的waypoint分组方法"""
@@ -331,7 +373,7 @@ class PathPlanner:
             return self.quad_centers[quad_id]
         # 如果缓存中没有，则计算并缓存
         quad = self.quads_data[quad_id]
-        vertices = np.array([[point['x'], -point['y']] for point in quad['vertices']])
+        vertices = np.array([[point['x'], point['y']] for point in quad['vertices']])
         center = np.mean(vertices, axis=0)
         self.quad_centers[quad_id] = center
         return center
@@ -361,7 +403,7 @@ class PathPlanner:
             return self._quad_directions_cache[quad_id]
         # 如果缓存中没有，则计算并缓存
         quad = self.quads_data[quad_id]
-        vertices = np.array([[point['x'], -point['y']] for point in quad['vertices']])
+        vertices = np.array([[point['x'], point['y']] for point in quad['vertices']])
         v0 = vertices[0]
         v2 = vertices[2]
         direction = v2 - v0
@@ -421,6 +463,45 @@ class PathPlanner:
         directions = torch.zeros(len(quad_ids), 2, device=self.device)
         directions[valid_mask] = self._quad_directions_gpu[array_indices[valid_mask]]
         return directions
+    
+    def _is_direction_similar(self, dir1: Union[np.ndarray, Tensor], dir2: Union[np.ndarray, Tensor], 
+                             angle_threshold_deg: float = 90) -> Union[bool, Tensor]:
+        """判断两个方向向量是否相似，支持GPU张量"""
+        if isinstance(dir1, np.ndarray) and isinstance(dir2, np.ndarray):
+            # CPU版本 - 修复除零错误
+            import math
+            norm1 = np.linalg.norm(dir1)
+            norm2 = np.linalg.norm(dir2)
+            
+            # 检查是否为零向量
+            if norm1 < 1e-8 or norm2 < 1e-8:
+                return False  # 零向量不相似
+            
+            cos_angle = np.dot(dir1, dir2) / (norm1 * norm2)
+            angle = math.degrees(np.arccos(np.clip(cos_angle, -1, 1)))
+            return angle < angle_threshold_deg
+        else:
+            # GPU张量版本
+            dir1_tensor = dir1 if isinstance(dir1, Tensor) else torch.tensor(dir1, device=self.device)
+            dir2_tensor = dir2 if isinstance(dir2, Tensor) else torch.tensor(dir2, device=self.device)
+            
+            # 计算余弦相似度，避免除零
+            norm1 = torch.norm(dir1_tensor, dim=-1)
+            norm2 = torch.norm(dir2_tensor, dim=-1)
+            
+            # 检查是否为零向量
+            zero_mask = (norm1 < 1e-8) | (norm2 < 1e-8)
+            
+            cos_angle = torch.sum(dir1_tensor * dir2_tensor, dim=-1) / (norm1 * norm2 + 1e-8)
+            
+            # 计算角度
+            angle = torch.acos(torch.clamp(cos_angle, -1, 1)) * 180 / torch.pi
+            
+            # 零向量返回False
+            result = angle < angle_threshold_deg
+            if isinstance(result, Tensor):
+                result = torch.where(zero_mask, torch.tensor(False, device=self.device), result)
+            return result
     
     def _is_direction_similar_batch(self, dir1_batch: Tensor, dir2_batch: Tensor, 
                                    angle_threshold_deg: float = 90) -> Tensor:
@@ -624,7 +705,7 @@ class PathPlanner:
                         
                         result.append({
                             'type': 'lane_waypoint',
-                            'coords': {'x': wp['x'], 'y': -wp['y']},
+                            'coords': {'x': wp['x'], 'y': wp['y']},
                             'road_id': wp_info['road_id'],
                             'lane_id': wp_info['lane_id'],
                             's': wp_info['s']
@@ -811,7 +892,7 @@ class PathPlanner:
                             wp = wps_in_lane[i]
                             navigation_sequence.append({
                                 'type': 'lane_waypoint',
-                                'coords': {'x': wp['x'], 'y': -wp['y']},
+                                'coords': {'x': wp['x'], 'y': wp['y']},
                                 'road_id': wp['carla_waypoint_info']['road_id'],
                                 'lane_id': wp['carla_waypoint_info']['lane_id'],
                                 's': wp['carla_waypoint_info']['s']
@@ -872,7 +953,7 @@ class PathPlanner:
                     'cross_id': cross_id,
                     'road_id': road_id,
                     'lane_id': lane_id,
-                    'coords': {'x': x, 'y': -y},
+                    'coords': {'x': x, 'y': y},
                     's': s,
                     'node_type': typ
                 })
@@ -922,7 +1003,7 @@ class PathPlanner:
                             wp = wps_in_lane[i]
                             navigation_sequence.append({
                                 'type': 'lane_waypoint',
-                                'coords': {'x': wp['x'], 'y': -wp['y']},
+                                'coords': {'x': wp['x'], 'y': wp['y']},
                                 'road_id': wp['carla_waypoint_info']['road_id'],
                                 'lane_id': wp['carla_waypoint_info']['lane_id'],
                                 's': wp['carla_waypoint_info']['s']
@@ -1035,6 +1116,71 @@ class PathPlanner:
             total_distance += distance
         
         return total_distance
+    
+    def plan_path_batch(self, start_quad_ids: Tensor, goal_quad_ids: Tensor) -> Tensor:
+        """
+        批量路径规划
+        
+        Args:
+            start_quad_ids: 起始quad ID张量 [batch_size]
+            goal_quad_ids: 目标quad ID张量 [batch_size]
+            
+        Returns:
+            批量路径坐标张量 [batch_size, max_path_length, 2]，其中2表示(x, y)坐标
+            如果某个路径为空，对应位置填充为0
+        """
+        if not isinstance(start_quad_ids, Tensor):
+            start_quad_ids = torch.tensor(start_quad_ids, device=self.device)
+        if not isinstance(goal_quad_ids, Tensor):
+            goal_quad_ids = torch.tensor(goal_quad_ids, device=self.device)
+        
+        batch_size = len(start_quad_ids)
+        
+        # 批量获取quad中心点和方向
+        start_centers = self._get_quad_centers_batch(start_quad_ids)
+        goal_centers = self._get_quad_centers_batch(goal_quad_ids)
+        start_directions = self._get_quad_directions_batch(start_quad_ids)
+        goal_directions = self._get_quad_directions_batch(goal_quad_ids)
+        
+        # 先获取所有路径以确定最大长度
+        all_paths = []
+        max_path_length = 0
+        
+        for i in range(batch_size):
+            start_id = start_quad_ids[i].item()
+            goal_id = goal_quad_ids[i].item()
+            
+            # 使用单路径规划方法
+            path_result = self.plan_path(start_id, goal_id)
+            all_paths.append(path_result)
+            
+            # 提取坐标点
+            coords = []
+            for item in path_result:
+                if 'coords' in item:
+                    coords.append([item['coords']['x'], item['coords']['y']])
+            
+            max_path_length = max(max_path_length, len(coords))
+        
+        # 创建结果张量 [batch_size, max_path_length, 2]
+        if max_path_length == 0:
+            # 如果所有路径都为空，返回空张量
+            return torch.zeros(batch_size, 0, 2, device=self.device)
+        
+        result_tensor = torch.zeros(batch_size, max_path_length, 2, device=self.device)
+        
+        # 填充坐标数据
+        for i, path_result in enumerate(all_paths):
+            coords = []
+            for item in path_result:
+                if 'coords' in item:
+                    coords.append([item['coords']['x'], item['coords']['y']])
+            
+            if coords:
+                coords_tensor = torch.tensor(coords, device=self.device, dtype=torch.float32)
+                result_tensor[i, :len(coords), :] = coords_tensor
+        
+        return result_tensor
     
     def plan_path_batch_with_lengths(self, start_quad_ids: Tensor, goal_quad_ids: Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -1210,6 +1356,26 @@ class PathPlanner:
         if self._waypoints_gpu is not None:
             self._waypoints_gpu = self._waypoints_gpu.to(target_device)
     
+    def get_memory_usage(self) -> Dict[str, float]:
+        """获取GPU内存使用情况"""
+        memory_info = {}
+        
+        if torch.cuda.is_available():
+            memory_info['gpu_allocated'] = torch.cuda.memory_allocated() / 1024**3  # GB
+            memory_info['gpu_reserved'] = torch.cuda.memory_reserved() / 1024**3  # GB
+            memory_info['gpu_max_allocated'] = torch.cuda.max_memory_allocated() / 1024**3  # GB
+        
+        # 计算张量内存使用
+        tensor_memory = 0
+        for attr_name in ['_quad_centers_gpu', '_quad_directions_gpu', '_waypoints_gpu']:
+            tensor = getattr(self, attr_name, None)
+            if tensor is not None:
+                tensor_memory += tensor.numel() * tensor.element_size()
+        
+        memory_info['tensor_memory_mb'] = tensor_memory / 1024**2  # MB
+        
+        return memory_info
+
 def load_cross_data(cross_data_path: str) -> Optional[Dict]:
     """加载cross数据文件"""
     if not os.path.exists(cross_data_path):

@@ -2,20 +2,19 @@
 simulator:
   # 设备配置 - 8张显卡的分布式设置
   device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
-  num_envs: 38400       # 总并行环境数量 (8 * 4800 = 38400)
-  sim_dt: 0.3           # 模拟时间步长
-  
   # 分布式训练配置
   distributed:
-    world_size: 8              # 总GPU数量
+    gpu_num: 8              # 总GPU数量
     devices: ["cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4", "cuda:5", "cuda:6", "cuda:7"]  # 8张显卡设备列表
     envs_per_gpu: 4800         # 每个GPU的环境数量 (38400 / 8 = 4800)
     backend: "nccl"            # 分布式后端
     init_method: "tcp://localhost:12355"  # 初始化方法
 
+  num_envs: 1           # 总并行环境数量 (8 * 4800 = 38400)
+  sim_dt: 0.3           # 模拟时间步长
   max_agents_num: 150   # 最大车辆数量,定义每个环境中最大可能的智能体数量
   #必须满足：num_npc_vehicles <= max_agents_num，否则会报错
-  num_npc_vehicles: 1   # NPC车辆数量,定义每个环境中实际生成的智能体数量
+  num_npc_vehicles: 5   # NPC车辆数量,定义每个环境中实际生成的智能体数量
 
   # 地图配置  
   map_path: "./maps/processed_map_Town01_stitched.json" # 地图路径
@@ -86,52 +85,54 @@ simulator:
     hash_cell_size: 20.0 # 20m，哈希方形网格单元大小，
     # Further simulator-specific configs...
 
-# Reward parameters based on Appendix B.3 and GIGAFLOW paper
-reward:
-  # Goal reward parameters (Rgoal)
-  delta_goal_min: 2.0         # 目标距离阈值最小值
-  delta_goal_max: 12.0        # 目标距离阈值最大值
-  v_goal: 3.0                 # 目标速度阈值
-  goal_reward: 1.0            # 目标奖励值
+  # Reward parameters based on Appendix B.3 and GIGAFLOW paper
+  reward:
+    # Goal reward parameters (Rgoal)
+    delta_goal_min: 2.0         # 目标距离阈值最小值
+    delta_goal_max: 12.0        # 目标距离阈值最大值
+    v_goal: 3.0                 # 目标速度阈值
+    goal_reward: 1.0            # 目标奖励值
+    
+    # Collision penalty parameters (Rcollision)
+    collision_alpha_min: 0.0    # 碰撞惩罚系数最小值
+    collision_alpha_max: 3.0    # 碰撞惩罚系数最大值
+    collision_speed_mult: 0.1   # 碰撞速度乘数
+    
+    # Off-road penalty parameters (Roff-road)
+    boundary_alpha_min: 0.0     # 边界惩罚系数最小值
+    boundary_alpha_max: 3.0     # 边界惩罚系数最大值
+    
+    # Comfort penalty parameters (Rcomfort)
+    comfort_alpha_min: 0.0      # 舒适度惩罚系数最小值
+    comfort_alpha_max: 0.1      # 舒适度惩罚系数最大值
+    
+    # Lane alignment reward parameters (R_{l-align})
+    l_align_alpha_min: 2.5e-4   # 车道对齐奖励系数最小值
+    l_align_alpha_max: 2.5e-2   # 车道对齐奖励系数最大值
+    vel_align_alpha_min: 0.0    # 速度对齐奖励系数最小值
+    vel_align_alpha_max: 1.0    # 速度对齐奖励系数最大值
+    
+    # Lane center reward parameters (R_{l-center})
+    l_center_alpha_min: 2.5e-4  # 车道中心对齐奖励系数最小值
+    l_center_alpha_max: 7.5e-3  # 车道中心对齐奖励系数最大值
+    center_bias_alpha_min: -0.5 # 中心偏置系数最小值
+    center_bias_alpha_max: 0.5  # 中心偏置系数最大值
+    
+    # Velocity reward parameters (Rvelocity)
+    velocity_alpha: 2.5e-3      # 速度奖励系数
+    
+    # Reverse penalty parameters (Rreverse)
+    reverse_alpha_min: 2.5e-4   # 倒车惩罚系数最小值
+    reverse_alpha_max: 7.5e-3   # 倒车惩罚系数最大值
+    
+    # Stop line penalty parameters (Rstop-line)
+    stop_line_alpha_min: 0.0    # 停止线违规惩罚系数最小值
+    stop_line_alpha_max: 1.0    # 停止线违规惩罚系数最大值
+    
+    # Timestep penalty parameters (Rtimestep)
+    timestep_alpha: 2.5e-5      # 时间步惩罚系数
   
-  # Collision penalty parameters (Rcollision)
-  collision_alpha_min: 0.0    # 碰撞惩罚系数最小值
-  collision_alpha_max: 3.0    # 碰撞惩罚系数最大值
-  collision_speed_mult: 0.1   # 碰撞速度乘数
-  
-  # Off-road penalty parameters (Roff-road)
-  boundary_alpha_min: 0.0     # 边界惩罚系数最小值
-  boundary_alpha_max: 3.0     # 边界惩罚系数最大值
-  
-  # Comfort penalty parameters (Rcomfort)
-  comfort_alpha_min: 0.0      # 舒适度惩罚系数最小值
-  comfort_alpha_max: 0.1      # 舒适度惩罚系数最大值
-  
-  # Lane alignment reward parameters (R_{l-align})
-  l_align_alpha_min: 2.5e-4   # 车道对齐奖励系数最小值
-  l_align_alpha_max: 2.5e-2   # 车道对齐奖励系数最大值
-  vel_align_alpha_min: 0.0    # 速度对齐奖励系数最小值
-  vel_align_alpha_max: 1.0    # 速度对齐奖励系数最大值
-  
-  # Lane center reward parameters (R_{l-center})
-  l_center_alpha_min: 2.5e-4  # 车道中心对齐奖励系数最小值
-  l_center_alpha_max: 7.5e-3  # 车道中心对齐奖励系数最大值
-  center_bias_alpha_min: -0.5 # 中心偏置系数最小值
-  center_bias_alpha_max: 0.5  # 中心偏置系数最大值
-  
-  # Velocity reward parameters (Rvelocity)
-  velocity_alpha: 2.5e-3      # 速度奖励系数
-  
-  # Reverse penalty parameters (Rreverse)
-  reverse_alpha_min: 2.5e-4   # 倒车惩罚系数最小值
-  reverse_alpha_max: 7.5e-3   # 倒车惩罚系数最大值
-  
-  # Stop line penalty parameters (Rstop-line)
-  stop_line_alpha_min: 0.0    # 停止线违规惩罚系数最小值
-  stop_line_alpha_max: 1.0    # 停止线违规惩罚系数最大值
-  
-  # Timestep penalty parameters (Rtimestep)
-  timestep_alpha: 2.5e-5      # 时间步惩罚系数
+  traffic:
 
 policy:
   # agent_feature_dim and local_state_dim are now part of simulator config
@@ -159,4 +160,3 @@ training:
   experience_buffer_capacity: 50000  # 经验缓冲区容量
   min_buffer_size_for_training: 1000 # 开始训练的最小缓冲区大小
 
-traffic:

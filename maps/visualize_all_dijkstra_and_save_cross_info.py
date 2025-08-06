@@ -767,28 +767,38 @@ def find_shortest_path_waypoint(G, start_id, end_id):
 def main():
     """主函数"""
     # 读取配置文件，获取地图路径
-    config_path = os.path.join(os.path.dirname(__file__), '../configs/default_config.yaml')
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'configs', 'default_config.yaml')
+    
+    # 检查配置文件是否存在
     if not os.path.exists(config_path):
         print(f"错误: 配置文件不存在: {config_path}")
         return
+    
+    # 读取配置文件
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    map_path = None
-    try:
-        map_path = config['simulator']['map_path']
-    except Exception as e:
-        print(f"错误: 配置文件中未找到simulator.map_path字段: {e}")
+    
+    # 获取地图路径
+    map_path = config.get('simulator', {}).get('map_path')
+    if not map_path:
+        print("错误: 配置文件中未找到 map_path")
         return
-    # 替换原有 map_path 拼接部分
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
-    if os.path.isabs(map_path):
-        map_path_full = map_path
+    
+    # 构建完整的地图路径
+    if not os.path.isabs(map_path):
+        # 如果是相对路径，则相对于项目根目录
+        project_root = os.path.dirname(os.path.dirname(__file__))
+        map_path_full = os.path.join(project_root, map_path)
     else:
-        map_path_full = os.path.normpath(os.path.join(project_root, map_path.lstrip('./')))
+        map_path_full = map_path
+    
+    # 检查地图文件是否存在
     if not os.path.exists(map_path_full):
         print(f"错误: 地图文件不存在: {map_path_full}")
-        print("请确保地图文件路径正确")
         return
+    
+    print(f"使用地图文件: {map_path_full}")
+    
     # 执行可视化
     visualize_lane_paths(map_path_full)
 

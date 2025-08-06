@@ -13,12 +13,10 @@ class FeatureEncoder(nn.Module):
         super(FeatureEncoder, self).__init__()
         self.feature_dims = feature_dims
         self.hidden_dim = hidden_dim
-        
         # 需要MaxPool的特征类型
         self.maxpool_features = ['road_boundary', 'lane_points', 'stop_lines', 'other_agents']
         # 直接MLP的特征类型
         self.direct_features = ['vehicle_state', 'conditioning']
-        
         # 为每种特征类型创建独立的编码器
         self.encoders = nn.ModuleDict()
         for feature_name, feature_dim in feature_dims.items():

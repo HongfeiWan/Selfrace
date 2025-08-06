@@ -336,7 +336,7 @@ class RewardCalculator:
         return reverse_penalty
 
     def calculate_stop_line_penalty(self,
-                                   stop_line_violation: torch.Tensor) -> torch.Tensor:
+                                  stop_line_violation: torch.Tensor) -> torch.Tensor:
         """
         计算停止线违规惩罚 Rstop-line。
         
@@ -348,6 +348,10 @@ class RewardCalculator:
         Returns:
             torch.Tensor: 停止线违规惩罚 (B, M)
         """
+        # 如果stop_line_violation为None，返回零惩罚
+        if stop_line_violation is None:
+            return torch.zeros_like(self.stop_line_alpha, device=self.device)
+        
         # 计算停止线违规惩罚
         stop_line_penalty = -self.stop_line_alpha * stop_line_violation.float()
         

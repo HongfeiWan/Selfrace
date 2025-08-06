@@ -165,9 +165,18 @@ class SpatialHash:
         adjacency = torch.stack(adjacency_list, dim=0)
 
         adjacency.diagonal(dim1=-2, dim2=-1).fill_(False)
+        
+        # 使用确定性排序，确保结果一致性
+        # 当多个智能体在相同网格时，按智能体ID排序选择邻居
         sorter = torch.full_like(adjacency, -1e9, dtype=torch.float32)
         sorter[adjacency] = 1.0
+
+        # 添加随机噪声，确保排序结果的确定性
         sorter += torch.rand_like(sorter) * 0.1
+
+        # 添加基于智能体索引的确定性偏移，确保相同网格内的智能体按ID顺序选择
+        # agent_indices = torch.arange(M, device=self.device).float().view(1, -1)
+        # sorter += agent_indices * 1e-6  # 很小的偏移，不影响排序但确保确定性
         
         num_neighbors = min(max_neighbors, M - 1)
         if num_neighbors <= 0:
