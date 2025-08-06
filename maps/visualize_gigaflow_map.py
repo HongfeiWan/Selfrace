@@ -78,7 +78,7 @@ def visualize_processed_map(file_path, sample_size=5):
     # 2. Plot quad directions as arrows
     ax.quiver(all_quad_centers[:, 0], all_quad_centers[:, 1], 
               all_quad_dirs[:, 0], all_quad_dirs[:, 1], 
-              color=arrow_colors, alpha=0.4, width=0.002,
+              color=arrow_colors, alpha=0.8, width=0.002,
               headwidth=3, headlength=4, label='Quad Directions')
 
     # 3. Plot global point sets
@@ -183,16 +183,7 @@ def visualize_processed_map(file_path, sample_size=5):
     # Connect the click event handler
     fig.canvas.mpl_connect('button_press_event', on_click)
     
-    # --- Pre-draw a few samples ---
-    print("\n--- Random Samples ---")
-    if len(quads) > sample_size:
-        sample_indices = random.sample(range(len(quads)), sample_size)
-        for i in sample_indices:
-            quad = quads[i]
-            center = quad_centers_3d[quad['polyId']]
-            # Use a simple arrow to mark the sample location
-            ax.plot(center[0], center[1], '>', color='green', markersize=4, alpha=0.7)
-            
+
     ax.legend()
     ax.grid(True, linestyle='--', alpha=0.6)
     plt.show()

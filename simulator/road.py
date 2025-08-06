@@ -4,6 +4,7 @@ from typing import Dict, Tuple, List
 
 class RoadNetwork:
     """
+    无需更改,已经通过测试
     负责加载和管理从预处理的 CARLA 地图数据中提取的道路网络。
     这个类将地图数据（主要是四边形路块 'quads'）加载到 PyTorch 张量中，
     以便于在 GPU 上进行高效的批量化计算。它提供了查询地图几何信息
@@ -285,13 +286,6 @@ if __name__ == '__main__':
                 centerline = road_network.quad_centerlines[i].cpu().numpy()
                 ax.plot(centerline[:, 0], centerline[:, 1], 'r-', linewidth=3, alpha=0.8)
                 
-                # 为最近quad的四个顶点添加标注
-                # 顶点顺序: p0 (left_start) -> vertices[2], p1 (left_end) -> vertices[1], 
-                # p2 (right_end) -> vertices[0], p3 (right_start) -> vertices[3]
-                ax.text(quad[2][0], quad[2][1], 'P0', fontsize=12, color='red', weight='bold')
-                ax.text(quad[1][0], quad[1][1], 'P1', fontsize=12, color='red', weight='bold')
-                ax.text(quad[0][0], quad[0][1], 'P2', fontsize=12, color='red', weight='bold')
-                ax.text(quad[3][0], quad[3][1], 'P3', fontsize=12, color='red', weight='bold')
                 
                 # 为最近quad的中线添加箭头
                 start_point = centerline[0]

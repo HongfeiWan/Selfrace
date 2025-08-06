@@ -27,7 +27,6 @@ class CollisionChecker:
     def __init__(self, config: Dict, spatial_hash: SpatialHash):
         """
         目的: 初始化碰撞检测器的配置参数。
-
         逻辑:
         - 设置计算设备。
         - 从配置中获取地图的物理范围 (map_extent_m) 和网格的分辨率 (grid_width/height)。
@@ -71,7 +70,6 @@ class CollisionChecker:
         max_dim_safety = max_dim * 1.5 
         max_span = int(max_dim_safety / self.cell_size) + 2 # +2 确保覆盖边界情况
         self.max_cells_per_agent = max_span * max_span
-        
         self.max_neighbors = config.get('max_neighbors', 30)
         
         #print(f"Collision checker initialized.")
@@ -86,7 +84,6 @@ class CollisionChecker:
               debug_env_idx: int = 0) -> torch.Tensor:
         """
         目的: 作为主入口函数，对一批智能体的状态进行完整的碰撞检测。
-
         逻辑:
         1.  从 t1 时刻的状态中提取出当前处于激活状态的智能体。
         2.  计算所有智能体在 t0 和 t1 时刻的边界框顶点。
@@ -120,7 +117,7 @@ class CollisionChecker:
                 'broad_phase': broad_phase_debug_info
             }
             return final_collisions, debug_data
-        
+    
         return final_collisions
 
     def _broad_phase_vectorized(self, active_mask: torch.Tensor,
@@ -304,4 +301,3 @@ class CollisionChecker:
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    

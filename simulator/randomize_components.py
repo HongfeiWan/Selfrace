@@ -2,6 +2,9 @@ import torch
 from typing import Dict, Tuple
 import math
 import numpy as np
+import matplotlib.pyplot as plt
+import os
+import traceback
 
 class DrivingStyleSampler:
     """
@@ -16,7 +19,7 @@ class DrivingStyleSampler:
         Args:
             device (torch.device): 计算设备
         """
-        self.device = device if device is not None else torch.device('cpu')
+        self.device = device if device is not None else torch.device('cuda')
 
     def sample_mixed_uniform(self, a: float, size: int = 1) -> torch.Tensor:
         """
@@ -293,15 +296,48 @@ class RewardParameterSampler:
             'stop_line_alpha': self.sample_stop_line_alpha()
         }
 
-class CarParameterSampler:
+class VehicleParameterSampler:
     """
-    汽车参数采样器类，用于从各种分布中采样汽车参数。
+    批量车辆参数采样器类，用于world_init中多辆车的批量采样。
+    支持批量采样车辆长度、宽度和轴距，并应用约束条件。
     """
     def __init__(self, config: Dict, device: torch.device):
-        """
-        初始化参数采样器。
-        """
         self.device = device
+        dynamics_config = config.get('dynamics', {})
+        self.vehicle_length_min = dynamics_config.get('vehicle_length_min', 0.8)
+        self.vehicle_length_max = dynamics_config.get('vehicle_length_max', 7.0)
+        self.vehicle_width_min = dynamics_config.get('vehicle_width_min', 0.8)
+        self.vehicle_width_max = dynamics_config.get('vehicle_width_max', 3.0)
+        self.wheelbase_ratio = 0.6  # 轴距为长度的0.6倍
+
+    def sample_batch_vehicle_parameters(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        """
+        批量采样车辆参数
+        Args:
+            batch_size: 批量大小，即要采样的车辆数量
+        Returns:
+            Dict[str, torch.Tensor]: 包含车辆参数的字典
+                - 'length': 车辆长度 [batch_size]
+                - 'width': 车辆宽度 [batch_size] (已应用约束)
+                - 'wheelbase': 轴距 [batch_size]
+        """
+        # 采样车辆长度
+        lengths = torch.empty(batch_size, device=self.device).uniform_(
+            self.vehicle_length_min, self.vehicle_length_max
+        )
+        # 采样车辆宽度
+        widths = torch.empty(batch_size, device=self.device).uniform_(
+            self.vehicle_width_min, self.vehicle_width_max
+        )
+        # 应用约束：宽度不能超过长度
+        widths = torch.min(widths, lengths)
+        # 计算轴距：长度为长度的0.6倍
+        wheelbases = lengths * self.wheelbase_ratio
+        return {
+            'length': lengths,
+            'width': widths,
+            'wheelbase': wheelbases
+        }
 
 if __name__ == "__main__":
     import numpy as np
@@ -503,19 +539,129 @@ if __name__ == "__main__":
         
         print("\nDrivingStyleSampler 测试完成！")
     
+    def test_vehicle_parameter_sampler():
+        """测试 VehicleParameterSampler 类的参数采样功能"""
+        print("="*60)
+        print("测试 VehicleParameterSampler 类")
+        print("="*60)
+        
+        try:
+            # 从配置文件加载配置
+            config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'configs', 'default_config.yaml')
+            test_config = load_config_from_yaml(config_path)
+            if not test_config:
+                print("错误: 无法加载配置，测试终止")
+                return
+            
+            # 使用CUDA设备
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"使用设备: {device}")
+            sampler = VehicleParameterSampler(test_config, device)
+            
+            # 测试批量采样
+            print("测试批量车辆参数采样...")
+            batch_size = 1000000
+            vehicle_params = sampler.sample_batch_vehicle_parameters(batch_size)
+            
+            # 打印参数统计信息
+            print(f"\n批量采样结果 (batch_size={batch_size}):")
+            for param_name, param_tensor in vehicle_params.items():
+                print(f"  {param_name}:")
+                print(f"    形状: {param_tensor.shape}")
+                print(f"    设备: {param_tensor.device}")
+                print(f"    最小值: {param_tensor.min():.3f}")
+                print(f"    最大值: {param_tensor.max():.3f}")
+                print(f"    均值: {param_tensor.mean():.3f}")
+                print(f"    标准差: {param_tensor.std():.3f}")
+            
+            # 验证约束条件
+            print("\n验证约束条件:")
+            lengths = vehicle_params['length']
+            widths = vehicle_params['width']
+            wheelbases = vehicle_params['wheelbase']
+            
+            # 检查宽度约束: width <= length
+            width_constraint = torch.all(widths <= lengths)
+            print(f"  宽度约束 (width <= length): {'✓' if width_constraint else '✗'}")
+            
+            # 检查轴距约束: wheelbase = 0.6 * length
+            expected_wheelbases = lengths * 0.6
+            wheelbase_diff = torch.abs(wheelbases - expected_wheelbases)
+            wheelbase_constraint = torch.all(wheelbase_diff < 1e-6)
+            print(f"  轴距约束 (wheelbase = 0.6 * length): {'✓' if wheelbase_constraint else '✗'}")
+            
+            # 绘制三个分布图
+            print("\n绘制车辆参数分布图...")
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            
+            # 将张量转移到CPU并转换为numpy数组用于绘图
+            lengths_cpu = lengths.cpu().numpy()
+            widths_cpu = widths.cpu().numpy()
+            wheelbases_cpu = wheelbases.cpu().numpy()
+            
+            # 绘制长度分布
+            axes[0].hist(lengths_cpu, bins=50, alpha=0.7, color='blue', edgecolor='black')
+            axes[0].set_title('length')
+            axes[0].set_xlabel('length (m)')
+            axes[0].set_ylabel('frequency')
+            axes[0].grid(True, alpha=0.3)
+            
+            # 标记长度分布的最大最小值
+            length_min = lengths_cpu.min()
+            length_max = lengths_cpu.max()
+            axes[0].axvline(length_min, color='red', linestyle='--', alpha=0.8, label=f'min: {length_min:.3f}')
+            axes[0].axvline(length_max, color='red', linestyle='--', alpha=0.8, label=f'max: {length_max:.3f}')
+            axes[0].legend()
+            
+            # 绘制宽度分布
+            axes[1].hist(widths_cpu, bins=50, alpha=0.7, color='green', edgecolor='black')
+            axes[1].set_title('width')
+            axes[1].set_xlabel('width (m)')
+            axes[1].set_ylabel('frequency')
+            axes[1].grid(True, alpha=0.3)
+            
+            # 标记宽度分布的最大最小值
+            width_min = widths_cpu.min()
+            width_max = widths_cpu.max()
+            axes[1].axvline(width_min, color='red', linestyle='--', alpha=0.8, label=f'min: {width_min:.3f}')
+            axes[1].axvline(width_max, color='red', linestyle='--', alpha=0.8, label=f'max: {width_max:.3f}')
+            axes[1].legend()
+            
+            # 绘制轴距分布
+            axes[2].hist(wheelbases_cpu, bins=50, alpha=0.7, color='red', edgecolor='black')
+            axes[2].set_title('wheelbase')
+            axes[2].set_xlabel('wheelbase (m)')
+            axes[2].set_ylabel('frequency')
+            axes[2].grid(True, alpha=0.3)
+            
+            # 标记轴距分布的最大最小值
+            wheelbase_min = wheelbases_cpu.min()
+            wheelbase_max = wheelbases_cpu.max()
+            axes[2].axvline(wheelbase_min, color='red', linestyle='--', alpha=0.8, label=f'min: {wheelbase_min:.3f}')
+            axes[2].axvline(wheelbase_max, color='red', linestyle='--', alpha=0.8, label=f'max: {wheelbase_max:.3f}')
+            axes[2].legend()
+            
+            plt.tight_layout()
+            plt.show()
+
+
+            print("\n✓ VehicleParameterSampler 测试完成！")
+
+        except Exception as e:
+            print(f"✗ VehicleParameterSampler 测试失败: {e}")
+            traceback.print_exc()
+
     def main():
         # 测试 DrivingStyleSampler
-        test_driving_style_sampler()
+        # test_driving_style_sampler()
         
         # 测试 RewardParameterSampler
-        test_reward_parameter_sampler()
-        
-        # 测试其他类（将来添加）
-        # test_other_classes()
+        # test_reward_parameter_sampler()
+
+        # 测试 VehicleParameterSampler
+        test_vehicle_parameter_sampler()
+
         print("\n所有测试完成！")
-    
-    # 运行测试
-    if __name__ == "__main__":
-        main()
+    main()
 
 

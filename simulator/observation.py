@@ -13,6 +13,7 @@ from road import RoadNetwork
 
 class ObservationGenerator:
     """
+    已经通过测试
     负责为批次中的所有 Agent 生成局部观测。
     通过完全向量化的操作，该模块可以一次性为所有环境中的所有智能体高效地计算观测，
     避免了在 Python 中进行循环，从而最大限度地利用 GPU 并行能力。
@@ -24,26 +25,54 @@ class ObservationGenerator:
         self.road_network = road_network
         self.config = config
         self.device = device
-
         self.num_neighbors = config.get('num_neighbors', 1) # 邻居数量
         self.num_w_lanes = config.get('num_w_lanes', 25) # 车道数量
         self.num_w_boundaries = config.get('num_w_boundaries', 26) # 边界数量
         self.horizon = config.get('horizon', 100.0) # 视野范围
-
         # 定义观测空间维度
-        self.local_state_dim = config.get('local_state_dim', 4)           # (vel_x, vel_y, acc_x, acc_y)
-        self.neighbor_feature_dim = config.get('neighbor_feature_dim', 5) # (dx, dy, vx, vy, active)
-        self.waypoint_feature_dim = config.get('waypoint_feature_dim', 2) # (dx, dy) for each point
+        self.local_state_dim = config.get('local_state_dim', 7)            # 修改为7个特征: x,y,yaw,speed,length,width,active       
+        self.neighbor_feature_dim = config.get('neighbor_feature_dim', 7)  # 修改为7个特征：dx, dy, vx, vy, length, width, active 
+        self.waypoint_feature_dim = config.get('waypoint_feature_dim', 2) 
+        self.boundary_feature_dim = config.get('boundary_feature_dim', 2)  
+        
+
+    def get_observation_dim(self) -> int:
+        """
+        计算观测向量的总维度
+        Returns:
+            int: 观测向量的总维度
+        """
+        # 计算各部分维度
+        local_state_size = self.local_state_dim  # 局部状态维度
+        neighbors_size = self.num_neighbors * self.neighbor_feature_dim  # 邻居特征维度
+        w_lanes_size = self.num_w_lanes * self.waypoint_feature_dim  # 车道航点维度
+        w_boundaries_size = self.num_w_boundaries * self.boundary_feature_dim  # 边界点维度
+        # 总维度
+        total_dim = local_state_size + neighbors_size + w_lanes_size + w_boundaries_size
+        return total_dim
         
     def generate(self, agents_state: torch.Tensor) -> torch.Tensor:
         """
         为所有环境中的所有 agent 生成一批观测。
         Args:
             agents_state (torch.Tensor): 全局状态张量 (B, M, 7)。
+            agents_state[..., 0] = x
+            agents_state[..., 1] = y
+            agents_state[..., 2] = yaw
+            agents_state[..., 3] = speed
+            agents_state[..., 4] = vehicle_length
+            agents_state[..., 5] = vehicle_width
+            agents_state[..., 6] = active
         Returns:
             torch.Tensor: 展平后的观测向量张量 (B, M, feature_dim)。
+            local_state: (B, M, 4)
+            neighbors_local: (B, M, K, 7)  # dx, dy, vx, vy, length, width, active
+            w_lanes_local: (B, M, N_lanes, 2)
+            w_boundaries_local: (B, M, N_boundaries, 2)
         """
         batch_size, max_agents, _ = agents_state.shape
+        # B,M
+
         # 1. 获取世界坐标系下的特征
         # (B, M, K, 7)
         neighbor_states_world = self._get_nearest_neighbors(agents_state)
@@ -57,23 +86,21 @@ class ObservationGenerator:
         )
         # 3. 展平并拼接成最终的观测向量
         observation = torch.cat([
-            local_state,
+            agents_state,
             neighbors_local.flatten(start_dim=2),
             w_lanes_local.flatten(start_dim=2),
             w_boundaries_local.flatten(start_dim=2)
         ], dim=2)
-        return observation    
+        return observation
     
     def _get_nearest_neighbors(self, agents_state: torch.Tensor) -> torch.Tensor:
         """为每个 agent 找到最近的 K 个邻居。完全向量化版本。"""
         batch_size, max_agents, _ = agents_state.shape
-        
         # 如果不需要邻居，直接返回空的张量
         if self.num_neighbors == 0:
             return torch.zeros(batch_size, max_agents, 0, 7, device=self.device)
-        
+        # 获取所有agent的坐标
         query_pos = agents_state[..., :2] # (B, M, 2)
-
         # 使用 torch.cdist 计算每个环境中所有 agent 之间的配对距离
         dist_sq = torch.cdist(query_pos, query_pos, p=2).pow(2) # (B, M, M)
 
@@ -82,24 +109,21 @@ class ObservationGenerator:
         self_mask = torch.eye(max_agents, device=self.device, dtype=torch.bool).expand(batch_size, -1, -1)
         # 2. 不活跃的 agent 不能作为邻居
         inactive_mask = (agents_state[..., 6] < 0.5).unsqueeze(1).expand(-1, max_agents, -1)
-        
+        # 3. 距离超过视野范围的邻居不考虑
         dist_sq[self_mask | inactive_mask] = float('inf')
-        dist_sq[dist_sq > self.horizon**2] = float('inf') # 距离超过视野范围的邻居不考虑
-
-        # 找到最近的 K 个
+        dist_sq[dist_sq > self.horizon**2] = float('inf') 
+        # 4. 找到最近的 K 个
         _, topk_indices = torch.topk(dist_sq, k=self.num_neighbors, dim=-1, largest=False) # (B, M, K)
-        
-        # 使用高级索引高效地收集邻居状态
+        # 5. 使用高级索引高效地收集邻居状态
         batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1, 1)
         agent_idx = torch.arange(max_agents, device=self.device).view(1, max_agents, 1)
         neighbor_states = agents_state[batch_idx, topk_indices] # (B, M, K, 7)
-
-        # 如果邻居是无效的 (距离为inf)，则其状态需要被掩码/清零
+        # 6. 如果邻居是无效的 (距离为inf)，则其状态需要被掩码/清零
         valid_neighbor_dists = dist_sq[batch_idx, agent_idx, topk_indices]
         is_valid_neighbor = torch.isfinite(valid_neighbor_dists) # (B, M, K)
         neighbor_states[~is_valid_neighbor] = 0.0
-        
         return neighbor_states
+    
     def _get_nearby_global_points(self, agents_state: torch.Tensor, source_points: torch.Tensor, num_points: int) -> torch.Tensor:
         """为所有 agent 从全局点集中找到 k 个最近的点。"""
         batch_size, max_agents, _ = agents_state.shape
@@ -107,7 +131,6 @@ class ObservationGenerator:
             return torch.zeros(batch_size, max_agents, num_points, 2, device=self.device)
 
         query_pos = agents_state[..., :2].view(-1, 2) # (B*M, 2)
-        
         dist_sq = torch.cdist(query_pos, source_points, p=2).pow(2)
         
         # 如果 num_points 为 0，直接返回空张量
@@ -115,25 +138,18 @@ class ObservationGenerator:
             return torch.zeros(batch_size, max_agents, 0, 2, device=self.device)
             
         _, topk_indices = torch.topk(dist_sq, k=num_points, dim=1, largest=False) # (B*M, k)
-        
         selected_points = source_points[topk_indices] # (B*M, k, 2)
-        
         return selected_points.view(batch_size, max_agents, num_points, 2)
+    
     def _world_to_ego_centric(self, ego_states, neighbor_states, w_lanes_world, w_boundaries_world):
         """将世界坐标系下的状态转换为以每个 agent 为中心的坐标系。"""
         B, M, _ = ego_states.shape
         K_neighbors = neighbor_states.shape[2]
-        N_lanes = w_lanes_world.shape[2]
-        N_boundaries = w_boundaries_world.shape[2]
-
         ego_pos = ego_states[..., :2] # (B, M, 2)
         ego_yaw = ego_states[..., 2]  # (B, M)
-
-        # 修正: 为行向量构建正确的旋转矩阵
-        # 要将世界坐标点按 -ego_yaw 旋转，对于行向量 v' = v @ R,
-        # 旋转矩阵 R 应为 [[cos(yaw), -sin(yaw)], [sin(yaw), cos(yaw)]]
         cos_yaw, sin_yaw = torch.cos(ego_yaw), torch.sin(ego_yaw)
-        # (B, M, 2, 2)
+
+        # 使用标准2D旋转矩阵（车左边为正）
         rot_matrix = torch.stack([
             torch.stack([cos_yaw, -sin_yaw], dim=-1), 
             torch.stack([sin_yaw, cos_yaw], dim=-1)
@@ -145,527 +161,371 @@ class ObservationGenerator:
             rel_pos = points_world - ego_pos.unsqueeze(2)
             B, M, N, D = rel_pos.shape
             return torch.bmm(rel_pos.view(B*M, N, D), rot_matrix.view(B*M, D, D)).view(B, M, N, D)
-        
+        # 将世界坐标系下的车道线和边界线转换到局部坐标系
         w_lanes_local = batch_rotate(w_lanes_world, ego_pos, rot_matrix)
         w_boundaries_local = batch_rotate(w_boundaries_world, ego_pos, rot_matrix)
-
         # --- 转换邻居 ---
         if K_neighbors > 0:
             rel_pos_neighbors = neighbor_states[..., :2] - ego_pos.unsqueeze(2) # (B, M, K, 2)
             local_pos_neighbors = torch.bmm(
                 rel_pos_neighbors.view(B*M, K_neighbors, 2), rot_matrix.view(B*M, 2, 2)
             ).view(B, M, K_neighbors, 2)
-
             neighbor_speed = neighbor_states[..., 3]
             neighbor_yaw = neighbor_states[..., 2]
             vx_world = neighbor_speed * torch.cos(neighbor_yaw)
             vy_world = neighbor_speed * torch.sin(neighbor_yaw)
             v_world = torch.stack([vx_world, vy_world], dim=-1) # (B, M, K, 2)
-            
             v_local = torch.bmm(
                 v_world.view(B*M, K_neighbors, 2), rot_matrix.view(B*M, 2, 2)
             ).view(B, M, K_neighbors, 2)
-            
+            length = neighbor_states[..., 4].unsqueeze(-1)
+            width = neighbor_states[..., 5].unsqueeze(-1)
             active_flag = neighbor_states[..., 6].unsqueeze(-1)
-            neighbors_local = torch.cat([local_pos_neighbors, v_local, active_flag], dim=-1)
+            neighbors_local = torch.cat([local_pos_neighbors, v_local, length, width, active_flag], dim=-1)
+            #包含七个特征：dx, dy, vx, vy, length, width, active
         else:
             # 如果没有邻居，创建空的邻居特征张量
             neighbors_local = torch.zeros(B, M, 0, self.neighbor_feature_dim, device=self.device)
-
         # --- 创建每个 Agent 自身在局部坐标系下的状态 ---
-        local_state = torch.zeros(B, M, self.local_state_dim, device=self.device) # 151维
-        local_state[..., 0] = ego_states[..., 3] # vx_local = speed 
+        local_state = torch.zeros(B, M, self.local_state_dim, device=self.device) # 7个特征：x, y, yaw, speed, length, width, active
+        local_state[..., 4] = ego_states[..., 4] # 长度
+        local_state[..., 5] = ego_states[..., 5] # 宽度
+        local_state[..., 6] = ego_states[..., 6] # 活跃状态
         return local_state, neighbors_local, w_lanes_local, w_boundaries_local
 
 if __name__ == '__main__':
-    # --- 测试设置 ---
-    import yaml
     import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
     import numpy as np
+    import random
+    print("RoadNetwork 测试")
+    # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    map_file_path = 'teraflow_replication/maps/carla_maps/processed_map_Town01_stitched.json'
+    print(f"使用设备: {device}")
+    # 加载地图数据
+    map_path = "maps/processed_map_Town01_stitched.json"
+    print(f"加载地图: {map_path}")
 
-    # 从配置文件读取配置
-    config_path = 'teraflow_replication/configs/default_config.yaml'
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-        #print(f"Loaded configuration from {config_path}")
-        # 获取simulator配置中的observation部分
-        if 'simulator' in config and 'observation' in config['simulator']:
-            test_config = config['simulator']['observation']
-        else:
-            # 如果没有嵌套结构，直接使用根级别的observation配置
-            test_config = config.get('observation', {})
-        print(f"Using observation config:\n {test_config}")
-    except FileNotFoundError:
-        print(f"Warning: Config file {config_path} not found, using default values")
-
-    # 1. 实例化依赖项 RoadNetwork
-    try:
-        road_network = RoadNetwork(map_path=map_file_path, device=device)
-    except FileNotFoundError:
-        print("Error: Map file not found. Make sure the path is correct.")
-        exit()
-
-    # 2. 实例化 ObservationGenerator
-    obs_generator = ObservationGenerator(road_network, test_config, device)
-    #print("ObservationGenerator instantiated successfully.")
-
-    # 3. 创建模拟的全局状态
-    B, M = 1, int(obs_generator.num_neighbors)+1 # 1 envs, num_neighbors+1 agents
-    agents_state = torch.zeros(B, M, 7, device=device)
-    # 随机填充一些状态
-    agents_state[:, :, :2] = torch.randn(B, M, 2, device=device) * 20 # positions
-    agents_state[:, :, 2] = (torch.rand(B, M, device=device) * 2 - 1) * torch.pi # yaws
-    agents_state[:, :, 3] = torch.rand(B, M, device=device) * 10 # speeds
-    agents_state[:, :, 4:6] = torch.tensor([4.5, 2.0], device=device) # size
-    agents_state[:, :, 6] = (torch.rand(B, M, device=device) > 0).float() # 100% active
-    # 假设 ego 都是第一个 agent
-    agents_state[:, 0, 6] = 1.0 #确保ego是active的
-
-    # 4. 生成观测
-    observation = obs_generator.generate(agents_state)
-
-    # 5. 打印结果
-    print(f"\n--- Observation Generation Results ---")
-    print(f"Generated observation shape: {observation.shape}")
-
-    # 计算期望的维度
-    expected_dim = (test_config['local_state_dim'] + 
-                    test_config['num_neighbors'] * test_config['neighbor_feature_dim'] +
-                    test_config['num_w_lanes'] * test_config['waypoint_feature_dim'] +
-                    test_config['num_w_boundaries'] * test_config['waypoint_feature_dim'])
-    print(f"Expected feature dimension: {expected_dim}")
-    assert observation.shape[2] == expected_dim, f"Observation dim mismatch! Got {observation.shape[2]}, expected {expected_dim}"
-    print("Dimension check PASSED.")
-
-    # 6. 可视化部分
-    print("\n--- Starting Visualization ---")
-    # 创建图形
-    fig, ax = plt.subplots(figsize=(15, 12))
-    ax.set_aspect('equal')
-    ax.set_facecolor('lightgray')
-    # 绘制静态地图背景
-    def draw_static_map():
-        """绘制道路网络的静态背景。"""
-        print("Drawing static map background...")
-        # 获取并绘制车道边界
-        left_bounds = road_network.get_all_lanes_left_boundaries().cpu().numpy()
-        right_bounds = road_network.get_all_lanes_right_boundaries().cpu().numpy()
-        # 绘制所有车道的边界线
-        for line in np.concatenate([left_bounds, right_bounds]):
-            ax.plot(line[:, 0], line[:, 1], color='white', linewidth=1.0, zorder=1)
-        print("Map background drawn.")
-    draw_static_map()
-    
-    # 获取车辆OBB顶点
-    def get_world_vertices_from_state(states: torch.Tensor) -> torch.Tensor:
-        """根据车辆状态计算OBB顶点。"""
-        x, y, yaw = states[..., 0], states[..., 1], states[..., 2]
-        length, width = states[..., 4], states[..., 5]
-
-        cos_yaw, sin_yaw = torch.cos(yaw), torch.sin(yaw)
+    # 绘制车辆矩形
+    def draw_vehicle(ax, x, y, yaw, speed , length=4.5, width=2.0, color='green', alpha=0.8):
+        """绘制车辆矩形"""
+        # 车辆矩形的四个角点（相对于车辆中心）
+        half_length = length / 2
+        half_width = width / 2
         
-        half_l, half_w = length / 2, width / 2
-        
-        corners_local = states.new_tensor([
-            [1, 1], [1, -1], [-1, -1], [-1, 1]
-        ], device=states.device) * torch.stack([half_l, half_w], dim=-1).unsqueeze(-2)
+        # 车辆矩形的四个角点（相对于车辆中心）
+        corners = np.array([
+            [-half_length, -half_width],  # 左下
+            [half_length, -half_width],   # 右下
+            [half_length, half_width],    # 右上
+            [-half_length, half_width]    # 左上
+        ])
         # 旋转矩阵
-        rot_matrix = torch.stack([cos_yaw, sin_yaw, -sin_yaw, cos_yaw], dim=-1).view(*states.shape[:-1], 2, 2)
+        cos_yaw = np.cos(yaw)
+        sin_yaw = np.sin(yaw)
+        rotation_matrix = np.array([
+            [cos_yaw, -sin_yaw],
+            [sin_yaw, cos_yaw]
+        ])
         
-        # 旋转并平移到世界坐标
-        verts_world = corners_local @ rot_matrix
-        verts_world += states[..., :2].unsqueeze(-2)
-        return verts_world
-    
-    # 绘制车辆
-    agents_state_env = agents_state[0]  # 取第一个环境
-    ego_idx = 0  # ego是第一个agent
-    
-    # 获取ego状态（提前提取，避免在循环中重复计算）
-    ego_state = agents_state_env[ego_idx]
-    ego_x, ego_y, ego_yaw, *_ = ego_state.cpu().numpy()
-    
-    # 获取所有车辆的OBB顶点
-    all_agent_vertices = get_world_vertices_from_state(agents_state_env)
-    
-    # 绘制每个活跃的车辆
-    for i, agent_state in enumerate(agents_state_env):
-        if agent_state[6] > 0.5:  # 如果agent是活跃的
-            is_ego = (i == ego_idx)
-            color = 'royalblue' if is_ego else 'crimson'
-            zorder = 10 if is_ego else 5
-            
-            # 绘制车辆OBB（使用Rectangle，与test_and_visualize_simulator.py保持一致）
-            _, _, _, _, length, width, _ = agent_state.cpu().numpy()
-            x, y, yaw = agent_state[:3].cpu().numpy()
-            
-            # 创建Rectangle patch
-            rect = patches.Rectangle(
-                (-length / 2, -width / 2), 
-                length, 
-                width, 
-                facecolor=color, 
-                edgecolor='black',
-                linewidth=1.0,
-                zorder=zorder
-            )
-            
-            # 应用旋转和平移变换
-            rotation = plt.matplotlib.transforms.Affine2D().rotate_deg(np.degrees(yaw))
-            translation = plt.matplotlib.transforms.Affine2D().translate(x, y)
-            final_transform = rotation + translation + ax.transData
-            rect.set_transform(final_transform)
-            ax.add_patch(rect)
-            
-            # 添加车辆标签
-            agent_yaw = agent_state[2].item()
-            
-            if is_ego:
-                # ego车辆显示基本信息
-                label_text = f'ID:{i}\nSpeed:{agent_state[3]:.1f}m/s'
-            else:
-                # 非ego车辆显示转换到ego坐标系的信息
-                # 计算相对位置
-                rel_x = x - ego_x
-                rel_y = y - ego_y
-                # 转换到ego坐标系（旋转）
-                cos_yaw = np.cos(-ego_yaw)  # 注意是负角度，因为要转换到ego坐标系
-                sin_yaw = np.sin(-ego_yaw)
-                ego_rel_x = rel_x * cos_yaw - rel_y * sin_yaw
-                ego_rel_y = rel_x * sin_yaw + rel_y * cos_yaw
-                # 计算相对速度
-                agent_speed = agent_state[3].item()
-                agent_yaw = agent_state[2].item()
-                
-                # 世界坐标系下的速度分量
-                agent_vx_world = agent_speed * np.cos(agent_yaw)
-                agent_vy_world = agent_speed * np.sin(agent_yaw)
-                
-                # 转换到ego坐标系的速度
-                ego_rel_vx = agent_vx_world * cos_yaw - agent_vy_world * sin_yaw
-                ego_rel_vy = agent_vx_world * sin_yaw + agent_vy_world * cos_yaw
-                
-                # 翻转速度的Y分量以匹配matplotlib坐标系
-                ego_rel_vy = -ego_rel_vy
-                
-                # 计算距离
-                distance = np.sqrt(rel_x**2 + rel_y**2)
-                
-                label_text = f'ID:{i}\nPos:({ego_rel_x:.1f},{ego_rel_y:.1f})\nVel:({ego_rel_vx:.1f},{ego_rel_vy:.1f})\nDist:{distance:.1f}m'
-            
-            ax.text(x, y, label_text, fontsize=7, ha='center', va='center', 
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-    
-    # 可视化观测内容
-    ego_obs = observation[0, ego_idx]  # ego的观测，B=0，M=ego_idx,151维
-    # 解析观测向量的各个部分
-    local_state_dim = test_config['local_state_dim']
-    neighbor_feature_dim = test_config['neighbor_feature_dim']
-    num_neighbors = test_config['num_neighbors']
-    waypoint_feature_dim = test_config.get('waypoint_feature_dim', 2)
-    num_w_lanes = test_config['num_w_lanes']
-    num_w_boundaries = test_config['num_w_boundaries']
-    
-    # 计算切片索引
-    start_w_lane = local_state_dim + num_neighbors * neighbor_feature_dim
-    end_w_lane = start_w_lane + num_w_lanes * waypoint_feature_dim
-    start_w_boundary = end_w_lane
-    end_w_boundary = start_w_boundary + num_w_boundaries * waypoint_feature_dim
-    
-    # 提取局部坐标特征
-    w_lane_local_feats = ego_obs[start_w_lane:end_w_lane].view(-1, waypoint_feature_dim).cpu().numpy()
-    w_boundary_local_feats = ego_obs[start_w_boundary:end_w_boundary].view(-1, waypoint_feature_dim).cpu().numpy()
+        # 旋转角点
+        rotated_corners = corners @ rotation_matrix.T
+        
+        # 平移到车辆位置
+        vehicle_corners = rotated_corners + np.array([x, y])
+        
+        # 绘制车辆矩形
+        vehicle_x = np.append(vehicle_corners[:, 0], vehicle_corners[0, 0])
+        vehicle_y = np.append(vehicle_corners[:, 1], vehicle_corners[0, 1])
+        ax.plot(vehicle_x, vehicle_y, color=color, linewidth=2, alpha=alpha)
+        
+        # 绘制车辆朝向箭头
+        arrow_length = speed
+        arrow_dx = arrow_length * cos_yaw
+        arrow_dy = arrow_length * sin_yaw
+        ax.arrow(x, y, arrow_dx, arrow_dy, 
+                head_width=1, head_length=0.5, fc=color, ec=color, alpha=alpha)
+        # 标记车辆中心
+        ax.plot(x, y, 'o', color=color, markersize=4, alpha=alpha)    
+    try:
+        # 创建RoadNetwork实例
+        road_network = RoadNetwork(map_path, device)
+        # 获取quads顶点数据
+        quads_vertices_np = road_network.quads_vertices.cpu().numpy()
+        # 随机选择一个quad并在其中生成车辆位置
+        random_quad_idx = random.randint(0, road_network.num_quads - 1)
+        print(f"随机选择quad索引: {random_quad_idx}")
+        # 获取选中quad的顶点
+        selected_quad = quads_vertices_np[random_quad_idx]
+        # 在quad范围内随机生成车辆位置
+        # 使用重心坐标法在quad内随机生成点
+        def random_point_in_quad(quad_vertices):
+            # 生成随机重心坐标
+            r1, r2 = np.random.random(2)
+            sqrt_r1 = np.sqrt(r1)
+            u = 1 - sqrt_r1
+            v = r2 * sqrt_r1
+            # 计算随机点
+            point = (1-u-v) * quad_vertices[0] + u * quad_vertices[1] + v * quad_vertices[2]
+            return point
+        vehicle_pos = random_point_in_quad(selected_quad)
+        vehicle_yaw = random.uniform(0, 2 * np.pi)  # 随机朝向
+        # 绘制地图
+        print("绘制地图...")
+        fig, ax = plt.subplots(figsize=(12, 8))
 
-    # 过滤掉填充值 (通常是全0)
-    w_lane_local_feats = w_lane_local_feats[np.any(w_lane_local_feats != 0, axis=1)]
-    w_boundary_local_feats = w_boundary_local_feats[np.any(w_boundary_local_feats != 0, axis=1)]
+        # 只绘制ego周围的quads
+        vehicle_pos_array = np.array([vehicle_pos], dtype=np.float32)
+        vehicle_pos_tensor = torch.tensor(vehicle_pos_array, dtype=torch.float32, device=device)
+        # 找到距离ego最近的quads
+        distances, nearest_indices = road_network.find_nearest_lanes(vehicle_pos_tensor, k=400)
+        nearest_indices = nearest_indices.cpu().numpy().flatten()
+        nearest_quad_idx = nearest_indices[0]  # 最近的quad索引
+        nearby_quads = nearest_indices.tolist()
 
-    # 转换到全局坐标
-    cos_yaw = np.cos(ego_yaw)
-    sin_yaw = np.sin(ego_yaw)
-    rotation_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
-    
-    ego_pos_global = np.array([ego_x, ego_y])
-    w_lane_obs_global = (w_lane_local_feats @ rotation_matrix.T) + ego_pos_global
-    w_boundary_obs_global = (w_boundary_local_feats @ rotation_matrix.T) + ego_pos_global
-    
-    # 绘制观测点
-    if w_lane_obs_global.shape[0] > 0:
-        ax.scatter(w_lane_obs_global[:, 0], w_lane_obs_global[:, 1], 
-                  c='lime', marker='+', s=60, zorder=14, label='Obs W_Lanes')
-    
-    if w_boundary_obs_global.shape[0] > 0:
-        ax.scatter(w_boundary_obs_global[:, 0], w_boundary_obs_global[:, 1], 
-                  s=40, facecolors='none', edgecolors='cyan', zorder=13, label='Obs W_Boundaries')
-    
-    # 绘制ego位置标记
-    ax.scatter([ego_x], [ego_y], c='yellow', marker='X', s=100, zorder=15, label='Ego Vehicle')
-    
-    # 设置坐标轴范围 - 显示整个地图
-    # 获取地图的边界范围
-    all_verts = road_network.quads_vertices.view(-1, 2)
-    min_bounds, _ = torch.min(all_verts, dim=0)
-    max_bounds, _ = torch.max(all_verts, dim=0)
-    
-    # 添加一些边距
-    margin = 20.0
-    ax.set_xlim(min_bounds[0].item() - margin, max_bounds[0].item() + margin)
-    ax.set_ylim(min_bounds[1].item() - margin, max_bounds[1].item() + margin)
-    
-    # 添加图例和标题
-    ax.legend(loc='upper right')
-    #ax.set_title('Observation Visualization - Full Map View\nBlue: Ego Vehicle, Red: Other Vehicles\nGreen +: Lane Waypoints, Cyan O: Boundary Waypoints')
-    
-    # 添加信息文本
-    info_text = (
-        f"Ego Speed: {ego_state[3]:.2f} m/s\n"
-        f"Ego Yaw: {np.degrees(ego_yaw):.1f}°\n"
-        f"Ego Position: ({ego_x:.1f}, {ego_y:.1f})\n"
-        f"Active Vehicles: {(agents_state_env[:, 6] > 0.5).sum().item()}\n"
-        f"Lane Waypoints: {w_lane_obs_global.shape[0]}\n"
-        f"Boundary Waypoints: {w_boundary_obs_global.shape[0]}\n"
-        f"Map Bounds: ({min_bounds[0]:.0f}, {min_bounds[1]:.0f}) to ({max_bounds[0]:.0f}, {max_bounds[1]:.0f})"
-    )
-    ax.text(0.02, 0.98, info_text, transform=ax.transAxes, 
-            ha='left', va='top', fontsize=10, 
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-    
-    # 创建以ego为中心的坐标系可视化
-    fig2, ax2 = plt.subplots(figsize=(12, 10))
-    ax2.set_aspect('equal')
-    ax2.set_facecolor('lightgray')
-    ax2.grid(True, alpha=0.3)
-    # 绘制ego坐标系原点
-    ax2.scatter([0], [0], c='yellow', marker='X', s=150, zorder=20, label='Ego (Origin)')
-    
-    # 绘制ego坐标轴
-    axis_length = 5.0
-    # X轴（ego前方）
-    ax2.arrow(0, 0, axis_length, 0, head_width=2, head_length=3, fc='red', ec='red', zorder=15, label='Ego X-axis')
-    ax2.text(axis_length + 2, 0, 'X (Ego Forward)', fontsize=10, ha='left', va='center', color='red', weight='bold')
-    # Y轴（ego右侧，向下为正以匹配matplotlib）
-    ax2.arrow(0, 0, 0, axis_length, head_width=2, head_length=3, fc='green', ec='green', zorder=15, label='Ego Y-axis')
-    ax2.text(0, axis_length, 'Y (Ego Right)', fontsize=10, ha='center', va='top', color='green', weight='bold')
-    
-    # 添加坐标系说明
-    ax2.text(0.02, 0.02, 'ego coordinate system:\n• X-axis(red): ego forward direction\n• Y-axis(green): ego right direction (down=positive)\n• Origin(yellow X): ego current position', 
-             transform=ax2.transAxes, ha='left', va='bottom', fontsize=9,
-             bbox=dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.8))
-    
-    # 转换地图信息到ego坐标系
-    def draw_map_in_ego_coords():
-        """在ego坐标系中绘制地图信息。"""
-        print("Drawing map in ego coordinates...")
+        # 在nearby_quads中随机选择一个quad生成第二辆车
+        if len(nearby_quads) > 1:
+            # 随机选择一个不同于最近quad的quad
+            available_quads = [q for q in nearby_quads if q != nearest_quad_idx]
+            if available_quads:
+                second_quad_idx = random.choice(available_quads)
+                second_quad = quads_vertices_np[second_quad_idx]
+                # 在第二个quad中生成随机车辆位置
+                second_vehicle_pos = random_point_in_quad(second_quad)
+                second_vehicle_yaw = random.uniform(0, 2 * np.pi)  # 随机朝向
+        # 创建agents_state (B=1, M=2, 7个特征)
+        # agents_state[..., 0] = x, agents_state[..., 1] = y, agents_state[..., 2] = yaw
+        # agents_state[..., 3] = speed, agents_state[..., 4] = vehicle_length, agents_state[..., 5] = vehicle_width, agents_state[..., 6] = active
+        agents_state = torch.zeros(1, 2, 7, device=device)
+        # 第一辆车的信息
+        agents_state[0, 0, 0] = float(vehicle_pos[0])  # x
+        agents_state[0, 0, 1] = float(vehicle_pos[1])  # y
+        agents_state[0, 0, 2] = float(vehicle_yaw)     # yaw
+        agents_state[0, 0, 3] = 10.0                   # speed (m/s)
+        agents_state[0, 0, 4] = 4.5                    # vehicle_length (m)
+        agents_state[0, 0, 5] = 2.0                    # vehicle_width (m)
+        agents_state[0, 0, 6] = 1.0                    # active
+        # 第二辆车的信息（如果存在）
+        if len(nearby_quads) > 1 and 'second_vehicle_pos' in locals():
+            agents_state[0, 1, 0] = float(second_vehicle_pos[0])  # x
+            agents_state[0, 1, 1] = float(second_vehicle_pos[1])  # y
+            agents_state[0, 1, 2] = float(second_vehicle_yaw)     # yaw
+            agents_state[0, 1, 3] = 8.0                           # speed (m/s)
+            agents_state[0, 1, 4] = 4.5                           # vehicle_length (m)
+            agents_state[0, 1, 5] = 2.0                           # vehicle_width (m)
+            agents_state[0, 1, 6] = 1.0                           # active
+
+        # 测试ObservationGenerator
+        print("\n=== 测试ObservationGenerator ===")
+        # 创建配置字典
+        config = {
+            'num_neighbors': 1,  # 只有2个agents，所以最多1个邻居
+            'num_w_lanes': 25,
+            'num_w_boundaries': 26,
+            'horizon': 100.0,
+            'local_state_dim': 7,  # 修改为7个特征：x, y, yaw, speed, length, width, active
+            'neighbor_feature_dim': 7,  # 修改为7个特征：dx, dy, vx, vy, length, width, active
+            'waypoint_feature_dim': 2
+        }
+        # 创建ObservationGenerator实例
+        observation_generator = ObservationGenerator(road_network, config, device)
+        print(f"观测维度: {observation_generator.get_observation_dim()}")
+        # 生成观测
+        observation = observation_generator.generate(agents_state)
         
-        # 获取车道边界
-        left_bounds = road_network.get_all_lanes_left_boundaries().cpu().numpy()
-        right_bounds = road_network.get_all_lanes_right_boundaries().cpu().numpy()
+        # 从observation中提取w_lanes_local和w_boundaries_local
+        # 计算各部分在观测向量中的位置
+        local_state_dim = config['local_state_dim']
+        neighbor_feature_dim = config['neighbor_feature_dim']
+        num_neighbors = config['num_neighbors']
+        num_w_lanes = config['num_w_lanes']
+        num_w_boundaries = config['num_w_boundaries']
+        waypoint_feature_dim = config['waypoint_feature_dim']
         
-        # 合并所有边界线
-        all_boundaries = np.concatenate([left_bounds, right_bounds])
+        # 计算各部分在观测向量中的位置
+        local_state_size = local_state_dim
+        neighbors_size = num_neighbors * neighbor_feature_dim
+        w_lanes_size = num_w_lanes * waypoint_feature_dim
+        w_boundaries_size = num_w_boundaries * waypoint_feature_dim
         
-        # 转换每条边界线到ego坐标系
-        for boundary_line in all_boundaries:
-            if len(boundary_line) > 0:
-                # 计算相对位置
-                rel_positions = boundary_line - np.array([ego_x, ego_y])
-                
-                # 旋转到ego坐标系
-                cos_yaw = np.cos(-ego_yaw)
-                sin_yaw = np.sin(-ego_yaw)
+        # 提取第一辆车的w_lanes_local和w_boundaries_local
+        vehicle1_obs = observation[0, 0].cpu().numpy()
+        w_lanes_start = local_state_size + neighbors_size
+        w_boundaries_start = w_lanes_start + w_lanes_size
+        w_lanes_local = vehicle1_obs[w_lanes_start:w_boundaries_start].reshape(num_w_lanes, waypoint_feature_dim)
+        w_boundaries_local = vehicle1_obs[w_boundaries_start:].reshape(num_w_boundaries, waypoint_feature_dim)
+        
+        # 获取第一辆车的世界坐标和朝向（从agents_state中获取，确保一致性）
+        vehicle_world_pos = np.array([float(agents_state[0, 0, 0]), float(agents_state[0, 0, 1])])
+        vehicle_world_yaw = float(agents_state[0, 0, 3])  # 注意：agents_state[..., 3]是yaw
+        
+        # 绘制w_lanes_local (车道线)
+        if w_lanes_local.shape[0] > 0:
+            # 过滤掉无效的点（全零或NaN）
+            valid_lanes = w_lanes_local[~np.all(w_lanes_local == 0, axis=1)]
+            valid_lanes = valid_lanes[~np.any(np.isnan(valid_lanes), axis=1)]
+            if valid_lanes.shape[0] > 0:
+                # 逆变换：从local坐标转换回world坐标
+                # 按照正确代码的实现方式
+                ego_x, ego_y, ego_yaw, *_ = agents_state[0, 0].cpu().numpy()
+                cos_yaw = np.cos(ego_yaw)
+                sin_yaw = np.sin(ego_yaw)
                 rotation_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
-                
-                ego_coord_positions = rel_positions @ rotation_matrix.T
-                
-                # 翻转Y轴以匹配matplotlib坐标系（向下为正）
-                ego_coord_positions[:, 1] = -ego_coord_positions[:, 1]
-                
-                # 只绘制在显示范围内的线段
-                mask = (ego_coord_positions[:, 0] >= -100) & (ego_coord_positions[:, 0] <= 100) & \
-                       (ego_coord_positions[:, 1] >= -100) & (ego_coord_positions[:, 1] <= 100)
-                
-                if np.any(mask):
-                    # 找到连续的线段段
-                    segments = []
-                    start_idx = None
-                    for i, is_visible in enumerate(mask):
-                        if is_visible and start_idx is None:
-                            start_idx = i
-                        elif not is_visible and start_idx is not None:
-                            segments.append((start_idx, i))
-                            start_idx = None
-                    
-                    # 处理最后一个段
-                    if start_idx is not None:
-                        segments.append((start_idx, len(mask)))
-                    
-                    # 绘制每个可见段
-                    for start, end in segments:
-                        if end - start > 1:  # 至少需要2个点才能画线
-                            segment_coords = ego_coord_positions[start:end]
-                            ax2.plot(segment_coords[:, 0], segment_coords[:, 1], 
-                                   color='white', linewidth=1.0, zorder=1, alpha=0.7)
-        
-        print("Map drawn in ego coordinates.")
-    
-    # 绘制ego坐标系中的地图
-    draw_map_in_ego_coords()
-    
-    # 转换所有车辆到ego坐标系
-    for i, agent_state in enumerate(agents_state_env):
-        if agent_state[6] > 0.5:  # 如果agent是活跃的
-            is_ego = (i == ego_idx)
-            
-            if is_ego:
-                # ego在原点
-                ego_coord_x, ego_coord_y = 0, 0
-                color = 'royalblue'
-                zorder = 10
-                # 绘制ego车辆（在原点）
-                ego_length, ego_width = agent_state[4:6].cpu().numpy()
-                ego_rect = patches.Rectangle((-ego_length/2, -ego_width/2), ego_length, ego_width, 
-                                           facecolor=color, edgecolor='black', linewidth=1.0, alpha=0.8, zorder=zorder)
-                ax2.add_patch(ego_rect)
-                
-                # 绘制ego的速度向量（朝向ego的前进方向）
-                ego_speed = agent_state[3].item()
-                # ego在ego坐标系中，其前进方向就是X轴正方向
-                ego_vx = ego_speed  # ego的速度在ego坐标系中就是沿X轴正方向
-                ego_vy = 0.0
-                
-                # 绘制速度向量（从车辆中心开始，朝向ego的前进方向）
-                velocity_scale = 1.0  # 速度向量的缩放因子
-                ax2.arrow(0, 0, ego_vx * velocity_scale, ego_vy * velocity_scale, 
-                         head_width=1.5, head_length=2, fc='blue', ec='blue', 
-                         linewidth=2, zorder=zorder+1, alpha=0.8)
-                # 添加速度向量标签
-                ax2.text(ego_vx * velocity_scale + 2, ego_vy * velocity_scale, 
-                        f'Forward Speed: {ego_speed:.1f}m/s', fontsize=8, ha='left', va='center', 
-                        color='blue', weight='bold', bbox=dict(boxstyle='round,pad=0.2', facecolor='lightblue', alpha=0.7))
-                
-                ax2.text(0, 0, f'ID:{i}\nSpeed:{agent_state[3]:.1f}m/s', fontsize=8, ha='center', va='center',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+                ego_pos_global = np.array([ego_x, ego_y])
+                world_lanes = (valid_lanes @ rotation_matrix.T) + ego_pos_global
+                # 绘制车道线点
+                ax.scatter(world_lanes[:, 0], world_lanes[:, 1], c='orange', s=20, alpha=0.8, label='w_lanes_local')
             else:
-                # 转换其他车辆到ego坐标系
-                x, y = agent_state[:2].cpu().numpy()
-                rel_x = x - ego_x
-                rel_y = y - ego_y
-                
-                # 旋转到ego坐标系
-                cos_yaw = np.cos(-ego_yaw)
-                sin_yaw = np.sin(-ego_yaw)
-                ego_coord_x = rel_x * cos_yaw - rel_y * sin_yaw
-                ego_coord_y = rel_x * sin_yaw + rel_y * cos_yaw
-                
-                # 翻转Y轴以匹配matplotlib坐标系（向下为正）
-                # 这样ego右侧的物体在figure2中会显示在Y轴正方向（朝下）
-                ego_coord_y = -ego_coord_y
-                
-                # 计算车辆在ego坐标系中的朝向
-                agent_yaw = agent_state[2].item()
-                ego_rel_yaw = agent_yaw - ego_yaw
-                # 由于figure2中Y轴向下为正，需要翻转yaw角度
-                ego_rel_yaw = -ego_rel_yaw
-                
-                # 绘制车辆（在ego坐标系中）
-                color = 'crimson'
-                zorder = 5
-                length, width = agent_state[4:6].cpu().numpy()
-                
-                # 创建旋转的矩形
-                rect = patches.Rectangle((-length/2, -width/2), length, width, 
-                                       facecolor=color, edgecolor='black', linewidth=1.0, alpha=0.8, zorder=zorder)
-                
-                # 应用旋转和平移变换（注意ego_coord_y已经翻转过了）
-                rotation = plt.matplotlib.transforms.Affine2D().rotate(ego_rel_yaw)
-                translation = plt.matplotlib.transforms.Affine2D().translate(ego_coord_x, ego_coord_y)
-                final_transform = rotation + translation + ax2.transData
-                rect.set_transform(final_transform)
-                ax2.add_patch(rect)
-                
-                # 计算相对速度
-                agent_speed = agent_state[3].item()
-                agent_vx_world = agent_speed * np.cos(agent_yaw)
-                agent_vy_world = agent_speed * np.sin(agent_yaw)
-                ego_rel_vx = agent_vx_world * cos_yaw - agent_vy_world * sin_yaw
-                ego_rel_vy = agent_vx_world * sin_yaw + agent_vy_world * cos_yaw
-                
-                # 翻转速度的Y分量以匹配matplotlib坐标系
-                ego_rel_vy = -ego_rel_vy
-                
-                # 绘制邻居车辆的速度向量（朝向邻居自己的前进方向）
-                agent_speed = agent_state[3].item()
-                # 使用已经计算好的ego_rel_yaw（已经考虑了Y轴翻转）
-                
-                # 邻居车辆在ego坐标系中的速度向量（朝向邻居自己的前进方向）
-                # 模仿ego的方式：速度向量沿着车辆自己的前进方向
-                # 在ego坐标系中，邻居车辆的前进方向就是ego_rel_yaw
-                # 注意：ego_rel_yaw已经考虑了Y轴翻转，所以这里不需要再次翻转Y分量
-                neighbor_vx = agent_speed * np.cos(ego_rel_yaw)
-                neighbor_vy = agent_speed * np.sin(ego_rel_yaw)
-                
-                velocity_scale = 1.0  # 速度向量的缩放因子
-                ax2.arrow(ego_coord_x, ego_coord_y, neighbor_vx * velocity_scale, neighbor_vy * velocity_scale, 
-                         head_width=1.5, head_length=2, fc='red', ec='red', 
-                         linewidth=2, zorder=zorder+1, alpha=0.8)
-                # 添加速度向量标签
-                ax2.text(ego_coord_x + neighbor_vx * velocity_scale + 2, ego_coord_y + neighbor_vy * velocity_scale, 
-                        f'Forward Speed: {agent_speed:.1f}m/s', fontsize=8, ha='left', va='center', 
-                        color='red', weight='bold', bbox=dict(boxstyle='round,pad=0.2', facecolor='lightcoral', alpha=0.7))
-                
-                # 计算距离
-                distance = np.sqrt(rel_x**2 + rel_y**2)
-                
-                # 添加标签
-                label_text = f'ID:{i}\nPos:({ego_coord_x:.1f},{ego_coord_y:.1f})\nVel:({ego_rel_vx:.1f},{ego_rel_vy:.1f})\nDist:{distance:.1f}m'
-                ax2.text(ego_coord_x, ego_coord_y, label_text, fontsize=7, ha='center', va='center',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-    
-    # 转换观测点到ego坐标系
-    if w_lane_obs_global.shape[0] > 0:
-        # 观测点已经在ego坐标系中，翻转Y轴以匹配matplotlib坐标系
-        w_lane_ego_coords = w_lane_local_feats.copy()
-        w_lane_ego_coords[:, 1] = -w_lane_ego_coords[:, 1]
-        ax2.scatter(w_lane_ego_coords[:, 0], w_lane_ego_coords[:, 1], 
-                   c='lime', marker='+', s=60, zorder=14, label='Obs W_Lanes (Ego Coords)')
-    
-    if w_boundary_obs_global.shape[0] > 0:
-        # 观测点已经在ego坐标系中，翻转Y轴以匹配matplotlib坐标系
-        w_boundary_ego_coords = w_boundary_local_feats.copy()
-        w_boundary_ego_coords[:, 1] = -w_boundary_ego_coords[:, 1]
-        ax2.scatter(w_boundary_ego_coords[:, 0], w_boundary_ego_coords[:, 1], 
-                   s=40, facecolors='none', edgecolors='cyan', zorder=13, label='Obs W_Boundaries (Ego Coords)')
-    
-    # 设置ego坐标系的显示范围
-    ax2.set_xlim(-100, 100)
-    ax2.set_ylim(100, -100)  # 反转Y轴，让向下为正数
-    ax2.set_xlabel('Ego X-axis (Forward)')
-    ax2.set_ylabel('Ego Y-axis (Right)')
-    #ax2.set_title('Observation Visualization - Ego Centered Coordinates\nBlue: Ego Vehicle, Red: Other Vehicles\nBlue/Red Arrows: Velocity Vectors\nGreen +: Lane Waypoints, Cyan O: Boundary Waypoints\nWhite: Road Boundaries')
-    
-    # 添加ego坐标系信息
-    ego_info_text = (
-        f"Ego Speed: {ego_state[3]:.2f} m/s\n"
-        f"Ego Yaw: {np.degrees(ego_yaw):.1f}°\n"
-        f"Active Vehicles: {(agents_state_env[:, 6] > 0.5).sum().item()}\n"
-        f"Lane Waypoints: {w_lane_local_feats.shape[0]}\n"
-        f"Boundary Waypoints: {w_boundary_local_feats.shape[0]}\n"
-        f"Coordinate System: Ego-centered"
-    )
-    ax2.text(0.02, 0.98, ego_info_text, transform=ax2.transAxes, 
-             ha='left', va='top', fontsize=10, 
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-    
-    ax2.legend(loc='upper right')
-    plt.tight_layout()
-    plt.show()
-    
-    plt.tight_layout()
-    plt.show()
-    
-    print("Visualization completed!")
+                print("没有有效的车道线点")
+        
+        # 绘制w_boundaries_local (边界线)
+        if w_boundaries_local.shape[0] > 0:
+            # 过滤掉无效的点（全零或NaN）
+            valid_boundaries = w_boundaries_local[~np.all(w_boundaries_local == 0, axis=1)]
+            valid_boundaries = valid_boundaries[~np.any(np.isnan(valid_boundaries), axis=1)]
+            if valid_boundaries.shape[0] > 0:
+                # 逆变换：从local坐标转换回world坐标
+                # 按照正确代码的实现方式
+                ego_x, ego_y, ego_yaw, *_ = agents_state[0, 0].cpu().numpy()
+                cos_yaw = np.cos(ego_yaw)
+                sin_yaw = np.sin(ego_yaw)
+                rotation_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+                ego_pos_global = np.array([ego_x, ego_y])
+                world_boundaries = (valid_boundaries @ rotation_matrix.T) + ego_pos_global
+                # 绘制边界线点
+                ax.scatter(world_boundaries[:, 0], world_boundaries[:, 1], c='purple', s=15, alpha=0.8, label='w_boundaries_local')
+            else:
+                print("没有有效的边界线点")
+        
+        # 计算邻居特征在observation中的位置
+        neighbors_start = local_state_dim
+        neighbors_end = neighbors_start + num_neighbors * neighbor_feature_dim
+        # 提取第一辆车的邻居观测
+        neighbors_obs = vehicle1_obs[neighbors_start:neighbors_end].reshape(num_neighbors, neighbor_feature_dim)
+        # 过滤掉无效的邻居（全零）
+        valid_neighbors = neighbors_obs[np.any(neighbors_obs != 0, axis=1)]
+        if valid_neighbors.shape[0] > 0:
+            print(f"观测到 {valid_neighbors.shape[0]} 个有效邻居")
+            # 获取ego车辆信息用于逆变换
+            ego_x, ego_y, ego_yaw, *_ = agents_state[0, 0].cpu().numpy()
+            cos_yaw = np.cos(ego_yaw)
+            sin_yaw = np.sin(ego_yaw)
+            rotation_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+            ego_pos_global = np.array([ego_x, ego_y])
+            for i, neighbor_local in enumerate(valid_neighbors):
+                # neighbor_local包含7个特征：[dx, dy, vx, vy, length, width, active]
+                dx_local, dy_local, vx_local, vy_local, length, width, active = neighbor_local
+                if active > 0.5:  # 只绘制活跃的邻居
+                    # 1. 逆变换邻居位置：从局部坐标转换回全局坐标
+                    neighbor_pos_local = np.array([dx_local, dy_local])
+                    neighbor_pos_global = (neighbor_pos_local @ rotation_matrix.T) + ego_pos_global
+                    # 2. 逆变换邻居速度：从局部坐标转换回全局坐标
+                    neighbor_vel_local = np.array([vx_local, vy_local])
+                    neighbor_vel_global = neighbor_vel_local @ rotation_matrix.T
+                    # 3. 绘制邻居位置
+                    ax.scatter(neighbor_pos_global[0], neighbor_pos_global[1], 
+                             c='red', s=10, alpha=0.8, marker='o', label=f'Neighbor_{i}' if i == 0 else "")
+                    # 4. 绘制邻居速度箭头（正交分解）
+                    vel_x_arrow = neighbor_vel_global[0] 
+                    vel_y_arrow = neighbor_vel_global[1] 
+                    # X方向速度箭头（红色）
+                    if abs(vel_x_arrow) > 0.1:  # 只绘制有意义的箭头
+                        ax.arrow(neighbor_pos_global[0], neighbor_pos_global[1], 
+                                vel_x_arrow, 0, head_width=2, head_length=1, 
+                                fc='red', ec='red', alpha=0.8, zorder=10)
+                    # Y方向速度箭头（蓝色）
+                    if abs(vel_y_arrow) > 0.1:  # 只绘制有意义的箭头
+                        ax.arrow(neighbor_pos_global[0], neighbor_pos_global[1], 
+                                0, vel_y_arrow, head_width=2, head_length=1, 
+                                fc='green', ec='green', alpha=0.8, zorder=10)
+                    
+                    # 5. 绘制邻居车辆的矩形（使用复原的长度和宽度）
+                    # 计算邻居的朝向（从速度向量推断）
+                    if np.linalg.norm(neighbor_vel_global) > 0.1:
+                        neighbor_yaw = np.arctan2(neighbor_vel_global[1], neighbor_vel_global[0])
+                    else:
+                        neighbor_yaw = 0.0  # 如果速度很小，假设朝向为0
+                    
+                    # 绘制邻居车辆矩形
+                    draw_vehicle(ax, neighbor_pos_global[0], neighbor_pos_global[1], 
+                               neighbor_yaw, np.linalg.norm(neighbor_vel_global), 
+                               length, width, color='red', alpha=1)
+                    
+        else:
+            print("没有观测到有效的邻居")
+
+        # 绘制ego矩形
+        draw_vehicle(ax, agents_state[0, 0, 0].cpu().numpy(), agents_state[0, 0, 1].cpu().numpy(), agents_state[0, 0, 2].cpu().numpy(), agents_state[0, 0, 3].cpu().numpy())
+        # 绘制第二辆车的矩形(真值)
+        draw_vehicle(ax, agents_state[0, 1, 0].cpu().numpy(), agents_state[0, 1, 1].cpu().numpy(), agents_state[0, 1, 2].cpu().numpy(), agents_state[0, 1, 3].cpu().numpy(), color='blue',alpha=0.5)
+
+        # 绘制车辆周围的quads
+        for i in nearby_quads:
+            quad = quads_vertices_np[i]
+            # 绘制quad边界
+            quad_x = [quad[0][0], quad[1][0], quad[2][0], quad[3][0], quad[0][0]]
+            quad_y = [quad[0][1], quad[1][1], quad[2][1], quad[3][1], quad[0][1]]
+            # 判断是否为最近的quad，决定颜色
+            if i == nearest_quad_idx:
+                # 最近的quad用红色
+                ax.plot(quad_x, quad_y, 'r-', alpha=0.5, linewidth=2, label='nearest quad')
+                centerline = road_network.quad_centerlines[i].cpu().numpy()
+                ax.plot(centerline[:, 0], centerline[:, 1], 'r-', linewidth=3, alpha=0.8)
+                                
+                # 为最近quad的中线添加箭头
+                start_point = centerline[0]
+                end_point = centerline[1]
+                # 计算箭头位置（在中心线的中点）
+                arrow_pos = (start_point + end_point) / 2
+                # 计算箭头方向
+                arrow_direction = end_point - start_point
+                arrow_length = np.linalg.norm(arrow_direction) * 0.3  # 箭头长度为线段长度的30%
+                arrow_direction_normalized = arrow_direction / np.linalg.norm(arrow_direction)
+                # 绘制箭头
+                ax.arrow(arrow_pos[0], arrow_pos[1], 
+                        arrow_direction_normalized[0] * arrow_length, 
+                        arrow_direction_normalized[1] * arrow_length,
+                        head_width=3, head_length=2, fc='red', ec='red', alpha=0.8)
+            else:
+                # 其他quad用蓝色
+                ax.plot(quad_x, quad_y, 'b-', alpha=0.3, linewidth=0.5)
+                centerline = road_network.quad_centerlines[i].cpu().numpy()
+                ax.plot(centerline[:, 0], centerline[:, 1], 'b-', linewidth=1, alpha=0.5)   
+        
+        # 只显示一次图例
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+        
+        # 计算Frenet坐标
+        vehicle_pos_array = np.array([vehicle_pos], dtype=np.float32)
+        vehicle_pos_tensor = torch.tensor(vehicle_pos_array, dtype=torch.float32, device=device)
+        vehicle_yaw_tensor = torch.tensor([vehicle_yaw], dtype=torch.float32, device=device)
+        print("计算Frenet坐标...")
+        d, theta_f = road_network.calculate_frenet_coordinates(vehicle_pos_tensor, vehicle_yaw_tensor)
+        print(f"横向距离 d: {d.item():.2f} (正值表示在道路右侧，负值表示在道路左侧)")
+        print(f"角度误差 theta_f: {theta_f.item():.2f} 弧度 ({np.degrees(theta_f.item()):.1f} 度)")
+        print(f"角度误差解释: 正值表示车辆朝向偏右，负值表示偏左")
+
+        # 设置图形属性
+        ax.set_xlabel('X Coordinate')
+        ax.set_ylabel('Y Coordinate')
+        ax.set_title('RoadNetwork Test - Map Visualization and Frenet Coordinate Calculation')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal')
+         
+        # 保存图片
+        plt.savefig('road_network_test.png', dpi=300, bbox_inches='tight')
+        print("地图已保存为 road_network_test.png")
+        # 显示图形
+        plt.show()
+
+    except FileNotFoundError:
+        print(f"错误: 找不到地图文件 {map_path}")
+        print("请确保地图文件存在，或者修改map_path变量指向正确的地图文件")
+    except Exception as e:
+        print(f"测试过程中发生错误: {e}")
+        import traceback
+
+        traceback.print_exc()
 

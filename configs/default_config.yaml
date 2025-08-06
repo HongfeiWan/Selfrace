@@ -1,10 +1,17 @@
 # Default configuration for the TeraFlow replication project
 simulator:
-  # 设备配置
-  device: "cuda:0"
-
-  num_envs: 38400       # 并行环境数量
+  # 设备配置 - 8张显卡的分布式设置
+  device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
+  num_envs: 38400       # 总并行环境数量 (8 * 4800 = 38400)
   sim_dt: 0.3           # 模拟时间步长
+  
+  # 分布式训练配置
+  distributed:
+    world_size: 8              # 总GPU数量
+    devices: ["cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4", "cuda:5", "cuda:6", "cuda:7"]  # 8张显卡设备列表
+    envs_per_gpu: 4800         # 每个GPU的环境数量 (38400 / 8 = 4800)
+    backend: "nccl"            # 分布式后端
+    init_method: "tcp://localhost:12355"  # 初始化方法
 
   max_agents_num: 150   # 最大车辆数量,定义每个环境中最大可能的智能体数量
   #必须满足：num_npc_vehicles <= max_agents_num，否则会报错
@@ -20,6 +27,11 @@ simulator:
     action_space_size: 12
 
     # Vehicle physical parameters
+    vehicle_length_min: 0.8 # 车辆长度最小值 (m)
+    vehicle_length_max: 7.0 # 车辆长度最大值 (m)
+    vehicle_width_min: 0.8 # 车辆宽度最小值 (m)
+    vehicle_width_max: 3.0 # 车辆宽度最大值 (m)
+
     vehicle_length: 4.5 # 车辆长度 (m)
     vehicle_width: 2.0 # 车辆宽度 (m)
     vehicle_wheelbase: 2.9  # 车辆轴距 (L)，前后轮轴心之间的距离 (m)
@@ -58,9 +70,10 @@ simulator:
   observation:
     # Observation space config
     # 定义观测空间
-    local_state_dim: 4 # (vel_x, vel_y, acc_x, acc_y)
-    neighbor_feature_dim: 5 # (dx, dy, vx, vy, active)
+    local_state_dim: 7 # (x, y, yaw, speed, length, width, active)
+    neighbor_feature_dim: 7 # (dx, dy, vx, vy, length, width, active)
     waypoint_feature_dim: 2 # (dx, dy) for each point
+    boundary_feature_dim: 2 # (dx, dy) for each point
 
     # 定义视野
     num_neighbors: 20     # 邻居数量
@@ -72,6 +85,7 @@ simulator:
     # Spatial hash config
     hash_cell_size: 20.0 # 20m，哈希方形网格单元大小，
     # Further simulator-specific configs...
+
 # Reward parameters based on Appendix B.3 and GIGAFLOW paper
 reward:
   # Goal reward parameters (Rgoal)
@@ -124,6 +138,7 @@ policy:
   # Further network architecture configs...
 
 training:
+  # 训练参数
   total_timesteps: 1_000_000_000_000 # As per paper
   rollout_steps: 128
   learning_rate: 0.0001 # Placeholder, should be tuned
@@ -135,5 +150,13 @@ training:
   ent_coef: 0.01
   max_grad_norm: 0.5
   advantage_filter_fraction: 0.8 # Filter out 80% of samples
+  
+  # 内存和性能优化
+  checkpoint_interval: 100     # 检查点保存间隔
+  log_interval: 10            # 日志记录间隔
+  
+  # 经验缓冲区配置
+  experience_buffer_capacity: 50000  # 经验缓冲区容量
+  min_buffer_size_for_training: 1000 # 开始训练的最小缓冲区大小
 
 traffic:

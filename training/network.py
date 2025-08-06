@@ -191,7 +191,7 @@ def create_network(network_type="shared", feature_dims=None, num_actions=4, netw
             'road_boundary': 20,    # 道路边界特征
             'lane_points': 30,       # 车道点特征
             'stop_lines': 10,        # 停止线特征
-            'vehicle_state': 15,     # 车辆状态特征
+            'vehicle_state': 249,    # 车辆状态特征 (默认值，实际使用时会被动态更新)
             'other_agents': 25,      # 其他智能体特征
             'conditioning': 12       # 条件和目标特征
         }

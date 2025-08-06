@@ -322,8 +322,8 @@
 
 #### 1.1 观测组成
 观测向量包含以下四个主要部分：
-- **局部状态 (local_state)**：智能体自身的状态信息 (vel_x, vel_y, acc_x, acc_y)
-- **邻居特征 (neighbors)**：附近智能体的相对位置、速度、活跃状态 (dx, dy, vx, vy, active)
+- **局部状态 (local_state)**：智能体自身的状态信息 (x, y, yaw, speed, length, width, active)
+- **邻居特征 (neighbors)**：附近智能体的相对位置、速度、活跃状态 (dx, dy, vx, vy, length, width, active)
 - **车道航点 (w_lanes)**：附近车道航点的相对位置 (dx, dy)
 - **边界点 (w_boundaries)**：附近道路边界点的相对位置 (dx, dy)
 
@@ -334,8 +334,8 @@ observation:
   num_w_lanes: 25          # 车道航点数量
   num_w_boundaries: 26     # 边界点数量
   horizon: 100.0           # 视野范围
-  local_state_dim: 4       # 局部状态维度
-  neighbor_feature_dim: 5  # 邻居特征维度
+  local_state_dim: 7       # 局部状态维度 (x, y, yaw, speed, length, width, active)
+  neighbor_feature_dim: 7  # 邻居特征维度
   waypoint_feature_dim: 2  # 航点特征维度
 ```
 

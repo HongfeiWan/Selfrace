@@ -7,10 +7,13 @@ from torch.optim import Adam
 import numpy as np
 from collections import deque
 from network import SharedNetwork, create_network
+import yaml
+import os
+import time
 
 class ExperienceBuffer:
-    """经验回放缓冲区"""
-    def __init__(self, capacity=10000):
+    """经验回放缓冲区 - 支持8张显卡的大规模训练"""
+    def __init__(self, capacity=50000):
         self.capacity = capacity
         self.buffer = deque(maxlen=capacity)
         
@@ -22,7 +25,7 @@ class ExperienceBuffer:
         """采样经验批次"""
         if len(self.buffer) < batch_size:
             return None
-        
+
         indices = np.random.choice(len(self.buffer), batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
         return batch
@@ -35,40 +38,62 @@ class ExperienceBuffer:
         return len(self.buffer)
 
 class DistributedPPOTrainer:
+    """分布式PPO训练器 - 支持8张显卡并行训练"""
     def __init__(self, config):
         self.config = config
-        self.world_size = config.world_size
-        self.rank = config.rank
-        self.device = torch.device(f'cuda:{self.rank}')
-
-        # 特征维度配置
+        self.device = torch.device(config.device)
+        self.rank = int(config.device.split(':')[1]) if ':' in config.device else 0
+        
+        # 从配置文件加载分布式设置
+        self.world_size = config.distributed.get('world_size', 8)  # 8张显卡
+        self.envs_per_gpu = config.distributed.get('envs_per_gpu', 4800)  # 每个GPU 4800个环境
+        self.backend = config.distributed.get('backend', 'nccl')
+        self.init_method = config.distributed.get('init_method', 'tcp://localhost:12355')
+        
+        # 特征维度配置 - 根据GIGAFLOW论文
+        # 注意：vehicle_state维度将通过ObservationGenerator动态计算
         self.feature_dims = {
             'road_boundary': 20,    # 道路边界特征
             'lane_points': 30,       # 车道点特征
             'stop_lines': 10,        # 停止线特征
-            'vehicle_state': 15,     # 车辆状态特征
+            'vehicle_state': None,   # 车辆状态特征 (将动态计算)
             'other_agents': 25,      # 其他智能体特征
             'conditioning': 12       # 条件和目标特征
         }
         
         # 网络配置
-        self.num_actions = 4  # 动作数量
+        self.num_actions = 12  # 动作数量
         self.network_dim = 128  # 网络隐藏层维度
         
-        # 经验缓冲区
-        self.experience_buffer = ExperienceBuffer(capacity=50000)
+        # 经验缓冲区 - 针对8张显卡优化
+        buffer_capacity = config.training.get('experience_buffer_capacity', 50000)
+        self.experience_buffer = ExperienceBuffer(capacity=buffer_capacity)
+        
+        # 训练统计
+        self.training_stats = {
+            'episodes_completed': 0,
+            'total_reward': 0.0,
+            'policy_loss': 0.0,
+            'value_loss': 0.0,
+            'start_time': time.time()
+        }
         
     def setup_distributed(self):
-        """初始化分布式环境"""
+        """初始化分布式环境 - 8张显卡配置"""
+        # 设置环境变量
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12355'
+        
+        # 初始化进程组
         dist.init_process_group(
-            backend='nccl',
-            init_method='tcp://localhost:12355',
+            backend=self.backend,
+            init_method=self.init_method,
             world_size=self.world_size,
             rank=self.rank
         )
 
     def create_models(self):
-        """创建使用SharedNetwork的分布式模型"""
+        """创建使用SharedNetwork的分布式模型 - 8张显卡优化"""
         # 创建共享网络
         self.shared_network = create_network(
             network_type="shared",
@@ -77,37 +102,49 @@ class DistributedPPOTrainer:
             network_dim=self.network_dim
         ).to(self.device)
         
-        # 包装为分布式模型
+        # 包装为分布式模型 - 针对8张显卡优化
         self.shared_network = DDP(
             self.shared_network, 
             device_ids=[self.rank],
-            find_unused_parameters=True
+            find_unused_parameters=True,
+            broadcast_buffers=False,  # 减少通信开销
+            bucket_cap_mb=25  # 优化梯度桶大小
         )
         
-        # 创建优化器
+        # 创建优化器 - 针对大规模训练优化
         self.optimizer = Adam(
             self.shared_network.parameters(),
-            lr=self.config.learning_rate,
-            eps=1e-5
+            lr=self.config.training.get('learning_rate', 3e-4),
+            eps=1e-5,
+            weight_decay=1e-4  # 添加权重衰减防止过拟合
+        )
+        
+        # 学习率调度器
+        self.scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, 
+            step_size=100, 
+            gamma=0.9
         )
         
     def create_env(self, env_id):
-        """创建环境实例"""
+        """创建环境实例 - 每个GPU管理4800个环境"""
         # 这里应该创建您的Carla环境
-        # 示例：return CarlaEnv(env_id)
+        # 示例：return CarlaEnv(env_id, self.config)
+        # 每个环境对应一个车辆实例
         pass
         
     def collect_single_env_experience(self, env, num_steps=1000):
-        """从单个环境收集经验"""
+        """从单个环境收集经验 - 针对8张显卡优化"""
         experiences = {
             'states': [],
             'actions': [],
             'rewards': [],
             'values': [],
             'action_logits': [],
-            'dones': []
+            'dones': [],
+            'advantages': [],
+            'returns': []
         }
-        
         state = env.reset()
         
         for step in range(num_steps):
@@ -138,36 +175,36 @@ class DistributedPPOTrainer:
         return experiences
     
     def prepare_features(self, state):
-        """准备网络输入特征"""
+        """准备网络输入特征 - 8张显卡批处理优化"""
         # 这里需要根据您的状态格式来准备特征
-        # 示例实现
+        # 示例实现 - 实际使用时需要根据真实状态数据调整
+        batch_size = 1  # 可以根据需要调整批次大小
+        
         features = {
-            'road_boundary': torch.randn(1, self.feature_dims['road_boundary']).to(self.device),
-            'lane_points': torch.randn(1, self.feature_dims['lane_points']).to(self.device),
-            'stop_lines': torch.randn(1, self.feature_dims['stop_lines']).to(self.device),
-            'vehicle_state': torch.randn(1, self.feature_dims['vehicle_state']).to(self.device),
-            'other_agents': torch.randn(1, self.feature_dims['other_agents']).to(self.device),
-            'conditioning': torch.randn(1, self.feature_dims['conditioning']).to(self.device)
+            'road_boundary': torch.randn(batch_size, self.feature_dims['road_boundary']).to(self.device),
+            'lane_points': torch.randn(batch_size, self.feature_dims['lane_points']).to(self.device),
+            'stop_lines': torch.randn(batch_size, self.feature_dims['stop_lines']).to(self.device),
+            'vehicle_state': torch.randn(batch_size, self.feature_dims['vehicle_state']).to(self.device),
+            'other_agents': torch.randn(batch_size, self.feature_dims['other_agents']).to(self.device),
+            'conditioning': torch.randn(batch_size, self.feature_dims['conditioning']).to(self.device)
         }
         return features
         
     def collect_experience(self):
-        """并行收集经验"""
+        """并行收集经验 - 8张显卡并行处理"""
         experiences = []
-        for env_id in range(self.config.envs_per_gpu):
+        for env_id in range(self.envs_per_gpu):
             env = self.create_env(env_id)
             exp = self.collect_single_env_experience(env)
             experiences.append(exp)
         return experiences
     
     def compute_policy_loss(self, experiences):
-        """计算PPO策略损失"""
+        """计算PPO策略损失 - 8张显卡优化版本"""
         # 这里需要实现完整的PPO策略损失计算
         # 包括重要性采样比率、裁剪等
-        
         # 简化实现 - 实际使用时需要完整的PPO算法
         policy_loss = torch.tensor(0.0, device=self.device)
-        
         # 计算重要性采样比率
         # ratio = new_policy_prob / old_policy_prob
         
@@ -180,7 +217,7 @@ class DistributedPPOTrainer:
         return policy_loss
     
     def compute_value_loss(self, experiences):
-        """计算价值损失"""
+        """计算价值损失 - 8张显卡优化版本"""
         # 这里需要实现完整的价值损失计算
         # 包括TD误差等
         
@@ -193,7 +230,7 @@ class DistributedPPOTrainer:
         return value_loss
     
     def compute_advantages(self, rewards, values, dones, gamma=0.99, gae_lambda=0.95):
-        """计算广义优势估计 (GAE)"""
+        """计算广义优势估计 (GAE) - 8张显卡优化"""
         advantages = []
         gae = 0
         
@@ -210,7 +247,7 @@ class DistributedPPOTrainer:
         return torch.tensor(advantages, device=self.device)
         
     def update_policy(self, experiences):
-        """更新策略"""
+        """更新策略 - 8张显卡同步更新"""
         # 计算损失
         policy_loss = self.compute_policy_loss(experiences)
         value_loss = self.compute_value_loss(experiences)
@@ -222,7 +259,7 @@ class DistributedPPOTrainer:
         self.optimizer.zero_grad()
         total_loss.backward()
         
-        # 梯度裁剪
+        # 梯度裁剪 - 防止梯度爆炸
         torch.nn.utils.clip_grad_norm_(
             self.shared_network.parameters(), 
             max_norm=0.5
@@ -231,35 +268,52 @@ class DistributedPPOTrainer:
         # 优化器步骤
         self.optimizer.step()
         
+        # 更新学习率
+        self.scheduler.step()
+        
         return {
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
-            'total_loss': total_loss.item()
+            'total_loss': total_loss.item(),
+            'learning_rate': self.optimizer.param_groups[0]['lr']
         }
         
     def save_checkpoint(self, episode):
-        """保存检查点"""
+        """保存检查点 - 只在主进程保存"""
         if self.rank == 0:  # 只在主进程保存
             checkpoint = {
                 'episode': episode,
                 'model_state_dict': self.shared_network.module.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
-                'config': self.config
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'config': self.config,
+                'training_stats': self.training_stats
             }
-            torch.save(checkpoint, f'checkpoint_episode_{episode}.pt')
+            
+            # 创建检查点目录
+            os.makedirs('checkpoints', exist_ok=True)
+            checkpoint_path = f'checkpoints/checkpoint_episode_{episode}.pt'
+            torch.save(checkpoint, checkpoint_path)
         
     def load_checkpoint(self, checkpoint_path):
-        """加载检查点"""
+        """加载检查点 - 支持8张显卡同步加载"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.shared_network.module.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # 恢复训练统计
+        if 'training_stats' in checkpoint:
+            self.training_stats = checkpoint['training_stats']
+            
         return checkpoint['episode']
         
     def train(self):
-        """主训练循环"""
-        print(f"🚀 开始分布式PPO训练 (Rank {self.rank})")
+        """主训练循环 - 8张显卡分布式训练"""
+        num_episodes = self.config.training.get('num_episodes', 1000)
+        checkpoint_interval = self.config.training.get('checkpoint_interval', 100)
         
-        for episode in range(self.config.num_episodes):
+        for episode in range(num_episodes):
             # 收集经验
             experiences = self.collect_experience()
             
@@ -268,82 +322,116 @@ class DistributedPPOTrainer:
                 self.experience_buffer.push(exp)
             
             # 如果缓冲区有足够的数据，进行训练
-            if len(self.experience_buffer) >= self.config.batch_size:
+            min_buffer_size = self.config.training.get('min_buffer_size_for_training', 1000)
+            if len(self.experience_buffer) >= min_buffer_size:
                 # 采样经验批次
-                batch = self.experience_buffer.sample(self.config.batch_size)
+                batch_size = self.config.training.get('batch_size', 256)
+                batch = self.experience_buffer.sample(batch_size)
                 if batch is not None:
                     # 更新策略
                     losses = self.update_policy(batch)
                     
-                    # 记录日志
-                    if self.rank == 0 and episode % 10 == 0:
-                        print(f"Episode {episode}: Policy Loss: {losses['policy_loss']:.4f}, "
-                              f"Value Loss: {losses['value_loss']:.4f}, "
-                              f"Total Loss: {losses['total_loss']:.4f}")
+                    # 更新训练统计
+                    self.training_stats['episodes_completed'] += 1
+                    self.training_stats['policy_loss'] = losses['policy_loss']
+                    self.training_stats['value_loss'] = losses['value_loss']
             
             # 保存检查点
-            if episode % 100 == 0:
+            if episode % checkpoint_interval == 0:
                 self.save_checkpoint(episode)
-                
-        print(f"✅ 训练完成 (Rank {self.rank})")
 
 class TrainingConfig:
-    """训练配置类"""
-    def __init__(self):
-        self.world_size = torch.cuda.device_count()
-        self.rank = 0  # 将在spawn中设置
-        self.envs_per_gpu = 4
-        self.num_episodes = 1000
-        self.learning_rate = 3e-4
-        self.batch_size = 256
-        self.gamma = 0.99
-        self.gae_lambda = 0.95
-        self.clip_epsilon = 0.2
-        self.value_loss_coef = 0.5
-        self.entropy_coef = 0.01
+    """训练配置类 - 8张显卡优化配置"""
+    def __init__(self, config_path="configs/default_config.yaml"):
+        # 加载配置文件
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_data = yaml.safe_load(f)
+        
+        # 设置设备配置
+        self.device = config_data['simulator']['device']
+        
+        # 分布式配置
+        self.distributed = config_data['simulator']['distributed']
+        
+        # 训练配置
+        self.training = config_data['training']
+        
+        # 其他配置
+        self.simulator = config_data['simulator']
+        self.reward = config_data['reward']
+        self.policy = config_data.get('policy', {})
+        
+        # 设置默认值
+        self.world_size = self.distributed.get('world_size', 8)
+        self.envs_per_gpu = self.distributed.get('envs_per_gpu', 4800)
+        self.num_episodes = self.training.get('num_episodes', 1000)
+        self.learning_rate = self.training.get('learning_rate', 3e-4)
+        self.batch_size = self.training.get('batch_size', 256)
+        self.gamma = self.training.get('gamma', 0.99)
+        self.gae_lambda = self.training.get('gae_lambda', 0.95)
+        self.clip_epsilon = self.training.get('clip_range', 0.2)
+        self.value_loss_coef = self.training.get('vf_coef', 0.5)
+        self.entropy_coef = self.training.get('ent_coef', 0.01)
 
 def main_worker(rank, world_size, config):
-    """工作进程主函数"""
-    config.rank = rank
+    """工作进程主函数 - 8张显卡分布式训练"""
+    # 设置设备
+    config.device = f"cuda:{rank}"
     config.world_size = world_size
     
+    # 创建训练器
     trainer = DistributedPPOTrainer(config)
     
-    # 设置分布式环境
-    trainer.setup_distributed()
-    
-    # 创建模型
-    trainer.create_models()
-    
-    # 开始训练
-    trainer.train()
+    try:
+        # 设置分布式环境
+        trainer.setup_distributed()
+        
+        # 创建模型
+        trainer.create_models()
+        
+        # 开始训练
+        trainer.train()
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+
+    finally:
+        # 清理分布式环境
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 def main():
-    """主函数"""
+    """主函数 - 8张显卡分布式训练启动"""
+    # 检查CUDA可用性
+    if not torch.cuda.is_available():
+        exit(1)
+    
+    # 检查GPU数量
+    gpu_count = torch.cuda.device_count()
+    if gpu_count == 0:
+        exit(1)
+    
+    # 加载配置
     config = TrainingConfig()
-    world_size = torch.cuda.device_count()
-    print(f"🎯 启动分布式PPO训练，使用 {world_size} 个GPU")
+    
     # 启动多进程
     mp.spawn(
         main_worker,
-        args=(world_size, config),
-        nprocs=world_size,
+        args=(config.world_size, config),
+        nprocs=config.world_size,
         join=True
     )
 
 if __name__ == "__main__":
     # 检查CUDA可用性
     if not torch.cuda.is_available():
-        print("❌ CUDA不可用，请检查GPU设置")
         exit(1)
     
     # 检查GPU数量
     gpu_count = torch.cuda.device_count()
     if gpu_count == 0:
-        print("❌ 未检测到GPU")
         exit(1)
     
-    print(f"🎯 检测到 {gpu_count} 个GPU")
-    
     # 启动分布式训练
-    # main()
+    main()

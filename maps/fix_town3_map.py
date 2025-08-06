@@ -63,12 +63,10 @@ def fix_short_direction_quad(quad, reference_direction, target_length=0.5):
         return True  # 已经达到目标长度，无需修复
     
     # 计算需要延长的距离
-    extension_distance = (target_length - current_length) / 2.0  # 前后各延长一半
-    
+    extension_distance = (target_length - current_length) * 2
     # 调整vertices的坐标
     # 第1、2个顶点（前部）沿着方向增加extension_distance
     # 第3、4个顶点（后部）沿着逆方向减少extension_distance
-    
     for i, vertex in enumerate(quad['vertices']):
         if i < 2:  # 前部顶点 (0, 1)
             # 沿着方向增加extension_distance
@@ -78,7 +76,6 @@ def fix_short_direction_quad(quad, reference_direction, target_length=0.5):
             # 沿着逆方向减少extension_distance
             vertex['x'] -= normalized_ref_dir[0] * extension_distance
             vertex['y'] -= normalized_ref_dir[1] * extension_distance
-    
     return True
 
 def fix_zero_direction_quad(quad, reference_direction):
@@ -98,7 +95,6 @@ def fix_zero_direction_quad(quad, reference_direction):
     # 调整vertices的坐标
     # 第1、2个顶点（前部）沿着方向增加0.5m
     # 第3、4个顶点（后部）沿着逆方向减少0.5m
-    
     for i, vertex in enumerate(quad['vertices']):
         if i < 2:  # 前部顶点 (0, 1)
             # 沿着方向增加0.5m
@@ -108,7 +104,6 @@ def fix_zero_direction_quad(quad, reference_direction):
             # 沿着逆方向减少0.5m
             vertex['x'] -= normalized_ref_dir[0] * 0.5
             vertex['y'] -= normalized_ref_dir[1] * 0.5
-    
     return True
 
 def fix_oob_points_x(data):
@@ -189,7 +184,6 @@ def fix_quad_vertices(data):
     print(f"quad13942 vertices[1] 现在等于 quad5273 vertices[2]: ({quad13942['vertices'][1]['x']}, {quad13942['vertices'][1]['y']})")
     print(f"quad5272 vertices[0] 现在等于 quad5284 vertices[3]: ({quad5272['vertices'][0]['x']}, {quad5272['vertices'][0]['y']})")
     print(f"quad5272 vertices[1] 现在等于 quad5284 vertices[2]: ({quad5272['vertices'][1]['x']}, {quad5272['vertices'][1]['y']})")
-    
     return True
 
 def fix_zero_direction_quads(data, min_length=0.5):
@@ -203,11 +197,6 @@ def fix_zero_direction_quads(data, min_length=0.5):
     
     quads_data = data.get('quads', [])
     print(f"总共有 {len(quads_data)} 个quads")
-    
-    # 翻转Y轴（如果需要）
-    for q in quads_data:
-        for v in q['vertices']:
-            v['y'] = -v['y']
     
     # 计算所有quads的中心点和方向向量
     quad_centers_3d = {}
@@ -317,11 +306,6 @@ def fix_zero_direction_quads(data, min_length=0.5):
     
     print(f"修复后仍有 {zero_direction_count_after} 个方向向量为0的quads")
     print(f"修复后仍有 {short_direction_count_after} 个方向向量长度小于{min_length}m的quads")
-    
-    # 翻转Y轴回原来的方向
-    for q in quads_data:
-        for v in q['vertices']:
-            v['y'] = -v['y']
     
     return True
 
