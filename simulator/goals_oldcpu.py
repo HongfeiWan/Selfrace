@@ -34,7 +34,7 @@ class PathPlanner:
             map_path: 地图文件路径，如果提供则自动加载cross_data和map_data
         """
         self.device = device if device is not None else globals()['device']
-        
+
         # 如果提供了map_path，自动加载数据
         if map_path is not None:
             cross_data_path = map_path.replace('processed_map_', 'cross_data_processed_map_')
@@ -1376,22 +1376,3 @@ class PathPlanner:
         
         return memory_info
 
-def load_cross_data(cross_data_path: str) -> Optional[Dict]:
-    """加载cross数据文件"""
-    if not os.path.exists(cross_data_path):
-        print(f"错误: cross数据文件不存在: {cross_data_path}")
-        return None
-    
-    with open(cross_data_path, 'r', encoding='utf-8') as f:
-        cross_data = json.load(f)
-    return cross_data
-
-def load_map_data(map_data_path: str) -> Optional[Dict]:
-    """加载地图数据文件"""
-    if not os.path.exists(map_data_path):
-        print(f"错误: 地图数据文件不存在: {map_data_path}")
-        return None
-    
-    with open(map_data_path, 'r', encoding='utf-8') as f:
-        map_data = json.load(f)
-    return map_data 

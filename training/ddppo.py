@@ -29,7 +29,7 @@ class ExperienceBuffer:
         indices = np.random.choice(len(self.buffer), batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
         return batch
-        
+
     def clear(self):
         """清空缓冲区"""
         self.buffer.clear()

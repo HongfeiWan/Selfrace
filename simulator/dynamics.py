@@ -17,7 +17,7 @@ class DiscreteActionSpace:
         max_long_jerk = config.get('max_longitudinal_jerk', 4.0)
         min_lat_jerk = config.get('min_lateral_jerk', -4.0)
         max_lat_jerk = config.get('max_lateral_jerk', 4.0)
-        self.along_values = [min_long_jerk, -4, 0, max_long_jerk]
+        self.along_values = [min_long_jerk, -max_long_jerk, 0, max_long_jerk]
         self.alat_values = [min_lat_jerk, 0, max_lat_jerk]
         # 创建所有可能的动作组合
         self.actions = []
@@ -44,7 +44,7 @@ class DiscreteActionSpace:
     def get_all_actions(self) -> torch.Tensor:
         """获取所有动作"""
         return self.actions_tensor
-    
+
 class KinematicBicycleModel:
     """
     实现了一个精确且批量化的运动学自行车模型。

@@ -1,0 +1,250 @@
+digraph {
+	graph [size="31.95,31.95"]
+	node [align=left fontname=monospace fontsize=10 height=0.2 ranksep=0.1 shape=box style=filled]
+	2019351823680 [label="
+ (1, 12)" fillcolor=darkolivegreen1]
+	2019351815376 [label=AddmmBackward0]
+	2019351813360 -> 2019351815376
+	2019351100240 [label="action_head.bias
+ (12)" fillcolor=lightblue]
+	2019351100240 -> 2019351813360
+	2019351813360 [label=AccumulateGrad]
+	2019351815280 -> 2019351815376
+	2019351815280 [label=ReluBackward0]
+	2019351815232 -> 2019351815280
+	2019351815232 [label=AddmmBackward0]
+	2019351813552 -> 2019351815232
+	2019351099440 [label="fc3.bias
+ (1024)" fillcolor=lightblue]
+	2019351099440 -> 2019351813552
+	2019351813552 [label=AccumulateGrad]
+	2019351813504 -> 2019351815232
+	2019351813504 [label=ReluBackward0]
+	2019351813840 -> 2019351813504
+	2019351813840 [label=AddmmBackward0]
+	2019351814080 -> 2019351813840
+	2019351099200 [label="fc2.bias
+ (1024)" fillcolor=lightblue]
+	2019351099200 -> 2019351814080
+	2019351814080 [label=AccumulateGrad]
+	2019351813984 -> 2019351813840
+	2019351813984 [label=ReluBackward0]
+	2019351814368 -> 2019351813984
+	2019351814368 [label=AddmmBackward0]
+	2019351816144 -> 2019351814368
+	2019351099760 [label="fc1.bias
+ (1024)" fillcolor=lightblue]
+	2019351099760 -> 2019351816144
+	2019351816144 [label=AccumulateGrad]
+	2019351816096 -> 2019351814368
+	2019351816096 [label=CatBackward0]
+	2019351816240 -> 2019351816096
+	2019351816240 [label=AddmmBackward0]
+	2019351816720 -> 2019351816240
+	2019351100560 [label="feature_encoder.simple_encoders.vehicle_state.mlp.2.bias
+ (64)" fillcolor=lightblue]
+	2019351100560 -> 2019351816720
+	2019351816720 [label=AccumulateGrad]
+	2019351816672 -> 2019351816240
+	2019351816672 [label=ReluBackward0]
+	2019351816816 -> 2019351816672
+	2019351816816 [label=AddmmBackward0]
+	2019351817008 -> 2019351816816
+	2019351099600 [label="feature_encoder.simple_encoders.vehicle_state.mlp.0.bias
+ (64)" fillcolor=lightblue]
+	2019351099600 -> 2019351817008
+	2019351817008 [label=AccumulateGrad]
+	2019351816960 -> 2019351816816
+	2019351816960 [label=TBackward0]
+	2019351817056 -> 2019351816960
+	2019351100480 [label="feature_encoder.simple_encoders.vehicle_state.mlp.0.weight
+ (64, 7)" fillcolor=lightblue]
+	2019351100480 -> 2019351817056
+	2019351817056 [label=AccumulateGrad]
+	2019351816624 -> 2019351816240
+	2019351816624 [label=TBackward0]
+	2019351817152 -> 2019351816624
+	2019351099040 [label="feature_encoder.simple_encoders.vehicle_state.mlp.2.weight
+ (64, 64)" fillcolor=lightblue]
+	2019351099040 -> 2019351817152
+	2019351817152 [label=AccumulateGrad]
+	2019351816336 -> 2019351816096
+	2019351816336 [label=AddmmBackward0]
+	2019351817296 -> 2019351816336
+	2019351089360 [label="feature_encoder.simple_encoders.conditioning.mlp.2.bias
+ (64)" fillcolor=lightblue]
+	2019351089360 -> 2019351817296
+	2019351817296 [label=AccumulateGrad]
+	2019351816912 -> 2019351816336
+	2019351816912 [label=ReluBackward0]
+	2019351816864 -> 2019351816912
+	2019351816864 [label=AddmmBackward0]
+	2019351817488 -> 2019351816864
+	2019351101360 [label="feature_encoder.simple_encoders.conditioning.mlp.0.bias
+ (64)" fillcolor=lightblue]
+	2019351101360 -> 2019351817488
+	2019351817488 [label=AccumulateGrad]
+	2019351817440 -> 2019351816864
+	2019351817440 [label=TBackward0]
+	2019351817536 -> 2019351817440
+	2019351095840 [label="feature_encoder.simple_encoders.conditioning.mlp.0.weight
+ (64, 512)" fillcolor=lightblue]
+	2019351095840 -> 2019351817536
+	2019351817536 [label=AccumulateGrad]
+	2019351816768 -> 2019351816336
+	2019351816768 [label=TBackward0]
+	2019351817584 -> 2019351816768
+	2019351090000 [label="feature_encoder.simple_encoders.conditioning.mlp.2.weight
+ (64, 64)" fillcolor=lightblue]
+	2019351090000 -> 2019351817584
+	2019351817584 [label=AccumulateGrad]
+	2019351816384 -> 2019351816096
+	2019351816384 [label=AddmmBackward0]
+	2019351817680 -> 2019351816384
+	2019351098240 [label="feature_encoder.permutation_encoders.road_boundary.element_encoder.2.bias
+ (64)" fillcolor=lightblue]
+	2019351098240 -> 2019351817680
+	2019351817680 [label=AccumulateGrad]
+	2019351817392 -> 2019351816384
+	2019351817392 [label=ReluBackward0]
+	2019351817200 -> 2019351817392
+	2019351817200 [label=AddmmBackward0]
+	2019351817872 -> 2019351817200
+	2019351098400 [label="feature_encoder.permutation_encoders.road_boundary.element_encoder.0.bias
+ (64)" fillcolor=lightblue]
+	2019351098400 -> 2019351817872
+	2019351817872 [label=AccumulateGrad]
+	2019351817824 -> 2019351817200
+	2019351817824 [label=TBackward0]
+	2019351817920 -> 2019351817824
+	2019351101280 [label="feature_encoder.permutation_encoders.road_boundary.element_encoder.0.weight
+ (64, 52)" fillcolor=lightblue]
+	2019351101280 -> 2019351817920
+	2019351817920 [label=AccumulateGrad]
+	2019351817344 -> 2019351816384
+	2019351817344 [label=TBackward0]
+	2019351817968 -> 2019351817344
+	2019351096240 [label="feature_encoder.permutation_encoders.road_boundary.element_encoder.2.weight
+ (64, 64)" fillcolor=lightblue]
+	2019351096240 -> 2019351817968
+	2019351817968 [label=AccumulateGrad]
+	2019351816432 -> 2019351816096
+	2019351816432 [label=AddmmBackward0]
+	2019351818064 -> 2019351816432
+	2019351098480 [label="feature_encoder.permutation_encoders.lane_points.element_encoder.2.bias
+ (64)" fillcolor=lightblue]
+	2019351098480 -> 2019351818064
+	2019351818064 [label=AccumulateGrad]
+	2019351817776 -> 2019351816432
+	2019351817776 [label=ReluBackward0]
+	2019351817632 -> 2019351817776
+	2019351817632 [label=AddmmBackward0]
+	2019351818256 -> 2019351817632
+	2019351098720 [label="feature_encoder.permutation_encoders.lane_points.element_encoder.0.bias
+ (64)" fillcolor=lightblue]
+	2019351098720 -> 2019351818256
+	2019351818256 [label=AccumulateGrad]
+	2019351818208 -> 2019351817632
+	2019351818208 [label=TBackward0]
+	2019351818304 -> 2019351818208
+	2019351098640 [label="feature_encoder.permutation_encoders.lane_points.element_encoder.0.weight
+ (64, 50)" fillcolor=lightblue]
+	2019351098640 -> 2019351818304
+	2019351818304 [label=AccumulateGrad]
+	2019351817728 -> 2019351816432
+	2019351817728 [label=TBackward0]
+	2019351818352 -> 2019351817728
+	2019351098800 [label="feature_encoder.permutation_encoders.lane_points.element_encoder.2.weight
+ (64, 64)" fillcolor=lightblue]
+	2019351098800 -> 2019351818352
+	2019351818352 [label=AccumulateGrad]
+	2019351816480 -> 2019351816096
+	2019351816480 [label=AddmmBackward0]
+	2019351818448 -> 2019351816480
+	2019351096880 [label="feature_encoder.permutation_encoders.stop_lines.element_encoder.2.bias
+ (64)" fillcolor=lightblue]
+	2019351096880 -> 2019351818448
+	2019351818448 [label=AccumulateGrad]
+	2019351818160 -> 2019351816480
+	2019351818160 [label=ReluBackward0]
+	2019351818016 -> 2019351818160
+	2019351818016 [label=AddmmBackward0]
+	2019351818640 -> 2019351818016
+	2019351098560 [label="feature_encoder.permutation_encoders.stop_lines.element_encoder.0.bias
+ (64)" fillcolor=lightblue]
+	2019351098560 -> 2019351818640
+	2019351818640 [label=AccumulateGrad]
+	2019351818592 -> 2019351818016
+	2019351818592 [label=TBackward0]
+	2019351818688 -> 2019351818592
+	2019351098960 [label="feature_encoder.permutation_encoders.stop_lines.element_encoder.0.weight
+ (64, 20)" fillcolor=lightblue]
+	2019351098960 -> 2019351818688
+	2019351818688 [label=AccumulateGrad]
+	2019351818112 -> 2019351816480
+	2019351818112 [label=TBackward0]
+	2019351818736 -> 2019351818112
+	2019351099120 [label="feature_encoder.permutation_encoders.stop_lines.element_encoder.2.weight
+ (64, 64)" fillcolor=lightblue]
+	2019351099120 -> 2019351818736
+	2019351818736 [label=AccumulateGrad]
+	2019351816528 -> 2019351816096
+	2019351816528 [label=AddmmBackward0]
+	2019351818832 -> 2019351816528
+	2019351099520 [label="feature_encoder.permutation_encoders.other_agents.element_encoder.2.bias
+ (64)" fillcolor=lightblue]
+	2019351099520 -> 2019351818832
+	2019351818832 [label=AccumulateGrad]
+	2019351818544 -> 2019351816528
+	2019351818544 [label=ReluBackward0]
+	2019351818400 -> 2019351818544
+	2019351818400 [label=AddmmBackward0]
+	2019351819024 -> 2019351818400
+	2019351099360 [label="feature_encoder.permutation_encoders.other_agents.element_encoder.0.bias
+ (64)" fillcolor=lightblue]
+	2019351099360 -> 2019351819024
+	2019351819024 [label=AccumulateGrad]
+	2019351818976 -> 2019351818400
+	2019351818976 [label=TBackward0]
+	2019351819072 -> 2019351818976
+	2019351099280 [label="feature_encoder.permutation_encoders.other_agents.element_encoder.0.weight
+ (64, 140)" fillcolor=lightblue]
+	2019351099280 -> 2019351819072
+	2019351819072 [label=AccumulateGrad]
+	2019351818496 -> 2019351816528
+	2019351818496 [label=TBackward0]
+	2019351819120 -> 2019351818496
+	2019351096560 [label="feature_encoder.permutation_encoders.other_agents.element_encoder.2.weight
+ (64, 64)" fillcolor=lightblue]
+	2019351096560 -> 2019351819120
+	2019351819120 [label=AccumulateGrad]
+	2019351816048 -> 2019351814368
+	2019351816048 [label=TBackward0]
+	2019351818928 -> 2019351816048
+	2019351098880 [label="fc1.weight
+ (1024, 384)" fillcolor=lightblue]
+	2019351098880 -> 2019351818928
+	2019351818928 [label=AccumulateGrad]
+	2019351813936 -> 2019351813840
+	2019351813936 [label=TBackward0]
+	2019351818880 -> 2019351813936
+	2019351099840 [label="fc2.weight
+ (1024, 1024)" fillcolor=lightblue]
+	2019351099840 -> 2019351818880
+	2019351818880 [label=AccumulateGrad]
+	2019351813120 -> 2019351815232
+	2019351813120 [label=TBackward0]
+	2019351816192 -> 2019351813120
+	2019351100000 [label="fc3.weight
+ (1024, 1024)" fillcolor=lightblue]
+	2019351100000 -> 2019351816192
+	2019351816192 [label=AccumulateGrad]
+	2019351813456 -> 2019351815376
+	2019351813456 [label=TBackward0]
+	2019351814272 -> 2019351813456
+	2019351100160 [label="action_head.weight
+ (12, 1024)" fillcolor=lightblue]
+	2019351100160 -> 2019351814272
+	2019351814272 [label=AccumulateGrad]
+	2019351815376 -> 2019351823680
+}

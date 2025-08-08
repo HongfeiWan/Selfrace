@@ -171,6 +171,12 @@ def visualize_lane_paths(map_data_path):
     waypoints = data.get('global_w_lane_waypoints', [])
     quads_data = data.get('quads', [])
     map_name = data.get('map_name', 'Unknown')
+
+    # 构建一个用于查找waypoint_id的索引
+    waypoint_id_lookup = {}
+    for wp in waypoints:
+        key = (wp['x'], wp['y'], wp['carla_waypoint_info']['road_id'], wp['carla_waypoint_info']['lane_id'], wp['carla_waypoint_info']['s'])
+        waypoint_id_lookup[key] = wp.get('waypoint_id', None)
     
     if not waypoints:
         print("错误: 未找到航点数据")
@@ -478,7 +484,12 @@ def visualize_lane_paths(map_data_path):
                 
                 # 添加起点航点信息
                 for wp in cluster_start_waypoints:
+                    key = (wp['x'], wp['y'], wp['carla_waypoint_info']['road_id'], wp['carla_waypoint_info']['lane_id'], wp['carla_waypoint_info']['s'])
+                    waypoint_id = waypoint_id_lookup.get(key, None)
+                    if waypoint_id is None:
+                        print(f"警告: 未找到起点waypoint的waypoint_id: {key}")
                     cross_data[f'cross_{cluster_id}']['start_waypoints'].append({
+                        'waypoint_id': waypoint_id,
                         'x': wp['x'],
                         'y': wp['y'],
                         'road_id': wp['carla_waypoint_info']['road_id'],
@@ -488,7 +499,12 @@ def visualize_lane_paths(map_data_path):
                 
                 # 添加终点航点信息
                 for wp in cluster_end_waypoints:
+                    key = (wp['x'], wp['y'], wp['carla_waypoint_info']['road_id'], wp['carla_waypoint_info']['lane_id'], wp['carla_waypoint_info']['s'])
+                    waypoint_id = waypoint_id_lookup.get(key, None)
+                    if waypoint_id is None:
+                        print(f"警告: 未找到终点waypoint的waypoint_id: {key}")
                     cross_data[f'cross_{cluster_id}']['end_waypoints'].append({
+                        'waypoint_id': waypoint_id,
                         'x': wp['x'],
                         'y': wp['y'],
                         'road_id': wp['carla_waypoint_info']['road_id'],
@@ -570,14 +586,16 @@ def visualize_lane_paths(map_data_path):
                                             'y': end_wp['y'],
                                             'road_id': end_wp['carla_waypoint_info']['road_id'],
                                             'lane_id': end_wp['carla_waypoint_info']['lane_id'],
-                                            's': end_wp['carla_waypoint_info']['s']
+                                            's': end_wp['carla_waypoint_info']['s'],
+                                            'from_end_waypoint_id': end_wp['waypoint_id']
                                         },
                                         'to_start_waypoint': {
                                             'x': start_wp['x'],
                                             'y': start_wp['y'],
                                             'road_id': start_wp['carla_waypoint_info']['road_id'],
                                             'lane_id': start_wp['carla_waypoint_info']['lane_id'],
-                                            's': start_wp['carla_waypoint_info']['s']
+                                            's': start_wp['carla_waypoint_info']['s'],
+                                            'to_start_waypoint_id': start_wp['waypoint_id']
                                         },
                                         'path_quad_ids': path_quad_ids,
                                         'distance': float(distance)
