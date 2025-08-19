@@ -141,9 +141,8 @@ class WorldInitializer:
                 # 记录有效的quad_id
                 agents_start_quad_ids[valid_mask, i] = spawn_quad_indices[valid_mask]
                 
-                
             else: # 如果循环正常结束 (即 retries 耗尽)
-                logging.warning(f"Could not place agent in slot {i} for all environments after {max_retries} retries. Some envs may have fewer agents.")
+                logging.warning(f"Could not place agent in slot {i} in all environments after {max_retries} retries. Some envs may have fewer agents.")
                 # 将仍然无效的 agent 标记为不激活
                 agents_state[invalid_placement_mask, i, 6] = 0.0
 

@@ -2,13 +2,6 @@
 simulator:
   # 设备配置 - 8张显卡的分布式设置
   device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
-  # 分布式训练配置
-  distributed:
-    gpu_num: 8              # 总GPU数量
-    devices: ["cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4", "cuda:5", "cuda:6", "cuda:7"]  # 8张显卡设备列表
-    envs_per_gpu: 4800         # 每个GPU的环境数量 (38400 / 8 = 4800)
-    backend: "nccl"            # 分布式后端
-    init_method: "tcp://localhost:12355"  # 初始化方法
 
   num_envs: 1           # 总并行环境数量 (8 * 4800 = 38400)
   sim_dt: 0.3           # 模拟时间步长
@@ -134,23 +127,51 @@ simulator:
   
   traffic:
 
-policy:
-  # agent_feature_dim and local_state_dim are now part of simulator config
-  # Further network architecture configs...
+  policy:
+    # agent_feature_dim and local_state_dim are now part of simulator config
+    # Further network architecture configs...
 
 training:
+
+  # 分布式训练配置
+  distributed:
+    gpu_num: 8              # 总GPU数量
+    devices: ["cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4", "cuda:5", "cuda:6", "cuda:7"]  # 8张显卡设备列表
+    envs_per_gpu: 4800         # 每个GPU的环境数量 (38400 / 8 = 4800)
+
+    backend: "nccl"            # 分布式后端
+    init_method: "tcp://localhost:12355"  # 初始化方法
+
+  # 修正batch size
+  batch_size: 256000  # 总batch size
+  batch_size_per_gpu: 32000  # 每GPU batch size
+  
+  # 修正其他参数
+  rollout_steps: 128
+  ppo_epochs: 3
+
+  gamma: 0.999  # 改为0.999
+  gae_lambda: 0.95
+
+  max_episode_length: 1200
+
+  clip_ratio: 0.2
+  learning_rate: 0.0005  # 5×10⁻⁴
+
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 0.5
+  
+  # 添加缺失的参数
+  value_clip_ratio: null  # Value function clipping = None
+  lr_schedule: "cosine"  # 改为cosine
+  precision: "16-bit"  # 添加16-bit AMP
+  
+  # 修正advantage filtering
+  advantage_filter_threshold: 0.01  # 改为阈值过滤
+  
   # 训练参数
   total_timesteps: 1_000_000_000_000 # As per paper
-  rollout_steps: 128
-  learning_rate: 0.0001 # Placeholder, should be tuned
-  ppo_epochs: 4
-  gamma: 0.99
-  gae_lambda: 0.95
-  clip_range: 0.2
-  vf_coef: 0.5
-  ent_coef: 0.01
-  max_grad_norm: 0.5
-  advantage_filter_fraction: 0.8 # Filter out 80% of samples
   
   # 内存和性能优化
   checkpoint_interval: 100     # 检查点保存间隔
@@ -159,4 +180,15 @@ training:
   # 经验缓冲区配置
   experience_buffer_capacity: 50000  # 经验缓冲区容量
   min_buffer_size_for_training: 1000 # 开始训练的最小缓冲区大小
+
+  # 模型权重初始化配置
+  weight_init:
+    type: "orthogonal"  # 使用Orthogonal初始化
+    gain: 1.0           # Orthogonal初始化的gain参数
+    bias_zero: true     # bias初始化为0
+
+  # 优势过滤配置
+  advantage_filtering:
+    beta: 0.25  # EWMA衰减参数
+    enabled: true  # 启用优势过滤
 

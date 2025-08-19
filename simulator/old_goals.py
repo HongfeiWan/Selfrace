@@ -34,39 +34,45 @@ class PathPlanner:
             map_path: 地图文件路径，如果提供则自动加载cross_data和map_data
         """
         self.device = device if device is not None else globals()['device']
-
+        
         # 如果提供了map_path，自动加载数据
         if map_path is not None:
             cross_data_path = map_path.replace('processed_map_', 'cross_data_processed_map_')
             print(f"自动加载cross数据: {cross_data_path}")
+            
             # 加载cross数据
             if cross_data is None:
                 cross_data = load_cross_data(cross_data_path)
                 if cross_data is None:
                     print(f"警告: 无法加载cross数据文件: {cross_data_path}")
                     cross_data = {}
+            
             # 加载地图数据
             if map_data is None:
                 map_data = load_map_data(map_path)
                 if map_data is None:
                     print(f"警告: 无法加载地图数据文件: {map_path}")
                     map_data = {}
-
+        
         self.cross_data = cross_data or {}
+        
         # 从map_data中提取必要信息
         self.quads_data = map_data.get('quads', []) if map_data else []
         self.global_w_lane_waypoints = map_data.get('global_w_lane_waypoints', []) if map_data else []
         self.quad_to_next_waypoint = {int(k): v for k, v in map_data.get('quad_to_next_waypoint', {}).items()} if map_data else {}
         self.quad_to_prev_waypoint = {int(k): v for k, v in map_data.get('quad_to_prev_waypoint', {}).items()} if map_data else {}
+        
         # 构建索引映射
         self.quads_by_id = {q['polyId']: q for q in self.quads_data if 'polyId' in q}
         self.polyid_to_index = {q['polyId']: i for i, q in enumerate(self.quads_data) if 'polyId' in q}
+        
         # GPU缓存
         self._lanes_cache = None
         self._lanes_cache_waypoints = None
         self._quad_centers_gpu = None
         self._quad_directions_gpu = None
         self._waypoints_gpu = None
+        
         # CPU缓存（用于兼容性）
         self.quad_centers = {}
         self._quad_directions_cache = {}
@@ -84,6 +90,7 @@ class PathPlanner:
         """预计算GPU张量数据，提高后续计算效率"""
         if not self.quads_data:
             return
+        
         # 预计算所有quad的中心点和方向向量
         num_quads = len(self.quads_data)
         quad_centers = torch.zeros(num_quads, 2, dtype=torch.float32, device=self.device)
@@ -91,7 +98,7 @@ class PathPlanner:
         
         for i, quad in enumerate(self.quads_data):
             # 计算中心点
-            vertices = torch.tensor([[point['x'], point['y']] for point in quad['vertices']], 
+            vertices = torch.tensor([[point['x'], -point['y']] for point in quad['vertices']], 
                                   dtype=torch.float32, device=self.device)
             center = torch.mean(vertices, dim=0)
             quad_centers[i] = center
@@ -134,7 +141,7 @@ class PathPlanner:
             
             for i, wp in enumerate(self.global_w_lane_waypoints):
                 waypoints_tensor[i, 0] = wp['x']
-                waypoints_tensor[i, 1] = wp['y']  # 移除Y轴翻转
+                waypoints_tensor[i, 1] = -wp['y']  # 翻转Y轴
                 waypoints_tensor[i, 2] = wp['carla_waypoint_info']['road_id']
                 waypoints_tensor[i, 3] = wp['carla_waypoint_info']['lane_id']
                 waypoints_tensor[i, 4] = wp['carla_waypoint_info']['s']
@@ -373,7 +380,7 @@ class PathPlanner:
             return self.quad_centers[quad_id]
         # 如果缓存中没有，则计算并缓存
         quad = self.quads_data[quad_id]
-        vertices = np.array([[point['x'], point['y']] for point in quad['vertices']])
+        vertices = np.array([[point['x'], -point['y']] for point in quad['vertices']])
         center = np.mean(vertices, axis=0)
         self.quad_centers[quad_id] = center
         return center
@@ -403,7 +410,7 @@ class PathPlanner:
             return self._quad_directions_cache[quad_id]
         # 如果缓存中没有，则计算并缓存
         quad = self.quads_data[quad_id]
-        vertices = np.array([[point['x'], point['y']] for point in quad['vertices']])
+        vertices = np.array([[point['x'], -point['y']] for point in quad['vertices']])
         v0 = vertices[0]
         v2 = vertices[2]
         direction = v2 - v0
@@ -705,7 +712,7 @@ class PathPlanner:
                         
                         result.append({
                             'type': 'lane_waypoint',
-                            'coords': {'x': wp['x'], 'y': wp['y']},
+                            'coords': {'x': wp['x'], 'y': -wp['y']},
                             'road_id': wp_info['road_id'],
                             'lane_id': wp_info['lane_id'],
                             's': wp_info['s']
@@ -892,7 +899,7 @@ class PathPlanner:
                             wp = wps_in_lane[i]
                             navigation_sequence.append({
                                 'type': 'lane_waypoint',
-                                'coords': {'x': wp['x'], 'y': wp['y']},
+                                'coords': {'x': wp['x'], 'y': -wp['y']},
                                 'road_id': wp['carla_waypoint_info']['road_id'],
                                 'lane_id': wp['carla_waypoint_info']['lane_id'],
                                 's': wp['carla_waypoint_info']['s']
@@ -953,7 +960,7 @@ class PathPlanner:
                     'cross_id': cross_id,
                     'road_id': road_id,
                     'lane_id': lane_id,
-                    'coords': {'x': x, 'y': y},
+                    'coords': {'x': x, 'y': -y},
                     's': s,
                     'node_type': typ
                 })
@@ -1003,7 +1010,7 @@ class PathPlanner:
                             wp = wps_in_lane[i]
                             navigation_sequence.append({
                                 'type': 'lane_waypoint',
-                                'coords': {'x': wp['x'], 'y': wp['y']},
+                                'coords': {'x': wp['x'], 'y': -wp['y']},
                                 'road_id': wp['carla_waypoint_info']['road_id'],
                                 'lane_id': wp['carla_waypoint_info']['lane_id'],
                                 's': wp['carla_waypoint_info']['s']
@@ -1376,3 +1383,22 @@ class PathPlanner:
         
         return memory_info
 
+def load_cross_data(cross_data_path: str) -> Optional[Dict]:
+    """加载cross数据文件"""
+    if not os.path.exists(cross_data_path):
+        print(f"错误: cross数据文件不存在: {cross_data_path}")
+        return None
+    
+    with open(cross_data_path, 'r', encoding='utf-8') as f:
+        cross_data = json.load(f)
+    return cross_data
+
+def load_map_data(map_data_path: str) -> Optional[Dict]:
+    """加载地图数据文件"""
+    if not os.path.exists(map_data_path):
+        print(f"错误: 地图数据文件不存在: {map_data_path}")
+        return None
+    
+    with open(map_data_path, 'r', encoding='utf-8') as f:
+        map_data = json.load(f)
+    return map_data 

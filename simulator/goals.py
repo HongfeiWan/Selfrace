@@ -2,6 +2,7 @@ import torch
 import json
 import numpy as np
 import time
+from typing import Dict, Tuple, List, Optional, Any
 
 class PathPlanner:
     def __init__(self,map_path: str, device: torch.device):
@@ -21,11 +22,13 @@ class PathPlanner:
             print(f"地图数据加载耗时: {load_time:.4f}秒")
         else:
             raise ValueError("map_path is required")
+
         # ===================存直路的quad_id==============================
         filtered_start = time.time()
         self.filtered_quad_indices = torch.tensor(cross_data.get('filtered_quad_indices', []), dtype=torch.int32, device=self.device)
         filtered_time = time.time() - filtered_start
         print(f"直路quad_id处理耗时: {filtered_time:.4f}秒")
+
         # ===================存cross的信息================================
         cross_start = time.time()
         cross_data_dict = {}
@@ -92,6 +95,105 @@ class PathPlanner:
         self.cross_data = cross_data_dict
         cross_time = time.time() - cross_start
         print(f"cross信息处理耗时: {cross_time:.4f}秒")
+
+        # ===================基于 cross_data 预存 (cross,road,lane) → (x,y) 查找表===================
+        # 规则：优先使用 start_waypoints 的 (x,y)；若不存在则使用 end_waypoints 的 (x,y)
+        # 存储为向量化可查表结构：排序后的唯一 key 及其坐标，查询时用 searchsorted 无循环映射
+        triplet_build_start = time.time()
+        all_triplets_list = []  # List of (N_i, 3)
+        all_coords_list = []    # List of (N_i, 2)
+        for cid, info in self.cross_data.items():
+            # 收集 start 中的 (road,lane) → (x,y)
+            start_road_id = info.get('start_road_id', torch.empty(0, dtype=torch.int32, device=self.device))
+            start_lane_id = info.get('start_lane_id', torch.empty(0, dtype=torch.int32, device=self.device))
+            start_x = info.get('start_x', torch.empty(0, dtype=torch.float32, device=self.device))
+            start_y = info.get('start_y', torch.empty(0, dtype=torch.float32, device=self.device))
+
+            end_road_id = info.get('end_road_id', torch.empty(0, dtype=torch.int32, device=self.device))
+            end_lane_id = info.get('end_lane_id', torch.empty(0, dtype=torch.int32, device=self.device))
+            end_x = info.get('end_x', torch.empty(0, dtype=torch.float32, device=self.device))
+            end_y = info.get('end_y', torch.empty(0, dtype=torch.float32, device=self.device))
+
+            # 将 start/end 合并，优先采用 start
+            if start_road_id.numel() > 0:
+                trip_start = torch.stack([
+                    torch.full_like(start_road_id, int(cid)),
+                    start_road_id.to(torch.int32),
+                    start_lane_id.to(torch.int32)
+                ], dim=1)  # [Ns,3]
+                coords_start = torch.stack([start_x.to(torch.float32), start_y.to(torch.float32)], dim=1)  # [Ns,2]
+            else:
+                trip_start = torch.empty((0, 3), dtype=torch.int32, device=self.device)
+                coords_start = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+
+            if end_road_id.numel() > 0:
+                trip_end = torch.stack([
+                    torch.full_like(end_road_id, int(cid)),
+                    end_road_id.to(torch.int32),
+                    end_lane_id.to(torch.int32)
+                ], dim=1)  # [Ne,3]
+                coords_end = torch.stack([end_x.to(torch.float32), end_y.to(torch.float32)], dim=1)  # [Ne,2]
+            else:
+                trip_end = torch.empty((0, 3), dtype=torch.int32, device=self.device)
+                coords_end = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+
+            # 合并，并去重 (cross,road,lane)（优先保留 start 中的条目）
+            if trip_start.numel() == 0 and trip_end.numel() == 0:
+                continue
+
+            trip_all = torch.cat([trip_start, trip_end], dim=0)  # [Ns+Ne,3]
+            coords_all = torch.cat([coords_start, coords_end], dim=0)  # [Ns+Ne,2]
+
+            # 生成唯一 key 以去重：使用偏移编码，road/lane 可能为负，先整体平移
+            # 为安全起见，用每个 cross 内的最小值做平移
+            mins_local = trip_all.min(dim=0).values.to(torch.int64)
+            maxs_local = trip_all.max(dim=0).values.to(torch.int64)
+            ranges_local = (maxs_local - mins_local + 1).to(torch.int64)
+            mul_cross = (ranges_local[1] * ranges_local[2]).to(torch.int64)
+            mul_road = ranges_local[2].to(torch.int64)
+            off = (trip_all.to(torch.int64) - mins_local)
+            keys = off[:, 0] * mul_cross + off[:, 1] * mul_road + off[:, 2]
+            # 保留首次出现（start 优先，因为它在前）;
+            # 兼容旧版 PyTorch：不使用 return_indices，改为相邻比较提取首位置索引
+            keys_sorted, order = torch.sort(keys)
+            is_first = torch.ones_like(keys_sorted, dtype=torch.bool)
+            is_first[1:] = keys_sorted[1:] != keys_sorted[:-1]
+            first_idx = torch.nonzero(is_first, as_tuple=False).squeeze(1)
+            keep_idx = order[first_idx]
+            all_triplets_list.append(trip_all[keep_idx].to(torch.int32))
+            all_coords_list.append(coords_all[keep_idx].to(torch.float32))
+
+        if len(all_triplets_list) > 0:
+            triplets_cat = torch.cat(all_triplets_list, dim=0).to(torch.int32)  # [N,3]
+            coords_cat = torch.cat(all_coords_list, dim=0).to(torch.float32)    # [N,2]
+            # 构建全局有序查找表：计算全局 key 并排序
+            mins = triplets_cat.min(dim=0).values.to(torch.int64)
+            maxs = triplets_cat.max(dim=0).values.to(torch.int64)
+            ranges = (maxs - mins + 1).to(torch.int64)
+            mul_cross = (ranges[1] * ranges[2]).to(torch.int64)
+            mul_road = ranges[2].to(torch.int64)
+            off = (triplets_cat.to(torch.int64) - mins)
+            keys_global = off[:, 0] * mul_cross + off[:, 1] * mul_road + off[:, 2]
+            keys_sorted, order = torch.sort(keys_global)
+            trip_sorted = triplets_cat.index_select(0, order)
+            coords_sorted = coords_cat.index_select(0, order)
+
+            # 保存查找表
+            self.triplet_lookup_mins = mins  # int64 [3]
+            self.triplet_lookup_mul_cross = mul_cross  # int64
+            self.triplet_lookup_mul_road = mul_road    # int64
+            self.triplet_lookup_sorted_keys = keys_sorted  # int64 [N]
+            self.triplet_lookup_coords_sorted = coords_sorted  # float32 [N,2]
+        else:
+            # 空表占位
+            self.triplet_lookup_mins = torch.zeros(3, dtype=torch.int64, device=self.device)
+            self.triplet_lookup_mul_cross = torch.tensor(0, dtype=torch.int64, device=self.device)
+            self.triplet_lookup_mul_road = torch.tensor(0, dtype=torch.int64, device=self.device)
+            self.triplet_lookup_sorted_keys = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.triplet_lookup_coords_sorted = torch.empty(0, 2, dtype=torch.float32, device=self.device)
+
+        print(f"triplet坐标查找表构建耗时: {time.time() - triplet_build_start:.4f}秒, 共{self.triplet_lookup_sorted_keys.numel()}条")
+
 
         # ===================存global_w_lane_waypoints===================
         waypoints_start = time.time()
@@ -432,6 +534,16 @@ class PathPlanner:
         cross_match_time = time.time() - cross_match_start
         print(f"cross匹配数据预处理耗时: {cross_match_time:.4f}秒")
         
+        # ===================初始化WaypointGraphGPU===================
+        try:
+            # 使用cross_data_path作为waypoint_graph的输入
+            self.waypoint_graph_gpu = WaypointGraphGPU(cross_data_path, device=str(self.device))
+            print(f"WaypointGraphGPU初始化成功")
+
+        except Exception as e:
+            print(f"WaypointGraphGPU初始化失败: {e}")
+            self.waypoint_graph_gpu = None
+        
         total_init_time = time.time() - start_time
         print(f"PathPlanner初始化总耗时: {total_init_time:.4f}秒")
 
@@ -444,15 +556,17 @@ class PathPlanner:
             path: 路径(B,M,max_path_length,2)
         '''
         plan_start_time = time.time()
+
         # 初始化规划的路径：
         # path = (B,M,512,2)
         path = torch.full((start_quad_id.shape[0], start_quad_id.shape[1], 512, 2), -1, dtype=torch.float32, device=self.device)
-        
+
         # 确定起始点和目标点的类型（是否在filtered_quad_indices内）
         # 使用GPU张量进行快速查询
         # 重塑张量以便进行广播比较
         start_quad_flat = start_quad_id.view(-1)  # (B*M,)
         goal_quad_flat = goal_quad_id.view(-1)    # (B*M,)
+
         # 查询哪些quad_id在filtered_quad_indices内
         start_in_filtered_mask = torch.isin(start_quad_flat, self.filtered_quad_indices)
         goal_in_filtered_mask = torch.isin(goal_quad_flat, self.filtered_quad_indices)
@@ -475,81 +589,51 @@ class PathPlanner:
         case1_start = time.time()
         if start_in_filtered_mask.any():
             # 获取满足条件的start_quad索引
-            case1_step1_start = time.time()
             valid_start_indices = torch.where(start_in_filtered_mask)[0]
             valid_start_quads = start_quad_flat[valid_start_indices]
-            case1_step1_time = time.time() - case1_step1_start
-            print(f"  情况1-步骤1(获取有效索引): {case1_step1_time:.4f}秒")
             
-            # 使用广播操作进行批量查找
-            # 1. 广播查找quad_to_next_waypoint映射
-            case1_step2_start = time.time()
+            # 广播查找quad_to_next_waypoint映射
             quad_expanded = valid_start_quads.unsqueeze(1)  # (num_valid, 1)
             quad_ids_expanded = self.quad_to_next_waypoint_quad_ids.unsqueeze(0)  # (1, num_quad_ids)
             quad_matches = (quad_expanded == quad_ids_expanded)  # (num_valid, num_quad_ids)
-            case1_step2_time = time.time() - case1_step2_start
-            print(f"  情况1-步骤2(广播查找): {case1_step2_time:.4f}秒")
-            
-            # 获取匹配的索引和对应的waypoint_ids
-            case1_step3_start = time.time()
             matched_indices = torch.where(quad_matches)
             if len(matched_indices[0]) > 0:
                 valid_quad_indices = matched_indices[0]  # 在valid_start_quads中的索引
                 quad_to_next_indices = matched_indices[1]  # 在quad_to_next_waypoint_quad_ids中的索引
                 waypoint_ids = self.quad_to_next_waypoint_values[quad_to_next_indices]#获取了所有起始quad的下一个waypoint
-            case1_step3_time = time.time() - case1_step3_start
-            print(f"  情况1-步骤3(获取匹配索引): {case1_step3_time:.4f}秒")
 
             if len(matched_indices[0]) > 0:
-                # 2. 使用预创建的waypoint_to_lane映射进行批量查找（GPU向量化）
-                case1_step4a_start = time.time()
                 waypoint_ids_expanded = waypoint_ids.unsqueeze(1)  # (N, 1)
                 map_ids_expanded = self.waypoint_to_lane['waypoint_ids'].unsqueeze(0)  # (1, K)
                 waypoint_matches = (waypoint_ids_expanded == map_ids_expanded)  # (N, K)
-                case1_step4a_time = time.time() - case1_step4a_start
-                print(f"  情况1-步骤4a(waypoint广播查找): {case1_step4a_time:.4f}秒")
-
-                # 3. 批量处理匹配（GPU向量化）
-                case1_step4b_start = time.time()
                 waypoint_matches_int = waypoint_matches.int()        # 将布尔张量转换为整数张量
                 match_indices = waypoint_matches_int.argmax(dim=1)   # 获取每个waypoint在waypoint_to_lane中匹配的索引
                 valid_matches = waypoint_matches.any(dim=1)          # 标记哪些waypoint在waypoint_to_lane中找到了有效值
                 valid_wp_idx = torch.where(valid_matches)[0]         # 获取所有有效匹配的waypoint的索引
-                case1_step4b_time = time.time() - case1_step4b_start
-                print(f"  情况1-步骤4b(waypoint匹配处理): {case1_step4b_time:.4f}秒")
 
                 if valid_wp_idx.numel() > 0:
-                    case1_step5_start = time.time()
                     sel_match_idx = match_indices[valid_wp_idx]
                     roads_found = self.waypoint_to_lane['road_ids'][sel_match_idx]
                     lanes_found = self.waypoint_to_lane['lane_ids'][sel_match_idx]
                     # 使用预处理的lane索引张量
                     lane_indices_tensor = self.waypoint_to_lane['lane_indices_tensor'][sel_match_idx]
                     lane_lengths = self.waypoint_to_lane['lane_lengths'][sel_match_idx]
-                    case1_step5_time = time.time() - case1_step5_start
-                    print(f"  情况1-步骤5(获取lane信息): {case1_step5_time:.4f}秒")
 
                     # waypoint在对应lane中的位置（GPU并行查找）
-                    case1_step6_start = time.time()
                     wp_to_find = waypoint_ids[valid_wp_idx]
                     eq = (wp_to_find.unsqueeze(1) == lane_indices_tensor)  # (Nv, L)
                     eq_int = eq.int()
                     pos = eq_int.argmax(dim=1)           # 第一个匹配位置
                     has_pos = eq.any(dim=1)
                     pos = torch.where(has_pos, pos, torch.full_like(pos, -1))
-                    case1_step6_time = time.time() - case1_step6_start
-                    print(f"  情况1-步骤6(waypoint位置查找): {case1_step6_time:.4f}秒")
 
                     # 末端waypoint（每条lane最后一个有效点）
-                    case1_step7_start = time.time()
                     last_idx = torch.clamp(lane_lengths - 1, min=0)
                     final_wp_ids = lane_indices_tensor[torch.arange(lane_indices_tensor.shape[0], device=self.device), last_idx]
                     final_wp_ids = torch.where((lane_lengths > 0) & (pos >= 0), final_wp_ids, torch.full_like(final_wp_ids, -1))
-                    case1_step7_time = time.time() - case1_step7_start
-                    print(f"  情况1-步骤7(末端waypoint计算): {case1_step7_time:.4f}秒")
+
                     
                     # 使用预处理的cross匹配数据
-                    case1_step8_start = time.time()
                     if self.all_end_ids.numel() > 0:
                         m = (final_wp_ids.unsqueeze(1) == self.all_end_ids.unsqueeze(0))  # (Nv, T)
                         any_m = m.any(dim=1)
@@ -558,11 +642,9 @@ class PathPlanner:
                         cross_ids_found = torch.where(any_m, self.all_end_cids[idx], torch.full_like(final_wp_ids, -1))
                     else:
                         cross_ids_found = torch.full_like(final_wp_ids, -1)
-                    case1_step8_time = time.time() - case1_step8_start
-                    print(f"  情况1-步骤8(cross匹配): {case1_step8_time:.4f}秒")
+
                     
                     # 回写 start_ids（仅对有效项）
-                    case1_step9_start = time.time()
                     orig_idx = valid_start_indices[valid_quad_indices[valid_wp_idx]]
                     write_mask = (cross_ids_found != -1) & (pos >= 0)
                     if write_mask.any():
@@ -570,9 +652,7 @@ class PathPlanner:
                         start_ids[idx_w, 0] = cross_ids_found[write_mask]
                         start_ids[idx_w, 1] = roads_found[write_mask]
                         start_ids[idx_w, 2] = lanes_found[write_mask]
-                    case1_step9_time = time.time() - case1_step9_start
-                    print(f"  情况1-步骤9(回写start_ids): {case1_step9_time:.4f}秒")
-                    
+
                     if write_mask.any():
                         # 填充lane_waypoints（只保存有效值）- 优化版本
                         case1_step10_start = time.time()
@@ -656,9 +736,7 @@ class PathPlanner:
 
                             case1_step13_time = time.time() - case1_step13_start
                             print(f"  情况1-步骤13(获取有效waypoint): {case1_step13_time:.4f}秒") 
-        case1_time = time.time() - case1_start
-        print(f"情况1处理耗时: {case1_time:.4f}秒")
-        
+
         # 情况2：处理起点不在filtered_quad_indices内的情况 - 使用张量批量查找
         case2_start = time.time()
         if (~start_in_filtered_mask).any():
@@ -669,8 +747,7 @@ class PathPlanner:
                 # 使用新的张量批量查找方法
                 case2_step1_start = time.time()
                 neighbor_info_batch = self.get_nearest_neighbor_info_batch(invalid_start_quads)
-                case2_step1_time = time.time() - case2_step1_start
-                print(f"  情况2-步骤1(批量获取最近邻): {case2_step1_time:.4f}秒")
+
                 # 筛选有效的最近邻信息
                 valid_mask = neighbor_info_batch['valid_mask']
                 if valid_mask.any():
@@ -678,14 +755,13 @@ class PathPlanner:
                     valid_indices = torch.where(valid_mask)[0]
                     valid_start_indices = invalid_start_indices[valid_indices]
                     # 批量更新start_ids
-                    case2_step2_start = time.time()
+
                     start_ids[valid_start_indices, 0] = neighbor_info_batch['nearest_cross_ids'][valid_indices]
                     start_ids[valid_start_indices, 1] = neighbor_info_batch['to_start_road_ids'][valid_indices]
                     start_ids[valid_start_indices, 2] = neighbor_info_batch['to_start_lane_ids'][valid_indices]
-                    case2_step2_time = time.time() - case2_step2_start
-                    print(f"  情况2-步骤2(批量更新start_ids): {case2_step2_time:.4f}秒")
+
                     # 批量处理waypoints - 使用张量操作
-                    case2_step3_start = time.time()
+
                     # 获取有效的remaining_quad_ids
                     valid_remaining_quad_ids = neighbor_info_batch['remaining_quad_ids'][valid_indices]
                     valid_remaining_lengths = neighbor_info_batch['remaining_quad_lengths'][valid_indices]
@@ -737,9 +813,6 @@ class PathPlanner:
                                 # 更新长度信息
                                 safe_lengths = torch.clamp(valid_counts, max=max_waypoints_per_lane).to(torch.int32)
                                 lane_waypoints_lengths[valid_start_indices] = safe_lengths   
-
-                    case2_step3_time = time.time() - case2_step3_start
-                    print(f"  情况2-步骤3(批量处理waypoints): {case2_step3_time:.4f}秒")            
         case2_time = time.time() - case2_start
         print(f"情况2处理耗时: {case2_time:.4f}秒")
 
@@ -973,18 +1046,99 @@ class PathPlanner:
         # 在这里已经得到了start_ids，end_ids。通过cross_data内部的"waypoint_graph"得到两个节点之间的其它节点。
         plan_total_time = time.time() - plan_start_time
         print(f"plan_path总耗时: {plan_total_time:.4f}秒")
-        print()
-        
+
+
         # 返回张量结构的结果，便于后续处理
-        # lane_waypoints_tensor: (batch_size, max_waypoints_per_lane, 2) - 起点lane坐标
-        # goal_lane_waypoints_tensor: (batch_size, max_waypoints_per_lane, 2) - 终点lane坐标
-        # lane_waypoints_lengths: (batch_size,) - 每个起点lane的实际waypoint数量
-        # goal_lane_waypoints_lengths: (batch_size,) - 每个终点lane的实际waypoint数量
+        # lane_waypoints_tensor: (B*M, max_waypoints_per_lane, 2) - 起点lane坐标
+        # goal_lane_waypoints_tensor: (B*M, max_waypoints_per_lane, 2) - 终点lane坐标
+        # lane_waypoints_lengths: (B*M,) - 每个起点lane的实际waypoint数量
+        # goal_lane_waypoints_lengths: (B*M,) - 每个终点lane的实际waypoint数量
+        # start_ids：（B*M,3）
+        # end_ids: (B*M,3)
+        # 注意这里的值都没有左对齐，因此可能第一个有效值是从中间某个地方开始的。
+        waypoint_graph, waypoint_mask = self.waypoint_graph_gpu.batch_shortest_paths_fixed_len(start_ids, end_ids)
+        waypoint_graph_coords = self.triplet_grid_to_coords(waypoint_graph)  # [B*M,100,2]
 
+        # =================== 将各段左对齐并拼接为路径 ===================
+        N = start_quad_flat.shape[0]
+        Lmax = 512
+        device = self.device
 
-        return start_ids
+        # 1) 起点、终点坐标 (N,2)
+        start_centers = self.get_quad_centers(start_quad_flat.to(torch.long))
+        goal_centers = self.get_quad_centers(goal_quad_flat.to(torch.long))
+
+        # 2) 起点 lane 坐标左对齐
+        max_lane_len = lane_waypoints_tensor.shape[1]
+        lane_valid_mask = (lane_waypoints_tensor[..., 0] != -1) & (lane_waypoints_tensor[..., 1] != -1)  # (N, W)
+        lane_indices = torch.arange(max_lane_len, device=device).unsqueeze(0).expand(N, -1)
+        lane_sort_scores = (~lane_valid_mask).long() * max_lane_len + lane_indices
+        lane_order = torch.argsort(lane_sort_scores, dim=1, stable=True)
+        lane_left = lane_waypoints_tensor.gather(1, lane_order.unsqueeze(-1).expand(-1, -1, 2))  # (N,W,2)
+        lane_counts = lane_valid_mask.sum(dim=1)  # (N,)
+
+        # 3) waypoint_graph 坐标左对齐（根据其自身 mask）
+        wg_W = waypoint_graph_coords.shape[1]
+        wg_valid_mask = (waypoint_graph_coords[..., 0] != -1) & (waypoint_graph_coords[..., 1] != -1)
+        wg_indices = torch.arange(wg_W, device=device).unsqueeze(0).expand(N, -1)
+        wg_sort_scores = (~wg_valid_mask).long() * wg_W + wg_indices
+        wg_order = torch.argsort(wg_sort_scores, dim=1, stable=True)
+        wg_left = waypoint_graph_coords.gather(1, wg_order.unsqueeze(-1).expand(-1, -1, 2))  # (N,100,2)
+        wg_counts = wg_valid_mask.sum(dim=1)  # (N,)
+
+        # 4) 终点 lane 坐标左对齐
+        gl_max = goal_lane_waypoints_tensor.shape[1]
+        gl_valid_mask = (goal_lane_waypoints_tensor[..., 0] != -1) & (goal_lane_waypoints_tensor[..., 1] != -1)
+        gl_indices = torch.arange(gl_max, device=device).unsqueeze(0).expand(N, -1)
+        gl_sort_scores = (~gl_valid_mask).long() * gl_max + gl_indices
+        gl_order = torch.argsort(gl_sort_scores, dim=1, stable=True)
+        gl_left = goal_lane_waypoints_tensor.gather(1, gl_order.unsqueeze(-1).expand(-1, -1, 2))  # (N,gl_max,2)
+        gl_counts = gl_valid_mask.sum(dim=1)  # (N,)
+
+        # 5) 组装 path_flat = (N, Lmax, 2)
+        path_flat = torch.full((N, Lmax, 2), -1, dtype=torch.float32, device=device)
+
+        # 段1：起点，固定写入列0
+        path_flat[:, 0, :] = start_centers
+        offset = torch.ones(N, dtype=torch.long, device=device)  # 当前写入起始列
+
+        # 实用函数：把 segment_left (N,S,2) 写入 path_flat，从 offset 起，写 count_i 列
+        def write_segment(segment_left: torch.Tensor, counts: torch.Tensor, offset: torch.Tensor):
+            S = segment_left.shape[1]
+            idx_j = torch.arange(S, device=device).unsqueeze(0).expand(N, -1)  # (N,S)
+            target_j = offset.unsqueeze(1) + idx_j  # (N,S)
+            within = (idx_j < counts.unsqueeze(1)) & (target_j < Lmax)
+            if within.any():
+                bi = torch.arange(N, device=device).unsqueeze(1).expand(N, S)
+                bi_sel = bi[within]
+                tj_sel = target_j[within]
+                path_flat[bi_sel, tj_sel, :] = segment_left[within, :]
+            # 返回新 offset = offset + counts，且不超过 Lmax
+            return torch.minimum(offset + counts, torch.full_like(offset, Lmax))
+
+        # 段2：起点 lane
+        remain = torch.clamp(Lmax - offset, min=0)
+        offset = write_segment(lane_left, torch.minimum(lane_counts, remain), offset)
+
+        # 段3：waypoint_graph
+        remain = torch.clamp(Lmax - offset, min=0)
+        offset = write_segment(wg_left, torch.minimum(wg_counts, remain), offset)
+
+        # 段4：终点 lane
+        remain = torch.clamp(Lmax - offset, min=0)
+        offset = write_segment(gl_left, torch.minimum(gl_counts, remain), offset)
+
+        # 段5：终点，若仍有空间则写入一列
+        has_room = offset < Lmax
+        if has_room.any():
+            bi = torch.nonzero(has_room, as_tuple=False).squeeze(1)
+            tj = offset[bi]
+            path_flat[bi, tj, :] = goal_centers.index_select(0, bi)
+
+        # 形状还原为 (B,M,Lmax,2)
+        path = path_flat.view(start_quad_id.shape[0], start_quad_id.shape[1], Lmax, 2)
+        return path
         
-
 #=======================查找工具函数=======================
 
     def get_waypoint_coords(self, indices: torch.Tensor) -> torch.Tensor:
@@ -1016,6 +1170,55 @@ class PathPlanner:
             'lane_id': self.global_w_lane_waypoints['carla_waypoint_info']['lane_id'][indices],
             's': self.global_w_lane_waypoints['carla_waypoint_info']['s'][indices]
         }
+
+    def triplet_grid_to_coords(self, triplet_grid: torch.Tensor, pad_value: int = -1) -> torch.Tensor:
+        """
+        将 [N, L, 3] 的 (cross, road, lane) 三元组张量映射为 [N, L, 2] 的 (x,y) 坐标。
+        要求在 __init__ 中已构建好 triplet 查找表（self.triplet_lookup_*）。
+        对无效/未匹配位置返回 (pad_value, pad_value)。
+        """
+        device = self.device
+        if not hasattr(self, 'triplet_lookup_sorted_keys') or self.triplet_lookup_sorted_keys.numel() == 0:
+            # 没有可用查找表，直接返回 pad
+            out = torch.full((triplet_grid.shape[0], triplet_grid.shape[1], 2),
+                             float(pad_value), dtype=torch.float32, device=device)
+            return out
+
+        # 形状处理
+        orig_shape = triplet_grid.shape  # [N, L, 3]
+        assert orig_shape[-1] == 3, "triplet_grid 最后维必须为3"
+        flat = triplet_grid.reshape(-1, 3).to(device)
+
+        # 有效三元组 mask（排除 -1 填充）
+        valid = (flat >= 0).all(dim=1)
+
+        # 初始化输出为 pad
+        out_flat = torch.full((flat.shape[0], 2), float(pad_value), dtype=torch.float32, device=device)
+
+        if valid.any():
+            v = flat[valid].to(torch.int64)
+            # 计算 key
+            mins = self.triplet_lookup_mins  # int64[3]
+            mul_cross = self.triplet_lookup_mul_cross  # int64
+            mul_road = self.triplet_lookup_mul_road    # int64
+            off = (v - mins)
+            keys = off[:, 0] * mul_cross + off[:, 1] * mul_road + off[:, 2]  # int64 [Nv]
+
+            # searchsorted 定位
+            sorted_keys = self.triplet_lookup_sorted_keys  # [K]
+            pos = torch.searchsorted(sorted_keys, keys)
+            pos = torch.clamp(pos, 0, max(0, sorted_keys.numel() - 1))
+            matched = (sorted_keys.numel() > 0) & (sorted_keys[pos] == keys)
+
+            if matched.any():
+                coords_sorted = self.triplet_lookup_coords_sorted  # [K,2]
+                coords_hit = coords_sorted.index_select(0, pos[matched])  # [Nh,2]
+                # 回填命中坐标
+                idx_flat = torch.nonzero(valid, as_tuple=False).squeeze(1)[matched]
+                out_flat[idx_flat] = coords_hit
+
+        out = out_flat.reshape(orig_shape[0], orig_shape[1], 2)
+        return out
     
     def find_waypoints_by_road_lane(self, road_id: int, lane_id: int) -> torch.Tensor:
         """根据road_id和lane_id查找waypoints"""
@@ -1034,6 +1237,7 @@ class PathPlanner:
         center_x = self.quads_info['center_x'][quad_ids]
         center_y = self.quads_info['center_y'][quad_ids]
         return torch.stack([center_x, center_y], dim=1)
+    
     
     def get_nearest_neighbor_info_batch(self, quad_ids: torch.Tensor) -> dict:
         """
@@ -1117,6 +1321,40 @@ class PathPlanner:
                 result['path_start_to_nearest_lengths'][query_indices] = path_start_lengths
         return result
 
+        """
+        使用排序方法将有效坐标左对齐
+        """
+        # 重塑为(B, M, max_waypoints_per_lane, 2)
+        lane_waypoints_bmn = lane_waypoints_tensor.view(B, M, -1, 2)
+        # 重塑lengths为(B, M)
+        lengths_bmn = lane_waypoints_lengths.view(B, M)
+        # 找到最大有效长度
+        max_valid_length = lengths_bmn.max().item()
+        # 创建有效坐标的mask
+        valid_mask = (lane_waypoints_bmn[:, :, :, 0] != -1) & (lane_waypoints_bmn[:, :, :, 1] != -1)  # (B, M, max_waypoints_per_lane)
+        # 创建长度mask
+        length_mask = torch.arange(lane_waypoints_bmn.shape[2], device=self.device).unsqueeze(0).unsqueeze(0).expand(B, M, -1)
+        valid_length_mask = length_mask < lengths_bmn.unsqueeze(2)
+        
+        # 组合mask
+        final_mask = valid_mask & valid_length_mask
+        
+        # 使用排序进行左对齐
+        indices = torch.arange(lane_waypoints_bmn.shape[2], device=self.device).unsqueeze(0).unsqueeze(0).expand(B, M, -1)
+        sort_scores = (~final_mask).long() * max_valid_length + indices
+        sorted_indices = torch.argsort(sort_scores, dim=2, stable=True)
+        
+        # 重新排列坐标
+        batch_indices = torch.arange(B, device=self.device).unsqueeze(1).unsqueeze(2).expand(-1, M, lane_waypoints_bmn.shape[2])
+        sample_indices = torch.arange(M, device=self.device).unsqueeze(0).unsqueeze(2).expand(B, -1, lane_waypoints_bmn.shape[2])
+        
+        result = lane_waypoints_bmn[batch_indices, sample_indices, sorted_indices, :]
+        
+        # 只保留前max_valid_length个坐标
+        result = result[:, :, :max_valid_length, :]
+        
+        return result
+
 #=======================预处理函数=======================
     def _group_waypoints_by_lane_gpu(self):
         """
@@ -1150,12 +1388,365 @@ class PathPlanner:
                     lane_id = lane_ids[sorted_indices[0]].item()
                     lanes[(road_id, lane_id)] = sorted_indices
         return lanes
+
+class WaypointGraphGPU:
+    """
+    将 waypoint_graph 预处理为 GPU 常驻的稀疏入边表，并提供固定长度的批量最短路径生成功能。
+    """
+    def __init__(self, json_path: str, device: Optional[str] = None):
+        # 1) 读取 JSON 并解析 waypoint_graph
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if 'waypoint_graph' not in data:
+            raise ValueError(f"文件中未找到 'waypoint_graph': {json_path}")
+        wg = data['waypoint_graph']
+        raw_nodes: List[List[Any]] = wg['nodes']
+        raw_edges: List[List[Any]] = wg['edges']
+
+        # 2) 向量化解析 nodes
+        nodes_arr = np.array(raw_nodes, dtype=object)  # [N,6]
+        N = int(nodes_arr.shape[0])
+        cross_col = nodes_arr[:, 0].astype(np.int64)
+        road_col = nodes_arr[:, 1].astype(np.int64)
+        lane_col = nodes_arr[:, 2].astype(np.int64)
+        x_col = nodes_arr[:, 3].astype(np.float64)
+        y_col = nodes_arr[:, 4].astype(np.float64)
+        type_col = nodes_arr[:, 5].astype(str)
+
+        # 三元组张量 [N,3]
+        node_triplets_np = np.stack([cross_col, road_col, lane_col], axis=1)
+        # 构造节点唯一键（字符串），用于与边端点对齐
+        # 使用固定小数格式保证稳定性
+        x_str = np.char.mod('%.6f', x_col)
+        y_str = np.char.mod('%.6f', y_col)
+        key_nodes = np.char.add(np.char.add(np.char.add(np.char.add(np.char.add(
+        cross_col.astype(str), '|'), road_col.astype(str)), '|'), lane_col.astype(str)), '|')
+        key_nodes = np.char.add(np.char.add(np.char.add(np.char.add(key_nodes, x_str), '|'), y_str), '|')
+        key_nodes = np.char.add(key_nodes, type_col)
+
+        # 3) 向量化解析 edges
+        edges_arr = np.array(raw_edges, dtype=object)  # [E,3]
+        # 提取 u/v 节点矩阵 [E,6]
+        u_arr = np.stack(edges_arr[:, 0])
+        v_arr = np.stack(edges_arr[:, 1])
+        w_arr = edges_arr[:, 2].astype(np.float32)
+        # 为 u/v 节点生成键
+        u_key = np.char.add(np.char.add(np.char.add(np.char.add(np.char.add(
+        u_arr[:, 0].astype(str), '|'), u_arr[:, 1].astype(str)), '|'), u_arr[:, 2].astype(str)), '|')
+        u_x_str = np.char.mod('%.6f', u_arr[:, 3].astype(np.float64))
+        u_y_str = np.char.mod('%.6f', u_arr[:, 4].astype(np.float64))
+        u_key = np.char.add(np.char.add(np.char.add(np.char.add(u_key, u_x_str), '|'), u_y_str), '|')
+        u_key = np.char.add(u_key, u_arr[:, 5].astype(str))
+        v_key = np.char.add(np.char.add(np.char.add(np.char.add(np.char.add(
+        v_arr[:, 0].astype(str), '|'), v_arr[:, 1].astype(str)), '|'), v_arr[:, 2].astype(str)), '|')
+        v_x_str = np.char.mod('%.6f', v_arr[:, 3].astype(np.float64))
+        v_y_str = np.char.mod('%.6f', v_arr[:, 4].astype(np.float64))
+        v_key = np.char.add(np.char.add(np.char.add(np.char.add(v_key, v_x_str), '|'), v_y_str), '|')
+        v_key = np.char.add(v_key, v_arr[:, 5].astype(str))
+
+        # 4) 用排序 + searchsorted 将 u/v 键映射到节点索引（避免 Python 字典循环）
+        order_nodes = np.argsort(key_nodes)
+        key_nodes_sorted = key_nodes[order_nodes]
+        pos_u = np.searchsorted(key_nodes_sorted, u_key)
+        pos_v = np.searchsorted(key_nodes_sorted, v_key)
+        u_idx = order_nodes[pos_u].astype(np.int64)
+        v_idx = order_nodes[pos_v].astype(np.int64)
+
+        # 5) 基于 v_idx 分组构建稠密入边表 [N, max_in_deg]
+        deg = np.bincount(v_idx, minlength=N)
+        max_in_deg = int(deg.max()) if N > 0 else 1
+        if max_in_deg == 0:
+            max_in_deg = 1
+        # 无效位置用0占位，配合 inf 权重在松弛时不会被选中
+        incoming_src_idx_np = np.full((N, max_in_deg), 0, dtype=np.int64)
+        incoming_w_np = np.full((N, max_in_deg), np.inf, dtype=np.float32)
+        if max_in_deg > 0 and v_idx.size > 0:
+            order_e = np.argsort(v_idx, kind='stable')
+            v_sorted = v_idx[order_e]
+            u_sorted = u_idx[order_e]
+            w_sorted = w_arr[order_e]
+            # 每个节点的起始偏移（按排序后）
+            starts = np.cumsum(np.concatenate(([0], deg[:-1])))
+            # 逐节点切片填充（这个环节循环的是节点数而非边数，且纯切片赋值，已较轻）
+            nz_nodes = np.nonzero(deg)[0]
+            for v in nz_nodes:
+                s = starts[v]
+                d = deg[v]
+                incoming_src_idx_np[v, :d] = u_sorted[s:s + d]
+                incoming_w_np[v, :d] = w_sorted[s:s + d]
+
+        # 3) 迁移到设备并保存
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = device
+        self.incoming_src_idx = torch.from_numpy(incoming_src_idx_np).to(device)  # [N, M]
+        self.incoming_w = torch.from_numpy(incoming_w_np).to(device)              # [N, M]
+        self.node_triplets = torch.from_numpy(node_triplets_np.astype(np.int64)).to(device)
+
+        # 同步构建出边表 [N, max_out_deg]（用于终点反向DP+前向next跳转）
+        deg_out = np.bincount(u_idx, minlength=N)
+        max_out_deg = int(deg_out.max()) if N > 0 else 1
+        if max_out_deg == 0:
+            max_out_deg = 1
+        out_tgt_idx_np = np.full((N, max_out_deg), 0, dtype=np.int64)
+        out_w_np = np.full((N, max_out_deg), np.inf, dtype=np.float32)
+        if max_out_deg > 0 and u_idx.size > 0:
+            order_e2 = np.argsort(u_idx, kind='stable')
+            u_sorted2 = u_idx[order_e2]
+            v_sorted2 = v_idx[order_e2]
+            w_sorted2 = w_arr[order_e2]
+            starts_out = np.cumsum(np.concatenate(([0], deg_out[:-1])))
+            nz_u = np.nonzero(deg_out)[0]
+            for u in nz_u:
+                s = starts_out[u]
+                d = deg_out[u]
+                out_tgt_idx_np[u, :d] = v_sorted2[s:s + d]
+                out_w_np[u, :d] = w_sorted2[s:s + d]
+        self.outgoing_tgt_idx = torch.from_numpy(out_tgt_idx_np).to(device)  # [N, M_out]
+        self.outgoing_w = torch.from_numpy(out_w_np).to(device)              # [N, M_out]
+
+
+        # 4) 纯GPU三元组分组结构（唯一键、分组起始/大小、排序后的节点索引）
+        mins = self.node_triplets.min(dim=0).values.to(torch.int64)
+        maxs = self.node_triplets.max(dim=0).values.to(torch.int64)
+        ranges = (maxs - mins + 1).to(torch.int64)
+        mul_cross = (ranges[1] * ranges[2]).to(torch.int64)
+        mul_road = ranges[2].to(torch.int64)
+        off = (self.node_triplets - mins)
+        keys_nodes = off[:, 0] * mul_cross + off[:, 1] * mul_road + off[:, 2]
+        keys_sorted, order_nodes2 = torch.sort(keys_nodes)
+        uniq_keys_t, counts = torch.unique_consecutive(keys_sorted, return_counts=True)
+        starts = torch.cumsum(torch.cat([torch.zeros(1, device=device, dtype=torch.int64), counts[:-1]]), dim=0)
+        self._triplet_mins = mins
+        self._triplet_mul_cross = mul_cross
+        self._triplet_mul_road = mul_road
+        self.triplet_unique_keys = uniq_keys_t
+        self.triplet_group_starts = starts
+        self.triplet_group_counts = counts
+        self.nodes_sorted_by_triplet = order_nodes2
+        
+        # 缓存（offset位掩码、终点树）
+        self._offset_masks_cache = {}
+        # 预计算所有终点组的最短路径树，使用张量存储
+        self._precompute_all_end_trees_tensor()
+
+    def _precompute_all_end_trees_tensor(self):
+        """为每个终点组预计算最短路径树，使用张量存储"""
+        device = self.device
+        U = self.triplet_unique_keys.numel()
+        N = self.outgoing_tgt_idx.size(0)
+        print(f"预计算 {U} 个终点组的最短路径树（张量存储）...")
+        start_time = time.time()
+        # 预分配张量存储所有终点组的结果
+        # dist_tensor: [U, N] - 每个终点组到所有节点的最短距离
+        # next_tensor: [U, N] - 每个终点组的最短路径下一跳
+        dist_tensor = torch.full((U, N), float('inf'), dtype=torch.float32, device=device)
+        next_tensor = torch.full((U, N), -1, dtype=torch.long, device=device)
+        # 批量构建所有终点组的最短路径树
+        for g in range(U):
+            dist_g, next_g = self._build_end_tree(g)
+            dist_tensor[g] = dist_g
+            next_tensor[g] = next_g
+        self.end_dist_tensor = dist_tensor  # [U, N]
+        self.end_next_tensor = next_tensor  # [U, N]
+        end_time = time.time()
+        print(f"终点组预计算完成，耗时: {end_time - start_time:.4f}秒")
+
+    def _build_end_tree(self, end_group_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """为给定终点组构建最短路径树"""
+        device = self.device
+        N = self.outgoing_tgt_idx.size(0)
+        
+        # 终点组内所有节点
+        start = self.triplet_group_starts[end_group_id]
+        count = self.triplet_group_counts[end_group_id]
+        nodes = self.nodes_sorted_by_triplet[start:start + count]
+        
+        dist = torch.full((N,), float('inf'), dtype=torch.float32, device=device)
+        next_idx = torch.full((N,), -1, dtype=torch.long, device=device)
+        if count > 0:
+            dist.index_fill_(0, nodes, 0.0)
+        
+        # Bellman-Ford 松弛
+        for _ in range(max(1, N - 1)):
+            tgt_d = dist[self.outgoing_tgt_idx]           # [N, M_out]
+            cand = tgt_d + self.outgoing_w                # [N, M_out]
+            new_d, min_pos = torch.min(cand, dim=1)       # [N]
+            improved = new_d < dist
+            if not torch.any(improved):
+                break
+            dist = torch.minimum(dist, new_d)
+            best_v = self.outgoing_tgt_idx.gather(1, min_pos.view(-1, 1)).squeeze(1)  # [N]
+            next_idx[improved] = best_v[improved]
+        
+        return dist, next_idx
+
+    def _get_offset_masks(self, L: int) -> torch.Tensor:
+        """
+        返回形状 [K, L] 的 bool 掩码，第 k 行表示 offset 中第 k 个比特是否为 1。
+        缓存到 (L, device) 键。
+        """
+        device = self.device
+        L = int(L)
+        K = int(max(1, (L - 1).bit_length()))
+        key = (L, device)
+        cached = self._offset_masks_cache.get(key, None)
+        if cached is not None and cached.shape == (K, L):
+            return cached
+        offsets = torch.arange(L, device=device, dtype=torch.long).unsqueeze(0)  # [1,L]
+        bits = torch.arange(K, device=device, dtype=torch.long).unsqueeze(1)     # [K,1]
+        use = ((offsets >> bits) & 1).to(torch.bool)                              # [K,L]
+        self._offset_masks_cache[key] = use
+        return use
+
+    def batch_shortest_paths_fixed_len(self,
+                                   start_ids: torch.Tensor,
+                                   end_ids: torch.Tensor,
+                                   fixed_len: int = 100,
+                                   pad_value: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        返回: (paths, mask)
+            paths: [B, L, 3] long，三元组 (cross, road, lane)，用 pad_value 填充
+            mask:  [B, L] bool，True 表示该步有效
+        Args:
+            start_ids: [B, 3] long tensor，起点三元组 (cross, road, lane)
+            end_ids: [B, 3] long tensor，终点三元组 (cross, road, lane)
+        """
+        if start_ids.shape != end_ids.shape:
+            raise ValueError(f"start_ids 与 end_ids 形状必须一致，got {start_ids.shape} vs {end_ids.shape}")
+        if start_ids.dim() != 2 or start_ids.size(1) != 3:
+            raise ValueError(f"start_ids 必须是 [B, 3] 形状，got {start_ids.shape}")
+        
+        device = self.device
+        N = self.outgoing_tgt_idx.size(0)
+        U = self.end_dist_tensor.size(0)
+        B = start_ids.size(0)
+        L = int(fixed_len)
+        
+        # 确保张量在正确设备上
+        start_tensor = start_ids.to(device=device, dtype=torch.long)
+        end_tensor = end_ids.to(device=device, dtype=torch.long)
+        
+        # 输出张量
+        triplets = torch.full((B, L, 3), pad_value, dtype=torch.long, device=device)
+        mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+        
+        # 将三元组映射为组id
+        s_off = (start_tensor - self._triplet_mins)
+        s_keys = s_off[:, 0] * self._triplet_mul_cross + s_off[:, 1] * self._triplet_mul_road + s_off[:, 2]
+        pos_s = torch.searchsorted(self.triplet_unique_keys, s_keys)
+        pos_s = torch.clamp(pos_s, 0, U - 1)
+        matched_s = self.triplet_unique_keys[pos_s] == s_keys  # [B]
+
+        e_off = (end_tensor - self._triplet_mins)
+        e_keys = e_off[:, 0] * self._triplet_mul_cross + e_off[:, 1] * self._triplet_mul_road + e_off[:, 2]
+        pos_e = torch.searchsorted(self.triplet_unique_keys, e_keys)
+        pos_e = torch.clamp(pos_e, 0, U - 1)
+        matched_e = self.triplet_unique_keys[pos_e] == e_keys  # [B]
+
+        # 预取 offsets 掩码
+        use_masks = self._get_offset_masks(L)
+        K = use_masks.shape[0]
+
+        # 向量化处理所有批次
+        if torch.any(matched_e):
+            # 获取所有有效的终点组
+            valid_b = torch.nonzero(matched_e, as_tuple=False).squeeze(1)
+            end_groups = pos_e[valid_b]  # [valid_B]
+            
+            # 获取对应的距离和下一跳张量
+            dist_groups = self.end_dist_tensor[end_groups]  # [valid_B, N]
+            next_groups = self.end_next_tensor[end_groups]  # [valid_B, N]
+            
+            # 为每个批次选择起点：从其 start 组内选 dist_g 最小的节点
+            start_pos_sel = pos_s[valid_b]  # [valid_B]
+            start_matched_sel = matched_s[valid_b]  # [valid_B]
+            
+            # 初始化起点节点索引
+            start_node_idx = torch.full((valid_b.numel(),), -1, dtype=torch.long, device=device)
+            
+            if torch.any(start_matched_sel):
+                # 找到匹配的起点组
+                matched_start_b = torch.nonzero(start_matched_sel, as_tuple=False).squeeze(1)  # [matched_B]
+                matched_start_groups = start_pos_sel[matched_start_b]  # [matched_B]
+                
+                # 获取这些起点组的信息
+                g_starts = self.triplet_group_starts[matched_start_groups]  # [matched_B]
+                g_counts = self.triplet_group_counts[matched_start_groups]  # [matched_B]
+                max_c = int(g_counts.max().item())
+                
+                if max_c > 0:
+                    # 构建网格索引
+                    ar = torch.arange(max_c, device=device, dtype=torch.int64)
+                    grid = g_starts.unsqueeze(1) + ar.unsqueeze(0)  # [matched_B, max_c]
+                    valid = ar.unsqueeze(0) < g_counts.unsqueeze(1)  # [matched_B, max_c]
+                    
+                    # 安全索引
+                    grid_clamped = torch.clamp(grid, 0, self.nodes_sorted_by_triplet.numel() - 1)
+                    nodes_mat = self.nodes_sorted_by_triplet[grid_clamped]  # [matched_B, max_c]
+                    
+                    # 获取对应的距离
+                    dist_mat = dist_groups[matched_start_b.unsqueeze(1), nodes_mat]  # [matched_B, max_c]
+                    dist_mat = dist_mat.masked_fill(~valid, float('inf'))
+                    
+                    # 找到最小距离的节点
+                    min_vals, min_pos = torch.min(dist_mat, dim=1)  # [matched_B]
+                    chosen = nodes_mat.gather(1, min_pos.unsqueeze(1)).squeeze(1)  # [matched_B]
+                    ok = torch.isfinite(min_vals)
+                    
+                    # 更新起点节点索引
+                    start_node_idx[matched_start_b[ok]] = chosen[ok]
+            
+            # 向量化二进制跳转
+            valid_count = valid_b.numel()
+            if valid_count > 0:
+                # 准备跳转张量
+                v = start_node_idx.view(valid_count, 1).expand(-1, L)  # [valid_B, L]
+                cur = next_groups  # [valid_B, N]
+                
+                # 二进制跳转
+                for bit in range(K):
+                    use = use_masks[bit].view(1, L).expand(valid_count, -1)  # [valid_B, L]
+                    if torch.any(use):
+                        safe_v = torch.clamp(v, 0, N - 1)
+                        jumped = cur.gather(1, safe_v)  # [valid_B, L]
+                        jumped = torch.where(v >= 0, jumped, torch.full_like(v, -1))
+                        v = torch.where(use, jumped, v)
+                    
+                    # 自合成：cur = cur ∘ cur
+                    last = cur
+                    safe_idx = torch.clamp(last, 0, N - 1)
+                    nxt = last.gather(1, safe_idx)
+                    cur = torch.where(last >= 0, nxt, torch.full_like(last, -1))
+                
+                # 构建路径
+                path_idx = v  # [valid_B, L] - 已是从起点到终点方向
+                local_mask = path_idx >= 0  # [valid_B, L]
+                
+                # 左对齐（保持列内顺序）
+                if torch.any(local_mask):
+                    col_idx = torch.arange(L, device=device).view(1, L).expand(valid_count, -1)
+                    order_score = (~local_mask).to(torch.long) * L + col_idx
+                    order = torch.argsort(order_score, dim=1, stable=True)
+                    path_idx = path_idx.gather(1, order)
+                    local_mask = local_mask.gather(1, order)
     
+                # 映射到三元组
+                tris = torch.full((valid_count, L, 3), pad_value, dtype=torch.long, device=device)
+                if torch.any(local_mask):
+                    flat_idx = path_idx[local_mask]
+                    tris_flat = self.node_triplets.index_select(0, flat_idx)
+                    tris[local_mask] = tris_flat
+                # 回填到全局输出
+                triplets[valid_b] = tris
+                mask[valid_b] = local_mask
+
+        return triplets, mask
 
 if __name__ == "__main__":
     path_planner = PathPlanner(map_path='maps/processed_map_Town01_stitched.json', device=torch.device('cuda'))
     # 测试参数
-    B, M = 2400, 150
+    B, M = 1, 150
     # 生成随机的quad_id张量 (B, M, 1)
     # 从path_planner的quads_info中获取有效的quad_id范围
     if hasattr(path_planner, 'quads_info') and path_planner.quads_info is not None:

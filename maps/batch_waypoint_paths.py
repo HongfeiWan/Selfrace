@@ -27,6 +27,7 @@ class WaypointGraphGPU:
         x_col = nodes_arr[:, 3].astype(np.float64)
         y_col = nodes_arr[:, 4].astype(np.float64)
         type_col = nodes_arr[:, 5].astype(str)
+
         # 三元组张量 [N,3]
         node_triplets_np = np.stack([cross_col, road_col, lane_col], axis=1)
         # 构造节点唯一键（字符串），用于与边端点对齐
@@ -57,6 +58,7 @@ class WaypointGraphGPU:
         v_y_str = np.char.mod('%.6f', v_arr[:, 4].astype(np.float64))
         v_key = np.char.add(np.char.add(np.char.add(np.char.add(v_key, v_x_str), '|'), v_y_str), '|')
         v_key = np.char.add(v_key, v_arr[:, 5].astype(str))
+
         # 4) 用排序 + searchsorted 将 u/v 键映射到节点索引（避免 Python 字典循环）
         order_nodes = np.argsort(key_nodes)
         key_nodes_sorted = key_nodes[order_nodes]
@@ -64,6 +66,7 @@ class WaypointGraphGPU:
         pos_v = np.searchsorted(key_nodes_sorted, v_key)
         u_idx = order_nodes[pos_u].astype(np.int64)
         v_idx = order_nodes[pos_v].astype(np.int64)
+
         # 5) 基于 v_idx 分组构建稠密入边表 [N, max_in_deg]
         deg = np.bincount(v_idx, minlength=N)
         max_in_deg = int(deg.max()) if N > 0 else 1
@@ -95,6 +98,29 @@ class WaypointGraphGPU:
         self.incoming_w = torch.from_numpy(incoming_w_np).to(device)              # [N, M]
         self.node_triplets = torch.from_numpy(node_triplets_np.astype(np.int64)).to(device)
 
+        # 同步构建出边表 [N, max_out_deg]（用于终点反向DP+前向next跳转）
+        deg_out = np.bincount(u_idx, minlength=N)
+        max_out_deg = int(deg_out.max()) if N > 0 else 1
+        if max_out_deg == 0:
+            max_out_deg = 1
+        out_tgt_idx_np = np.full((N, max_out_deg), 0, dtype=np.int64)
+        out_w_np = np.full((N, max_out_deg), np.inf, dtype=np.float32)
+        if max_out_deg > 0 and u_idx.size > 0:
+            order_e2 = np.argsort(u_idx, kind='stable')
+            u_sorted2 = u_idx[order_e2]
+            v_sorted2 = v_idx[order_e2]
+            w_sorted2 = w_arr[order_e2]
+            starts_out = np.cumsum(np.concatenate(([0], deg_out[:-1])))
+            nz_u = np.nonzero(deg_out)[0]
+            for u in nz_u:
+                s = starts_out[u]
+                d = deg_out[u]
+                out_tgt_idx_np[u, :d] = v_sorted2[s:s + d]
+                out_w_np[u, :d] = w_sorted2[s:s + d]
+        self.outgoing_tgt_idx = torch.from_numpy(out_tgt_idx_np).to(device)  # [N, M_out]
+        self.outgoing_w = torch.from_numpy(out_w_np).to(device)              # [N, M_out]
+
+
         # 4) 纯GPU三元组分组结构（唯一键、分组起始/大小、排序后的节点索引）
         mins = self.node_triplets.min(dim=0).values.to(torch.int64)
         maxs = self.node_triplets.max(dim=0).values.to(torch.int64)
@@ -113,18 +139,96 @@ class WaypointGraphGPU:
         self.triplet_group_starts = starts
         self.triplet_group_counts = counts
         self.nodes_sorted_by_triplet = order_nodes2
+        
+        # 缓存（offset位掩码、终点树）
+        self._offset_masks_cache = {}
+        
+        # 预计算所有终点组的最短路径树，使用张量存储
+        self._precompute_all_end_trees_tensor()
+
+    def _precompute_all_end_trees_tensor(self):
+        """为每个终点组预计算最短路径树，使用张量存储"""
+        device = self.device
+        U = self.triplet_unique_keys.numel()
+        N = self.outgoing_tgt_idx.size(0)
+        
+        print(f"预计算 {U} 个终点组的最短路径树（张量存储）...")
+        start_time = time.time()
+        
+        # 预分配张量存储所有终点组的结果
+        # dist_tensor: [U, N] - 每个终点组到所有节点的最短距离
+        # next_tensor: [U, N] - 每个终点组的最短路径下一跳
+        dist_tensor = torch.full((U, N), float('inf'), dtype=torch.float32, device=device)
+        next_tensor = torch.full((U, N), -1, dtype=torch.long, device=device)
+        
+        # 批量构建所有终点组的最短路径树
+        for g in range(U):
+            dist_g, next_g = self._build_end_tree(g)
+            dist_tensor[g] = dist_g
+            next_tensor[g] = next_g
+        
+        self.end_dist_tensor = dist_tensor  # [U, N]
+        self.end_next_tensor = next_tensor  # [U, N]
+        
+        end_time = time.time()
+        print(f"终点组预计算完成，耗时: {end_time - start_time:.4f}秒")
+
+    def _build_end_tree(self, end_group_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """为给定终点组构建最短路径树"""
+        device = self.device
+        N = self.outgoing_tgt_idx.size(0)
+        
+        # 终点组内所有节点
+        start = self.triplet_group_starts[end_group_id]
+        count = self.triplet_group_counts[end_group_id]
+        nodes = self.nodes_sorted_by_triplet[start:start + count]
+        
+        dist = torch.full((N,), float('inf'), dtype=torch.float32, device=device)
+        next_idx = torch.full((N,), -1, dtype=torch.long, device=device)
+        if count > 0:
+            dist.index_fill_(0, nodes, 0.0)
+        
+        # Bellman-Ford 松弛
+        for _ in range(max(1, N - 1)):
+            tgt_d = dist[self.outgoing_tgt_idx]           # [N, M_out]
+            cand = tgt_d + self.outgoing_w                # [N, M_out]
+            new_d, min_pos = torch.min(cand, dim=1)       # [N]
+            improved = new_d < dist
+            if not torch.any(improved):
+                break
+            dist = torch.minimum(dist, new_d)
+            best_v = self.outgoing_tgt_idx.gather(1, min_pos.view(-1, 1)).squeeze(1)  # [N]
+            next_idx[improved] = best_v[improved]
+        
+        return dist, next_idx
+
+    def _get_offset_masks(self, L: int) -> torch.Tensor:
+        """
+        返回形状 [K, L] 的 bool 掩码，第 k 行表示 offset 中第 k 个比特是否为 1。
+        缓存到 (L, device) 键。
+        """
+        device = self.device
+        L = int(L)
+        K = int(max(1, (L - 1).bit_length()))
+        key = (L, device)
+        cached = self._offset_masks_cache.get(key, None)
+        if cached is not None and cached.shape == (K, L):
+            return cached
+        offsets = torch.arange(L, device=device, dtype=torch.long).unsqueeze(0)  # [1,L]
+        bits = torch.arange(K, device=device, dtype=torch.long).unsqueeze(1)     # [K,1]
+        use = ((offsets >> bits) & 1).to(torch.bool)                              # [K,L]
+        self._offset_masks_cache[key] = use
+        return use
 
     def batch_shortest_paths_fixed_len(self,
                                    start_ids: torch.Tensor,
                                    end_ids: torch.Tensor,
                                    fixed_len: int = 100,
-                                   max_iter: Optional[int] = None,
                                    pad_value: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         返回: (paths, mask)
             paths: [B, L, 3] long，三元组 (cross, road, lane)，用 pad_value 填充
             mask:  [B, L] bool，True 表示该步有效
-        
         Args:
             start_ids: [B, 3] long tensor，起点三元组 (cross, road, lane)
             end_ids: [B, 3] long tensor，终点三元组 (cross, road, lane)
@@ -133,143 +237,131 @@ class WaypointGraphGPU:
             raise ValueError(f"start_ids 与 end_ids 形状必须一致，got {start_ids.shape} vs {end_ids.shape}")
         if start_ids.dim() != 2 or start_ids.size(1) != 3:
             raise ValueError(f"start_ids 必须是 [B, 3] 形状，got {start_ids.shape}")
-    
+        
         device = self.device
-        N, M = self.incoming_src_idx.shape
+        N = self.outgoing_tgt_idx.size(0)
+        U = self.end_dist_tensor.size(0)
         B = start_ids.size(0)
+        L = int(fixed_len)
         
         # 确保张量在正确设备上
         start_tensor = start_ids.to(device=device, dtype=torch.long)
         end_tensor = end_ids.to(device=device, dtype=torch.long)
         
-        dist = torch.full((B, N), float('inf'), dtype=torch.float32, device=device)
-        prev = torch.full((B, N), -1, dtype=torch.long, device=device)
+        # 输出张量
+        triplets = torch.full((B, L, 3), pad_value, dtype=torch.long, device=device)
+        mask = torch.zeros((B, L), dtype=torch.bool, device=device)
         
-        # 批量映射 start_ids -> 节点集合
+        # 将三元组映射为组id
         s_off = (start_tensor - self._triplet_mins)
         s_keys = s_off[:, 0] * self._triplet_mul_cross + s_off[:, 1] * self._triplet_mul_road + s_off[:, 2]
-        pos = torch.searchsorted(self.triplet_unique_keys, s_keys)
-        pos = torch.clamp(pos, 0, self.triplet_unique_keys.numel() - 1)
-        matched = self.triplet_unique_keys[pos] == s_keys
-        if torch.any(matched):
-            b_idx = torch.nonzero(matched, as_tuple=False).squeeze(1)
-            g_starts = self.triplet_group_starts[pos[b_idx]]
-            g_counts = self.triplet_group_counts[pos[b_idx]]
-            max_c = int(g_counts.max().item())
-            if max_c > 0:
-                ar = torch.arange(max_c, device=device, dtype=torch.int64)
-                grid = g_starts.unsqueeze(1) + ar.unsqueeze(0)
-                valid = ar.unsqueeze(0) < g_counts.unsqueeze(1)
-                # 避免非法索引：先将 grid clamp 到合法范围，再结合 valid 掩码使用
-                grid_clamped = torch.clamp(grid, 0, self.nodes_sorted_by_triplet.numel() - 1)
-                nodes_mat = self.nodes_sorted_by_triplet[grid_clamped]
-                node_idx_flat = nodes_mat[valid]
-                b_grid = b_idx.unsqueeze(1).expand(-1, max_c)
-                b_flat = b_grid[valid]
-                dist[b_flat, node_idx_flat] = 0.0
+        pos_s = torch.searchsorted(self.triplet_unique_keys, s_keys)
+        pos_s = torch.clamp(pos_s, 0, U - 1)
+        matched_s = self.triplet_unique_keys[pos_s] == s_keys  # [B]
 
-        if max_iter is None:
-            max_iter = max(1, N - 1)
-        gather_index = self.incoming_src_idx.unsqueeze(0).expand(B, -1, -1)
-        w_broadcast = self.incoming_w.unsqueeze(0).expand(B, -1, -1)
-
-        loop1_time = time.time()
-        for _ in range(max_iter):
-            # dist: [B, N]; gather 索引为 [B, N, M]，先在 dim=1 上扩展为 [B, N, N]
-            dist_expanded = dist.unsqueeze(1).expand(B, N, -1)
-            src_dists = dist_expanded.gather(2, gather_index)     # [B, N, M]
-            cand = src_dists + w_broadcast                        # [B, N, M]
-            new_dist_v, min_src_j = torch.min(cand, dim=2)        # [B, N]
-            improved = new_dist_v < dist
-            if not torch.any(improved):
-                break
-            # 更新距离
-            dist = torch.minimum(dist, new_dist_v)
-            # 计算该最小候选对应的真实 src 索引
-            chosen_src = self.incoming_src_idx.unsqueeze(0).expand(B, -1, -1)
-            chosen_src = chosen_src.gather(2, min_src_j.unsqueeze(2)).squeeze(2)  # [B, N]
-            # 仅在改进处更新 prev
-            prev[improved] = chosen_src[improved]
-        
-        loop1_time = time.time() - loop1_time
-        print(f"loop1_time: {loop1_time:.4f}秒")
-
-        # 选择每个 b 的终点节点（在 end_ids 对应集合中距离最小者）
-        end_node_idx = torch.full((B,), -1, dtype=torch.long, device=device)
         e_off = (end_tensor - self._triplet_mins)
         e_keys = e_off[:, 0] * self._triplet_mul_cross + e_off[:, 1] * self._triplet_mul_road + e_off[:, 2]
         pos_e = torch.searchsorted(self.triplet_unique_keys, e_keys)
-        pos_e = torch.clamp(pos_e, 0, self.triplet_unique_keys.numel() - 1)
-        matched_e = self.triplet_unique_keys[pos_e] == e_keys
+        pos_e = torch.clamp(pos_e, 0, U - 1)
+        matched_e = self.triplet_unique_keys[pos_e] == e_keys  # [B]
+
+        # 预取 offsets 掩码
+        use_masks = self._get_offset_masks(L)
+        K = use_masks.shape[0]
+
+        # 向量化处理所有批次
         if torch.any(matched_e):
-            b_idx_e = torch.nonzero(matched_e, as_tuple=False).squeeze(1)
-            g_starts_e = self.triplet_group_starts[pos_e[b_idx_e]]
-            g_counts_e = self.triplet_group_counts[pos_e[b_idx_e]]
-            max_c_e = int(g_counts_e.max().item())
-            if max_c_e > 0:
-                ar = torch.arange(max_c_e, device=device, dtype=torch.int64)
-                grid = g_starts_e.unsqueeze(1) + ar.unsqueeze(0)
-                valid = ar.unsqueeze(0) < g_counts_e.unsqueeze(1)
-                grid_clamped = torch.clamp(grid, 0, self.nodes_sorted_by_triplet.numel() - 1)
-                nodes_mat = self.nodes_sorted_by_triplet[grid_clamped]
-                d_mat = dist[b_idx_e.unsqueeze(1), nodes_mat]
-                d_mat = d_mat.masked_fill(~valid, float('inf'))
-                min_vals, min_pos = torch.min(d_mat, dim=1)
-                chosen = nodes_mat.gather(1, min_pos.unsqueeze(1)).squeeze(1)
-                ok = torch.isfinite(min_vals)
-                end_node_idx[b_idx_e[ok]] = chosen[ok]
+            # 获取所有有效的终点组
+            valid_b = torch.nonzero(matched_e, as_tuple=False).squeeze(1)
+            end_groups = pos_e[valid_b]  # [valid_B]
+            
+            # 获取对应的距离和下一跳张量
+            dist_groups = self.end_dist_tensor[end_groups]  # [valid_B, N]
+            next_groups = self.end_next_tensor[end_groups]  # [valid_B, N]
+            
+            # 为每个批次选择起点：从其 start 组内选 dist_g 最小的节点
+            start_pos_sel = pos_s[valid_b]  # [valid_B]
+            start_matched_sel = matched_s[valid_b]  # [valid_B]
+            
+            # 初始化起点节点索引
+            start_node_idx = torch.full((valid_b.numel(),), -1, dtype=torch.long, device=device)
+            
+            if torch.any(start_matched_sel):
+                # 找到匹配的起点组
+                matched_start_b = torch.nonzero(start_matched_sel, as_tuple=False).squeeze(1)  # [matched_B]
+                matched_start_groups = start_pos_sel[matched_start_b]  # [matched_B]
+                
+                # 获取这些起点组的信息
+                g_starts = self.triplet_group_starts[matched_start_groups]  # [matched_B]
+                g_counts = self.triplet_group_counts[matched_start_groups]  # [matched_B]
+                max_c = int(g_counts.max().item())
+                
+                if max_c > 0:
+                    # 构建网格索引
+                    ar = torch.arange(max_c, device=device, dtype=torch.int64)
+                    grid = g_starts.unsqueeze(1) + ar.unsqueeze(0)  # [matched_B, max_c]
+                    valid = ar.unsqueeze(0) < g_counts.unsqueeze(1)  # [matched_B, max_c]
+                    
+                    # 安全索引
+                    grid_clamped = torch.clamp(grid, 0, self.nodes_sorted_by_triplet.numel() - 1)
+                    nodes_mat = self.nodes_sorted_by_triplet[grid_clamped]  # [matched_B, max_c]
+                    
+                    # 获取对应的距离
+                    dist_mat = dist_groups[matched_start_b.unsqueeze(1), nodes_mat]  # [matched_B, max_c]
+                    dist_mat = dist_mat.masked_fill(~valid, float('inf'))
+                    
+                    # 找到最小距离的节点
+                    min_vals, min_pos = torch.min(dist_mat, dim=1)  # [matched_B]
+                    chosen = nodes_mat.gather(1, min_pos.unsqueeze(1)).squeeze(1)  # [matched_B]
+                    ok = torch.isfinite(min_vals)
+                    
+                    # 更新起点节点索引
+                    start_node_idx[matched_start_b[ok]] = chosen[ok]
+            
+            # 向量化二进制跳转
+            valid_count = valid_b.numel()
+            if valid_count > 0:
+                # 准备跳转张量
+                v = start_node_idx.view(valid_count, 1).expand(-1, L)  # [valid_B, L]
+                cur = next_groups  # [valid_B, N]
+                
+                # 二进制跳转
+                for bit in range(K):
+                    use = use_masks[bit].view(1, L).expand(valid_count, -1)  # [valid_B, L]
+                    if torch.any(use):
+                        safe_v = torch.clamp(v, 0, N - 1)
+                        jumped = cur.gather(1, safe_v)  # [valid_B, L]
+                        jumped = torch.where(v >= 0, jumped, torch.full_like(v, -1))
+                        v = torch.where(use, jumped, v)
+                    
+                    # 自合成：cur = cur ∘ cur
+                    last = cur
+                    safe_idx = torch.clamp(last, 0, N - 1)
+                    nxt = last.gather(1, safe_idx)
+                    cur = torch.where(last >= 0, nxt, torch.full_like(last, -1))
+                
+                # 构建路径
+                path_idx = v  # [valid_B, L] - 已是从起点到终点方向
+                local_mask = path_idx >= 0  # [valid_B, L]
+                
+                # 左对齐（保持列内顺序）
+                if torch.any(local_mask):
+                    col_idx = torch.arange(L, device=device).view(1, L).expand(valid_count, -1)
+                    order_score = (~local_mask).to(torch.long) * L + col_idx
+                    order = torch.argsort(order_score, dim=1, stable=True)
+                    path_idx = path_idx.gather(1, order)
+                    local_mask = local_mask.gather(1, order)
+    
+                # 映射到三元组
+                tris = torch.full((valid_count, L, 3), pad_value, dtype=torch.long, device=device)
+                if torch.any(local_mask):
+                    flat_idx = path_idx[local_mask]
+                    tris_flat = self.node_triplets.index_select(0, flat_idx)
+                    tris[local_mask] = tris_flat
+                # 回填到全局输出
+                triplets[valid_b] = tris
+                mask[valid_b] = local_mask
 
-        # 回溯固定步长 L：用二进制 lifting 去掉逐步回溯循环
-        L = int(fixed_len)
-        K = int(max(1, (L - 1).bit_length()))
-
-        loop2_time = time.time()
-        # 构建 jump 表: ancestors[k] 表示沿 prev 前进 2^k 步的映射
-        ancestors = [prev]
-        for _k in range(1, K):
-            last = ancestors[-1]
-            safe_idx = torch.clamp(last, 0, N - 1)
-            nxt = last.gather(1, safe_idx)
-            nxt = torch.where(last >= 0, nxt, torch.full_like(last, -1))
-            ancestors.append(nxt)
-        loop2_time = time.time() - loop2_time
-        print(f"loop2_time: {loop2_time:.4f}秒")
-
-        loop3_time = time.time()
-        # 为每个列偏移 0..L-1 计算对应的祖先，向量化处理
-        offsets = torch.arange(L, device=device, dtype=torch.long).view(1, L).expand(B, -1)  # [B,L]
-        v = end_node_idx.view(B, 1).expand(-1, L)  # [B,L]
-        for bit in range(K):
-            step = 1 << bit
-            use = ((offsets >> bit) & 1).to(torch.bool)
-            if torch.any(use):
-                safe_v = torch.clamp(v, 0, N - 1)
-                jumped = ancestors[bit].gather(1, safe_v)
-                jumped = torch.where(v >= 0, jumped, torch.full_like(v, -1))
-                v = torch.where(use, jumped, v)
-        loop3_time = time.time() - loop3_time
-        print(f"loop3_time: {loop3_time:.4f}秒")
-
-        path_idx = v  # [B,L] 从终点回溯 offset 步的节点索引（倒序）
-        # 源->终点顺序与有效掩码
-        path_idx = torch.flip(path_idx, dims=[1])
-        mask = path_idx >= 0
-        # 将有效位置左对齐（保持列内顺序稳定）
-        if torch.any(mask):
-            col_idx = torch.arange(L, device=device).view(1, L).expand(B, -1)
-            order_score = (~mask).to(torch.long) * L + col_idx
-            order = torch.argsort(order_score, dim=1, stable=True)
-            path_idx = path_idx.gather(1, order)
-            mask = mask.gather(1, order)
-        # 将节点索引映射为 (cross, road, lane)
-        triplets = torch.full((B, L, 3), pad_value, dtype=torch.long, device=device)
-        valid_mask = mask
-        if torch.any(valid_mask):
-            r = valid_mask
-            # 扁平 gather
-            flat_idx = path_idx[r]
-            triplets_flat = self.node_triplets.index_select(0, flat_idx)
-            triplets[r] = triplets_flat
         return triplets, mask
 
 if __name__ == '__main__':
@@ -312,7 +404,6 @@ if __name__ == '__main__':
         start_ids=start_ids,
         end_ids=end_ids,
         fixed_len=args.fixed_len,
-        max_iter=None,
     )
     end_time = time.time()
     print(f"batch_shortest_paths_fixed_len 耗时: {end_time - start_time:.4f}秒")

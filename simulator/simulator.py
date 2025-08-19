@@ -14,7 +14,7 @@ if utils_dir not in sys.path:
 simulator_dir = os.path.join(parent_dir, 'simulator')
 if simulator_dir not in sys.path:
     sys.path.insert(0, simulator_dir)
-
+    
 from spatial_hash import SpatialHash
 from road import RoadNetwork
 from offroad import OffroadChecker
@@ -362,7 +362,8 @@ class TeraflowSimulator:
         """
         可视化当前所有环境的状态，绘制激活的智能体为矩形。
         """
-        print("Rendering function is not implemented yet.")
+        print("Rendering function is not implemented yet.") 
+
 if __name__ == '__main__':
     # 这是一个简单的使用示例，用于测试模拟器的基本功能
     # 从配置文件读取配置
@@ -370,6 +371,7 @@ if __name__ == '__main__':
     import numpy as np
     from matplotlib.patches import Polygon
     from matplotlib.collections import PatchCollection
+    
     config_path = 'configs/default_config.yaml'
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
@@ -460,6 +462,27 @@ if __name__ == '__main__':
             info_text = f'v={speed:.1f}m/s'
             ax.text(x, y + half_width + 1, info_text, ha='center', va='bottom', 
                    fontsize=8, color=color, weight='bold')
+            
+    # 绘制每个智能体的路径（过滤掉 -1,-1）
+    if simulator.agents_path_plans is not None:
+        try:
+            paths_np = simulator.agents_path_plans[0].detach().cpu().numpy()  # (M, L, 2)
+        except Exception:
+            paths_np = simulator.agents_path_plans.detach().cpu().numpy()      # (M, L, 2)
+        M_paths = paths_np.shape[0]
+        # 若颜色表不存在，则创建一个
+        if 'colors' not in locals():
+            colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+        for m in range(M_paths):
+            coords = paths_np[m]  # (L,2)
+            mask_valid = (coords[:, 0] != -1) & (coords[:, 1] != -1)
+            valid = coords[mask_valid]
+            if valid.shape[0] == 0:
+                continue
+            col = colors[m % len(colors)]
+            ax.scatter(valid[0, 0], valid[0, 1], c=col, s=16, zorder=4)
+            ax.scatter(valid[-1, 0], valid[-1, 1], c=col, s=16, marker='x', zorder=4)
+
     # 设置图形属性
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
@@ -477,6 +500,8 @@ if __name__ == '__main__':
     print(f"激活智能体数量: {len(active_agents)}")
     plt.tight_layout()
     plt.show()
+    print(simulator.agents_path_plans)
+
     
     
     

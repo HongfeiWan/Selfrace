@@ -1,40 +1,89 @@
+from networkx import to_dict_of_dicts
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 from torch.optim import Adam
-import numpy as np
+
 from collections import deque
+
 from network import SharedNetwork, create_network
+
+import numpy as np
 import yaml
 import os
 import time
 
+#Todo: 优势归一化
+
 class ExperienceBuffer:
     """经验回放缓冲区 - 支持8张显卡的大规模训练"""
-    def __init__(self, capacity=50000):
+    def __init__(self, capacity=int):
         self.capacity = capacity
         self.buffer = deque(maxlen=capacity)
     def push(self, experience):
         """添加经验到缓冲区"""
         self.buffer.append(experience)
-        
     def sample(self, batch_size):
         """采样经验批次"""
         if len(self.buffer) < batch_size:
             return None
-
         indices = np.random.choice(len(self.buffer), batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
         return batch
-
     def clear(self):
         """清空缓冲区"""
         self.buffer.clear()
-        
     def __len__(self):
         return len(self.buffer)
+
+class AdvantageFilter:
+    """优势过滤器 - 实现 Algorithm 1"""
+    def __init__(self, beta=0.25, eta_multiplier=0.01):
+        self.beta = beta  # EWMA衰减参数
+        self.eta_multiplier = eta_multiplier  # 过滤阈值乘数
+        self.amax_ewma = None  # 指数加权移动平均的最大优势值
+        
+    def compute_gae(self, rewards, values, dones, gamma=0.999, gae_lambda=0.95):
+        """计算广义优势估计 (GAE)"""
+        advantages = []
+        gae = 0
+        
+        for i in reversed(range(len(rewards))):
+            if i == len(rewards) - 1:
+                next_value = 0
+            else:
+                next_value = values[i + 1]
+            
+            delta = rewards[i] + gamma * next_value * (1 - dones[i]) - values[i]
+            gae = delta + gamma * gae_lambda * (1 - dones[i]) * gae
+            advantages.insert(0, gae)
+        
+        return torch.tensor(advantages)
+    
+    def update_amax_ewma(self, advantages, iteration):
+        """更新最大优势值的指数加权移动平均"""
+        current_amax = torch.abs(advantages).max().item()
+        
+        if iteration == 0:
+            self.amax_ewma = current_amax
+        else:
+            self.amax_ewma = self.beta * self.amax_ewma + (1 - self.beta) * current_amax
+    
+    def filter_experiences(self, experiences, advantages, iteration):
+        """根据 Algorithm 1 过滤经验"""
+        # 更新 EWMA
+        self.update_amax_ewma(advantages, iteration)
+        
+        # 计算过滤阈值
+        eta = self.eta_multiplier * self.amax_ewma
+        
+        # 过滤经验
+        filtered_indices = torch.abs(advantages) < eta
+        filtered_experiences = [exp for i, exp in enumerate(experiences) if filtered_indices[i]]
+        
+        return filtered_experiences, eta
 
 class DistributedPPOTrainer:
     """分布式PPO训练器 - 支持8张显卡并行训练"""
@@ -42,7 +91,7 @@ class DistributedPPOTrainer:
         self.config = config
         self.device = torch.device(config.device)
         self.rank = int(config.device.split(':')[1]) if ':' in config.device else 0
-        
+
         # 从配置文件加载分布式设置
         self.world_size = config.distributed.get('world_size', 8)  # 8张显卡
         self.envs_per_gpu = config.distributed.get('envs_per_gpu', 4800)  # 每个GPU 4800个环境
@@ -51,6 +100,7 @@ class DistributedPPOTrainer:
         
         # 特征维度配置 - 根据GIGAFLOW论文
         # 注意：vehicle_state维度将通过ObservationGenerator动态计算
+
         self.feature_dims = {
             'road_boundary': 20,    # 道路边界特征
             'lane_points': 30,       # 车道点特征
@@ -76,6 +126,15 @@ class DistributedPPOTrainer:
             'value_loss': 0.0,
             'start_time': time.time()
         }
+        
+        # 添加优势过滤器
+        self.advantage_filter = AdvantageFilter(
+            beta=0.25,  # EWMA衰减参数
+            eta_multiplier=0.01  # 过滤阈值乘数
+        )
+        
+        # 训练迭代计数器
+        self.training_iteration = 0
         
     def setup_distributed(self):
         """初始化分布式环境 - 8张显卡配置"""
@@ -346,12 +405,11 @@ class TrainingConfig:
         with open(config_path, 'r', encoding='utf-8') as f:
             config_data = yaml.safe_load(f)
         
-        # 设置设备配置
-        self.device = config_data['simulator']['device']
-        
         # 分布式配置
-        self.distributed = config_data['simulator']['distributed']
-        
+        self.distributed = config_data['training']['distributed']
+        # 设置设备配置
+        self.device = config_data['training']['distributed']['device']
+    
         # 训练配置
         self.training = config_data['training']
         
@@ -426,11 +484,9 @@ if __name__ == "__main__":
     # 检查CUDA可用性
     if not torch.cuda.is_available():
         exit(1)
-    
     # 检查GPU数量
     gpu_count = torch.cuda.device_count()
     if gpu_count == 0:
         exit(1)
-    
     # 启动分布式训练
     main()
