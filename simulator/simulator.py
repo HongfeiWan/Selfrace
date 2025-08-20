@@ -190,6 +190,7 @@ class TeraflowSimulator:
 
         # 7. 检查是否结束（包含目标到达判断）
         done = self._check_done(all_collisions, offroad_mask, goal_reached)
+
         return observation, reward, done
     
     def _get_observation(self) -> torch.Tensor:
@@ -289,6 +290,7 @@ class TeraflowSimulator:
             goal_positions=goal_positions,
             waypoint_reached=waypoint_reached,
         )
+        self.extend_state = extended_state # 用于传入网络
         return reward, goal_reached
     
     def _check_done(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, goal_reached: torch.Tensor = None) -> torch.Tensor:
@@ -480,7 +482,8 @@ if __name__ == '__main__':
             if valid.shape[0] == 0:
                 continue
             col = colors[m % len(colors)]
-            ax.scatter(valid[0, 0], valid[0, 1], c=col, s=16, zorder=4)
+            ax.scatter(valid[:, 0], valid[:, 1], color=col , s=5)
+            ax.scatter(valid[0, 0], valid[0, 1], c=col, s=16, marker='x', zorder=4)
             ax.scatter(valid[-1, 0], valid[-1, 1], c=col, s=16, marker='x', zorder=4)
 
     # 设置图形属性

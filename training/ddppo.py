@@ -15,6 +15,7 @@ import yaml
 import os
 import time
 
+
 #Todo: 优势归一化
 
 class ExperienceBuffer:
@@ -38,11 +39,12 @@ class ExperienceBuffer:
     def __len__(self):
         return len(self.buffer)
 
+
 class AdvantageFilter:
     """优势过滤器 - 实现 Algorithm 1"""
-    def __init__(self, beta=0.25, eta_multiplier=0.01):
+    def __init__(self, beta=0.25, advantage_filter_threshold=0.01):
         self.beta = beta  # EWMA衰减参数
-        self.eta_multiplier = eta_multiplier  # 过滤阈值乘数
+        self.advantage_filter_threshold = advantage_filter_threshold  # 过滤阈值乘数
         self.amax_ewma = None  # 指数加权移动平均的最大优势值
         
     def compute_gae(self, rewards, values, dones, gamma=0.999, gae_lambda=0.95):
@@ -77,7 +79,7 @@ class AdvantageFilter:
         self.update_amax_ewma(advantages, iteration)
         
         # 计算过滤阈值
-        eta = self.eta_multiplier * self.amax_ewma
+        eta = self.advantage_filter_threshold * self.amax_ewma
         
         # 过滤经验
         filtered_indices = torch.abs(advantages) < eta
@@ -130,7 +132,7 @@ class DistributedPPOTrainer:
         # 添加优势过滤器
         self.advantage_filter = AdvantageFilter(
             beta=0.25,  # EWMA衰减参数
-            eta_multiplier=0.01  # 过滤阈值乘数
+            advantage_filter_threshold=0.01  # 过滤阈值乘数
         )
         
         # 训练迭代计数器
