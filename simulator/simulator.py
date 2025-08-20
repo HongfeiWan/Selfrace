@@ -32,7 +32,7 @@ class TeraflowSimulator:
     负责管理和步进一个批次 (batch) 的交通模拟环境。
     它的设计遵循 GigaFlow 的核心思想：批量化、可微分（未来）以及与自博弈循环的兼容性。
     """
-    def __init__(self, config: Dict):
+    def __init__(self, config:Dict, device: torch.device):
         """
         初始化模拟器。
         Args:
@@ -44,9 +44,8 @@ class TeraflowSimulator:
                 - ... 其他配置，如车辆参数等
         """
         self.config = config
+        self.device = device
         simulator_config = config.get('simulator')
-
-        self.device = torch.device(simulator_config['device'])
         self.num_envs = simulator_config['num_envs']
         self.dt = simulator_config['sim_dt']
         self.map_path = simulator_config['map_path']
@@ -114,13 +113,12 @@ class TeraflowSimulator:
         
         # 生成初始观测
         print("Generating initial observation...") 
-        initial_observation = self._get_observation()
+        initial_observation = self.observation_generator.generate(self.agents_state)
         print("Initial observation generated")
 
         # 初始化路径规划器 - 为所有智能体分配目标和生成路径规划
         self._initialize_path_planning()
         print("Path planning initialized")
-
         print(f"Reset complete. World state shape: {self.agents_state.shape}")
         return initial_observation
     
@@ -183,23 +181,15 @@ class TeraflowSimulator:
         d, theta_f = self.road_network.calculate_frenet_coordinates(vehicle_positions, vehicle_headings)
         
         # 5. 生成新的观测
-        observation = self._get_observation()
+        observation = self.observation_generator.generate(self.agents_state)
         
         # 6. 计算奖励（传入Frenet坐标和动作）
         reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
 
         # 7. 检查是否结束（包含目标到达判断）
-        done = self._check_done(all_collisions, offroad_mask, goal_reached)
-
+        done = all_collisions|offroad_mask|goal_reached
         return observation, reward, done
     
-    def _get_observation(self) -> torch.Tensor:
-        """
-        调用观测生成器为所有智能体生成观测。
-        """
-        # 修正：移除循环，直接调用已完全向量化的观测生成器
-        return self.observation_generator.generate(self.agents_state)
-
     def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         为所有智能体计算奖励。
@@ -258,29 +248,10 @@ class TeraflowSimulator:
         extended_state[..., 8] = theta_f  # theta_f - Frenet角度误差
         extended_state[..., 9] = d        # d - Frenet横向距离
         # 准备目标奖励计算的参数
-        goal_positions = None
-        waypoint_reached = None
-        # 如果有路径规划信息，计算目标奖励
-        if self.agents_goal_quad_ids is not None and self.agents_path_plans is not None:
-            # 获取智能体当前位置
-            agent_positions = self.agents_state[..., :2]  # (B, M, 2)
-            # 获取目标位置（从路径规划中获取最后一个有效点）
-            B, M, path_length, _ = self.agents_path_plans.shape
-            goal_positions = torch.zeros((B, M, 2), device=self.device)
-            # 为每个智能体找到路径中的最后一个有效点作为目标
-            for b in range(B):
-                for m in range(M):
-                    path = self.agents_path_plans[b, m]  # (path_length, 2)
-                    # 找到最后一个非零点
-                    valid_points = path[path.sum(dim=1) != 0]  # 过滤掉零值点
-                    if len(valid_points) > 0:
-                        goal_positions[b, m] = valid_points[-1]  # 最后一个有效点作为目标
-                    else:
-                        # 如果没有有效路径点，使用当前位置
-                        goal_positions[b, m] = agent_positions[b, m]
-            # waypoint_reached计算
-            distances_to_goal = torch.norm(agent_positions - goal_positions, dim=-1)
-            waypoint_reached = distances_to_goal < 5.0  # 5米内认为到达路点
+
+        goal_positions = self.path_planner.get_quad_centers(self.agents_goal_quad_ids)
+        goal_reached = False
+
         # 调用奖励计算器
         reward, goal_reached = self.reward_calculator.calculate(
             extended_state,
@@ -288,21 +259,11 @@ class TeraflowSimulator:
             offroad_mask,
             dt=self.dt,
             goal_positions=goal_positions,
-            waypoint_reached=waypoint_reached,
+            waypoint_reached=goal_reached,
         )
+        
         self.extend_state = extended_state # 用于传入网络
         return reward, goal_reached
-    
-    def _check_done(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, goal_reached: torch.Tensor = None) -> torch.Tensor:
-        """
-        为所有智能体检查是否应该结束。
-        """
-        # 碰撞或离路都会导致结束
-        done = all_collisions | offroad_mask
-        # 如果提供了目标到达标志，将其也作为结束条件
-        if goal_reached is not None:
-            done = done | goal_reached
-        return done
     
     def _initialize_path_planning(self):
         """
@@ -360,11 +321,6 @@ class TeraflowSimulator:
         self.agents_goal_quad_ids = goal_quad_ids
         self.agents_path_plans = path_plans 
 
-    def render(self):
-        """
-        可视化当前所有环境的状态，绘制激活的智能体为矩形。
-        """
-        print("Rendering function is not implemented yet.") 
 
 if __name__ == '__main__':
     # 这是一个简单的使用示例，用于测试模拟器的基本功能
@@ -377,7 +333,8 @@ if __name__ == '__main__':
     config_path = 'configs/default_config.yaml'
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    simulator = TeraflowSimulator(config=config)
+
+    simulator = TeraflowSimulator(config=config, device=torch.device('cuda:0'))
     initial_obs = simulator.reset()
     print(f"Initial observation batch shape: {initial_obs.shape}")
     # 可视化道路网络和智能体位置（优化版本）
