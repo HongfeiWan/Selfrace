@@ -23,7 +23,6 @@ from collision import CollisionChecker
 
 class WorldInitializer:
     """
-    已经检查,无需更改,已经通过测试
     负责在模拟开始时初始化一批（batch）世界状态。
     遵循论文中的核心思想，通过迭代和拒绝采样，确保生成的初始交通流
     是无碰撞且在道路上的，从而为训练提供高质量的初始场景。
@@ -56,6 +55,10 @@ class WorldInitializer:
     def _generate_states_on_quads(self, quad_indices: torch.Tensor) -> torch.Tensor:
         """
         在指定的道路四边形上生成车辆状态。
+        Args:
+            quad_indices: 形状为 (num_vehicles,) 的四边形索引张量
+        Returns:
+            形状为 (num_vehicles, 7) 的车辆状态张量
         """
         num_vehicles = len(quad_indices)
         if num_vehicles == 0:
@@ -69,10 +72,10 @@ class WorldInitializer:
         
         centerline_vecs = centerlines[:, 1, :] - centerlines[:, 0, :]
         yaws = torch.atan2(centerline_vecs[:, 1], centerline_vecs[:, 0])
-        
+    
         speeds = (self.speed_range[0] + 
                   (self.speed_range[1] - self.speed_range[0]) * torch.rand(num_vehicles, device=self.device))
-        
+    
         new_states = torch.zeros(num_vehicles, 7, device=self.device)
         new_states[:, :2] = positions
         new_states[:, 2] = yaws
@@ -82,70 +85,74 @@ class WorldInitializer:
         new_states[:, 6] = 1.0
         return new_states
 
+
     def initialize_world(self, num_envs: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         生成一批新的、无碰撞的世界状态。
-        采用序贯放置和验证的策略，确保初始化的交通流是有效的。
+        采用并行生成和迭代优化的策略，确保初始化的交通流是有效的。
         """
-        logging.info(f"Initializing {num_envs} collision-free environments with up to {self.num_agents_per_env} agents each...")
-        agents_state = torch.zeros(num_envs, self.max_agents, self.local_state_dim, device=self.device)
         # 存储每个智能体的起始quad_id
+        agents_state = torch.zeros(num_envs, self.max_agents, self.local_state_dim, device=self.device)
         agents_start_quad_ids = torch.full((num_envs, self.max_agents), -1, dtype=torch.long, device=self.device)
         
-        # 序贯地为每个 agent slot (0, 1, 2, ...) 在所有环境中放置车辆
-        for i in range(self.num_agents_per_env):
-            max_retries = 10
-            for retry in range(max_retries):
-                # 1. 为当前 slot 在所有 envs 中生成候选状态
-                spawn_quad_indices = torch.randint(
-                    0, self.road_network.num_quads, (num_envs,), device=self.device
-                )
-                candidate_states = self._generate_states_on_quads(spawn_quad_indices)
-                
-                # 将候选状态放入一个临时的世界状态张量中进行检查
-                temp_agents_state = agents_state.clone()
-                temp_agents_state[:, i] = candidate_states
-                
-                # 2. 检查有效性 (离路和碰撞)
-                # 只检查新加入的 agent (在 slot i)
-                states_to_check = temp_agents_state[:, i]
-                
-                # a) 离路检查
-                offroad_states_for_checker = states_to_check[:, [0, 1, 2, 4, 5]]
-                is_on_road = self.offroad_checker.check_on_road(offroad_states_for_checker)
-                
-                # b) 碰撞检查 (新 agent 与所有已放置的 agents)
-                # 静态碰撞检查，t0 和 t1 状态相同
-                collision_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-                if i > 0:
-                    # check() 返回 (B, M) 的碰撞掩码，我们只关心新 agent 的
-                    collisions = self.collision_checker.check(temp_agents_state, temp_agents_state)
-                    collision_mask = collisions[:, i]
-                
-                # 3. 确定哪些 envs 的放置是无效的
-                invalid_placement_mask = ~is_on_road | collision_mask
-                
-                # 4. 如果所有放置都有效，则跳出重试循环
-                if not invalid_placement_mask.any():
-                    agents_state[:, i] = candidate_states
-                    # 记录有效的quad_id
-                    agents_start_quad_ids[:, i] = spawn_quad_indices
-                    if retry > 0:
-                        logging.debug(f"Slot {i}: Succeeded after {retry+1} retries.")
-                    break
-                
-                # 5. 对于无效的放置，只将有效的候选状态写入最终张量
-                # 这样在下一次重试时，我们只为之前失败的 envs 重新生成
-                valid_mask = ~invalid_placement_mask
-                agents_state[valid_mask, i] = candidate_states[valid_mask]
+        max_retries = 10
+        for retry in range(max_retries):
+            # 1. 并行生成所有环境的所有agent slot的候选状态
+            total_agents = num_envs * self.num_agents_per_env
+            # 为所有agent生成四边形索引
+            spawn_quad_indices = torch.randint(0, self.road_network.num_quads, (total_agents,), device=self.device)
+            # 生成所有候选状态
+            all_candidate_states = self._generate_states_on_quads(spawn_quad_indices)
+            # 重塑为 (num_envs, num_agents_per_env, 7)
+            candidate_states = all_candidate_states.view(num_envs, self.num_agents_per_env, 7)
+            
+            # 2. 将候选状态放入agents_state张量
+            agents_state[:, :self.num_agents_per_env] = candidate_states
+            
+            # 3. 并行检查所有agent的有效性
+            # a) 离路检查 - 检查所有agent
+            all_states_to_check = agents_state[:, :self.num_agents_per_env]  # (num_envs, num_agents_per_env, 7)
+            offroad_states_for_checker = all_states_to_check[:, :, [0, 1, 2, 4, 5]]  # (num_envs, num_agents_per_env, 5)
+            # 重塑为 (num_envs * num_agents_per_env, 5) 以便批量检查
+            offroad_states_flat = offroad_states_for_checker.view(-1, 5)
+            is_on_road_flat = self.offroad_checker.check_on_road(offroad_states_flat)
+            is_on_road = is_on_road_flat.view(num_envs, self.num_agents_per_env)  # (num_envs, num_agents_per_env)
+            
+            # b) 碰撞检查 - 检查所有agent之间的碰撞
+            collisions = self.collision_checker.check(agents_state, agents_state)  # (num_envs, max_agents)
+            collision_mask = collisions[:, :self.num_agents_per_env]  # (num_envs, num_agents_per_env)
+            
+            # 4. 确定哪些放置是无效的
+            invalid_placement_mask = ~is_on_road | collision_mask  # (num_envs, num_agents_per_env)
+            
+            # 5. 如果所有放置都有效，则完成初始化
+            if not invalid_placement_mask.any():
                 # 记录有效的quad_id
-                agents_start_quad_ids[valid_mask, i] = spawn_quad_indices[valid_mask]
+                total_agents = num_envs * self.num_agents_per_env
+                spawn_quad_indices = torch.randint(
+                    0, self.road_network.num_quads, (total_agents,), device=self.device
+                ).view(num_envs, self.num_agents_per_env)
+                agents_start_quad_ids[:, :self.num_agents_per_env] = spawn_quad_indices
                 
-            else: # 如果循环正常结束 (即 retries 耗尽)
-                logging.warning(f"Could not place agent in slot {i} in all environments after {max_retries} retries. Some envs may have fewer agents.")
-                # 将仍然无效的 agent 标记为不激活
-                agents_state[invalid_placement_mask, i, 6] = 0.0
-
+                if retry > 0:
+                    logging.debug(f"All agents placed successfully after {retry+1} retries.")
+                break
+            
+            # 6. 对于无效的放置，将对应的agent标记为不激活
+            # 直接使用切片索引来更新agents_state
+            agents_state[:, :self.num_agents_per_env, 6][invalid_placement_mask] = 0.0
+            
+            # 7. 记录有效的quad_id（对于有效的放置）
+            valid_placement_mask = ~invalid_placement_mask
+            if valid_placement_mask.any():
+                # 为有效的放置记录quad_id
+                total_agents = num_envs * self.num_agents_per_env
+                spawn_quad_indices = torch.randint(
+                    0, self.road_network.num_quads, (total_agents,), device=self.device
+                ).view(num_envs, self.num_agents_per_env)
+                # 使用布尔索引来更新有效的quad_id
+                agents_start_quad_ids[valid_placement_mask] = spawn_quad_indices[valid_placement_mask]
+        
         ego_agents_idx = torch.zeros(num_envs, dtype=torch.int64, device=self.device)
         logging.info("World initialization complete.")
         return agents_state, ego_agents_idx, agents_start_quad_ids

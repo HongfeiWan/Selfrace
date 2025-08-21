@@ -5,6 +5,7 @@ import sys
 from typing import Dict, Tuple, Optional
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
+
 # 依赖于 spatial_hash
 # 添加utils目录到路径
 utils_dir = os.path.join(parent_dir, 'utils')
@@ -110,12 +111,10 @@ class TeraflowSimulator:
         self.agents_state, _, self.agents_start_quad_ids = self.world_initializer.initialize_world(self.num_envs)
         # 将状态数据移动到正确的设备
         self.agents_state = self.agents_state.to(self.device)
-        
         # 生成初始观测
         print("Generating initial observation...") 
         initial_observation = self.observation_generator.generate(self.agents_state)
         print("Initial observation generated")
-
         # 初始化路径规划器 - 为所有智能体分配目标和生成路径规划
         self._initialize_path_planning()
         print("Path planning initialized")
@@ -261,7 +260,6 @@ class TeraflowSimulator:
             goal_positions=goal_positions,
             waypoint_reached=goal_reached,
         )
-        
         self.extend_state = extended_state # 用于传入网络
         return reward, goal_reached
     

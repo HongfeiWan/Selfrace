@@ -1261,12 +1261,26 @@ class PathPlanner:
     
     def get_quad_centers(self, quad_ids: torch.Tensor) -> torch.Tensor:
         """获取指定quad_id的中心点坐标"""
-        if not hasattr(self, 'quads_info') or self.quads_info is None:
-            return torch.zeros(len(quad_ids), 2, device=self.device)
+        # 目前兼容(B, M)和(N=B*M,)两种形状
+        # 保存原始形状
+        original_shape = quad_ids.shape
+        
+        # 如果输入是2D张量 (B, M)，展平为1D
+        if quad_ids.dim() == 2:
+            quad_ids_flat = quad_ids.flatten()
+        else:
+            quad_ids_flat = quad_ids
+
         # 获取quad的中心点坐标
-        center_x = self.quads_info['center_x'][quad_ids]
-        center_y = self.quads_info['center_y'][quad_ids]
-        return torch.stack([center_x, center_y], dim=1)
+        center_x = self.quads_info['center_x'][quad_ids_flat]
+        center_y = self.quads_info['center_y'][quad_ids_flat]
+        centers_flat = torch.stack([center_x, center_y], dim=1)
+        
+        # 如果原始输入是2D，重塑为 (B, M, 2)
+        if len(original_shape) == 2:
+            return centers_flat.view(original_shape[0], original_shape[1], 2)
+        else:
+            return centers_flat
     
     
     def get_nearest_neighbor_info_batch(self, quad_ids: torch.Tensor) -> dict:

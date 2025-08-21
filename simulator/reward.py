@@ -115,6 +115,12 @@ class RewardCalculator:
         """
         B, M, _ = agent_positions.shape
         
+        # 检查并修复goal_positions的形状
+        
+        if goal_positions.dim() == 2 and goal_positions.shape[1] == 2:
+            # 如果goal_positions是 (B*M, 2)，恢复为 (B, M, 2)
+            goal_positions = goal_positions.view(B, M, 2)
+        
         # 计算距离 ||x-g||
         distances = torch.norm(agent_positions - goal_positions, dim=-1)  # (B, M)
         # 距离条件: ||x-g|| < δgoal
