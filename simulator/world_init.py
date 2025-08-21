@@ -10,6 +10,7 @@ from matplotlib.patches import Polygon
 import numpy as np
 import math
 from matplotlib.lines import Line2D
+import time
 
 # 添加simulator目录到路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -85,7 +86,6 @@ class WorldInitializer:
         new_states[:, 6] = 1.0
         return new_states
 
-
     def initialize_world(self, num_envs: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         生成一批新的、无碰撞的世界状态。
@@ -94,10 +94,11 @@ class WorldInitializer:
         # 存储每个智能体的起始quad_id
         agents_state = torch.zeros(num_envs, self.max_agents, self.local_state_dim, device=self.device)
         agents_start_quad_ids = torch.full((num_envs, self.max_agents), -1, dtype=torch.long, device=self.device)
-        
-        max_retries = 10
+        start_time = time.time()
+        max_retries = 1
         for retry in range(max_retries):
             # 1. 并行生成所有环境的所有agent slot的候选状态
+            gen_start = time.time()
             total_agents = num_envs * self.num_agents_per_env
             # 为所有agent生成四边形索引
             spawn_quad_indices = torch.randint(0, self.road_network.num_quads, (total_agents,), device=self.device)
@@ -105,22 +106,29 @@ class WorldInitializer:
             all_candidate_states = self._generate_states_on_quads(spawn_quad_indices)
             # 重塑为 (num_envs, num_agents_per_env, 7)
             candidate_states = all_candidate_states.view(num_envs, self.num_agents_per_env, 7)
+            gen_time = time.time() - gen_start
             
             # 2. 将候选状态放入agents_state张量
             agents_state[:, :self.num_agents_per_env] = candidate_states
             
             # 3. 并行检查所有agent的有效性
+            check_start = time.time()
             # a) 离路检查 - 检查所有agent
+            offroad_start = time.time()
             all_states_to_check = agents_state[:, :self.num_agents_per_env]  # (num_envs, num_agents_per_env, 7)
             offroad_states_for_checker = all_states_to_check[:, :, [0, 1, 2, 4, 5]]  # (num_envs, num_agents_per_env, 5)
             # 重塑为 (num_envs * num_agents_per_env, 5) 以便批量检查
             offroad_states_flat = offroad_states_for_checker.view(-1, 5)
             is_on_road_flat = self.offroad_checker.check_on_road(offroad_states_flat)
+            offroad_time = time.time() - offroad_start
             is_on_road = is_on_road_flat.view(num_envs, self.num_agents_per_env)  # (num_envs, num_agents_per_env)
             
             # b) 碰撞检查 - 检查所有agent之间的碰撞
+            collision_start = time.time()
             collisions = self.collision_checker.check(agents_state, agents_state)  # (num_envs, max_agents)
+            collision_time = time.time() - collision_start
             collision_mask = collisions[:, :self.num_agents_per_env]  # (num_envs, num_agents_per_env)
+            check_time = time.time() - check_start
             
             # 4. 确定哪些放置是无效的
             invalid_placement_mask = ~is_on_road | collision_mask  # (num_envs, num_agents_per_env)
@@ -133,7 +141,7 @@ class WorldInitializer:
                     0, self.road_network.num_quads, (total_agents,), device=self.device
                 ).view(num_envs, self.num_agents_per_env)
                 agents_start_quad_ids[:, :self.num_agents_per_env] = spawn_quad_indices
-                
+
                 if retry > 0:
                     logging.debug(f"All agents placed successfully after {retry+1} retries.")
                 break
@@ -152,7 +160,10 @@ class WorldInitializer:
                 ).view(num_envs, self.num_agents_per_env)
                 # 使用布尔索引来更新有效的quad_id
                 agents_start_quad_ids[valid_placement_mask] = spawn_quad_indices[valid_placement_mask]
-        
+            if retry == 0:  # 只在第一次迭代时打印性能信息
+                print(f"Retry {retry}: gen_time={gen_time:.4f}s, check_time={check_time:.4f}s, offroad_time={offroad_time:.4f}s, collision_time={collision_time:.4f}s")
+        end_time = time.time()
+        print(f"World initialization time: {end_time - start_time} seconds")
         ego_agents_idx = torch.zeros(num_envs, dtype=torch.int64, device=self.device)
         logging.info("World initialization complete.")
         return agents_state, ego_agents_idx, agents_start_quad_ids
@@ -265,8 +276,6 @@ if __name__ == '__main__':
         
         for i, state in enumerate(active_states):
             x, y, yaw, speed, length, width, active = state.cpu().numpy()
-            
-
             
             # 创建车辆矩形
             # 车辆中心在(x, y)，需要根据yaw旋转
@@ -419,7 +428,7 @@ if __name__ == '__main__':
     print("WorldInitializer instantiated successfully.")
 
     # 4. 调用 initialize_world
-    num_test_envs = 1
+    num_test_envs = 2400
     agents_state, ego_idx, agents_start_quad_ids = initializer.initialize_world(num_envs=num_test_envs)
 
     # 5. 打印结果进行验证

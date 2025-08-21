@@ -6,6 +6,7 @@ import sys
 from road import RoadNetwork
 import os
 import sys
+import time
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 utils_dir = os.path.join(parent_dir, 'utils')
@@ -39,6 +40,10 @@ class OffroadChecker:
         poly_bounds = torch.stack([poly_min_bounds, poly_max_bounds], dim=1)
         self.spatial_hash.build_static_index(poly_bounds)
         self.local_bbox_points = self._create_local_bbox_points().to(self.device)
+        
+        # 预计算边界框信息，用于快速预筛选
+        self._precompute_polygon_bounds()
+
 
     def _create_local_bbox_points(self) -> Tensor:
         """
@@ -53,6 +58,20 @@ class OffroadChecker:
         center_point = torch.tensor([[0.0, 0.0]])
         points = torch.cat([points, center_point], dim=0)
         return points
+
+    def _precompute_polygon_bounds(self):
+        """
+        预计算所有多边形的边界框信息，用于快速预筛选。
+        """
+        # 计算每个多边形的AABB边界框
+        self.polygon_min_bounds = self.road_polygons.min(dim=1).values  # [N, 2]
+        self.polygon_max_bounds = self.road_polygons.max(dim=1).values  # [N, 2]
+        
+        # 预计算多边形的中心点和半径（用于快速距离检查）
+        centers = (self.polygon_min_bounds + self.polygon_max_bounds) / 2  # [N, 2]
+        half_sizes = (self.polygon_max_bounds - self.polygon_min_bounds) / 2  # [N, 2]
+        self.polygon_centers = centers
+        self.polygon_radii = torch.norm(half_sizes, dim=1)  # [N] - 边界框的对角线长度的一半
 
     def _get_discretized_bounding_boxes(self, states: Tensor) -> Tensor:
         """
@@ -74,35 +93,113 @@ class OffroadChecker:
     
     def _batch_point_in_polygon_test(self, points: Tensor) -> Tensor:
         """
-        使用射线投射法（Ray Casting）执行并行的"点在多边形内"测试。
+        使用边界框预筛选 + 重心坐标法的组合方法执行并行的"点在多边形内"测试。
+        先进行快速的边界框检查，再进行精确的重心坐标计算，性能最优。
         """
+        start_time = time.time()
         M = points.shape[0]
         if M == 0:
             return torch.empty(0, dtype=torch.bool, device=self.device)
         candidate_pairs = self.spatial_hash.query_points(points)
+        end_time = time.time()
+        print(f"spatial_hash.query_points time: {end_time - start_time} seconds")
         if candidate_pairs.shape[0] == 0:
             return torch.zeros(M, dtype=torch.bool, device=self.device)
         point_indices, polygon_indices = candidate_pairs[:, 0], candidate_pairs[:, 1]
         test_points = points[point_indices]
         test_polygons = self.road_polygons[polygon_indices]
-        px = test_points[:, None, 0]
-        py = test_points[:, None, 1]
-        v_start = test_polygons
-        v_end = torch.roll(test_polygons, shifts=-1, dims=1)
-        y1, x1 = v_start[..., 1], v_start[..., 0]
-        y2, x2 = v_end[..., 1], v_end[..., 0]
-        y_check = ((y1 <= py) & (py < y2)) | ((y2 <= py) & (py < y1))
-        denom = y2 - y1
-        denom[denom.abs() < 1e-9] = 1e-9
-        x_intersect = (py - y1) * (x2 - x1) / denom + x1
-        x_check = px < x_intersect
-        crossings = y_check & x_check
-        intersection_counts = torch.sum(crossings, dim=1)
-        is_inside_per_pair = (intersection_counts % 2 == 1)
-        is_on_road = torch.zeros(M, dtype=torch.long, device=self.device)
-        # 使用 scatter_add_ 以处理一个点在多个多边形内的情况（虽然不影响奇偶性，但更健壮）
-        is_on_road.scatter_add_(0, point_indices, is_inside_per_pair.long())
-        return is_on_road > 0
+        # 使用边界框预筛选 + 重心坐标法
+        is_inside = self._bounded_barycentric_test(test_points, test_polygons, polygon_indices)
+        # 使用scatter_操作，更高效
+        is_on_road = torch.zeros(M, dtype=torch.bool, device=self.device)
+        hit_indices = point_indices[is_inside] # 已经0.003s
+        if hit_indices.numel() > 0:
+            is_on_road.scatter_(0, hit_indices, True)
+        return is_on_road
+
+    def _bounded_barycentric_test(self, points: Tensor, polygons: Tensor, polygon_indices: Tensor) -> Tensor:
+        """
+        使用边界框预筛选 + 重心坐标法的组合方法。
+        先进行快速的边界框检查，再进行精确的重心坐标计算。
+        """
+        # 获取对应多边形的边界框信息
+        polygon_min_bounds = self.polygon_min_bounds[polygon_indices]  # [N, 2]
+        polygon_max_bounds = self.polygon_max_bounds[polygon_indices]  # [N, 2]
+        # 快速边界框预筛选
+        in_bounds = torch.all((points >= polygon_min_bounds) & (points <= polygon_max_bounds), dim=1)
+        # 只对在边界框内的点进行精确计算
+        if not torch.any(in_bounds):
+            return torch.zeros(points.shape[0], dtype=torch.bool, device=self.device)
+        # 提取需要精确计算的点和多边形
+        valid_points = points[in_bounds]
+        valid_polygons = polygons[in_bounds]
+        # 对有效点进行重心坐标计算
+        valid_inside = self._barycentric_coordinate_test(valid_points, valid_polygons)
+        # 创建结果张量
+        result = torch.zeros(points.shape[0], dtype=torch.bool, device=self.device)
+        result[in_bounds] = valid_inside
+        return result
+
+    def _barycentric_coordinate_test(self, points: Tensor, polygons: Tensor) -> Tensor:
+        """
+        使用重心坐标法检测点是否在多边形内。
+        对于四边形，此方法比射线投射法更高效。
+        """
+        # 将四边形分解为两个三角形
+        # 三角形1: 顶点0, 1, 2
+        # 三角形2: 顶点0, 2, 3
+        
+        # 测试三角形1
+        tri1_vertices = polygons[:, [0, 1, 2], :]  # [N, 3, 2]
+        in_tri1 = self._point_in_triangle_barycentric(points, tri1_vertices)
+        
+        # 测试三角形2
+        tri2_vertices = polygons[:, [0, 2, 3], :]  # [N, 3, 2]
+        in_tri2 = self._point_in_triangle_barycentric(points, tri2_vertices)
+        
+        # 点在四边形内 = 点在三角形1内 OR 点在三角形2内
+        return in_tri1 | in_tri2
+
+    def _point_in_triangle_barycentric(self, points: Tensor, triangle_vertices: Tensor) -> Tensor:
+        """
+        使用重心坐标法检测点是否在三角形内。
+        """
+        # 提取三角形顶点
+        v0 = triangle_vertices[:, 0, :]  # [N, 2]
+        v1 = triangle_vertices[:, 1, :]  # [N, 2]
+        v2 = triangle_vertices[:, 2, :]  # [N, 2]
+        
+        # 计算重心坐标
+        # 使用向量叉积计算面积
+        def cross_2d(a, b):
+            return a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+        
+        # 计算三角形面积
+        edge1 = v1 - v0  # [N, 2]
+        edge2 = v2 - v0  # [N, 2]
+        area = cross_2d(edge1, edge2)  # [N]
+        
+        # 避免除零
+        safe_area = torch.where(area.abs() < 1e-9, torch.tensor(1e-9, device=self.device), area)
+        
+        # 计算重心坐标
+        point_to_v0 = points - v0  # [N, 2]
+        point_to_v1 = points - v1  # [N, 2]
+        point_to_v2 = points - v2  # [N, 2]
+        
+        # 计算子三角形面积
+        area0 = cross_2d(point_to_v1, point_to_v2)  # [N]
+        area1 = cross_2d(point_to_v2, point_to_v0)  # [N]
+        area2 = cross_2d(point_to_v0, point_to_v1)  # [N]
+        
+        # 计算重心坐标
+        bary0 = area0 / safe_area  # [N]
+        bary1 = area1 / safe_area  # [N]
+        bary2 = area2 / safe_area  # [N]
+        
+        # 点在三角形内：所有重心坐标都在[0,1]范围内，且和为1
+        in_triangle = (bary0 >= 0) & (bary1 >= 0) & (bary2 >= 0) & (bary0 + bary1 + bary2 <= 1.0 + 1e-6)
+        return in_triangle
 
     def check_on_road(self, states: Tensor) -> Tensor:
         """
@@ -111,10 +208,16 @@ class OffroadChecker:
         N = states.shape[0]
         if N == 0:
             return torch.empty(0, dtype=torch.bool, device=self.device)
+        start_time = time.time()
         world_points = self._get_discretized_bounding_boxes(states)
+        end_time = time.time()
+        print(f"get_discretized_bounding_boxes time: {end_time - start_time} seconds")
+        start_time = time.time()
         num_points_per_box = world_points.shape[1]
         flat_points = world_points.view(-1, 2)
         flat_on_road_mask = self._batch_point_in_polygon_test(flat_points)
+        end_time = time.time()
+        print(f"batch_point_in_polygon_test time: {end_time - start_time} seconds")
         on_road_mask_per_point = flat_on_road_mask.view(N, num_points_per_box)
         is_on_road = torch.all(on_road_mask_per_point, dim=1)
         return is_on_road
