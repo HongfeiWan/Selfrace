@@ -32,6 +32,7 @@ class OffroadChecker:
             raise ValueError("points_per_vehicle_edge must be at least 2.")
         self.points_per_vehicle_edge = points_per_vehicle_edge
         self.road_polygons = map_data.quads_vertices.to(self.device)
+
         self.spatial_hash = spatial_hash
         
         # 使用共享的 spatial_hash 构建静态路面索引
@@ -41,11 +42,7 @@ class OffroadChecker:
         self.spatial_hash.build_static_index(poly_bounds)
         self.local_bbox_points = self._create_local_bbox_points().to(self.device)
         
-        # 预计算边界框信息，用于快速预筛选
-        self._precompute_polygon_bounds()
-        # 预栅格化占用图（仅初始化一次）；优先使用查表路径
-        self._init_occupancy_grid(resolution_m=0.5)
-        # 预计算用于半平面快速判定的凸四边形参数
+        # 预计算用于矢量叉乘半平面测试的凸四边形参数
         self._precompute_convex_quad_edges()
 
     def _create_local_bbox_points(self) -> Tensor:
@@ -62,19 +59,26 @@ class OffroadChecker:
         points = torch.cat([points, center_point], dim=0)
         return points
 
-    def _precompute_polygon_bounds(self):
+    def _precompute_convex_quad_edges(self):
         """
-        预计算所有多边形的边界框信息，用于快速预筛选。
+        预计算用于矢量叉乘半平面测试的凸四边形参数：
+        - poly_verts: 顶点坐标 [Q,4,2]
+        - poly_edges: 顺序边向量 v_{i+1}-v_i [Q,4,2]
+        - poly_sign: 顶点绕序符号（CCW=+1, CW=-1）[Q]
         """
-        # 计算每个多边形的AABB边界框
-        self.polygon_min_bounds = self.road_polygons.min(dim=1).values  # [N, 2]
-        self.polygon_max_bounds = self.road_polygons.max(dim=1).values  # [N, 2]
-        
-        # 预计算多边形的中心点和半径（用于快速距离检查）
-        centers = (self.polygon_min_bounds + self.polygon_max_bounds) / 2  # [N, 2]
-        half_sizes = (self.polygon_max_bounds - self.polygon_min_bounds) / 2  # [N, 2]
-        self.polygon_centers = centers
-        self.polygon_radii = torch.norm(half_sizes, dim=1)  # [N] - 边界框的对角线长度的一半
+        verts = self.road_polygons  # [Q,4,2]
+        next_idx = torch.tensor([1, 2, 3, 0], device=self.device)
+        self.poly_verts = verts
+        self.poly_edges = verts[:, next_idx, :] - verts
+        x = verts[..., 0]
+        y = verts[..., 1]
+        area2 = (x[:, 0] * y[:, 1] - y[:, 0] * x[:, 1] +
+                 x[:, 1] * y[:, 2] - y[:, 1] * x[:, 2] +
+                 x[:, 2] * y[:, 3] - y[:, 2] * x[:, 3] +
+                 x[:, 3] * y[:, 0] - y[:, 3] * x[:, 0])
+        self.poly_sign = torch.where(area2 >= 0,
+                                     torch.tensor(1.0, device=self.device),
+                                     torch.tensor(-1.0, device=self.device))
 
     def _get_discretized_bounding_boxes(self, states: Tensor) -> Tensor:
         """
@@ -96,66 +100,43 @@ class OffroadChecker:
     
     def _batch_point_in_polygon_test(self, points: Tensor) -> Tensor:
         """
-        使用预栅格化占用图进行查表
+        基于矢量叉乘（半平面）的方法：
+        1) 用空间哈希取候选 (point, quad)；
+        2) 对每个候选，计算四条边的 cross(e, p - v)；
+        3) 若多边形为顺时针，则 cross <= 0，全为右侧；若为逆时针则 cross >= 0；
+           统一写作 (sign * cross) >= -eps，sign=+1(CCW), -1(CW)。
+        4) 命中的点按原索引 scatter 回去。
         """
-        return self._check_points_with_grid(points)
+        start_time=time.time()
+        M = points.shape[0]
+        if M == 0:
+            return torch.empty(0, dtype=torch.bool, device=self.device)
+        candidate_pairs = self.spatial_hash.query_points(points)
+        if candidate_pairs.shape[0] == 0:
+            return torch.zeros(M, dtype=torch.bool, device=self.device)
+        point_indices = candidate_pairs[:, 0]
+        polygon_indices = candidate_pairs[:, 1]
+        print(len(point_indices),len(polygon_indices),len(points))
+        end_time=time.time()
+        print(f"query_points time: {end_time - start_time} seconds")
 
-    def _bounded_barycentric_test(self, points: Tensor, polygons: Tensor, polygon_indices: Tensor) -> Tensor:
-        """
-        使用边界框预筛选 + 半平面快速法的组合方法。
-        先进行快速的边界框检查，再进行快速的半平面判定。
-        """
-        # 获取对应多边形的边界框信息
-        polygon_min_bounds = self.polygon_min_bounds[polygon_indices]  # [N, 2]
-        polygon_max_bounds = self.polygon_max_bounds[polygon_indices]  # [N, 2]
-        # 快速边界框预筛选
-        in_bounds = torch.all((points >= polygon_min_bounds) & (points <= polygon_max_bounds), dim=1)
-        # 只对在边界框内的点进行精确计算
-        if not torch.any(in_bounds):
-            return torch.zeros(points.shape[0], dtype=torch.bool, device=self.device)
-        # 提取需要精确计算的点与索引
-        valid_points = points[in_bounds]
-        valid_indices = polygon_indices[in_bounds]
-        # 半平面快速判定（凸四边形）
-        valid_inside = self._point_in_convex_quad_fast(valid_points, valid_indices)
-        # 创建结果张量
-        result = torch.zeros(points.shape[0], dtype=torch.bool, device=self.device)
-        result[in_bounds] = valid_inside
-        return result
+        pts = points[point_indices]
+        verts = self.poly_verts[polygon_indices]
+        edges = self.poly_edges[polygon_indices]
+        sign = self.poly_sign[polygon_indices]
+        pv = pts.unsqueeze(1) - verts
+        cross = edges[..., 0] * pv[..., 1] - edges[..., 1] * pv[..., 0]
+        inside = (sign.unsqueeze(-1) * cross >= -1e-10).all(dim=-1)
 
-    def _precompute_convex_quad_edges(self):
-        """
-        为每个quad预计算用于半平面测试的参数：
-        - poly_verts: 顶点坐标 [Q,4,2]
-        - poly_edges: 顺序边向量 v_{i+1}-v_i [Q,4,2]
-        - poly_sign: 顶点绕序符号（CCW=+1, CW=-1）[Q]
-        """
-        verts = self.road_polygons  # [Q,4,2]
-        next_idx = torch.tensor([1, 2, 3, 0], device=self.device)
-        self.poly_verts = verts
-        self.poly_edges = verts[:, next_idx, :] - verts
-        x = verts[..., 0]
-        y = verts[..., 1]
-        area2 = (x[:, 0] * y[:, 1] - y[:, 0] * x[:, 1] +
-                 x[:, 1] * y[:, 2] - y[:, 1] * x[:, 2] +
-                 x[:, 2] * y[:, 3] - y[:, 2] * x[:, 3] +
-                 x[:, 3] * y[:, 0] - y[:, 3] * x[:, 0])
-        self.poly_sign = torch.where(area2 >= 0,
-                                     torch.tensor(1.0, device=self.device),
-                                     torch.tensor(-1.0, device=self.device))
-
-    def _point_in_convex_quad_fast(self, points: Tensor, polygon_indices: Tensor) -> Tensor:
-        """
-        半平面法：点在凸四边形内 <=> 对每条边 e=v_{i+1}-v_i，cross(e, p-v_i) 的符号与绕序一致。
-        """
-        verts = self.poly_verts[polygon_indices]      # [K,4,2]
-        edges = self.poly_edges[polygon_indices]      # [K,4,2]
-        sign = self.poly_sign[polygon_indices]        # [K]
-        pv = points.unsqueeze(1) - verts              # [K,4,2]
-        # 应使用 cross(e, p - v) = e_x * pv_y - e_y * pv_x
-        cross = edges[..., 0] * pv[..., 1] - edges[..., 1] * pv[..., 0]  # [K,4]
-        inside = (sign.unsqueeze(-1) * cross) >= -1e-6
-        return inside.all(dim=-1)
+        start_time = time.time()
+        # 修复版本：使用scatter_add_来正确处理一个点被多个多边形包含的情况
+        # 一个点只要被任何一个多边形包含，就应该被认为是"在道路上"
+        flat_on_road_mask = torch.zeros(M, dtype=torch.int32, device=self.device)
+        flat_on_road_mask.scatter_add_(0, point_indices, inside.to(torch.int32))
+        flat_on_road_mask = flat_on_road_mask.gt_(0)  # 只要有一个多边形包含该点，就为True
+        end_time = time.time()
+        print(f"batch_point_in_polygon_test time: {end_time - start_time} seconds")
+        return flat_on_road_mask
 
     def check_on_road(self, states: Tensor) -> Tensor:
         """
@@ -171,80 +152,8 @@ class OffroadChecker:
         on_road_mask_per_point = flat_on_road_mask.view(N, num_points_per_box)
         is_on_road = torch.all(on_road_mask_per_point, dim=1)
         return is_on_road
-    # ----------------------------
-    # 占用图：预计算与查表
-    # ----------------------------
-    def _init_occupancy_grid(self, resolution_m: float = 0.5):
-        """将所有道路四边形栅格化到布尔占用图。"""
-        polys = self.road_polygons  # [Q,4,2]
-        all_pts = polys.view(-1, 2)
-        min_xy = all_pts.min(dim=0).values
-        max_xy = all_pts.max(dim=0).values
-        self.grid_resolution = torch.tensor(resolution_m, device=self.device)
-        self.grid_origin = min_xy
-        size_xy = torch.clamp((max_xy - min_xy) / self.grid_resolution, min=1.0)
-        H = int(size_xy[1].item()) + 2
-        W = int(size_xy[0].item()) + 2
-        self.grid_size_hw = (H, W)
-        self.occupancy_grid = torch.zeros((H, W), dtype=torch.bool, device=self.device)
-        # 分块栅格化以控制显存峰值
-        Q = polys.shape[0]
-        chunk = 512
-        for s in range(0, Q, chunk):
-            e = min(Q, s + chunk)
-            self._rasterize_quads_to_grid(polys[s:e])
 
-    def _rasterize_quads_to_grid(self, quads: Tensor):
-        if quads.numel() == 0:
-            return
-        mins = quads.min(dim=1).values
-        maxs = quads.max(dim=1).values
-        xy0 = torch.floor((mins - self.grid_origin) / self.grid_resolution).long()
-        xy1 = torch.ceil((maxs - self.grid_origin) / self.grid_resolution).long()
-        xy0[:, 0].clamp_(0, self.grid_size_hw[1] - 1)
-        xy0[:, 1].clamp_(0, self.grid_size_hw[0] - 1)
-        xy1[:, 0].clamp_(0, self.grid_size_hw[1] - 1)
-        xy1[:, 1].clamp_(0, self.grid_size_hw[0] - 1)
-        for i in range(quads.shape[0]):
-            x0, y0 = xy0[i]
-            x1, y1 = xy1[i]
-            if x1 < x0 or y1 < y0:
-                continue
-            xs = torch.arange(x0.item(), x1.item() + 1, device=self.device)
-            ys = torch.arange(y0.item(), y1.item() + 1, device=self.device)
-            if xs.numel() == 0 or ys.numel() == 0:
-                continue
-            XX, YY = torch.meshgrid(xs, ys, indexing='xy')
-            centers = torch.stack([XX, YY], dim=-1).to(torch.float32)
-            centers = (centers + 0.5) * self.grid_resolution + self.grid_origin
-            centers = centers.reshape(-1, 2)
-            poly = quads[i]
-            # 半平面法（向量化）：对该 quad 的所有网格中心一次性判定
-            verts = poly.unsqueeze(0).expand(centers.shape[0], -1, -1)  # [K,4,2]
-            edges = verts[:, [1, 2, 3, 0], :] - verts[:, [0, 1, 2, 3], :]
-            pv = centers.unsqueeze(1) - verts
-            cross = edges[..., 0] * pv[..., 1] - edges[..., 1] * pv[..., 0]
-            # 计算绕序符号
-            x = poly[:, 0]
-            y = poly[:, 1]
-            area2 = (x[0] * y[1] - y[0] * x[1] + x[1] * y[2] - y[1] * x[2] + x[2] * y[3] - y[2] * x[3] + x[3] * y[0] - y[3] * x[0])
-            sign = 1.0 if area2 >= 0 else -1.0
-            inside = (sign * cross) >= -1e-6
-            inside = inside.all(dim=-1)
-            if inside.any():
-                idx = torch.nonzero(inside, as_tuple=False).squeeze(-1)
-                hit_x = XX.reshape(-1)[idx].long()
-                hit_y = YY.reshape(-1)[idx].long()
-                self.occupancy_grid[hit_y, hit_x] = True
 
-    def _check_points_with_grid(self, points: Tensor) -> Tensor:
-        gxgy = torch.floor((points - self.grid_origin) / self.grid_resolution).long()
-        gxgy[:, 0].clamp_(0, self.grid_size_hw[1] - 1)
-        gxgy[:, 1].clamp_(0, self.grid_size_hw[0] - 1)
-        xs = gxgy[:, 0]
-        ys = gxgy[:, 1]
-        return self.occupancy_grid[ys, xs]
-    
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(current_dir)

@@ -412,13 +412,13 @@ if __name__ == '__main__':
     all_verts = road_network.quads_vertices.view(-1, 2)
     min_bounds, _ = torch.min(all_verts, dim=0)
     max_bounds, _ = torch.max(all_verts, dim=0)
-    
     spatial_hash = SpatialHash(
         cell_size=test_config['hash']['hash_cell_size'],
         min_bounds=min_bounds,
         max_bounds=max_bounds,
         device=device
     )
+    print(f"SpatialHash initialized with cell size: {test_config['hash']['hash_cell_size']:.2f}m")
     offroad_checker = OffroadChecker(road_network, spatial_hash)
     collision_checker = CollisionChecker(test_config, spatial_hash)
     print("Dependencies instantiated successfully.")

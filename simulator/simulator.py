@@ -301,8 +301,7 @@ class TeraflowSimulator:
                 # 修复：正确获取随机索引
                 random_idx = torch.randint(0, len(available_goals), (1,)).item()
                 goal_quad_ids[b, m] = available_goals[random_idx].item()
-                print(f"智能体 ({b}, {m}): 起始 {start_id} -> 目标 {goal_quad_ids[b, m].item()}")
-                
+
                 # 验证目标quad_id的有效性
                 goal_id = goal_quad_ids[b, m].item()
                 if goal_id < 0 or goal_id >= self.road_network.num_quads:

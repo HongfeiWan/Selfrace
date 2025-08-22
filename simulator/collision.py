@@ -37,18 +37,19 @@ class CollisionChecker:
         """
         self.device = torch.device(config.get('device', 'cuda'))
         self.spatial_hash = spatial_hash
-        
-        # 空间哈希参数
-        # 用户定义网格分辨率，而不是物理尺寸
-        self.grid_width = config.get('grid_width', 1000)
-        self.grid_height = config.get('grid_height', 1000)
-        
-        # 从地图范围和网格分辨率计算出单元格的物理尺寸
-        map_extent_m = config.get('map_extent_m', 10000.0) # 默认为10km
-        # 假设为正方形单元格，基于宽度计算
-        self.cell_size = map_extent_m / self.grid_width
-        
-        self.grid_total_cells = self.grid_width * self.grid_height
+
+
+        # 从配置文件读取空间哈希参数
+        simulator_config = config.get('simulator', config)
+        hash_config = simulator_config.get('hash', {})
+
+        # 方法1：直接使用配置的cell_size
+        self.cell_size = hash_config.get('hash_cell_size', 5.0)
+        self.map_extent_m = hash_config.get('map_extent_m', 10000.0)
+        # 估算网格尺寸（用于max_cells_per_agent计算）
+        self.grid_width = int(self.map_extent_m / self.cell_size)
+        self.grid_height = self.grid_width
+
 
         # --- 优化的 max_cells_per_agent 计算 ---
         # 目的: 估算单个智能体在一个时间步内可能覆盖的最大网格单元数。
@@ -71,7 +72,6 @@ class CollisionChecker:
         max_dim_safety = max_dim * 1.5 
         max_span = int(max_dim_safety / self.cell_size) + 2 # +2 确保覆盖边界情况
         self.max_cells_per_agent = max_span * max_span
-        
         self.max_neighbors = config.get('max_neighbors', 30)
         
         #print(f"Collision checker initialized.")

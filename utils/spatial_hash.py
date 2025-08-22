@@ -5,7 +5,6 @@ import time
 class SpatialHash:
     """
     一个统一的、基于GPU加速的批量化空间哈希，用于高效查询几何图元。
-    
     该类支持两种核心功能：
     1. 索引和查询静态几何体（如路面多边形）。
     2. 对动态物体（如智能体）执行高效的临近对查询。
@@ -88,41 +87,29 @@ class SpatialHash:
         """
         批量查询点，返回每个点对应的候选静态物体ID。
         """
-        
         if self.static_sorted_items.numel() == 0:
             return torch.empty((0, 2), dtype=torch.long, device=self.device)
-
         cell_indices_2d = self.get_cell_idx(points)
         cell_indices_flat = cell_indices_2d[:, 0] * self.grid_size[1] + cell_indices_2d[:, 1]
         starts = self.static_cell_starts[cell_indices_flat]
         ends = self.static_cell_starts[cell_indices_flat + 1]
         num_candidates_per_point = ends - starts
-
         if num_candidates_per_point.sum() == 0:
             return torch.empty((0, 2), dtype=torch.long, device=self.device)
-
         point_indices_out = torch.arange(len(points), device=self.device).repeat_interleave(num_candidates_per_point)
-
         # GPU加速版本：避免for循环
         # 使用高级索引操作替代torch.cat和for循环
         max_candidates = num_candidates_per_point.max().item()
-        if max_candidates == 0:
-            item_indices_out = torch.empty(0, dtype=torch.long, device=self.device)
-        else:
-            # 创建索引偏移矩阵
-            offsets = torch.arange(max_candidates, device=self.device).unsqueeze(0)  # (1, max_candidates)
-            
-            # 扩展starts以匹配最大候选数
-            starts_expanded = starts.unsqueeze(1) + offsets  # (num_points, max_candidates)
-            
-            # 创建有效掩码
-            valid_mask = offsets < num_candidates_per_point.unsqueeze(1)  # (num_points, max_candidates)
-            
-            # 应用掩码并展平
-            valid_starts = starts_expanded[valid_mask]
-            
-            # 使用高级索引获取item_indices
-            item_indices_out = self.static_sorted_items[valid_starts]
+        # 创建索引偏移矩阵
+        offsets = torch.arange(max_candidates, device=self.device).unsqueeze(0)  # (1, max_candidates)
+        # 扩展starts以匹配最大候选数
+        starts_expanded = starts.unsqueeze(1) + offsets  # (num_points, max_candidates)
+        # 创建有效掩码
+        valid_mask = offsets < num_candidates_per_point.unsqueeze(1)  # (num_points, max_candidates)
+        # 应用掩码并展平
+        valid_starts = starts_expanded[valid_mask]
+        # 使用高级索引获取item_indices
+        item_indices_out = self.static_sorted_items[valid_starts]
 
         return torch.stack([point_indices_out, item_indices_out], dim=1)
 
@@ -251,3 +238,4 @@ class SpatialHash:
         candidate_pairs[sel_batch, sel_src, sel_pos] = sel_dst
 
         return candidate_pairs, debug_info
+    
