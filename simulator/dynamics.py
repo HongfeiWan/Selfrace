@@ -130,10 +130,15 @@ class KinematicBicycleModel:
         # 离散动作空间：actions是动作索引
         assert actions.ndim == 1, f"Discrete actions shape must be (N,), but got {actions.shape}"
         
-        # 初始化控制状态（如果还没有初始化）
-        if self.current_along is None or self.current_along.shape[0] != batch_size:
+        # 检查并初始化控制状态（确保batch_size正确）
+        if (self.current_along is None or self.current_along.shape[0] != batch_size or
+            self.current_alat is None or self.current_alat.shape[0] != batch_size):
+            print(f"Initializing dynamics state for batch_size: {batch_size}")
             self.current_along = torch.zeros(batch_size, device=self.device)
             self.current_alat = torch.zeros(batch_size, device=self.device)
+            # 同时重置prev_along以确保一致性
+            if hasattr(self, 'prev_along'):
+                self.prev_along = torch.zeros(batch_size, device=self.device)
         
         # 获取实际的jerk动作
         jerk_actions = self.discrete_action_space.get_action(actions)  # (N, 2) [along_jerk, alat_jerk]
@@ -247,14 +252,17 @@ class KinematicBicycleModel:
         new_states = torch.stack([new_x, new_y, new_yaw, new_speed], dim=1)
         return new_states
     
-    def reset_control_state(self, batch_size: int = 1):
+    def reset_control_state(self):
         """重置控制状态（加速度和转向角）"""
-        self.current_along = torch.zeros(batch_size, device=self.device)
-        self.current_alat = torch.zeros(batch_size, device=self.device)
-        self.current_steering_angle = torch.zeros(batch_size, device=self.device)
-        # 重置前一步的纵向加速度
+        # 清除所有控制状态变量，让step方法在需要时重新初始化正确的batch_size
+        self.current_along = None
+        self.current_alat = None
+        self.current_steering_angle = None
+        # 清除前一步的纵向加速度，让step方法重新创建
         if hasattr(self, 'prev_along'):
-            self.prev_along = torch.zeros(batch_size, device=self.device)
+            delattr(self, 'prev_along')
+        
+        print("Dynamics control state reset - variables cleared for fresh initialization")
 
     def calculate_steering_angle(self, alat: torch.Tensor, speed: torch.Tensor, epsilon: float = None) -> torch.Tensor:
         """

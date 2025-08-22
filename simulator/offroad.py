@@ -107,7 +107,7 @@ class OffroadChecker:
            统一写作 (sign * cross) >= -eps，sign=+1(CCW), -1(CW)。
         4) 命中的点按原索引 scatter 回去。
         """
-        start_time=time.time()
+
         M = points.shape[0]
         if M == 0:
             return torch.empty(0, dtype=torch.bool, device=self.device)
@@ -116,9 +116,6 @@ class OffroadChecker:
             return torch.zeros(M, dtype=torch.bool, device=self.device)
         point_indices = candidate_pairs[:, 0]
         polygon_indices = candidate_pairs[:, 1]
-        print(len(point_indices),len(polygon_indices),len(points))
-        end_time=time.time()
-        print(f"query_points time: {end_time - start_time} seconds")
 
         pts = points[point_indices]
         verts = self.poly_verts[polygon_indices]
@@ -128,14 +125,12 @@ class OffroadChecker:
         cross = edges[..., 0] * pv[..., 1] - edges[..., 1] * pv[..., 0]
         inside = (sign.unsqueeze(-1) * cross >= -1e-10).all(dim=-1)
 
-        start_time = time.time()
         # 修复版本：使用scatter_add_来正确处理一个点被多个多边形包含的情况
         # 一个点只要被任何一个多边形包含，就应该被认为是"在道路上"
         flat_on_road_mask = torch.zeros(M, dtype=torch.int32, device=self.device)
         flat_on_road_mask.scatter_add_(0, point_indices, inside.to(torch.int32))
         flat_on_road_mask = flat_on_road_mask.gt_(0)  # 只要有一个多边形包含该点，就为True
-        end_time = time.time()
-        print(f"batch_point_in_polygon_test time: {end_time - start_time} seconds")
+        
         return flat_on_road_mask
 
     def check_on_road(self, states: Tensor) -> Tensor:

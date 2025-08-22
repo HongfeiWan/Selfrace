@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
-from network import create_network,count_parameters
+import time
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -18,8 +18,9 @@ parent_dir = os.path.dirname(current_dir)
 simulator_dir = os.path.join(parent_dir, 'simulator')
 if simulator_dir not in sys.path:
     sys.path.insert(0, simulator_dir)
-	
+
 from simulator import TeraflowSimulator
+from network import create_network
 
 '''
 推荐环境变量（无 IB 时）：
@@ -159,15 +160,17 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		model = create_network(config=config, network_type="shared")
 		model = model.to(device)
 		simulator = TeraflowSimulator(config=config_dict, device=device)
-		
 		sim_cfg = getattr(config, 'simulator')
 		training_cfg = getattr(config, 'training')
 		learning_rate = getattr(training_cfg, 'learning_rate')
 		num_iterations = getattr(training_cfg, 'batch_size_per_gpu')
-		
+		max_episode_length = getattr(training_cfg,'max_episode_length')
 		optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 		scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_iterations, eta_min=0.0)
+
 		for k in range(num_iterations):
+			iteration_start_time = time.time()
+			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")			
 			# simulator初始化
 			initial_observation = simulator.reset()
 			agent_state = simulator.agents_state
@@ -175,10 +178,21 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			# 先往前匀速走一步
 			actions = torch.zeros((simulator.num_envs, simulator.world_initializer.max_agents), device=device, dtype=torch.float32)
 			actions[:,:] = 7 # 匀速
-			observation,reward,done = simulator.step(actions)
-			print(f"🔍 单卡训练: 奖励: {reward}")
+			episode_start_time = time.time()
+			for t in range(max_episode_length-1195):
+				step_start_time = time.time()
+				observation,reward,done = simulator.step(actions)
+				step_end_time = time.time()
+				step_duration = step_end_time - step_start_time
+				print(f"  📍 第 {t+1}/{max_episode_length} 步耗时: {step_duration:.4f}秒")
+			episode_end_time = time.time()
+			episode_duration = episode_end_time - episode_start_time
+			print(f"  🎯 本轮总步数耗时: {episode_duration:.4f}秒")
+			#print(f"🔍 单卡训练: 奖励: {reward[0]}")
+			optimizer.step()
 			scheduler.step()
 		return 0
+	
 	try:
 		device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
 		torch.cuda.set_device(device) if device.type == 'cuda' else None
@@ -230,8 +244,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		
 		# 每一轮迭代
 		for k in range(num_iterations):
-			# 1) 余弦退火更新学习率（单卡/多卡一致）
-			scheduler.step()
+			# 注意：学习率调度器应该在优化器更新后调用
+			# 这里先不调用scheduler.step()，等优化器更新后再调用
 
 			# 2) 本轮开始：重置完成计数
 			num_workers_done.set("done", b"0")
@@ -296,6 +310,9 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					loss.backward()
 					# DDP在backward中会自动AllReduce梯度
 					optimizer.step()
+			
+			# 7) 在优化器更新后调用学习率调度器
+			scheduler.step()
 
 			if is_master:
 				try:

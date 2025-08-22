@@ -1,8 +1,10 @@
+from multiprocessing.spawn import prepare
 import torch
 import yaml
 import os
 import sys
 from typing import Dict, Tuple, Optional
+import time
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 
@@ -107,10 +109,16 @@ class TeraflowSimulator:
             torch.Tensor: 一批初始观测, 形状为 (B, M, obs_dim)。
         """
         print("Resetting simulator environments...")
+        
+        # 重置动力学模型的状态变量，避免不同episode之间的tensor大小不匹配
+        self.dynamics_model.reset_control_state()
+        print("Reset dynamics model state - cleared for fresh initialization")
+        
         # 使用 WorldInitializer 来生成一批新的世界状态，包括起始quad_id
         self.agents_state, _, self.agents_start_quad_ids = self.world_initializer.initialize_world(self.num_envs)
         # 将状态数据移动到正确的设备
         self.agents_state = self.agents_state.to(self.device)
+
         # 生成初始观测
         print("Generating initial observation...") 
         initial_observation = self.observation_generator.generate(self.agents_state)
@@ -125,7 +133,7 @@ class TeraflowSimulator:
         """
         让所有环境向前步进一个时间步。所有智能体都根据actions更新。
         Args:
-            actions (torch.Tensor): 形状为 (num_envs, num_agents, action_dim) 的动作张量。
+            actions (torch.Tensor): 形状为 (B, M, action) 的动作张量。
             debug_collision (bool): 是否为碰撞检测器开启调试模式。
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
@@ -135,16 +143,20 @@ class TeraflowSimulator:
         """
         if self.agents_state is None:
             raise RuntimeError("Must call reset() before calling step().")
-        actions = actions.to(self.device)
-        states_t0 = self.agents_state.clone()
+        
+        actions = actions.to(self.device)     #action挪到当前显卡上
+        states_t0 = self.agents_state.clone() #这一时刻的状态
+
+        action_update_time=time.time()
         # 1. 基于收到的所有动作，更新所有激活智能体的状态
         active_mask = self.agents_state[..., 6] > 0.5
         if active_mask.any():
             active_states = self.agents_state[active_mask]
-            active_actions = actions[active_mask]
+            active_actions = actions[active_mask]   #保留有效的actions，无效的actions会被填充为0
             # 确保active_actions的形状正确
             if active_actions.ndim == 3:
                 active_actions = active_actions.squeeze(0)  # 移除多余的维度
+
             # 离散动作空间：actions是动作索引，需要转换为标量
             if active_actions.ndim > 1:
                 # 如果actions是二维的，取第一个维度作为动作索引
@@ -157,7 +169,10 @@ class TeraflowSimulator:
             updated_states = self.agents_state[active_mask]
             updated_states[:, :4] = new_active_dynamics_states
             self.agents_state[active_mask] = updated_states
-        
+        action_update_time=time.time()-action_update_time
+        print(f"action_update_time: {action_update_time:.4f}s")
+
+        offroad_check_time=time.time()
         # 2. 离路检测
         is_on_road = torch.ones_like(active_mask) # 默认在路上
         if active_mask.any():
@@ -167,26 +182,45 @@ class TeraflowSimulator:
             active_is_on_road = self.offroad_checker.check_on_road(states_for_checker)
             is_on_road[active_mask] = active_is_on_road
         offroad_mask = ~is_on_road # (B, M)
+        offroad_update_time=time.time()-offroad_check_time
+        print(f"offroad_update_time: {offroad_update_time:.4f}s")
 
+
+        collision_check_time=time.time()
         # 3. 动态碰撞检测
         collision_check_result = self.collision_checker.check(
             states_t0, self.agents_state, debug=debug_collision, debug_env_idx=0
         )
         all_collisions = collision_check_result
+        collision_update_time=time.time()-collision_check_time
+        print(f"collision_update_time: {collision_update_time:.4f}s")
 
+        frenet_time=time.time()
         # 4. 计算Frenet坐标信息
         vehicle_positions = self.agents_state[..., :2]  # (B, M, 2) - x, y
         vehicle_headings = self.agents_state[..., 2]    # (B, M) - heading
-        d, theta_f = self.road_network.calculate_frenet_coordinates(vehicle_positions, vehicle_headings)
-        
+        d, theta_f = self.road_network.calculate_frenet_coordinates(vehicle_positions, vehicle_headings, self.spatial_hash)
+        frenet_update_time=time.time()-frenet_time
+        print(f"frenet_update_time: {frenet_update_time:.4f}s")
+
+        observation_time=time.time()
         # 5. 生成新的观测
         observation = self.observation_generator.generate(self.agents_state)
-        
-        # 6. 计算奖励（传入Frenet坐标和动作）
-        reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
+        observation_update_time=time.time()-observation_time
+        print(f"observation_update_time: {observation_update_time:.4f}s")
 
+        reward_time=time.time()
+        # 6. 计算奖励（传入Frenet坐标和动作）#跟这里速度无关
+        reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
+        reward_update_time=time.time()-reward_time
+        print(f"reward_update_time: {reward_update_time:.4f}s")
+
+        done_time=time.time()
         # 7. 检查是否结束（包含目标到达判断）
         done = all_collisions|offroad_mask|goal_reached
+        done_update_time=time.time()-done_time
+        print(f"done_update_time: {done_update_time:.4f}s")
+
         return observation, reward, done
     
     def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -222,9 +256,12 @@ class TeraflowSimulator:
             full_alat_jerk = torch.zeros((B, M), device=self.device)
             # 只对激活的智能体应用加速度
             active_mask = self.agents_state[..., 6] > 0.5
+            prepare_time=time.time()
             if active_mask.any():
                 full_along[active_mask] = along
                 full_alat[active_mask] = alat
+                prepare_time=time.time()-prepare_time
+                print(f"prepare_time: {prepare_time:.4f}s")
                 # 直接从动作空间获取jerk值，而不是从动力学模型计算
                 if actions is not None:
                     # 获取激活智能体的动作索引
@@ -247,11 +284,13 @@ class TeraflowSimulator:
         extended_state[..., 8] = theta_f  # theta_f - Frenet角度误差
         extended_state[..., 9] = d        # d - Frenet横向距离
         # 准备目标奖励计算的参数
+        
 
+        # 计算目标和初始化goal_reached，速度很快
         goal_positions = self.path_planner.get_quad_centers(self.agents_goal_quad_ids)
         goal_reached = False
 
-        # 调用奖励计算器
+        # 调用奖励计算器，这个速度很快
         reward, goal_reached = self.reward_calculator.calculate(
             extended_state,
             all_collisions,
@@ -260,6 +299,7 @@ class TeraflowSimulator:
             goal_positions=goal_positions,
             waypoint_reached=goal_reached,
         )
+
         self.extend_state = extended_state # 用于传入网络
         return reward, goal_reached
     
@@ -288,28 +328,63 @@ class TeraflowSimulator:
         # 创建完整的目标quad_id张量 (B, M)
         goal_quad_ids = torch.full((B, M), -1, dtype=torch.long, device=self.device)
         
-        # 为每个激活的智能体分配目标
+        # 为每个激活的智能体分配目标（GPU加速版本）
         active_indices = torch.where(active_mask)
         num_active_agents = len(active_indices[0])
         print(f"为 {num_active_agents} 个激活智能体分配目标...")
         
-        for b, m in zip(active_indices[0], active_indices[1]):
-            start_id = self.agents_start_quad_ids[b, m].item()
-            # 排除起始quad_id，从其他quads中随机选择
-            available_goals = available_quad_ids[available_quad_ids != start_id]
-            if len(available_goals) > 0:
-                # 修复：正确获取随机索引
-                random_idx = torch.randint(0, len(available_goals), (1,)).item()
-                goal_quad_ids[b, m] = available_goals[random_idx].item()
+        if num_active_agents > 0:
+            # 获取所有激活智能体的起始quad_id
+            active_start_ids = self.agents_start_quad_ids[active_indices]  # (num_active_agents,)
+        
+            # 为每个激活智能体生成随机目标
+            # 方法：为每个智能体生成一个随机索引，然后映射到可用的quad_id
+            # 为了避免选择起始位置，我们为每个智能体创建一个排除起始位置的可用目标列表
+            
+            # 创建可用目标矩阵 (num_active_agents, num_available_quads)
+            # 对于每个智能体，排除其起始位置
+            available_goals_expanded = available_quad_ids.unsqueeze(0).expand(num_active_agents, -1)  # (num_active_agents, num_available_quads)
+            start_ids_expanded = active_start_ids.unsqueeze(1)  # (num_active_agents, 1)
+            
+            # 创建掩码，排除起始位置
+            valid_mask = available_goals_expanded != start_ids_expanded  # (num_active_agents, num_available_quads)
+            
+            # 为每个智能体生成随机目标（GPU加速版本）
+            # 计算每个智能体的有效目标数量
+            valid_counts = valid_mask.sum(dim=1)  # (num_active_agents,)
+            
+            # 初始化目标ID为起始ID（默认情况）
+            goal_quad_ids_active = active_start_ids.clone()
+            
+            # 对于有有效目标的智能体，使用向量化操作随机选择目标
+            agents_with_valid_goals = valid_counts > 0
+            if agents_with_valid_goals.any():
+                # 获取有有效目标的智能体索引
+                valid_agent_indices = torch.where(agents_with_valid_goals)[0]
+                # 使用torch.multinomial进行批量加权随机采样
+                # 为每个智能体创建一个权重向量，有效目标权重为1，无效目标权重为0
+                weights = valid_mask.float()  # (num_active_agents, num_available_quads)
 
-                # 验证目标quad_id的有效性
-                goal_id = goal_quad_ids[b, m].item()
-                if goal_id < 0 or goal_id >= self.road_network.num_quads:
-                    print(f"错误: 目标quad_id {goal_id} 无效，范围应为 0-{self.road_network.num_quads-1}")
-            else:
-                # 如果没有其他选择，使用起始位置
-                goal_quad_ids[b, m] = start_id
-                print(f"智能体 ({b}, {m}): 起始 {start_id} -> 目标 {start_id} (无其他选择)")
+                # 批量采样：为所有有有效目标的智能体同时采样
+                valid_weights = weights[agents_with_valid_goals]  # (num_valid_agents, num_available_quads)
+                
+                # 使用multinomial进行批量采样
+                sampled_indices = torch.multinomial(valid_weights, 1, replacement=True)  # (num_valid_agents, 1)
+                
+                # 将采样的索引映射回目标ID
+                sampled_goals = available_quad_ids[sampled_indices.squeeze()]  # (num_valid_agents,)
+
+                # 将结果写回目标张量
+                goal_quad_ids_active[agents_with_valid_goals] = sampled_goals
+            # 将结果写回原始张量
+            goal_quad_ids[active_indices] = goal_quad_ids_active
+            # 验证目标quad_id的有效性（批量验证）
+            invalid_mask = (goal_quad_ids_active < 0) | (goal_quad_ids_active >= self.road_network.num_quads)
+
+            if invalid_mask.any():
+                invalid_ids = goal_quad_ids_active[invalid_mask]
+                print(f"错误: 发现无效的目标quad_id: {invalid_ids.cpu().numpy()}")
+                print(f"有效范围应为 0-{self.road_network.num_quads-1}")
         
         # 4. 使用plan_path批量生成路径规划
         path_plans = self.path_planner.plan_path(self.agents_start_quad_ids, goal_quad_ids)
@@ -317,7 +392,6 @@ class TeraflowSimulator:
         # 5. 存储结果
         self.agents_goal_quad_ids = goal_quad_ids
         self.agents_path_plans = path_plans 
-
 
 if __name__ == '__main__':
     # 这是一个简单的使用示例，用于测试模拟器的基本功能

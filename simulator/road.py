@@ -4,7 +4,6 @@ from typing import Dict, Tuple, List
 
 class RoadNetwork:
     """
-    无需更改,已经通过测试
     负责加载和管理从预处理的 CARLA 地图数据中提取的道路网络。
     这个类将地图数据（主要是四边形路块 'quads'）加载到 PyTorch 张量中，
     以便于在 GPU 上进行高效的批量化计算。它提供了查询地图几何信息
@@ -119,12 +118,13 @@ class RoadNetwork:
         """
         return self.quad_centerlines
 
-    def find_nearest_lanes(self, points: torch.Tensor, k: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+    def find_nearest_lanes(self, points: torch.Tensor, k: int = 1, spatial_hash=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         为一批输入点找到最近的 k 个车道 (quads)。
         Args:
             points (torch.Tensor): 形状为 (N, 2) 的点坐标张量。
             k (int): 需要为每个点找到的最近车道的数量。
+            spatial_hash (SpatialHash, optional): 空间哈希对象，用于加速查询。如果提供，将使用空间哈希；否则使用暴力搜索。
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
             - distances: 形状为 (N, k) 的距离张量。
@@ -132,41 +132,91 @@ class RoadNetwork:
         """
         if points.ndim == 1:
             points = points.unsqueeze(0)
-        # 计算点到所有车道中心点 (quad 中心线的中点) 的距离
-        quad_centers = self.quad_centerlines.mean(dim=1) # (num_quads, 2)
-        # 使用广播计算欧氏距离的平方
-        # (N, 1, 2) - (1, num_quads, 2) -> (N, num_quads, 2)
-        diff = points.unsqueeze(1) - quad_centers.unsqueeze(0)
-        dist_sq = torch.sum(diff ** 2, dim=-1) # (N, num_quads)
-        # 找到最近的 k 个
-        distances, indices = torch.topk(dist_sq, k=k, dim=1, largest=False)
-        return torch.sqrt(distances), indices
-
-    def get_global_waypoints_by_ids(self, ids: torch.Tensor, point_type: str) -> torch.Tensor:
-        """根据ID列表从全局航点库中获取航点坐标。"""
-        # 映射点类型到对应的张量
-        point_type_map = {
-            'w_lane': self.global_w_lane_waypoints,
-            'w_boundary': self.global_w_boundary_points
-        }
-    
-        source_points = point_type_map.get(point_type)
-        if source_points is None:
-            return torch.empty((0, 2), device=self.device)
-    
-        # 过滤掉无效的ID (例如，填充的-1)
-        valid_ids = ids[ids >= 0]
-        if valid_ids.numel() == 0:
-            return torch.empty((0, 2), device=self.device)
         
-        return source_points[valid_ids]
+        N = points.shape[0]
+        
+        if spatial_hash is not None:
+            # 使用空间哈希加速查询
+            candidate_pairs = spatial_hash.query_points(points)  # (num_candidates, 2) -> (point_idx, quad_idx)
+            
+            if candidate_pairs.numel() == 0:
+                # 如果没有候选quad，返回默认值
+                distances = torch.full((N, k), float('inf'), device=self.device)
+                indices = torch.full((N, k), -1, dtype=torch.long, device=self.device)
+                return distances, indices
+            
+            # 计算候选quad到对应点的距离
+            point_indices = candidate_pairs[:, 0]  # (num_candidates,)
+            quad_indices = candidate_pairs[:, 1]   # (num_candidates,)
+            
+            # 获取候选点的坐标和quad中心点
+            candidate_points = points[point_indices]  # (num_candidates, 2)
+            quad_centers = self.quad_centerlines.mean(dim=1)  # (num_quads, 2)
+            candidate_quad_centers = quad_centers[quad_indices]  # (num_candidates, 2)
+            
+            # 计算距离
+            diff = candidate_points - candidate_quad_centers  # (num_candidates, 2)
+            candidate_distances = torch.sum(diff ** 2, dim=-1)  # (num_candidates,)
+            
+            # 为每个点找到最近的k个quad
+            distances = torch.full((N, k), float('inf'), device=self.device)
+            indices = torch.full((N, k), -1, dtype=torch.long, device=self.device)
+            
+            # 使用GPU向量化操作处理所有点（无循环版本）
+            if point_indices.numel() > 0:
+                # 计算每个点的候选数量
+                point_counts = torch.bincount(point_indices, minlength=N)  # (N,) - 每个点的候选数量
+                max_candidates_per_point = point_counts.max().item()
+                
+                if max_candidates_per_point > 0:
+                    # 创建排序索引以便按点分组
+                    sorted_indices = torch.argsort(point_indices)  # 将候选按点ID排序
+                    sorted_point_indices = point_indices[sorted_indices]
+                    sorted_candidate_distances = candidate_distances[sorted_indices]
+                    sorted_quad_indices = quad_indices[sorted_indices]
+                    
+                    # 计算每个点的起始位置
+                    point_starts = torch.cumsum(torch.nn.functional.pad(point_counts, (1, 0)), dim=0)[:-1]  # (N,)
+                    
+                    # 创建候选数据张量
+                    point_candidate_distances = torch.full((N, max_candidates_per_point), float('inf'), device=self.device)
+                    point_candidate_indices = torch.full((N, max_candidates_per_point), -1, dtype=torch.long, device=self.device)
+                    
+                    # 使用高级索引进行向量化填充
+                    # 为每个候选创建(点索引, 候选位置)的坐标
+                    candidate_positions = torch.arange(len(sorted_indices), device=self.device) - point_starts[sorted_point_indices]
+                    
+                    # 填充候选数据（GPU向量化操作）
+                    point_candidate_distances[sorted_point_indices, candidate_positions] = sorted_candidate_distances
+                    point_candidate_indices[sorted_point_indices, candidate_positions] = sorted_quad_indices
+                    
+                    # 找到每个点的最近k个quad
+                    topk_distances, topk_indices = torch.topk(point_candidate_distances, k=min(k, max_candidates_per_point), dim=1, largest=False)
+                    
+                    # 填充结果
+                    valid_k = min(k, max_candidates_per_point)
+                    distances[:, :valid_k] = torch.sqrt(topk_distances)
+                    indices[:, :valid_k] = torch.gather(point_candidate_indices, 1, topk_indices)
+            
+            return distances, indices
+        else:
+            # 使用原始暴力搜索方法
+            quad_centers = self.quad_centerlines.mean(dim=1) # (num_quads, 2)
+            # 使用广播计算欧氏距离的平方
+            # (N, 1, 2) - (1, num_quads, 2) -> (N, num_quads, 2)
+            diff = points.unsqueeze(1) - quad_centers.unsqueeze(0)
+            dist_sq = torch.sum(diff ** 2, dim=-1) # (N, num_quads)
+            # 找到最近的 k 个
+            distances, indices = torch.topk(dist_sq, k=k, dim=1, largest=False)
+            return torch.sqrt(distances), indices
 
-    def calculate_frenet_coordinates(self, vehicle_positions: torch.Tensor, vehicle_headings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def calculate_frenet_coordinates(self, vehicle_positions: torch.Tensor, vehicle_headings: torch.Tensor, spatial_hash=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         计算车辆在Frenet坐标系中的横向距离d和角度误差theta_f。
         Args:
             vehicle_positions (torch.Tensor): 车辆位置，形状为 (B, M, 2) 或 (N, 2)
             vehicle_headings (torch.Tensor): 车辆朝向角度（弧度），形状为 (B, M) 或 (N,)
+            spatial_hash (SpatialHash, optional): 空间哈希对象，用于加速查询。如果提供，将使用空间哈希；否则使用暴力搜索。
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
             - d: 横向距离，正值表示在道路右侧，负值表示在道路左侧
@@ -180,7 +230,7 @@ class RoadNetwork:
         
         # 为每个车辆找到最近的道路段
         vehicle_positions_flat = vehicle_positions.view(-1, 2)  # (B*M, 2)
-        distances, nearest_indices = self.find_nearest_lanes(vehicle_positions_flat, k=1)
+        distances, nearest_indices = self.find_nearest_lanes(vehicle_positions_flat, k=1, spatial_hash=spatial_hash)
         
         # 重塑回原始形状
         nearest_indices = nearest_indices.view(B, M)  # (B, M)
@@ -229,9 +279,47 @@ if __name__ == '__main__':
     # 加载地图数据
     map_path = "maps/processed_map_Town01_stitched.json"
     print(f"加载地图: {map_path}")
+
+    import os
+    import sys
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    utils_dir = os.path.join(parent_dir, 'utils')
+    if utils_dir not in sys.path:
+        sys.path.insert(0, utils_dir)
+    from spatial_hash import SpatialHash
+
     try:
         # 创建RoadNetwork实例
         road_network = RoadNetwork(map_path, device)
+        # 创建空间哈希用于加速查询
+        print("创建空间哈希网格...")
+        
+        
+        # 计算所有quad的边界框
+        quad_centers = road_network.quad_centerlines.mean(dim=1)  # (num_quads, 2)
+        quad_min_bounds = torch.min(road_network.quad_centerlines, dim=1)[0]  # (num_quads, 2)
+        quad_max_bounds = torch.max(road_network.quad_centerlines, dim=1)[0]  # (num_quads, 2)
+        # 计算整个地图的边界
+        map_min_bounds = torch.min(quad_min_bounds, dim=0)[0]  # (2,)
+        map_max_bounds = torch.max(quad_max_bounds, dim=0)[0]  # (2,)
+        
+        # 设置合适的网格大小（根据quad的平均大小）
+        cell_size = torch.tensor(5.0)
+        
+        # 初始化空间哈希
+        spatial_hash = SpatialHash(
+            cell_size=cell_size,
+            min_bounds=map_min_bounds,
+            max_bounds=map_max_bounds,
+            device=device
+        )
+        
+        # 构建静态索引
+        quad_bounds = torch.stack([quad_min_bounds, quad_max_bounds], dim=1)  # (num_quads, 2, 2)
+        spatial_hash.build_static_index(quad_bounds)
+        print(f"空间哈希网格创建完成，网格大小: {cell_size:.2f}m")
+        
         # 获取quads顶点数据
         quads_vertices_np = road_network.quads_vertices.cpu().numpy()
         # 随机选择一个quad并在其中生成车辆位置
@@ -263,8 +351,9 @@ if __name__ == '__main__':
         vehicle_pos_array = np.array([vehicle_pos], dtype=np.float32)
         vehicle_pos_tensor = torch.tensor(vehicle_pos_array, dtype=torch.float32, device=device)
         
-        # 找到距离车辆最近的200个quads
-        distances, nearest_indices = road_network.find_nearest_lanes(vehicle_pos_tensor, k=200)
+        # 使用空间哈希加速查询，找到距离车辆最近的200个quads
+        print("使用空间哈希查询最近quads...")
+        distances, nearest_indices = road_network.find_nearest_lanes(vehicle_pos_tensor, k=200, spatial_hash=spatial_hash)
         nearest_indices = nearest_indices.cpu().numpy().flatten()
         nearest_quad_idx = nearest_indices[0]  # 最近的quad索引
         print(f"距离车辆最近的quad索引: {nearest_quad_idx}")
@@ -327,7 +416,7 @@ if __name__ == '__main__':
         vehicle_pos_tensor = torch.tensor(vehicle_pos_array, dtype=torch.float32, device=device)
         vehicle_yaw_tensor = torch.tensor([vehicle_yaw], dtype=torch.float32, device=device)
         print("计算Frenet坐标...")
-        d, theta_f = road_network.calculate_frenet_coordinates(vehicle_pos_tensor, vehicle_yaw_tensor)
+        d, theta_f = road_network.calculate_frenet_coordinates(vehicle_pos_tensor, vehicle_yaw_tensor, spatial_hash=spatial_hash)
         print(f"横向距离 d: {d.item():.2f} (正值表示在道路右侧，负值表示在道路左侧)")
         print(f"角度误差 theta_f: {theta_f.item():.2f} 弧度 ({np.degrees(theta_f.item()):.1f} 度)")
         print(f"角度误差解释: 正值表示车辆朝向偏右，负值表示偏左")

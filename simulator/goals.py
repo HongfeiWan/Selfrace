@@ -6,31 +6,23 @@ from typing import Dict, Tuple, List, Optional, Any
 
 class PathPlanner:
     def __init__(self,map_path: str, device: torch.device):
-        print(f"==========PathPlanner init==========")
         start_time = time.time()
         self.device = device
         # 如果提供了map，自动加载数据
         if map_path is not None:
             cross_data_path = map_path.replace('processed_map_', 'cross_data_processed_map_')
             # 加载cross数据
-            load_start = time.time()
             with open(cross_data_path, 'r', encoding='utf-8') as f:
                 cross_data = json.load(f)
             with open(map_path, 'r', encoding='utf-8') as f:
                 map_data = json.load(f)
-            load_time = time.time() - load_start
-            print(f"地图数据加载耗时: {load_time:.4f}秒")
         else:
             raise ValueError("map_path is required")
 
         # ===================存直路的quad_id==============================
-        filtered_start = time.time()
         self.filtered_quad_indices = torch.tensor(cross_data.get('filtered_quad_indices', []), dtype=torch.int32, device=self.device)
-        filtered_time = time.time() - filtered_start
-        print(f"直路quad_id处理耗时: {filtered_time:.4f}秒")
 
         # ===================存cross的信息================================
-        cross_start = time.time()
         cross_data_dict = {}
         for key, value in cross_data.items():
             if not key.startswith('cross_'):
@@ -93,13 +85,10 @@ class PathPlanner:
                 'paths': paths_list
             }
         self.cross_data = cross_data_dict
-        cross_time = time.time() - cross_start
-        print(f"cross信息处理耗时: {cross_time:.4f}秒")
 
         # ===================基于 cross_data 预存 (cross,road,lane) → (x,y) 查找表===================
         # 规则：优先使用 start_waypoints 的 (x,y)；若不存在则使用 end_waypoints 的 (x,y)
         # 存储为向量化可查表结构：排序后的唯一 key 及其坐标，查询时用 searchsorted 无循环映射
-        triplet_build_start = time.time()
         all_triplets_list = []  # List of (N_i, 3)
         all_coords_list = []    # List of (N_i, 2)
         for cid, info in self.cross_data.items():
@@ -192,11 +181,7 @@ class PathPlanner:
             self.triplet_lookup_sorted_keys = torch.empty(0, dtype=torch.int64, device=self.device)
             self.triplet_lookup_coords_sorted = torch.empty(0, 2, dtype=torch.float32, device=self.device)
 
-        print(f"triplet坐标查找表构建耗时: {time.time() - triplet_build_start:.4f}秒, 共{self.triplet_lookup_sorted_keys.numel()}条")
-
-
         # ===================存global_w_lane_waypoints===================
-        waypoints_start = time.time()
         global_w_lane_waypoints_list = map_data.get('global_w_lane_waypoints', [])
         if global_w_lane_waypoints_list:
             # 提取所有字段并创建结构化张量
@@ -231,11 +216,8 @@ class PathPlanner:
                 waypoint_data['carla_waypoint_info']['s'][i] = carla_info['s']
             self.global_w_lane_waypoints = waypoint_data
             self.lanes = self._group_waypoints_by_lane_gpu()
-            waypoints_time = time.time() - waypoints_start
-            print(f"waypoints处理耗时: {waypoints_time:.4f}秒")
             
         # ===================创建waypoint_id到lane的映射===================
-        waypoint_mapping_start = time.time()
         # 收集所有waypoint_id并创建映射
         all_waypoint_ids = []
         all_road_ids = []
@@ -263,10 +245,7 @@ class PathPlanner:
             'lane_indices_tensor': lane_indices_tensor,
             'lane_lengths': lane_lengths
         }
-        waypoint_mapping_time = time.time() - waypoint_mapping_start
-        print(f"waypoint映射处理耗时: {waypoint_mapping_time:.4f}秒")
         # ===================存quads的信息===================
-        quads_start = time.time()
         quads_info = map_data.get('quads', [])
         if quads_info:
             num_quads = len(quads_info)
@@ -306,11 +285,8 @@ class PathPlanner:
             quad_data['direction_x'] = directions_normalized[:, 0]
             quad_data['direction_y'] = directions_normalized[:, 1]
             self.quads_info = quad_data
-        quads_time = time.time() - quads_start
-        print(f"quads信息处理耗时: {quads_time:.4f}秒")
 
         # ===================存quad_to_next_waypoint的信息===================
-        quad_next_start = time.time()
         quad_to_next_waypoint = map_data.get('quad_to_next_waypoint', {})
         # 将quad_to_next_waypoint字典转换为tensor映射关系
         if quad_to_next_waypoint:
@@ -320,22 +296,16 @@ class PathPlanner:
             # 创建tensor映射关系
             self.quad_to_next_waypoint_quad_ids = torch.tensor(quad_ids, dtype=torch.int32, device=self.device)
             self.quad_to_next_waypoint_values = torch.tensor(next_waypoint_values, dtype=torch.int32, device=self.device)
-        quad_next_time = time.time() - quad_next_start
-        print(f"quad_to_next_waypoint处理耗时: {quad_next_time:.4f}秒")
 
         # ===================存quad_to_prev_waypoint的信息===================
-        quad_prev_start = time.time()
         quad_to_prev_waypoint = map_data.get('quad_to_prev_waypoint', {})
         if quad_to_prev_waypoint:
             quad_ids = sorted([int(k) for k in quad_to_prev_waypoint.keys()])
             prev_waypoint_values = [quad_to_prev_waypoint[str(quad_id)] for quad_id in quad_ids]
             self.quad_to_prev_waypoint_quad_ids = torch.tensor(quad_ids, dtype=torch.int32, device=self.device)
             self.quad_to_prev_waypoint_values = torch.tensor(prev_waypoint_values, dtype=torch.int32, device=self.device)
-        quad_prev_time = time.time() - quad_prev_start
-        print(f"quad_to_prev_waypoint处理耗时: {quad_prev_time:.4f}秒")
 
         # ===================收集所有cross_data中的path_quad_ids===================
-        path_collect_start = time.time()
         all_path_quad_ids = []
         all_path_cross_ids = []
         all_path_indices = []
@@ -357,11 +327,8 @@ class PathPlanner:
             self.cross_quad_centers_y = self.quads_info['center_y'][self.all_quad_ids_flat]
             self.cross_quad_directions_x = self.quads_info['direction_x'][self.all_quad_ids_flat]
             self.cross_quad_directions_y = self.quads_info['direction_y'][self.all_quad_ids_flat]
-        path_collect_time = time.time() - path_collect_start
-        print(f"path_quad_ids收集处理耗时: {path_collect_time:.4f}秒")
 
         # ===================预计算不在filtered_quad_indices内的quad的最近邻===================
-        nearest_neighbor_start = time.time()
         # 获取所有不在filtered_quad_indices内的quad_id
         all_quad_ids = torch.arange(self.quads_info['center_x'].shape[0], device=self.device)
         non_filtered_mask = ~torch.isin(all_quad_ids, self.filtered_quad_indices)
@@ -494,11 +461,8 @@ class PathPlanner:
                         'distance': valid_min_distances[i],
                         'angle': valid_angles[i]
                     }
-        nearest_neighbor_time = time.time() - nearest_neighbor_start
-        print(f"最近邻预计算处理耗时: {nearest_neighbor_time:.4f}秒")
 
         # ===================预处理cross匹配数据===================
-        cross_match_start = time.time()
         # 批量匹配cross的end_waypoint_ids（合并所有cross）- 在初始化时预处理
         all_end_ids_list = []
         all_end_cids_list = []
@@ -531,21 +495,17 @@ class PathPlanner:
         else:
             self.all_start_ids = torch.empty(0, dtype=torch.int32, device=self.device)
             self.all_start_cids = torch.empty(0, dtype=torch.int32, device=self.device)
-        cross_match_time = time.time() - cross_match_start
-        print(f"cross匹配数据预处理耗时: {cross_match_time:.4f}秒")
         
         # ===================初始化WaypointGraphGPU===================
         try:
             # 使用cross_data_path作为waypoint_graph的输入
             self.waypoint_graph_gpu = WaypointGraphGPU(cross_data_path, device=str(self.device))
-            print(f"WaypointGraphGPU初始化成功")
-
         except Exception as e:
             print(f"WaypointGraphGPU初始化失败: {e}")
             self.waypoint_graph_gpu = None
         
         total_init_time = time.time() - start_time
-        print(f"PathPlanner初始化总耗时: {total_init_time:.4f}秒")
+        print(f"PathPlanner模块初始化总耗时: {total_init_time:.4f}秒")
 
     def plan_path(self, start_quad_id: torch.Tensor, goal_quad_id: torch.Tensor) -> torch.Tensor:
         '''
@@ -556,11 +516,9 @@ class PathPlanner:
             path: 路径(B,M,max_path_length,2)
         '''
         plan_start_time = time.time()
-
         # 初始化规划的路径：
         # path = (B,M,512,2)
         path = torch.full((start_quad_id.shape[0], start_quad_id.shape[1], 512, 2), -1, dtype=torch.float32, device=self.device)
-
         # 确定起始点和目标点的类型（是否在filtered_quad_indices内）
         # 使用GPU张量进行快速查询
         # 重塑张量以便进行广播比较
@@ -586,7 +544,6 @@ class PathPlanner:
         goal_lane_waypoints_lengths = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
         
         # 情况1：处理起点在filtered_quad_indices内的情况
-        case1_start = time.time()
         if start_in_filtered_mask.any():
             # 获取满足条件的start_quad索引
             valid_start_indices = torch.where(start_in_filtered_mask)[0]
@@ -655,33 +612,23 @@ class PathPlanner:
 
                     if write_mask.any():
                         # 填充lane_waypoints（只保存有效值）- 优化版本
-                        case1_step10_start = time.time()
                         sel_pos = pos[write_mask]
                         sel_indices = torch.where(write_mask)[0]
-                        case1_step10_time = time.time() - case1_step10_start
-                        print(f"  情况1-步骤10(回写start_ids): {case1_step10_time:.4f}秒")
             
                         # 批量处理，使用向量化操作
                         if sel_indices.numel() > 0:
                             # 获取所有需要处理的lane数据
-                            case1_step11_start = time.time()
                             batch_lane_data = lane_indices_tensor[sel_indices]
                             batch_positions = sel_pos
-                            case1_step11_time = time.time() - case1_step11_start
-                            print(f"  情况1-步骤11(获取lane数据): {case1_step11_time:.4f}秒")
                             
                             # 向量化处理：为每个位置创建mask
-                            case1_step12_start = time.time()
                             max_lane_length = batch_lane_data.shape[1]
                             position_indices = torch.arange(max_lane_length, device=self.device).unsqueeze(0).expand(batch_positions.shape[0], -1)
                             start_positions = batch_positions.unsqueeze(1)
-                            case1_step12_time = time.time() - case1_step12_start
-                            print(f"  情况1-步骤12(创建mask): {case1_step12_time:.4f}秒")
                             
                             # 创建有效mask：从start_position到末尾，且值>=0
                             valid_mask = (position_indices >= start_positions) & (batch_lane_data >= 0)
                             # 对每个lane，获取有效的waypoint - 完全GPU向量化版本
-                            case1_step13_start = time.time()
                             # 使用向量化操作直接处理所有waypoint
                             # 创建waypoint计数和偏移量
                             waypoint_counts = valid_mask.sum(dim=1)  # 每个lane的有效waypoint数量
@@ -734,18 +681,13 @@ class PathPlanner:
                                     safe_lengths = torch.clamp(valid_ends - valid_starts, max=max_waypoints_per_lane).to(torch.int32)
                                     lane_waypoints_lengths[target_indices] = safe_lengths
 
-                            case1_step13_time = time.time() - case1_step13_start
-                            print(f"  情况1-步骤13(获取有效waypoint): {case1_step13_time:.4f}秒") 
-
         # 情况2：处理起点不在filtered_quad_indices内的情况 - 使用张量批量查找
-        case2_start = time.time()
         if (~start_in_filtered_mask).any():
             # 获取不在filtered_quad_indices内的start_quad
             invalid_start_indices = torch.where(~start_in_filtered_mask)[0]
             invalid_start_quads = start_quad_flat[invalid_start_indices]
             if invalid_start_quads.numel() > 0:
                 # 使用新的张量批量查找方法
-                case2_step1_start = time.time()
                 neighbor_info_batch = self.get_nearest_neighbor_info_batch(invalid_start_quads)
 
                 # 筛选有效的最近邻信息
@@ -813,10 +755,7 @@ class PathPlanner:
                                 # 更新长度信息
                                 safe_lengths = torch.clamp(valid_counts, max=max_waypoints_per_lane).to(torch.int32)
                                 lane_waypoints_lengths[valid_start_indices] = safe_lengths   
-        case2_time = time.time() - case2_start
-        print(f"情况2处理耗时: {case2_time:.4f}秒")
 
-        case3_start = time.time()
         # 情况3：处理终点在filtered_quad_indices内的情况（类似逻辑）
         if goal_in_filtered_mask.any():
             # 获取满足条件的goal_quad索引
@@ -957,10 +896,7 @@ class PathPlanner:
                                     # 更新长度信息
                                     safe_lengths = torch.clamp(valid_ends - valid_starts, max=max_waypoints_per_lane).to(torch.int32)
                                     goal_lane_waypoints_lengths[target_indices] = safe_lengths                                
-        case3_time = time.time() - case3_start
-        print(f"情况3处理耗时: {case3_time:.4f}秒")
 
-        case4_start = time.time()
         # 情况4：处理终点不在filtered_quad_indices内的情况 - 使用张量批量查找
         if (~goal_in_filtered_mask).any():
             # 获取不在filtered_quad_indices内的goal_quad
@@ -968,10 +904,8 @@ class PathPlanner:
             invalid_goal_quads = goal_quad_flat[invalid_goal_indices]
             if invalid_goal_quads.numel() > 0:
                 # 使用新的张量批量查找方法
-                case4_step1_start = time.time()
                 neighbor_info_batch = self.get_nearest_neighbor_info_batch(invalid_goal_quads)
-                case4_step1_time = time.time() - case4_step1_start
-                print(f"  情况4-步骤1(批量获取最近邻): {case4_step1_time:.4f}秒")
+
                 # 筛选有效的最近邻信息
                 valid_mask = neighbor_info_batch['valid_mask']
                 if valid_mask.any():
@@ -979,14 +913,12 @@ class PathPlanner:
                     valid_indices = torch.where(valid_mask)[0]
                     valid_goal_indices = invalid_goal_indices[valid_indices]
                     # 批量更新end_ids
-                    case4_step2_start = time.time()
+
                     end_ids[valid_goal_indices, 0] = neighbor_info_batch['nearest_cross_ids'][valid_indices]
                     end_ids[valid_goal_indices, 1] = neighbor_info_batch['from_end_road_ids'][valid_indices]
                     end_ids[valid_goal_indices, 2] = neighbor_info_batch['from_end_lane_ids'][valid_indices]
-                    case4_step2_time = time.time() - case4_step2_start
-                    print(f"  情况4-步骤2(批量更新end_ids): {case4_step2_time:.4f}秒")
                     # 批量处理waypoints - 使用张量操作
-                    case4_step3_start = time.time()
+
                     # 获取有效的path_start_to_nearest_quad_ids
                     valid_path_start_quad_ids = neighbor_info_batch['path_start_to_nearest_quad_ids'][valid_indices]
                     valid_path_start_lengths = neighbor_info_batch['path_start_to_nearest_lengths'][valid_indices]
@@ -1038,15 +970,6 @@ class PathPlanner:
                                 safe_lengths = torch.clamp(valid_counts, max=max_waypoints_per_lane).to(torch.int32)
                                 goal_lane_waypoints_lengths[valid_goal_indices] = safe_lengths
                 
-                    case4_step3_time = time.time() - case4_step3_start
-                    print(f"  情况4-步骤3(批量处理waypoints): {case4_step3_time:.4f}秒")
-        case4_time = time.time() - case4_start
-        print(f"情况4处理耗时: {case4_time:.4f}秒")      
-
-        # 在这里已经得到了start_ids，end_ids。通过cross_data内部的"waypoint_graph"得到两个节点之间的其它节点。
-        plan_total_time = time.time() - plan_start_time
-        print(f"plan_path总耗时: {plan_total_time:.4f}秒")
-
 
         # 返回张量结构的结果，便于后续处理
         # lane_waypoints_tensor: (B*M, max_waypoints_per_lane, 2) - 起点lane坐标
@@ -1167,6 +1090,9 @@ class PathPlanner:
 
         # 形状还原为 (B,M,Lmax,2)
         path = path_flat.view(start_quad_id.shape[0], start_quad_id.shape[1], Lmax, 2)
+        # 在这里已经得到了start_ids，end_ids。通过cross_data内部的"waypoint_graph"得到两个节点之间的其它节点。
+        plan_total_time = time.time() - plan_start_time
+        print(f"plan_path总耗时: {plan_total_time:.4f}秒")
         return path
         
 #=======================查找工具函数=======================
@@ -1581,8 +1507,7 @@ class WaypointGraphGPU:
         device = self.device
         U = self.triplet_unique_keys.numel()
         N = self.outgoing_tgt_idx.size(0)
-        print(f"预计算 {U} 个终点组的最短路径树（张量存储）...")
-        start_time = time.time()
+
         # 预分配张量存储所有终点组的结果
         # dist_tensor: [U, N] - 每个终点组到所有节点的最短距离
         # next_tensor: [U, N] - 每个终点组的最短路径下一跳
@@ -1595,8 +1520,6 @@ class WaypointGraphGPU:
             next_tensor[g] = next_g
         self.end_dist_tensor = dist_tensor  # [U, N]
         self.end_next_tensor = next_tensor  # [U, N]
-        end_time = time.time()
-        print(f"终点组预计算完成，耗时: {end_time - start_time:.4f}秒")
 
     def _build_end_tree(self, end_group_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """为给定终点组构建最短路径树"""
