@@ -1,4 +1,5 @@
 from multiprocessing.spawn import prepare
+from sympy import N
 import torch
 import yaml
 import os
@@ -116,6 +117,7 @@ class TeraflowSimulator:
         
         # 使用 WorldInitializer 来生成一批新的世界状态，包括起始quad_id
         self.agents_state, _, self.agents_start_quad_ids = self.world_initializer.initialize_world(self.num_envs)
+
         # 将状态数据移动到正确的设备
         self.agents_state = self.agents_state.to(self.device)
 
@@ -210,7 +212,7 @@ class TeraflowSimulator:
         print(f"observation_update_time: {observation_update_time:.4f}s")
 
         reward_time=time.time()
-        # 6. 计算奖励（传入Frenet坐标和动作）#跟这里速度无关
+        # 6. 计算奖励（传入Frenet坐标和动作）
         reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
         reward_update_time=time.time()-reward_time
         print(f"reward_update_time: {reward_update_time:.4f}s")
@@ -220,7 +222,6 @@ class TeraflowSimulator:
         done = all_collisions|offroad_mask|goal_reached
         done_update_time=time.time()-done_time
         print(f"done_update_time: {done_update_time:.4f}s")
-
         return observation, reward, done
     
     def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -254,6 +255,7 @@ class TeraflowSimulator:
             full_alat = torch.zeros((B, M), device=self.device)
             full_along_jerk = torch.zeros((B, M), device=self.device)
             full_alat_jerk = torch.zeros((B, M), device=self.device)
+            print(along.shape, alat.shape)
             # 只对激活的智能体应用加速度
             active_mask = self.agents_state[..., 6] > 0.5
             prepare_time=time.time()
@@ -284,7 +286,6 @@ class TeraflowSimulator:
         extended_state[..., 8] = theta_f  # theta_f - Frenet角度误差
         extended_state[..., 9] = d        # d - Frenet横向距离
         # 准备目标奖励计算的参数
-        
 
         # 计算目标和初始化goal_reached，速度很快
         goal_positions = self.path_planner.get_quad_centers(self.agents_goal_quad_ids)
@@ -312,7 +313,7 @@ class TeraflowSimulator:
         if self.agents_state is None:
             return
         B, M, _ = self.agents_state.shape  # batch_size, max_agents, state_dim
-        
+    
         # 1. 获取所有激活智能体的位置
         active_mask = self.agents_state[..., 6] > 0.5  # (B, M)
 
@@ -321,73 +322,30 @@ class TeraflowSimulator:
             print("Warning: No start quad IDs available for path planning")
             return
         
-        # 3. 为所有激活智能体随机分配目标quad_id
-        # 获取所有可用的quad_id
-        available_quad_ids = torch.arange(self.road_network.num_quads, device=self.device)
+        # 3. 简化：复制start结构，激活位置随机赋一个合法quad_id
+        goal_quad_ids = self.agents_start_quad_ids.clone()
+        if active_mask.any():
+            rand_goals = torch.randint(0, self.road_network.num_quads, goal_quad_ids.shape, device=self.device)
+            goal_quad_ids[active_mask] = rand_goals[active_mask]
         
-        # 创建完整的目标quad_id张量 (B, M)
-        goal_quad_ids = torch.full((B, M), -1, dtype=torch.long, device=self.device)
-        
-        # 为每个激活的智能体分配目标（GPU加速版本）
-        active_indices = torch.where(active_mask)
-        num_active_agents = len(active_indices[0])
-        print(f"为 {num_active_agents} 个激活智能体分配目标...")
-        
-        if num_active_agents > 0:
-            # 获取所有激活智能体的起始quad_id
-            active_start_ids = self.agents_start_quad_ids[active_indices]  # (num_active_agents,)
-        
-            # 为每个激活智能体生成随机目标
-            # 方法：为每个智能体生成一个随机索引，然后映射到可用的quad_id
-            # 为了避免选择起始位置，我们为每个智能体创建一个排除起始位置的可用目标列表
-            
-            # 创建可用目标矩阵 (num_active_agents, num_available_quads)
-            # 对于每个智能体，排除其起始位置
-            available_goals_expanded = available_quad_ids.unsqueeze(0).expand(num_active_agents, -1)  # (num_active_agents, num_available_quads)
-            start_ids_expanded = active_start_ids.unsqueeze(1)  # (num_active_agents, 1)
-            
-            # 创建掩码，排除起始位置
-            valid_mask = available_goals_expanded != start_ids_expanded  # (num_active_agents, num_available_quads)
-            
-            # 为每个智能体生成随机目标（GPU加速版本）
-            # 计算每个智能体的有效目标数量
-            valid_counts = valid_mask.sum(dim=1)  # (num_active_agents,)
-            
-            # 初始化目标ID为起始ID（默认情况）
-            goal_quad_ids_active = active_start_ids.clone()
-            
-            # 对于有有效目标的智能体，使用向量化操作随机选择目标
-            agents_with_valid_goals = valid_counts > 0
-            if agents_with_valid_goals.any():
-                # 获取有有效目标的智能体索引
-                valid_agent_indices = torch.where(agents_with_valid_goals)[0]
-                # 使用torch.multinomial进行批量加权随机采样
-                # 为每个智能体创建一个权重向量，有效目标权重为1，无效目标权重为0
-                weights = valid_mask.float()  # (num_active_agents, num_available_quads)
+        # 4. 使用plan_path批量生成路径规划（仅对start/goal > 0的位置）
+        print(self.agents_start_quad_ids, goal_quad_ids)
+        start_i32 = self.agents_start_quad_ids.to(dtype=torch.int32, device=self.device)
+        goal_i32 = goal_quad_ids.to(dtype=torch.int32, device=self.device)
 
-                # 批量采样：为所有有有效目标的智能体同时采样
-                valid_weights = weights[agents_with_valid_goals]  # (num_valid_agents, num_available_quads)
-                
-                # 使用multinomial进行批量采样
-                sampled_indices = torch.multinomial(valid_weights, 1, replacement=True)  # (num_valid_agents, 1)
-                
-                # 将采样的索引映射回目标ID
-                sampled_goals = available_quad_ids[sampled_indices.squeeze()]  # (num_valid_agents,)
+        # 仅保留 start>0 且 goal>0 的位置，其他置为 -1
+        valid_mask = (start_i32 > 0) & (goal_i32 > 0)
+        start_i32 = start_i32.masked_fill(~valid_mask, -1)
+        goal_i32 = goal_i32.masked_fill(~valid_mask, -1)
+        # (B,M,1)
+        start_i32 = start_i32.unsqueeze(-1)
+        goal_i32 = goal_i32.unsqueeze(-1)
 
-                # 将结果写回目标张量
-                goal_quad_ids_active[agents_with_valid_goals] = sampled_goals
-            # 将结果写回原始张量
-            goal_quad_ids[active_indices] = goal_quad_ids_active
-            # 验证目标quad_id的有效性（批量验证）
-            invalid_mask = (goal_quad_ids_active < 0) | (goal_quad_ids_active >= self.road_network.num_quads)
-
-            if invalid_mask.any():
-                invalid_ids = goal_quad_ids_active[invalid_mask]
-                print(f"错误: 发现无效的目标quad_id: {invalid_ids.cpu().numpy()}")
-                print(f"有效范围应为 0-{self.road_network.num_quads-1}")
-        
-        # 4. 使用plan_path批量生成路径规划
-        path_plans = self.path_planner.plan_path(self.agents_start_quad_ids, goal_quad_ids)
+        path_plans = self.path_planner.plan_path(start_i32, goal_i32)
+        # 清空无效路径
+        invalid_mask = ~valid_mask
+        if invalid_mask.any():
+            path_plans[invalid_mask] = -1
 
         # 5. 存储结果
         self.agents_goal_quad_ids = goal_quad_ids
@@ -408,7 +366,7 @@ if __name__ == '__main__':
     simulator = TeraflowSimulator(config=config, device=torch.device('cuda:0'))
     initial_obs = simulator.reset()
     print(f"Initial observation batch shape: {initial_obs.shape}")
-    # 可视化道路网络和智能体位置（优化版本）
+    # 可视化道路网络和智能体位置（与goals.py绘制风格保持一致）
     print("\n=== 可视化道路网络和智能体位置 ===")
     # 获取道路网络的四边形顶点 这里是测试road.py
     quads_vertices = simulator.road_network.quads_vertices  # (num_quads, 4, 2)
@@ -431,6 +389,7 @@ if __name__ == '__main__':
 
     # 绘制激活的智能体
     active_mask = agents_state_np[0, :, 6] > 0.5  # 第一个环境的激活智能体
+    print(active_mask)
     active_agents = agents_state_np[0, active_mask]  # 激活智能体的状态
     if len(active_agents) > 0:
         print(f"绘制 {len(active_agents)} 个激活智能体...")
@@ -481,7 +440,6 @@ if __name__ == '__main__':
             ax.text(x, y, label, ha='center', va='center', fontsize=10, 
                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8),
                    weight='bold')
-            
             # 绘制速度向量（方向指示）
             speed_vector_length = 3.0  # 速度向量的显示长度
             speed_dx = speed_vector_length * cos_yaw
@@ -492,48 +450,35 @@ if __name__ == '__main__':
             info_text = f'v={speed:.1f}m/s'
             ax.text(x, y + half_width + 1, info_text, ha='center', va='bottom', 
                    fontsize=8, color=color, weight='bold')
-            
-    # 绘制每个智能体的路径（过滤掉 -1,-1）
+    
+    # 叠加绘制：对应mask位置的 agents_path_plans 路径（与goals.py一致）
     if simulator.agents_path_plans is not None:
-        try:
-            paths_np = simulator.agents_path_plans[0].detach().cpu().numpy()  # (M, L, 2)
-        except Exception:
-            paths_np = simulator.agents_path_plans.detach().cpu().numpy()      # (M, L, 2)
-        M_paths = paths_np.shape[0]
-        # 若颜色表不存在，则创建一个
-        if 'colors' not in locals():
-            colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
-        for m in range(M_paths):
-            coords = paths_np[m]  # (L,2)
-            mask_valid = (coords[:, 0] != -1) & (coords[:, 1] != -1)
-            valid = coords[mask_valid]
-            if valid.shape[0] == 0:
+        plans_np = simulator.agents_path_plans.cpu().numpy()  # (B, M, 512, 2)
+        method2_paths = []
+        for i in range(plans_np.shape[1]):
+            path_i = plans_np[0, i]
+            valid_mask = (path_i[:, 0] != -1) & (path_i[:, 1] != -1)
+            if valid_mask.any():
+                coords = path_i[valid_mask]
+                method2_paths.append(coords)
+                print(f"方法2路径 {i+1}: {len(coords)}个点")
+                print(f"  起点: {coords[0]}")
+                print(f"  终点: {coords[-1]}")
+            else:
+                method2_paths.append(None)
+        # 绘制方法2的路径（红虚线 + 起点圆点/终点叉号）
+        for i in range(len(method2_paths)):
+            if method2_paths[i] is None:
                 continue
-            col = colors[m % len(colors)]
-            ax.scatter(valid[:, 0], valid[:, 1], color=col , s=5)
-            ax.scatter(valid[0, 0], valid[0, 1], c=col, s=16, marker='x', zorder=4)
-            ax.scatter(valid[-1, 0], valid[-1, 1], c=col, s=16, marker='x', zorder=4)
-
-    # 设置图形属性
+            path2 = method2_paths[i]
+            ax.plot(path2[:, 0], path2[:, 1], 'r--', linewidth=2, label='Method2: plan_path' if i == 0 else None)
+            ax.scatter(path2[0, 0], path2[0, 1], c='red', marker='o', s=100, label='start' if i == 0 else None)
+            ax.scatter(path2[-1, 0], path2[-1, 1], c='red', marker='x', s=100, label='goal' if i == 0 else None)
+    # 统一图形样式
+    ax.set_aspect('equal', adjustable='box')
+    ax.grid(True, alpha=0.3)
+    ax.set_title('road graph and agent positions, path plans')
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
-    ax.set_title('visualization of road network, agent positions and path plans')
-    ax.grid(True, alpha=0.3)
-    # 设置坐标轴范围
-    all_vertices = quads_vertices_np.reshape(-1, 2)
-    x_min, x_max = all_vertices[:, 0].min(), all_vertices[:, 0].max()
-    y_min, y_max = all_vertices[:, 1].min(), all_vertices[:, 1].max()
-    # 添加一些边距
-    margin = 1
-    ax.set_xlim(x_min - margin, x_max + margin)
-    ax.set_ylim(y_min - margin, y_max + margin)
-    print(f"道路网络范围: X({x_min:.1f}, {x_max:.1f}), Y({y_min:.1f}, {y_max:.1f})")
-    print(f"激活智能体数量: {len(active_agents)}")
     plt.tight_layout()
     plt.show()
-    print(simulator.agents_path_plans)
-
-    
-    
-    
-

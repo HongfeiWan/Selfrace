@@ -135,12 +135,8 @@ class WorldInitializer:
             
             # 5. 如果所有放置都有效，则完成初始化
             if not invalid_placement_mask.any():
-                # 记录有效的quad_id
-                total_agents = num_envs * self.num_agents_per_env
-                spawn_quad_indices = torch.randint(
-                    0, self.road_network.num_quads, (total_agents,), device=self.device
-                ).view(num_envs, self.num_agents_per_env)
-                agents_start_quad_ids[:, :self.num_agents_per_env] = spawn_quad_indices
+                # 记录有效的quad_id - 使用实际生成智能体位置时使用的quad_id
+                agents_start_quad_ids[:, :self.num_agents_per_env] = spawn_quad_indices.view(num_envs, self.num_agents_per_env)
 
                 if retry > 0:
                     logging.debug(f"All agents placed successfully after {retry+1} retries.")
@@ -153,13 +149,10 @@ class WorldInitializer:
             # 7. 记录有效的quad_id（对于有效的放置）
             valid_placement_mask = ~invalid_placement_mask
             if valid_placement_mask.any():
-                # 为有效的放置记录quad_id
-                total_agents = num_envs * self.num_agents_per_env
-                spawn_quad_indices = torch.randint(
-                    0, self.road_network.num_quads, (total_agents,), device=self.device
-                ).view(num_envs, self.num_agents_per_env)
-                # 使用布尔索引来更新有效的quad_id
-                agents_start_quad_ids[valid_placement_mask] = spawn_quad_indices[valid_placement_mask]
+                # 使用实际生成智能体位置时使用的quad_id
+                # 修复形状不匹配：将spawn_quad_indices重塑为2D，然后更新
+                spawn_quad_indices_2d = spawn_quad_indices.view(num_envs, self.num_agents_per_env)
+                agents_start_quad_ids[:, :self.num_agents_per_env][valid_placement_mask] = spawn_quad_indices_2d[valid_placement_mask]
             if retry == 0:  # 只在第一次迭代时打印性能信息
                 print(f"Retry {retry}: gen_time={gen_time:.4f}s, check_time={check_time:.4f}s, offroad_time={offroad_time:.4f}s, collision_time={collision_time:.4f}s")
         end_time = time.time()
@@ -418,7 +411,6 @@ if __name__ == '__main__':
         max_bounds=max_bounds,
         device=device
     )
-    print(f"SpatialHash initialized with cell size: {test_config['hash']['hash_cell_size']:.2f}m")
     offroad_checker = OffroadChecker(road_network, spatial_hash)
     collision_checker = CollisionChecker(test_config, spatial_hash)
     print("Dependencies instantiated successfully.")

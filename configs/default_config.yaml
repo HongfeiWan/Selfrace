@@ -3,11 +3,11 @@ simulator:
   # 设备配置 - 8张显卡的分布式设置
   device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
 
-  num_envs: 2000        # 总并行环境数量 (8 * 4800 = 38400)
+  num_envs: 1           # 总并行环境数量 (8 * 4800 = 38400)
   sim_dt: 0.3           # 模拟时间步长
   max_agents_num: 150   # 最大车辆数量,定义每个环境中最大可能的智能体数量
   #必须满足：num_npc_vehicles <= max_agents_num，否则会报错
-  num_npc_vehicles: 150 # NPC车辆数量,定义每个环境中实际生成的智能体数量
+  num_npc_vehicles: 5   # NPC车辆数量,定义每个环境中实际生成的智能体数量
 
   # 地图配置  
   map_path: "./maps/processed_map_Town01_stitched.json" # 地图路径
