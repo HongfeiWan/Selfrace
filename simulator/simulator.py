@@ -89,8 +89,7 @@ class TeraflowSimulator:
         self.observation_generator = ObservationGenerator(self.road_network, obs_config, self.device, self.spatial_hash)
 
         # 8. 初始化奖励计算器
-        reward_config = simulator_config['reward']
-        self.reward_calculator = RewardCalculator(reward_config, self.device)
+        self.reward_calculator = RewardCalculator(self.config, self.device)
 
         # 9. 初始化路径规划器
         # PathPlanner现在会自动加载所需的数据
@@ -112,19 +111,27 @@ class TeraflowSimulator:
         # 重置动力学模型的状态变量，避免不同episode之间的tensor大小不匹配
         self.dynamics_model.reset_control_state()
         print("Reset dynamics model state - cleared for fresh initialization")
+
         # 使用 WorldInitializer 来生成一批新的世界状态，包括起始quad_id
         self.agents_state, _, self.agents_start_quad_ids = self.world_initializer.initialize_world(self.num_envs)
+        
+        # 重置reward风格参数
+        self.reward_calculator.reset_episode()
+
         # 将状态数据移动到正确的设备
         self.agents_state = self.agents_state.to(self.device)
+
         # 生成初始观测
         print("Generating initial observation...") 
         initial_observation = self.observation_generator.generate(self.agents_state)
         print(initial_observation.shape)
         print("Initial observation generated")
+
         # 初始化路径规划器 - 为所有智能体分配目标和生成路径规划
         self._initialize_path_planning()
         print("Path planning initialized")
         print(f"Reset complete. World state shape: {self.agents_state.shape}")
+        self.stop_lines = torch.zeros((self.num_envs, self.world_initializer.max_agents,20), dtype=torch.int32, device=self.device)
         return initial_observation
     
     def step(self, actions: torch.Tensor, debug_collision: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:

@@ -5,7 +5,6 @@ from randomize_components import RewardParameterSampler
 
 class RewardCalculator:
     """
-    无需更改，已经通过测试。
     该模块的设计可配置，并遵循 GIGAFLOW 论文中描述的奖励结构。
     输入状态张量 agents_state 的完整结构 (B, M, N):
     - B: 批次大小 (batch size)
@@ -26,8 +25,6 @@ class RewardCalculator:
     索引 8-9: Frenet 坐标系信息
         [8]: theta_f - Frenet 坐标系中的角度误差 (车道角度误差)
         [9]: d - Frenet 坐标系中的横向距离 (相对于车道中心的横向偏移)
-
-    注意: 索引 8-9 是可选的，如果提供则启用相应的奖励计算。
     
     奖励系统包含以下组件:
     1. 碰撞惩罚: Rcollision = -(αcollision + 0.1|v|)1collision
@@ -50,52 +47,47 @@ class RewardCalculator:
             device (torch.device): 计算设备。
         """
         self.device = device
-        self.reward_config = config.get('reward', {})
+        self.config = config
+        sim_cfg = config.get('simulator')
+        self.reward_config = sim_cfg.get('reward')
         # 初始化参数采样器
-        self.parameter_sampler = RewardParameterSampler(config, device)
+        self.parameter_sampler = RewardParameterSampler(self.reward_config, device)
+        # 从配置中读取默认的批次尺寸 (B, M)，若不存在则回退到1
+    
+        self.B = sim_cfg.get('num_envs')
+        self.M = sim_cfg.get('max_agents_num')
+
         # 从配置中加载固定参数
         self.v_goal = self.reward_config.get('v_goal', 3.0)
         self.goal_reward = self.reward_config.get('goal_reward', 1.0)
         self.collision_speed_mult = self.reward_config.get('collision_speed_mult', 0.1)
         self.velocity_alpha = self.reward_config.get('velocity_alpha', 2.5e-3)
         self.timestep_alpha = self.reward_config.get('timestep_alpha', 2.5e-5)
-        # 初始化所有随机参数
-        self._initialize_random_parameters()
         
-    def _initialize_random_parameters(self):
-        """初始化所有随机参数。"""
-        # 采样所有参数
-        sampled_params = self.parameter_sampler.sample_all_parameters()
-        # 将采样的参数赋值给实例变量
-        self.delta_goal = sampled_params['delta_goal']
-        self.collision_alpha = sampled_params['collision_alpha']
-        self.boundary_alpha = sampled_params['boundary_alpha']
-        self.comfort_alpha = sampled_params['comfort_alpha']
-        self.l_align_alpha = sampled_params['l_align_alpha']
-        self.vel_align_alpha = sampled_params['vel_align_alpha']
-        self.l_center_alpha = sampled_params['l_center_alpha']
-        self.center_bias_alpha = sampled_params['center_bias_alpha']
-        self.reverse_alpha = sampled_params['reverse_alpha']
-        self.stop_line_alpha = sampled_params['stop_line_alpha']
-
+        # 初始化所有随机参数
+        self.sampled_params = self.parameter_sampler.sample_all_parameters(self.B, self.M)
+        
+        # 参数名到sampled_params索引映射
+        self._param_name_to_idx = {
+            'delta_goal': 0,
+            'collision_alpha': 1,
+            'boundary_alpha': 2,
+            'comfort_alpha': 3,
+            'l_align_alpha': 4,
+            'vel_align_alpha': 5,
+            'l_center_alpha': 6,
+            'center_bias_alpha': 7,
+            'reverse_alpha': 8,
+            'stop_line_alpha': 9,
+        }
+        
     def reset_episode(self):
         """
         重置episode相关的随机参数。
         在每个新episode开始时调用。
         """
         # 重新采样所有参数
-        sampled_params = self.parameter_sampler.sample_all_parameters()
-        # 更新所有随机参数
-        self.delta_goal = sampled_params['delta_goal']
-        self.collision_alpha = sampled_params['collision_alpha']
-        self.boundary_alpha = sampled_params['boundary_alpha']
-        self.comfort_alpha = sampled_params['comfort_alpha']
-        self.l_align_alpha = sampled_params['l_align_alpha']
-        self.vel_align_alpha = sampled_params['vel_align_alpha']
-        self.l_center_alpha = sampled_params['l_center_alpha']
-        self.center_bias_alpha = sampled_params['center_bias_alpha']
-        self.reverse_alpha = sampled_params['reverse_alpha']
-        self.stop_line_alpha = sampled_params['stop_line_alpha']
+        self.sampled_params = self.parameter_sampler.sample_all_parameters(self.B, self.M)
     
     def calculate_goal_reward(self, 
                              agent_positions: torch.Tensor,
@@ -123,8 +115,15 @@ class RewardCalculator:
         
         # 计算距离 ||x-g||
         distances = torch.norm(agent_positions - goal_positions, dim=-1)  # (B, M)
-        # 距离条件: ||x-g|| < δgoal
-        distance_condition = distances < self.delta_goal
+        # 逐元素 δgoal 阈值 (B, M)
+        delta_goal_tensor = self.sampled_params[..., self._param_name_to_idx['delta_goal']]
+        try:
+            delta_goal_tensor = delta_goal_tensor.expand_as(distances)
+        except Exception:
+            pass
+
+        # 距离条件: ||x-g|| < δgoal(B,M)
+        distance_condition = distances < delta_goal_tensor
         # 速度条件: |v| < vgoal
         speed_condition = torch.abs(speeds) < self.v_goal
         
@@ -156,13 +155,12 @@ class RewardCalculator:
             B, M, _ = agents_state.shape
             # 提取速度信息
             speeds = agents_state[..., 3]  # 速度
-            # 计算碰撞惩罚
-            # -(αcollision + 0.1|v|)1collision
+            # 计算碰撞惩罚：-(αcollision + 0.1|v|)·1collision
             collision_penalty = torch.zeros((B, M), device=self.device)
-
+            alpha_collision = self.sampled_params[..., self._param_name_to_idx['collision_alpha']]
             # 只对发生碰撞的智能体计算惩罚
             collision_penalty[all_collisions] = -(
-                self.collision_alpha + 
+                alpha_collision[all_collisions] + 
                 self.collision_speed_mult * torch.abs(speeds[all_collisions])
             )
             return collision_penalty
@@ -179,12 +177,11 @@ class RewardCalculator:
         Returns:
             torch.Tensor: 离路惩罚 (B, M)
         """
-        # 计算离路惩罚
-        # -αboundary1boundary
+        # 计算离路惩罚：-αboundary·1boundary
         offroad_penalty = torch.zeros_like(offroad_mask, dtype=torch.float32, device=self.device)
-        
+        alpha_boundary = self.sampled_params[..., self._param_name_to_idx['boundary_alpha']]
         # 只对离路的智能体计算惩罚
-        offroad_penalty[offroad_mask] = -self.boundary_alpha
+        offroad_penalty[offroad_mask] = -alpha_boundary[offroad_mask]
         
         return offroad_penalty
 
@@ -218,8 +215,9 @@ class RewardCalculator:
         # 总违规次数
         total_violations = along_violation + alat_violation + jerk_violation
         
-        # 计算舒适度惩罚
-        comfort_penalty = -self.comfort_alpha * total_violations
+        # 计算舒适度惩罚（逐元素 αcomfort）
+        alpha_comfort = self.sampled_params[..., self._param_name_to_idx['comfort_alpha']]
+        comfort_penalty = -alpha_comfort * total_violations
         
         return comfort_penalty
 
@@ -246,14 +244,16 @@ class RewardCalculator:
         
         # 第二项: α_{vel-align} * min(cos(θ_f) * v, 0)
         cos_theta_v = cos_theta_f * speeds
-        term2 = self.vel_align_alpha * torch.min(cos_theta_v, torch.zeros_like(cos_theta_v))
+        alpha_vel_align = self.sampled_params[..., self._param_name_to_idx['vel_align_alpha']]
+        term2 = alpha_vel_align * torch.min(cos_theta_v, torch.zeros_like(cos_theta_v))
         
         # 第三项: 0.0025 * (1 - |θ_f|/(π/2))
         theta_ratio = torch.abs(theta_f) / (torch.pi / 2)
         term3 = 0.0025 * (1.0 - theta_ratio)
         
-        # 计算总奖励
-        lane_alignment_reward = self.l_align_alpha * dt * (term1 + term2 + term3)
+        # 计算总奖励（逐元素 α_{l-align}）
+        alpha_l_align = self.sampled_params[..., self._param_name_to_idx['l_align_alpha']]
+        lane_alignment_reward = alpha_l_align * dt * (term1 + term2 + term3)
         
         return lane_alignment_reward
 
@@ -275,7 +275,8 @@ class RewardCalculator:
         # 计算 cos(θ_f)
         cos_theta_f = torch.cos(theta_f)
         # 计算 |d - α_{center-bias}|
-        d_center_diff = torch.abs(d - self.center_bias_alpha)
+        alpha_center_bias = self.sampled_params[..., self._param_name_to_idx['center_bias_alpha']]
+        d_center_diff = torch.abs(d - alpha_center_bias)
         # 第一项: 1_{cos(θ_f) > 0.5} * |d - α_{center-bias}|
         cos_condition = (cos_theta_f > 0.5).float()
         term1 = cos_condition * d_center_diff
@@ -283,8 +284,9 @@ class RewardCalculator:
         exp_term = torch.exp(d_center_diff - 0.5)
         term2 = 0.05 / exp_term
         
-        # 计算总奖励 (注意是负号，因为这是惩罚)
-        lane_center_reward = -self.l_center_alpha * dt * (term1 - term2)
+        # 计算总奖励 (注意是负号，因为这是惩罚)（逐元素 α_{l-center}）
+        alpha_l_center = self.sampled_params[..., self._param_name_to_idx['l_center_alpha']]
+        lane_center_reward = -alpha_l_center * dt * (term1 - term2)
         
         return lane_center_reward
 
@@ -336,8 +338,9 @@ class RewardCalculator:
         """
         # 计算倒车条件: 1_{v < 0}
         reverse_condition = (speeds < 0.0).float()
-        # 计算倒车惩罚
-        reverse_penalty = -self.reverse_alpha * dt * reverse_condition
+        # 计算倒车惩罚（逐元素 αreverse）
+        alpha_reverse = self.sampled_params[..., self._param_name_to_idx['reverse_alpha']]
+        reverse_penalty = -alpha_reverse * dt * reverse_condition
         
         return reverse_penalty
 
@@ -354,12 +357,13 @@ class RewardCalculator:
         Returns:
             torch.Tensor: 停止线违规惩罚 (B, M)
         """
-        # 如果stop_line_violation为None，返回零惩罚
+        # 如果stop_line_violation为None，返回标量零
         if stop_line_violation is None:
-            return torch.zeros_like(self.stop_line_alpha, device=self.device)
+            return torch.tensor(0.0, device=self.device)
         
         # 计算停止线违规惩罚
-        stop_line_penalty = -self.stop_line_alpha * stop_line_violation.float()
+        alpha_stop = self.sampled_params[..., self._param_name_to_idx['stop_line_alpha']]
+        stop_line_penalty = -alpha_stop * stop_line_violation.float()
         
         return stop_line_penalty
 

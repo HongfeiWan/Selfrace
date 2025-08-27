@@ -23,22 +23,10 @@ from simulator import TeraflowSimulator
 from network import create_network
 
 '''
-推荐环境变量（无 IB 时）：
-NCCL_IB_DISABLE=1,NCCL_P2P_DISABLE=0(启用 P2P)
-可加 NCCL_DEBUG=INFO 验证是否走 NVLink
-需要时可设 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 验证 NVLink: nvidia-smi topo -m 查看拓扑,NCCL_DEBUG=INFO 输出里会显示使用 NVLink 的通道。
 '''
 
-# 余弦退火学习率调度器：α(k) = α0/2 * [1 - cos(π - π*k/K)]
-# 等价于 α(k) = α0/2 * (1 + cos(π*k/K))，k∈[0, K]
-# K<=0 时直接返回初始学习率
-def cosine_lr(initial_lr: float, step: int, total_steps: int) -> float:
-	if total_steps <= 0:
-		return initial_lr
-	# 按题设公式实现，避免歧义
-	return 0.5 * initial_lr * (1.0 - math.cos(math.pi - math.pi * float(step) / float(total_steps)))
-
+# ============================== 全tensor GAE ==============================
 # 全tensor GAE: rewards[T, ...], values[T+1, ...], dones[T, ...] (0/1)
 # 返回 advantages[T, ...], returns[T, ...]
 def gae_advantages(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor, gamma: float, gae_lambda: float):
@@ -58,6 +46,190 @@ def gae_advantages(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Ten
 	advantages = (advantages-advantages.mean())/advantages.std()
 	return advantages, returns #即返回A(s,a), Q(s,a)
 
+# ============================== 观测数据拆解 ==============================
+def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) -> tuple:
+    """
+    将initial_observation拆解为网络需要的各个组件
+    
+    Args:
+        observation: 形状为 (B, M, total_obs_dim) 的观测张量
+        config: 配置对象
+    
+    Returns:
+        tuple: (agents_state, neighbors_local, w_lanes_local, w_boundaries_local)
+            - agents_state: (B, M, 7) - 智能体状态 [x, y, yaw, speed, length, width, active]
+            - neighbors_local: (B, M, K, 7) - 邻居相对状态 [dx, dy, vx, vy, length, width, active]
+            - w_lanes_local: (B, M, N_lanes, 2) - 车道线相对坐标 [dx, dy]
+            - w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标 [dx, dy]
+    """
+    batch_size, max_agents, total_obs_dim = observation.shape
+    
+    # 从配置中获取维度信息
+    simulator_config = config.simulator
+    local_state_dim = simulator_config.observation.local_state_dim  # 7
+    neighbor_feature_dim = simulator_config.observation.neighbor_feature_dim  # 7
+    waypoint_feature_dim = simulator_config.observation.waypoint_feature_dim  # 2
+    boundary_feature_dim = simulator_config.observation.boundary_feature_dim  # 2
+    num_neighbors = simulator_config.observation.num_neighbors  # 20
+    num_w_lanes = simulator_config.observation.num_w_lanes  # 25
+    num_w_boundaries = simulator_config.observation.num_w_boundaries  # 26
+    
+    # 计算各部分在观测向量中的位置
+    local_state_size = local_state_dim
+    neighbors_size = num_neighbors * neighbor_feature_dim
+    w_lanes_size = num_w_lanes * waypoint_feature_dim
+    w_boundaries_size = num_w_boundaries * boundary_feature_dim
+    
+    # 1. 提取agents_state (前7个维度)
+    agents_state = observation[:, :, :local_state_dim]  # (B, M, 7)
+    
+    # 2. 提取neighbors_local
+    neighbors_start = local_state_size
+    neighbors_end = neighbors_start + neighbors_size
+    neighbors_flat = observation[:, :, neighbors_start:neighbors_end]  # (B, M, K*7)
+    neighbors_local = neighbors_flat.view(batch_size, max_agents, num_neighbors, neighbor_feature_dim)  # (B, M, K, 7)
+    
+    # 3. 提取w_lanes_local
+    w_lanes_start = neighbors_end
+    w_lanes_end = w_lanes_start + w_lanes_size
+    w_lanes_flat = observation[:, :, w_lanes_start:w_lanes_end]  # (B, M, N_lanes*2)
+    w_lanes_local = w_lanes_flat.view(batch_size, max_agents, num_w_lanes, waypoint_feature_dim)  # (B, M, N_lanes, 2)
+    
+    # 4. 提取w_boundaries_local
+    w_boundaries_start = w_lanes_end
+    w_boundaries_flat = observation[:, :, w_boundaries_start:]  # (B, M, N_boundaries*2)
+    w_boundaries_local = w_boundaries_flat.view(batch_size, max_agents, num_w_boundaries, boundary_feature_dim)  # (B, M, N_boundaries, 2)
+    
+    return agents_state, neighbors_local, w_lanes_local, w_boundaries_local
+
+# ============================== 构建网络输入特征 ==============================
+def build_network_features(agents_state: torch.Tensor, 
+                          neighbors_local: torch.Tensor, 
+                          w_lanes_local: torch.Tensor, 
+                          w_boundaries_local: torch.Tensor,
+                          path_plan: torch.Tensor,
+                          stop_lines: torch.Tensor,
+                          reward_coef: torch.Tensor,
+                          config: SimpleNamespace) -> torch.Tensor:
+    """
+    将拆解后的观测组件构建为网络输入的特征张量
+    
+    Args:
+        agents_state: (B, M, 7) - 智能体状态
+        neighbors_local: (B, M, K, 7) - 邻居相对状态
+        w_lanes_local: (B, M, N_lanes, 2) - 车道线相对坐标
+        w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标
+        path_plan: (B, M, path_length, 2) - 路径规划点
+        stop_lines: (B, M, num_stop_lines, 20) - 停止线点
+        reward_coef: (B, M, 10) - 奖励系数
+        config: 配置对象
+    
+    Returns:
+        torch.Tensor: 形状为 (B, M, total_input_dim) 的网络输入特征张量
+    """
+    batch_size, max_agents, _ = agents_state.shape
+    
+    # 从配置中获取网络需要的特征维度
+    network_config = config.training.network
+    simple_feature_dims = network_config.simple_feature_dims  # [10, 1024, 10, 4]
+    permutation_feature_dims = network_config.permutation_feature_dims  # [52, 50, 20, 140]
+    
+    # 计算总输入维度
+    total_input_dim = sum(simple_feature_dims) + sum(permutation_feature_dims)
+    
+    # 初始化输出张量
+    features_tensor = torch.zeros(batch_size, max_agents, total_input_dim, device=agents_state.device)
+    
+    # 1. 构建简单特征 (S(t), G(t), reward系数, 车辆风格参数)
+    simple_end = sum(simple_feature_dims)
+    
+    # S(t): 7维 - 直接使用agents_state
+    s_t_size = simple_feature_dims[0]  # 7
+    features_tensor[:, :, :s_t_size] = agents_state
+    
+    # G(t): 256维 - 使用路径规划信息
+    g_t_size = simple_feature_dims[1]  # 256
+    g_t_start = s_t_size
+    g_t_end = g_t_start + g_t_size
+    features_tensor[:, :, g_t_start:g_t_end] = path_plan.flatten(start_dim=2)  
+        
+    # reward系数: 10维 - 使用传入的采样参数
+    reward_coef_size = simple_feature_dims[2]  # 10
+    reward_coef_start = g_t_start + g_t_size
+    reward_coef_end = reward_coef_start + reward_coef_size
+    features_tensor[:, :, reward_coef_start:reward_coef_end] = reward_coef
+    
+    # 车辆风格参数: 4维 - 从agents_state中提取
+    vehicle_style_size = simple_feature_dims[3]  # 4
+    vehicle_style_start = reward_coef_start + reward_coef_size
+    vehicle_style_end = vehicle_style_start + vehicle_style_size
+    # 使用车辆的长度、宽度、速度和活跃状态
+    vehicle_style = torch.stack([
+        agents_state[:, :, 4],  # length
+        agents_state[:, :, 5],  # width
+        agents_state[:, :, 3],  # speed
+        agents_state[:, :, 6]   # active
+    ], dim=2)
+    features_tensor[:, :, vehicle_style_start:vehicle_style_end] = vehicle_style
+    
+    # 2. 构建排列不变特征 (road_boundary, lane_points, stop_lines, other_agents)
+    permutation_start = simple_end
+    
+    # road_boundary: 52维 - 使用边界线信息
+    road_boundary_size = permutation_feature_dims[0]  # 52
+    road_boundary_start = permutation_start
+    road_boundary_end = road_boundary_start + road_boundary_size
+    
+    # 将边界线展平并填充
+    w_boundaries_flat = w_boundaries_local.flatten(start_dim=2)  # (B, M, N_boundaries*2)
+    if w_boundaries_flat.shape[2] <= road_boundary_size:
+        features_tensor[:, :, road_boundary_start:road_boundary_start + w_boundaries_flat.shape[2]] = w_boundaries_flat
+    else:
+        features_tensor[:, :, road_boundary_start:road_boundary_end] = w_boundaries_flat[:, :, :road_boundary_size]
+    
+    # lane_points: 50维 - 使用车道线信息
+    lane_points_size = permutation_feature_dims[1]  # 50
+    lane_points_start = road_boundary_end
+    lane_points_end = lane_points_start + lane_points_size
+    
+    # 将车道线展平并填充
+    w_lanes_flat = w_lanes_local.flatten(start_dim=2)  # (B, M, N_lanes*2)
+    if w_lanes_flat.shape[2] <= lane_points_size:
+        features_tensor[:, :, lane_points_start:lane_points_start + w_lanes_flat.shape[2]] = w_lanes_flat
+    else:
+        features_tensor[:, :, lane_points_start:lane_points_end] = w_lanes_flat[:, :, :lane_points_size]
+    
+    # stop_lines: 20维 - 使用停止线信息
+    stop_lines_size = permutation_feature_dims[2]  # 20
+    stop_lines_start = lane_points_end
+    stop_lines_end = stop_lines_start + stop_lines_size
+    
+    # 将停止线展平并填充
+    if stop_lines is not None and stop_lines.numel() > 0:
+        stop_lines_flat = stop_lines.flatten(start_dim=2)  # (B, M, num_stop_lines*2)
+        if stop_lines_flat.shape[2] <= stop_lines_size:
+            features_tensor[:, :, stop_lines_start:stop_lines_start + stop_lines_flat.shape[2]] = stop_lines_flat
+        else:
+            features_tensor[:, :, stop_lines_start:stop_lines_end] = stop_lines_flat[:, :, :stop_lines_size]
+    else:
+        # 如果没有停止线信息，使用零填充
+        features_tensor[:, :, stop_lines_start:stop_lines_end] = 0.0
+    
+    # other_agents: 140维 - 使用邻居信息
+    other_agents_size = permutation_feature_dims[3]  # 140
+    other_agents_start = stop_lines_end
+    other_agents_end = other_agents_start + other_agents_size
+    
+    # 将邻居信息展平并填充
+    neighbors_flat = neighbors_local.flatten(start_dim=2)  # (B, M, K*7)
+    if neighbors_flat.shape[2] <= other_agents_size:
+        features_tensor[:, :, other_agents_start:other_agents_start + neighbors_flat.shape[2]] = neighbors_flat
+    else:
+        features_tensor[:, :, other_agents_start:other_agents_end] = neighbors_flat[:, :, :other_agents_size]
+    
+    return features_tensor
+
+# ============================== 检查GPU信息 ==============================
 def check_gpu_info(print_info: bool = True, **kwargs):
 	"""
 	检查GPU信息和CUDA支持情况
@@ -129,6 +301,7 @@ def check_gpu_info(print_info: bool = True, **kwargs):
 		log("💡 请确保已正确安装CUDA和对应版本的PyTorch")
 		return False, []
 
+# ============================== 寻找空闲端口 ==============================
 def _find_free_port() -> int:
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	s.bind(("127.0.0.1", 0))
@@ -136,6 +309,7 @@ def _find_free_port() -> int:
 	s.close()
 	return port
 
+# ============================== 设置DDP环境 ==============================
 def setup_ddp_env(rank: int, gpu_count: int, master_addr: str, master_port: int):
 	os.environ['MASTER_ADDR'] = master_addr
 	os.environ['MASTER_PORT'] = str(master_port)
@@ -147,16 +321,19 @@ def setup_ddp_env(rank: int, gpu_count: int, master_addr: str, master_port: int)
 		os.environ['GLOO_DEVICE_TRANSPORT'] = 'tcp'
 		os.environ.pop('GLOO_SOCKET_IFNAME', None)
 
+# ============================== 清理DDP环境 ==============================
 def cleanup_ddp():
 	if dist.is_initialized():
 		dist.destroy_process_group()
 
+# ============================== DDPPO训练 ==============================
 def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str, master_port: int, store_port: int):
 	if gpu_count == 1:
 		#TODO:这里写单卡训练代码，用于调试
 		device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
 		torch.cuda.set_device(device) if device.type == 'cuda' else None
 		config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
+
 		model = create_network(config=config, network_type="shared")
 		model = model.to(device)
 		simulator = TeraflowSimulator(config=config_dict, device=device)
@@ -165,33 +342,113 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		learning_rate = getattr(training_cfg, 'learning_rate')
 		num_iterations = getattr(training_cfg, 'batch_size_per_gpu')
 		max_episode_length = getattr(training_cfg,'max_episode_length')
+		ppo_epochs = getattr(training_cfg, 'ppo_epochs')
+		rollout_length = getattr(training_cfg, 'rollout_length')
+
+		gamma = getattr(training_cfg, 'gamma')
+		gae_lambda = getattr(training_cfg, 'gae_lambda')
+
+		clip_ratio = getattr(training_cfg, 'clip_ratio')
+		entropy_coef = getattr(training_cfg, 'entropy_coef')
+		value_loss_coef = getattr(training_cfg, 'value_loss_coef')
+
 		optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 		scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_iterations, eta_min=0.0)
+		
 
 		for k in range(num_iterations):
-			iteration_start_time = time.time()
-			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")			
+			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")
+			episode_start_time = time.time()
+
+			# ============================== 采样 ==============================
 			# simulator初始化
 			initial_observation = simulator.reset()
-			agent_state = simulator.agents_state
 			path_plan = simulator.agents_path_plans
+			stop_lines = simulator.stop_lines
+			# 拆解initial_observation为网络需要的组件
+			agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(initial_observation, config)
+			# 构建网络输入特征
+			features_tensor = build_network_features(agents_state, neighbors_local, w_lanes_local, w_boundaries_local, path_plan, stop_lines, simulator.reward_calculator.sampled_params, config)
+			# =========================== 初始化本轮buffer（存每步所有agents的状态） ==============================
+			# 形状: [T+1, B, M, 7]
+			B, M, S = agents_state.shape
+			episode_states_buffer = torch.empty((max_episode_length+1, B, M, S), device=agents_state.device, dtype=agents_state.dtype)
+			episode_states_buffer[0] = agents_state
+			rewards_buffer = torch.zeros(max_episode_length, B, M, device=agents_state.device)
+			dones_buffer = torch.zeros(max_episode_length, B, M, device=agents_state.device)
+			values_buffer = torch.zeros(max_episode_length, B, M, device=agents_state.device)
+			old_log_probs_buffer = torch.zeros(max_episode_length, B, M, device=agents_state.device)
 
-			actions = torch.zeros((simulator.num_envs, simulator.world_initializer.max_agents), device=device, dtype=torch.float32)
-			actions[:,:] = 7 # 匀速
-			episode_start_time = time.time()
 			for t in range(max_episode_length):
 				step_start_time = time.time()
-				observation,reward,done = simulator.step(actions)
-				step_end_time = time.time()
-				step_duration = step_end_time - step_start_time
-				print(f"  📍 第 {t+1}/{max_episode_length} 步耗时: {step_duration:.4f}秒")
-			episode_end_time = time.time()
-			episode_duration = episode_end_time - episode_start_time
-			print(f"  🎯 本轮总步数耗时: {episode_duration:.4f}秒")
-			print(f"🔍 单卡训练: 奖励: {reward[0]}")
-
-			optimizer.step()
+				# ============================== 执行环境步进 ==============================
+				# 使用网络进行前向传播
+				with torch.no_grad():
+					action_logits, value_pred = model(features_tensor)
+				dist = torch.distributions.Categorical(logits=action_logits)
+				actions = dist.sample()  # 根据策略分布采样动作索引 (0-11)
+				# 执行环境步进
+				observation, reward, done = simulator.step(actions)
+				# 更新观测数据用于下一步
+				agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
+				features_tensor = build_network_features(agents_state, neighbors_local, w_lanes_local, w_boundaries_local, path_plan, stop_lines, simulator.reward_calculator.sampled_params, config)
+				# ============================== 收集经验 ==================================
+				# 记录本步所有agents的状态到buffer
+				episode_states_buffer[t+1].copy_(agents_state)
+				values_buffer[t] = value_pred.detach()
+				rewards_buffer[t] = reward
+				dones_buffer[t] = done
+				old_log_probs_buffer[t] = dist.log_prob(actions).detach()
+				print(f"  📍 第 {t+1}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
+			# ============================== 计算优势 ==============================
+			with torch.no_grad():
+				_, last_value_pred = model(features_tensor)  # 最后一个状态的V_{T}
+			# 拼接为 [T+1, B, M]
+			values_tp1 = torch.cat([values_buffer, last_value_pred.unsqueeze(0)], dim=0)
+			advantages, returns = gae_advantages(rewards_buffer, values_tp1, dones_buffer, gamma, gae_lambda)
+			# ============================== 更新网络 ==============================
+			for _ in range(ppo_epochs):
+				indices = torch.randperm(max_episode_length, device=device)[:rollout_length]
+				# 重新构建网络输入特征以节约显存
+				features_batch = []
+				for idx in indices:
+					# 对每个时间步重新生成观测和特征
+					agents_state = episode_states_buffer[idx]  # [B, M, 7]
+					# 通过simulator重新生成观测
+					observation = simulator.observation_generator.generate(agents_state)
+					# 拆解观测并构建特征
+					agents_state_decomp, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
+					features = build_network_features(agents_state_decomp, neighbors_local, w_lanes_local, w_boundaries_local, path_plan, stop_lines, simulator.reward_calculator.sampled_params, config)
+					features_batch.append(features)
+					
+				features_tensor = torch.stack(features_batch, dim=0)  # [rollout_length, B, M, total_input_dim]
+				# 重塑为网络期望的输入形状 [B*rollout_length, M, total_input_dim]
+				features_tensor = features_tensor.transpose(0, 1).contiguous().view(-1, features_tensor.shape[2], features_tensor.shape[3])
+				
+				old_log_probs_batch = old_log_probs_buffer[indices].transpose(0, 1).contiguous().view(-1)  # [B*rollout_length*M]
+				advantages_batch = advantages[indices].transpose(0, 1).contiguous().view(-1)  # [B*rollout_length*M]
+				returns_batch = returns[indices].transpose(0, 1).contiguous().view(-1)  # [B*rollout_length*M]
+				action_logits, value_pred = model(features_tensor)
+				dist = torch.distributions.Categorical(logits=action_logits)
+				actions_batch = dist.sample()
+				new_log_probs = dist.log_prob(actions_batch)
+				# 确保维度匹配
+				new_log_probs = new_log_probs.view(-1)  # [B*rollout_length*M]
+				value_pred = value_pred.view(-1)  # [B*rollout_length*M]
+				ratio = torch.exp(torch.clamp(new_log_probs - old_log_probs_batch, -1, 1))
+				surr1 = ratio * advantages_batch
+				surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantages_batch
+				policy_loss = -torch.min(surr1, surr2).mean()
+				entropy = dist.entropy().mean()
+				value_loss = (value_pred - returns_batch).pow(2).mean()
+				loss = policy_loss + value_loss_coef * value_loss - entropy_coef * entropy
+				loss = torch.clamp(loss, -100, 100)
+				optimizer.zero_grad(set_to_none=True)
+				loss.backward()
+				optimizer.step()
 			scheduler.step()
+			print(f"🎯 本轮总步数耗时: {time.time()-episode_start_time:.4f}秒")
+		print('train done!')
 		return 0
 	
 	try:
@@ -327,6 +584,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 	finally:
 		cleanup_ddp()
 
+# ============================== 运行分布式DDPPO ==============================
 def run_distributed_ddppo(config_dict: dict, cuda_ranks: list[int]):
 	if not cuda_ranks:
 		raise RuntimeError("没有可用的CUDA设备")
@@ -348,7 +606,6 @@ def run_distributed_ddppo(config_dict: dict, cuda_ranks: list[int]):
 		p = ctx.Process(target=ddppo_worker, args=(rank, gpu_count, config_dict, master_addr, master_port, store_port))
 		p.start()
 		processes.append(p)
-
 	for p in processes:
 		p.join()
 
@@ -364,5 +621,3 @@ if __name__ == "__main__":
 	with open('configs/default_config.yaml', 'r', encoding='utf-8') as f:
 		cfg = yaml.safe_load(f)
 	run_distributed_ddppo(cfg, ranks)
-
-

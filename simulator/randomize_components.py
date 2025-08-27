@@ -276,25 +276,49 @@ class RewardParameterSampler:
             self.stop_line_alpha_min, self.stop_line_alpha_max
         )
     
-    def sample_all_parameters(self) -> Dict[str, torch.Tensor]:
+    def sample_all_parameters(self, B: int = 1, M: int = 1) -> torch.Tensor:
         """
-        采样所有参数并返回字典。
-        
+        批量采样所有参数并返回张量。
+        Args:
+            B: 批量大小 B (默认1)
+            M: 智能体数 M (默认1)
         Returns:
-            Dict[str, torch.Tensor]: 包含所有采样参数的字典
+            torch.Tensor: 形状为 (B, M, 10) 的reward系数张量
         """
-        return {
-            'delta_goal': self.sample_delta_goal(),
-            'collision_alpha': self.sample_collision_alpha(),
-            'boundary_alpha': self.sample_boundary_alpha(),
-            'comfort_alpha': self.sample_comfort_alpha(),
-            'l_align_alpha': self.sample_l_align_alpha(),
-            'vel_align_alpha': self.sample_vel_align_alpha(),
-            'l_center_alpha': self.sample_l_center_alpha(),
-            'center_bias_alpha': self.sample_center_bias_alpha(),
-            'reverse_alpha': self.sample_reverse_alpha(),
-            'stop_line_alpha': self.sample_stop_line_alpha()
+        device = self.device
+        def uniform(min_v, max_v):
+            return torch.empty(B, M, device=device).uniform_(min_v, max_v)
+        
+        # 采样所有参数
+        params = {
+            'delta_goal': uniform(self.delta_goal_min, self.delta_goal_max),
+            'collision_alpha': uniform(self.collision_alpha_min, self.collision_alpha_max),
+            'boundary_alpha': uniform(self.boundary_alpha_min, self.boundary_alpha_max),
+            'comfort_alpha': uniform(self.comfort_alpha_min, self.comfort_alpha_max),
+            'l_align_alpha': uniform(self.l_align_alpha_min, self.l_align_alpha_max),
+            'vel_align_alpha': uniform(self.vel_align_alpha_min, self.vel_align_alpha_max),
+            'l_center_alpha': uniform(self.l_center_alpha_min, self.l_center_alpha_max),
+            'center_bias_alpha': uniform(self.center_bias_alpha_min, self.center_bias_alpha_max),
+            'reverse_alpha': uniform(self.reverse_alpha_min, self.reverse_alpha_max),
+            'stop_line_alpha': uniform(self.stop_line_alpha_min, self.stop_line_alpha_max),
         }
+        
+        # 将参数堆叠成 (B, M, 10) 的张量
+        reward_coef_list = [
+            params['delta_goal'],
+            params['collision_alpha'],
+            params['boundary_alpha'],
+            params['comfort_alpha'],
+            params['l_align_alpha'],
+            params['vel_align_alpha'],
+            params['l_center_alpha'],
+            params['center_bias_alpha'],
+            params['reverse_alpha'],
+            params['stop_line_alpha']
+        ]
+        
+        return torch.stack(reward_coef_list, dim=-1)  # (B, M, 10)
+
 
 class VehicleParameterSampler:
     """

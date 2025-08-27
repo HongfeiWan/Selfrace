@@ -261,7 +261,6 @@ class KinematicBicycleModel:
         # 清除前一步的纵向加速度，让step方法重新创建
         if hasattr(self, 'prev_along'):
             delattr(self, 'prev_along')
-        
         print("Dynamics control state reset - variables cleared for fresh initialization")
 
     def calculate_steering_angle(self, alat: torch.Tensor, speed: torch.Tensor, epsilon: float = None) -> torch.Tensor:
