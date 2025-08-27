@@ -9,8 +9,12 @@ parent_dir = os.path.dirname(current_dir)
 simulator_dir = os.path.join(parent_dir, 'simulator')
 if simulator_dir not in sys.path:
     sys.path.insert(0, simulator_dir)
+utils_dir = os.path.join(parent_dir, 'utils')
+if utils_dir not in sys.path:
+    sys.path.insert(0, utils_dir)
 from road import RoadNetwork
-
+from spatial_hash import SpatialHash
+    
 class ObservationGenerator:
     """
     已经通过测试
@@ -18,7 +22,7 @@ class ObservationGenerator:
     通过完全向量化的操作，该模块可以一次性为所有环境中的所有智能体高效地计算观测，
     避免了在 Python 中进行循环，从而最大限度地利用 GPU 并行能力。
     """
-    def __init__(self, road_network: RoadNetwork, config: Dict, device: torch.device):
+    def __init__(self, road_network: RoadNetwork, config: Dict, device: torch.device, spatial_hash: SpatialHash = None):
         """
         初始化观测生成器。
         """
@@ -34,6 +38,128 @@ class ObservationGenerator:
         self.neighbor_feature_dim = config.get('neighbor_feature_dim', 7)  # 修改为7个特征：dx, dy, vx, vy, length, width, active 
         self.waypoint_feature_dim = config.get('waypoint_feature_dim', 2)  # 修改为2个特征：x,y
         self.boundary_feature_dim = config.get('boundary_feature_dim', 2)  # 修改为2个特征：x,y
+        # 使用来自 TeraflowSimulator 的共享哈希，仅作网格坐标与单元ID计算，不在此处重建静态索引
+        self.spatial_hash = spatial_hash
+        
+        # 预计算每个quad_id对应的最近w_lanes和w_boundaries的ID
+        self._precompute_quad_waypoint_associations()
+
+
+    def _precompute_quad_waypoint_associations(self):
+        """
+        预计算每个quad_id对应的最近w_lanes和w_boundaries的ID。
+        这样在generate时可以直接通过quad_id查找，避免重复计算。
+        """
+        num_quads = self.road_network.num_quads
+        
+        # 获取所有quad的中心点作为查询点
+        quad_centers = self.road_network.quad_centerlines.mean(dim=1)  # (num_quads, 2)
+        
+        # 预计算w_lanes关联
+        if self.road_network.global_w_lane_waypoints.numel() > 0:
+            self.quad_to_w_lanes_ids = self._compute_nearest_waypoint_ids(
+                quad_centers, 
+                self.road_network.global_w_lane_waypoints, 
+                self.num_w_lanes
+            )  # (num_quads, num_w_lanes)
+        else:
+            self.quad_to_w_lanes_ids = torch.zeros(num_quads, self.num_w_lanes, dtype=torch.long, device=self.device)
+        
+        # 预计算w_boundaries关联
+        if self.road_network.global_w_boundary_points.numel() > 0:
+            self.quad_to_w_boundaries_ids = self._compute_nearest_waypoint_ids(
+                quad_centers, 
+                self.road_network.global_w_boundary_points, 
+                self.num_w_boundaries
+            )  # (num_quads, num_w_boundaries)
+        else:
+            self.quad_to_w_boundaries_ids = torch.zeros(num_quads, self.num_w_boundaries, dtype=torch.long, device=self.device)
+
+    def _compute_nearest_waypoint_ids(self, query_points: torch.Tensor, waypoints: torch.Tensor, num_nearest: int) -> torch.Tensor:
+        """
+        计算每个查询点到waypoints的最近num_nearest个点的ID。
+        Args:
+            query_points: 查询点坐标 (N, 2)
+            waypoints: waypoints坐标 (M, 2)
+            num_nearest: 需要找到的最近点数量
+        Returns:
+            最近点的ID (N, num_nearest)
+        """
+        if waypoints.numel() == 0 or num_nearest == 0:
+            return torch.zeros(query_points.shape[0], num_nearest, dtype=torch.long, device=self.device)
+        
+        # 计算所有查询点到所有waypoints的距离
+        distances = torch.cdist(query_points, waypoints, p=2)  # (N, M)
+        
+        # 找到最近的num_nearest个点
+        _, nearest_indices = torch.topk(distances, k=min(num_nearest, waypoints.shape[0]), dim=1, largest=False)
+        
+        # 如果waypoints数量不足，用0填充
+        if waypoints.shape[0] < num_nearest:
+            padding = torch.zeros(query_points.shape[0], num_nearest - waypoints.shape[0], dtype=torch.long, device=self.device)
+            nearest_indices = torch.cat([nearest_indices, padding], dim=1)
+        
+        return nearest_indices
+
+    def _get_precomputed_waypoints(self, agents_state: torch.Tensor) -> tuple:
+        """
+        使用预计算的数据获取w_lanes和w_boundaries。
+        Args:
+            agents_state: 形状为 (B, M, 7) 的agent状态张量
+        Returns:
+            tuple: (w_lanes_world, w_boundaries_world)
+        """
+        batch_size, max_agents, _ = agents_state.shape
+        
+        # 获取每个agent所在的quad_id
+        agent_positions = agents_state[..., :2]  # (B, M, 2)
+        agent_positions_flat = agent_positions.view(-1, 2)  # (B*M, 2)
+        
+        # 找到每个agent最近的quad索引
+        distances, quad_indices = self.road_network.find_nearest_lanes(agent_positions_flat, k=1, spatial_hash=self.spatial_hash)
+        quad_indices = quad_indices.squeeze(-1)  # (B*M,)
+        
+        # 使用预计算的关联获取waypoint IDs
+        w_lanes_ids = self.quad_to_w_lanes_ids[quad_indices]  # (B*M, num_w_lanes)
+        w_boundaries_ids = self.quad_to_w_boundaries_ids[quad_indices]  # (B*M, num_w_boundaries)
+        
+        # 通过ID获取waypoint坐标
+        w_lanes_world = self._get_waypoints_by_ids(w_lanes_ids, self.road_network.global_w_lane_waypoints)
+        w_boundaries_world = self._get_waypoints_by_ids(w_boundaries_ids, self.road_network.global_w_boundary_points)
+        
+        # 恢复原始形状
+        w_lanes_world = w_lanes_world.view(batch_size, max_agents, self.num_w_lanes, 2)
+        w_boundaries_world = w_boundaries_world.view(batch_size, max_agents, self.num_w_boundaries, 2)
+        
+        return w_lanes_world, w_boundaries_world
+
+    def _get_waypoints_by_ids(self, waypoint_ids: torch.Tensor, waypoints: torch.Tensor) -> torch.Tensor:
+        """
+        根据ID列表获取waypoint坐标。
+        Args:
+            waypoint_ids: waypoint ID张量 (N, K)
+            waypoints: 所有waypoints坐标 (M, 2)
+        Returns:
+            waypoint坐标张量 (N, K, 2)
+        """
+        if waypoints.numel() == 0:
+            return torch.zeros(waypoint_ids.shape[0], waypoint_ids.shape[1], 2, device=self.device)
+        
+        # 创建有效ID掩码（ID为0表示无效）
+        valid_mask = waypoint_ids > 0
+        
+        # 初始化输出张量
+        result = torch.zeros(waypoint_ids.shape[0], waypoint_ids.shape[1], 2, device=self.device)
+        
+        # 只对有效的ID进行索引
+        if valid_mask.any():
+            valid_ids = waypoint_ids[valid_mask]
+            # 确保ID在有效范围内
+            valid_ids = torch.clamp(valid_ids, 0, waypoints.shape[0] - 1)
+            valid_coords = waypoints[valid_ids]
+            result[valid_mask] = valid_coords
+        
+        return result
 
     def get_observation_dim(self) -> int:
         """
@@ -69,20 +195,18 @@ class ObservationGenerator:
             w_lanes_local: (B, M, N_lanes, 2)
             w_boundaries_local: (B, M, N_boundaries, 2)
         """
-        batch_size, max_agents, _ = agents_state.shape
-        # B,M
-
         # 1. 获取世界坐标系下的特征
         # (B, M, K, 7)
         neighbor_states_world = self._get_nearest_neighbors(agents_state)
-        # (B, M, N_lanes, 2)
-        w_lanes_world = self._get_nearby_global_points(agents_state, self.road_network.global_w_lane_waypoints, self.num_w_lanes)
-        # (B, M, N_bounds, 2)
-        w_boundaries_world = self._get_nearby_global_points(agents_state, self.road_network.global_w_boundary_points, self.num_w_boundaries)
+        
+        # 使用预计算的数据获取w_lanes和w_boundaries
+        w_lanes_world, w_boundaries_world = self._get_precomputed_waypoints(agents_state)
+
         # 2. 将所有信息转换到每个 Agent 的局部坐标系
         local_state, neighbors_local, w_lanes_local, w_boundaries_local = self._world_to_ego_centric(
             agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
         )
+
         # 3. 展平并拼接成最终的观测向量
         # 返回：自身绝对状态，邻居相对状态，车道线相对状态，边界线相对状态
         observation = torch.cat([
@@ -124,22 +248,7 @@ class ObservationGenerator:
         neighbor_states[~is_valid_neighbor] = 0.0
         return neighbor_states
     
-    def _get_nearby_global_points(self, agents_state: torch.Tensor, source_points: torch.Tensor, num_points: int) -> torch.Tensor:
-        """为所有 agent 从全局点集中找到 k 个最近的点。"""
-        batch_size, max_agents, _ = agents_state.shape
-        if source_points.numel() == 0 or num_points == 0:
-            return torch.zeros(batch_size, max_agents, num_points, 2, device=self.device)
 
-        query_pos = agents_state[..., :2].view(-1, 2) # (B*M, 2)
-        dist_sq = torch.cdist(query_pos, source_points, p=2).pow(2)
-        
-        # 如果 num_points 为 0，直接返回空张量
-        if num_points == 0:
-            return torch.zeros(batch_size, max_agents, 0, 2, device=self.device)
-            
-        _, topk_indices = torch.topk(dist_sq, k=num_points, dim=1, largest=False) # (B*M, k)
-        selected_points = source_points[topk_indices] # (B*M, k, 2)
-        return selected_points.view(batch_size, max_agents, num_points, 2)
     
     def _world_to_ego_centric(self, ego_states, neighbor_states, w_lanes_world, w_boundaries_world):
         """将世界坐标系下的状态转换为以每个 agent 为中心的坐标系。"""
@@ -265,23 +374,61 @@ if __name__ == '__main__':
         road_network = RoadNetwork(map_path, device)
         # 获取quads顶点数据
         quads_vertices_np = road_network.quads_vertices.cpu().numpy()
-        # 随机选择一个quad并在其中生成车辆位置
-        random_quad_idx = random.randint(0, road_network.num_quads - 1)
-        print(f"随机选择quad索引: {random_quad_idx}")
+        # 随机选择一个quad_id
+        random_quad_id = random.choice(road_network.quad_ids.cpu().numpy())
+        print(f"随机选择quad_id: {random_quad_id}")
+        # 根据quad_id找到对应的索引
+        quad_id_positions = torch.where(road_network.quad_ids == random_quad_id)[0]
+        random_quad_idx = quad_id_positions[0].item()
+        
         # 获取选中quad的顶点
         selected_quad = quads_vertices_np[random_quad_idx]
         # 在quad范围内随机生成车辆位置
-        # 使用重心坐标法在quad内随机生成点
-        def random_point_in_quad(quad_vertices):
-            # 生成随机重心坐标
-            r1, r2 = np.random.random(2)
-            sqrt_r1 = np.sqrt(r1)
-            u = 1 - sqrt_r1
-            v = r2 * sqrt_r1
-            # 计算随机点
-            point = (1-u-v) * quad_vertices[0] + u * quad_vertices[1] + v * quad_vertices[2]
-            return point
-        vehicle_pos = random_point_in_quad(selected_quad)
+        # 改进的随机点生成方法，确保点在quad内
+        def random_point_in_quad_improved(quad_vertices):
+            """改进的quad内随机点生成，确保点在quad内部"""
+            # 计算quad的边界框
+            min_x, min_y = np.min(quad_vertices, axis=0)
+            max_x, max_y = np.max(quad_vertices, axis=0)
+            
+            # 在边界框内随机生成点，直到找到在quad内的点
+            max_attempts = 100
+            for _ in range(max_attempts):
+                x = np.random.uniform(min_x, max_x)
+                y = np.random.uniform(min_y, max_y)
+                point = np.array([x, y])
+                
+                # 检查点是否在quad内（使用射线法）
+                if is_point_in_quad(point, quad_vertices):
+                    return point
+            
+            # 如果失败，返回quad的中心点
+            center = np.mean(quad_vertices, axis=0)
+            print(f"警告：无法在quad内生成随机点，使用中心点: {center}")
+            return center
+        
+        def is_point_in_quad(point, quad_vertices):
+            """使用射线法判断点是否在quad内"""
+            x, y = point
+            n = len(quad_vertices)
+            inside = False
+            
+            p1x, p1y = quad_vertices[0]
+            for i in range(n + 1):
+                p2x, p2y = quad_vertices[i % n]
+                if y > min(p1y, p2y):
+                    if y <= max(p1y, p2y):
+                        if x <= max(p1x, p2x):
+                            if p1y != p2y:
+                                xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                            if p1x == p2x or x <= xinters:
+                                inside = not inside
+                p1x, p1y = p2x, p2y
+            
+            return inside
+        
+        # 使用改进的方法生成车辆位置
+        vehicle_pos = random_point_in_quad_improved(selected_quad)
         vehicle_yaw = random.uniform(0, 2 * np.pi)  # 随机朝向
         # 绘制地图
         print("绘制地图...")
@@ -304,7 +451,7 @@ if __name__ == '__main__':
                 second_quad_idx = random.choice(available_quads)
                 second_quad = quads_vertices_np[second_quad_idx]
                 # 在第二个quad中生成随机车辆位置
-                second_vehicle_pos = random_point_in_quad(second_quad)
+                second_vehicle_pos = random_point_in_quad_improved(second_quad)
                 second_vehicle_yaw = random.uniform(0, 2 * np.pi)  # 随机朝向
 
         # 创建agents_state (B=1, M=2, 7个特征)
@@ -327,6 +474,9 @@ if __name__ == '__main__':
             agents_state[0, 1, 5] = 2.0                           # vehicle_width (m)
             agents_state[0, 1, 6] = 1.0                           # active
 
+
+        
+
         # 测试ObservationGenerator
         print("\n=== 测试ObservationGenerator ===")
         # 创建配置字典
@@ -340,9 +490,83 @@ if __name__ == '__main__':
             'waypoint_feature_dim': 2,
             'boundary_feature_dim': 2
         }
+
+        # 创建空间哈希用于加速查询
+        # 计算所有quad的边界框
+        all_verts = road_network.quads_vertices.view(-1, 2)
+        min_bounds, _ = torch.min(all_verts, dim=0)
+        max_bounds, _ = torch.max(all_verts, dim=0)
+        # 设置合适的网格大小
+        cell_size = 5  # 5米的网格单元
+        spatial_hash = SpatialHash(cell_size, min_bounds, max_bounds, device)
+        # 构建静态索引
+        quad_centers = road_network.quad_centerlines.mean(dim=1)  # (num_quads, 2)
+        quad_min_bounds = torch.min(road_network.quad_centerlines, dim=1)[0]  # (num_quads, 2)
+        quad_max_bounds = torch.max(road_network.quad_centerlines, dim=1)[0]  # (num_quads, 2)
+        quad_bounds = torch.stack([quad_min_bounds, quad_max_bounds], dim=1)  # (num_quads, 2, 2)
+        spatial_hash.build_static_index(quad_bounds)
+        print(f"空间哈希网格创建完成，网格大小: {cell_size:.2f}m")
+        
         # 创建ObservationGenerator实例
-        observation_generator = ObservationGenerator(road_network, config, device)
+        observation_generator = ObservationGenerator(road_network, config, device, spatial_hash)
         print(f"观测维度: {observation_generator.get_observation_dim()}")
+        
+        # 使用find_nearest_lanes找到最近的quad
+        distances, quad_indices = road_network.find_nearest_lanes(agents_state[0, 0, :2], k=1, spatial_hash=spatial_hash)
+        # 获取对应的quad_id (polyId)
+        quad_id = road_network.quad_ids[quad_indices.squeeze(-1)]
+        print(f"第一辆车所在quad_id: {quad_id.item()}")
+        
+        # 验证quad_id一致性
+        print(f"\n=== 验证quad_id一致性 ===")
+        print(f"随机选择的quad_id: {random_quad_id}")
+        print(f"find_nearest_lanes得到的quad_id: {quad_id.item()}")
+        print(f"是否一致: {random_quad_id == quad_id.item()}")
+        
+        if random_quad_id != quad_id.item():
+            print(f"不一致的原因分析:")
+            print(f"1. 车辆位置: {vehicle_pos}")
+            
+            # 计算车辆到随机选择quad的距离
+            random_quad_center = road_network.quad_centerlines[random_quad_idx].mean(dim=0)
+            dist_to_random = torch.norm(torch.tensor(vehicle_pos, device=device) - random_quad_center)
+            print(f"2. 车辆到随机quad中心的距离: {dist_to_random.item():.2f}")
+            
+            # 计算车辆到最近quad的距离
+            nearest_quad_center = road_network.quad_centerlines[quad_indices.item()].mean(dim=0)
+            dist_to_nearest = torch.norm(torch.tensor(vehicle_pos, device=device) - nearest_quad_center)
+            print(f"3. 车辆到最近quad中心的距离: {dist_to_nearest.item():.2f}")
+            
+            print(f"4. 距离差异: {abs(dist_to_random - dist_to_nearest).item():.2f}")
+            
+            # 检查车辆是否真的在随机选择的quad内
+            def is_point_in_quad(point, quad_vertices):
+                """使用射线法判断点是否在quad内"""
+                x, y = point
+                n = len(quad_vertices)
+                inside = False
+                
+                p1x, p1y = quad_vertices[0]
+                for i in range(n + 1):
+                    p2x, p2y = quad_vertices[i % n]
+                    if y > min(p1y, p2y):
+                        if y <= max(p1y, p2y):
+                            if x <= max(p1x, p2x):
+                                if p1y != p2y:
+                                    xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                                if p1x == p2x or x <= xinters:
+                                    inside = not inside
+                    p1x, p1y = p2x, p2y
+                
+                return inside
+            
+            is_in_random_quad = is_point_in_quad(vehicle_pos, selected_quad)
+            print(f"5. 车辆是否在随机选择的quad内: {is_in_random_quad}")
+            
+            if not is_in_random_quad:
+                print("6. 原因：重心坐标法生成的点不在quad内！")
+                print("7. 建议：使用改进的随机点生成方法")
+        
         # 生成观测
         observation = observation_generator.generate(agents_state)
         # 从observation中提取w_lanes_local和w_boundaries_local
@@ -534,7 +758,6 @@ if __name__ == '__main__':
         vehicle_pos_array = np.array([vehicle_pos], dtype=np.float32)
         vehicle_pos_tensor = torch.tensor(vehicle_pos_array, dtype=torch.float32, device=device)
         vehicle_yaw_tensor = torch.tensor([vehicle_yaw], dtype=torch.float32, device=device)
-        print("计算Frenet坐标...")
         d, theta_f = road_network.calculate_frenet_coordinates(vehicle_pos_tensor, vehicle_yaw_tensor)
         print(f"横向距离 d: {d.item():.2f} (正值表示在道路右侧，负值表示在道路左侧)")
         print(f"角度误差 theta_f: {theta_f.item():.2f} 弧度 ({np.degrees(theta_f.item()):.1f} 度)")
@@ -550,16 +773,13 @@ if __name__ == '__main__':
          
         # 保存图片
         plt.savefig('road_network_test.png', dpi=300, bbox_inches='tight')
-        print("地图已保存为 road_network_test.png")
         # 显示图形
         plt.show()
 
     except FileNotFoundError:
         print(f"错误: 找不到地图文件 {map_path}")
-        print("请确保地图文件存在，或者修改map_path变量指向正确的地图文件")
     except Exception as e:
         print(f"测试过程中发生错误: {e}")
         import traceback
-
         traceback.print_exc()
 

@@ -132,28 +132,22 @@ class RoadNetwork:
         """
         if points.ndim == 1:
             points = points.unsqueeze(0)
-        
         N = points.shape[0]
-        
         if spatial_hash is not None:
             # 使用空间哈希加速查询
             candidate_pairs = spatial_hash.query_points(points)  # (num_candidates, 2) -> (point_idx, quad_idx)
-            
             if candidate_pairs.numel() == 0:
                 # 如果没有候选quad，返回默认值
                 distances = torch.full((N, k), float('inf'), device=self.device)
                 indices = torch.full((N, k), -1, dtype=torch.long, device=self.device)
                 return distances, indices
-            
             # 计算候选quad到对应点的距离
             point_indices = candidate_pairs[:, 0]  # (num_candidates,)
             quad_indices = candidate_pairs[:, 1]   # (num_candidates,)
-            
             # 获取候选点的坐标和quad中心点
             candidate_points = points[point_indices]  # (num_candidates, 2)
             quad_centers = self.quad_centerlines.mean(dim=1)  # (num_quads, 2)
             candidate_quad_centers = quad_centers[quad_indices]  # (num_candidates, 2)
-            
             # 计算距离
             diff = candidate_points - candidate_quad_centers  # (num_candidates, 2)
             candidate_distances = torch.sum(diff ** 2, dim=-1)  # (num_candidates,)

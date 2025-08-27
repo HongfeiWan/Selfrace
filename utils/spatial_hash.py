@@ -40,7 +40,6 @@ class SpatialHash:
     def build_static_index(self, static_items_bounds: torch.Tensor):
         """
         为静态几何体（如多边形）构建一个持久化的哈希索引。
-
         Args:
             static_items_bounds (torch.Tensor): 静态物体的AABB，形状 (num_items, 2, 2) for (min, max).
         """
@@ -76,7 +75,6 @@ class SpatialHash:
 
         sorted_pairs = item_cell_pairs[item_cell_pairs[:, 1].argsort()]
         self.static_sorted_items = sorted_pairs[:, 0].contiguous()
-
         self.static_cell_starts = torch.zeros(self.grid_total_cells + 1, dtype=torch.long, device=self.device)
         unique_cells, counts = torch.unique_consecutive(sorted_pairs[:, 1], return_counts=True)
         self.static_cell_starts[unique_cells + 1] = counts

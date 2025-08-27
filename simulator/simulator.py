@@ -11,14 +11,13 @@ parent_dir = os.path.dirname(current_dir)
 
 # 依赖于 spatial_hash
 # 添加utils目录到路径
-utils_dir = os.path.join(parent_dir, 'utils')
-if utils_dir not in sys.path:
-    sys.path.insert(0, utils_dir)
 # 添加simulator目录到路径
 simulator_dir = os.path.join(parent_dir, 'simulator')
 if simulator_dir not in sys.path:
     sys.path.insert(0, simulator_dir)
-    
+utils_dir = os.path.join(parent_dir, 'utils')
+if utils_dir not in sys.path:
+    sys.path.insert(0, utils_dir)
 from spatial_hash import SpatialHash
 from road import RoadNetwork
 from offroad import OffroadChecker
@@ -87,7 +86,7 @@ class TeraflowSimulator:
         # 7. 初始化观测生成器
         # observation.py 负责为每个自车生成局部观测
         obs_config = simulator_config['observation']
-        self.observation_generator = ObservationGenerator(self.road_network, obs_config, self.device)
+        self.observation_generator = ObservationGenerator(self.road_network, obs_config, self.device, self.spatial_hash)
 
         # 8. 初始化奖励计算器
         reward_config = simulator_config['reward']
@@ -110,20 +109,17 @@ class TeraflowSimulator:
             torch.Tensor: 一批初始观测, 形状为 (B, M, obs_dim)。
         """
         print("Resetting simulator environments...")
-        
         # 重置动力学模型的状态变量，避免不同episode之间的tensor大小不匹配
         self.dynamics_model.reset_control_state()
         print("Reset dynamics model state - cleared for fresh initialization")
-        
         # 使用 WorldInitializer 来生成一批新的世界状态，包括起始quad_id
         self.agents_state, _, self.agents_start_quad_ids = self.world_initializer.initialize_world(self.num_envs)
-
         # 将状态数据移动到正确的设备
         self.agents_state = self.agents_state.to(self.device)
-
         # 生成初始观测
         print("Generating initial observation...") 
         initial_observation = self.observation_generator.generate(self.agents_state)
+        print(initial_observation.shape)
         print("Initial observation generated")
         # 初始化路径规划器 - 为所有智能体分配目标和生成路径规划
         self._initialize_path_planning()
@@ -236,6 +232,7 @@ class TeraflowSimulator:
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (奖励值 (B, M), 目标到达标志 (B, M))
         """
+
         # 构建扩展的状态张量，包含加速度信息
         B, M, _ = self.agents_state.shape
         # 创建扩展的状态张量 (B, M, 10)
@@ -245,39 +242,47 @@ class TeraflowSimulator:
         # 复制原始状态信息
         extended_state[..., :4] = self.agents_state[..., :4]  # x, y, heading, speed
         
-        # 从动力学模型获取当前加速度
+        # 从动力学模型与动作空间获取批量化的 (B,M) 张量
         if hasattr(self.dynamics_model, 'current_along') and hasattr(self.dynamics_model, 'current_alat'):
-            # 获取当前加速度
-            along = self.dynamics_model.current_along
-            alat = self.dynamics_model.current_alat
-            # 创建完整的加速度张量，为未激活的智能体填充零值
-            full_along = torch.zeros((B, M), device=self.device)
-            full_alat = torch.zeros((B, M), device=self.device)
-            full_along_jerk = torch.zeros((B, M), device=self.device)
-            full_alat_jerk = torch.zeros((B, M), device=self.device)
-            print(along.shape, alat.shape)
-            # 只对激活的智能体应用加速度
-            active_mask = self.agents_state[..., 6] > 0.5
-            prepare_time=time.time()
-            if active_mask.any():
-                full_along[active_mask] = along
-                full_alat[active_mask] = alat
-                prepare_time=time.time()-prepare_time
-                print(f"prepare_time: {prepare_time:.4f}s")
-                # 直接从动作空间获取jerk值，而不是从动力学模型计算
-                if actions is not None:
-                    # 获取激活智能体的动作索引
-                    active_actions = actions[active_mask]
-                    # 确保动作索引是正确的形状
-                    if active_actions.ndim > 1:
-                        active_actions = active_actions[:, 0].long()
-                    else:
-                        active_actions = active_actions.long()
-                    # 从离散动作空间获取对应的jerk值
-                    jerk_actions = self.dynamics_model.discrete_action_space.get_action(active_actions)  # (N, 2) [along_jerk, alat_jerk]
-                    full_along_jerk[active_mask] = jerk_actions[:, 0]  # 纵向jerk
-                    full_alat_jerk[active_mask] = jerk_actions[:, 1]   # 横向jerk
-            # 填充加速度信息
+            # 激活掩码
+            active_mask = self.agents_state[..., 6] > 0.5  # (B, M)
+            # 1) 构造全局 along/alat 加速度 (B,M)，仅激活位置为有效值
+            #    将连续的 active 向量按掩码散射回批量形状
+            along_active = self.dynamics_model.current_along  # (N_active,) or None
+            alat_active = self.dynamics_model.current_alat    # (N_active,) or None
+            flat_mask = active_mask.view(-1)
+            zeros_flat = torch.zeros(B * M, device=self.device)
+            # 若动力学尚未初始化（None），以0填充
+            if along_active is None:
+                along_active = torch.zeros(int(flat_mask.sum().item()), device=self.device)
+            if alat_active is None:
+                alat_active = torch.zeros(int(flat_mask.sum().item()), device=self.device)
+            full_along = zeros_flat.masked_scatter(flat_mask, along_active).view(B, M)
+            full_alat  = zeros_flat.clone().masked_scatter(flat_mask, alat_active).view(B, M)
+
+            # 2) 从动作空间一次性映射出所有智能体的 jerk (B,M,2)，未激活位置后续用掩码置零
+            if actions is not None:
+                # 规整为 (B, M) 的索引
+                if actions.ndim == 3 and actions.shape[-1] == 1:
+                    actions_idx = actions.squeeze(-1).long()
+                elif actions.ndim == 2:
+                    actions_idx = actions.long()
+                else:
+                    # 兜底：兼容 (N,1) after masking 的情况
+                    actions_idx = actions.view(B, M).long()
+                jerk_all = self.dynamics_model.discrete_action_space.get_action(actions_idx.view(-1))  # (B*M,2)
+                jerk_all = jerk_all.view(B, M, 2)
+                full_along_jerk = jerk_all[..., 0]  # (B, M)
+                full_alat_jerk  = jerk_all[..., 1]  # (B, M)
+                # 仅对激活体保留数值
+                mask_f = active_mask.float()
+                full_along_jerk = full_along_jerk * mask_f
+                full_alat_jerk  = full_alat_jerk  * mask_f
+            else:
+                full_along_jerk = torch.zeros((B, M), device=self.device)
+                full_alat_jerk  = torch.zeros((B, M), device=self.device)
+
+            # 3) 写入扩展状态（数值构造已完成，无需布尔掩码赋值）
             extended_state[..., 4] = full_along      # along
             extended_state[..., 5] = full_alat       # alat
             extended_state[..., 6] = full_along_jerk # along_jerk
@@ -310,46 +315,30 @@ class TeraflowSimulator:
         1. 为每个激活的智能体随机分配一个目标quad_id
         2. 使用plan_path批量生成从起始位置到目标的路径规划
         """
+        prepare_time = time.time()
         if self.agents_state is None:
             return
-        B, M, _ = self.agents_state.shape  # batch_size, max_agents, state_dim
-    
-        # 1. 获取所有激活智能体的位置
-        active_mask = self.agents_state[..., 6] > 0.5  # (B, M)
-
-        # 2. 使用已知的起始quad_id（从世界初始化中获取）
+        # 基本尺寸与激活掩码（GPU）
+        B, M, _ = self.agents_state.shape
+        active_mask = self.agents_state[..., 6] > 0.5
+        # 起点与目标（纯GPU、极简随机目标，仅在激活位赋值）
         if not hasattr(self, 'agents_start_quad_ids') or self.agents_start_quad_ids is None:
             print("Warning: No start quad IDs available for path planning")
             return
-        
-        # 3. 简化：复制start结构，激活位置随机赋一个合法quad_id
-        goal_quad_ids = self.agents_start_quad_ids.clone()
-        if active_mask.any():
-            rand_goals = torch.randint(0, self.road_network.num_quads, goal_quad_ids.shape, device=self.device)
-            goal_quad_ids[active_mask] = rand_goals[active_mask]
-        
-        # 4. 使用plan_path批量生成路径规划（仅对start/goal > 0的位置）
-        print(self.agents_start_quad_ids, goal_quad_ids)
         start_i32 = self.agents_start_quad_ids.to(dtype=torch.int32, device=self.device)
-        goal_i32 = goal_quad_ids.to(dtype=torch.int32, device=self.device)
-
-        # 仅保留 start>0 且 goal>0 的位置，其他置为 -1
-        valid_mask = (start_i32 > 0) & (goal_i32 > 0)
-        start_i32 = start_i32.masked_fill(~valid_mask, -1)
-        goal_i32 = goal_i32.masked_fill(~valid_mask, -1)
-        # (B,M,1)
-        start_i32 = start_i32.unsqueeze(-1)
-        goal_i32 = goal_i32.unsqueeze(-1)
-
-        path_plans = self.path_planner.plan_path(start_i32, goal_i32)
-        # 清空无效路径
-        invalid_mask = ~valid_mask
-        if invalid_mask.any():
-            path_plans[invalid_mask] = -1
-
-        # 5. 存储结果
-        self.agents_goal_quad_ids = goal_quad_ids
-        self.agents_path_plans = path_plans 
+        goal_i32 = torch.full_like(start_i32, -1, dtype=torch.int32, device=self.device)
+        if active_mask.any():
+            rand_vals = torch.randint(0, self.road_network.num_quads, (int(active_mask.sum().item()),), device=self.device, dtype=torch.int32)
+            goal_i32 = goal_i32.masked_scatter(active_mask, rand_vals)
+        # 一次性调用 planner（形状为 (B,M,1)）
+        start_3d = start_i32.unsqueeze(-1)
+        goal_3d = goal_i32.unsqueeze(-1)
+        prepare_time_done = time.time()
+        print(f"prepare_time_done: {prepare_time_done-prepare_time:.4f}s")
+        path_plans = self.path_planner.plan_path(start_3d, goal_3d)  # 形状 (B,M,L,2)
+        # 存储结果
+        self.agents_goal_quad_ids = goal_i32
+        self.agents_path_plans = path_plans
 
 if __name__ == '__main__':
     # 这是一个简单的使用示例，用于测试模拟器的基本功能

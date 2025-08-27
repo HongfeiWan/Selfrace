@@ -442,7 +442,7 @@ class PathPlanner:
         plan_start_time = time.time()
         # 初始化规划的路径：
         # path = (B,M,512,2)
-        path = torch.full((start_quad_id.shape[0], start_quad_id.shape[1], 512, 2), -1, dtype=torch.float32, device=self.device)
+        # path = torch.full((start_quad_id.shape[0], start_quad_id.shape[1], 512, 2), -1, dtype=torch.float32, device=self.device)
         # 确定起始点和目标点的类型（是否在filtered_quad_indices内）
         # 使用GPU张量进行快速查询
         # 重塑张量以便进行广播比较
@@ -460,7 +460,7 @@ class PathPlanner:
         
         # 使用张量存储有效的lane_waypoints，支持向量化操作
         # 预分配固定大小的张量，最大waypoint数量设为100
-        max_waypoints_per_lane = 100  # 增加到100，确保足够空间
+        max_waypoints_per_lane = 50  # 增加到100，确保足够空间
         lane_waypoints_tensor = torch.full((batch_size, max_waypoints_per_lane, 2), -1, dtype=torch.float32, device=self.device)
         goal_lane_waypoints_tensor = torch.full((batch_size, max_waypoints_per_lane, 2), -1, dtype=torch.float32, device=self.device)
         # 记录每个lane的实际waypoint数量
@@ -902,17 +902,6 @@ class PathPlanner:
         # start_ids：（B*M,3）
         # end_ids: (B*M,3)
         # 注意这里的值都没有左对齐，因此可能第一个有效值是从中间某个地方开始的。
-        # 只打印cross_id不为-1的start_ids和end_ids
-        valid_start_mask = start_ids[:, 0] != -1
-        valid_end_mask = end_ids[:, 0] != -1
-        
-        if valid_start_mask.any():
-            print("有效的start_ids (cross_id != -1):")
-            print(start_ids[valid_start_mask])
-        
-        if valid_end_mask.any():
-            print("有效的end_ids (cross_id != -1):")
-            print(end_ids[valid_end_mask])
 
         waypoint_graph, waypoint_mask, waypoint_node_idx = self.waypoint_graph_gpu.batch_shortest_paths_fixed_len(start_ids, end_ids)
         
@@ -967,7 +956,7 @@ class PathPlanner:
         # ========= GPU批量拼接并左对齐（无for循环） =========
         # 基本参数
         N = start_quad_flat.shape[0]
-        Lmax = 512
+        Lmax = 128
         # 起终点坐标 (N,2)
         start_centers = self.get_quad_centers(start_quad_flat.to(torch.long))
         goal_centers = self.get_quad_centers(goal_quad_flat.to(torch.long))

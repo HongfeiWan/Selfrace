@@ -175,11 +175,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			initial_observation = simulator.reset()
 			agent_state = simulator.agents_state
 			path_plan = simulator.agents_path_plans
-			# 先往前匀速走一步
+
 			actions = torch.zeros((simulator.num_envs, simulator.world_initializer.max_agents), device=device, dtype=torch.float32)
 			actions[:,:] = 7 # 匀速
 			episode_start_time = time.time()
-			for t in range(max_episode_length-1195):
+			for t in range(max_episode_length):
 				step_start_time = time.time()
 				observation,reward,done = simulator.step(actions)
 				step_end_time = time.time()
@@ -188,7 +188,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			episode_end_time = time.time()
 			episode_duration = episode_end_time - episode_start_time
 			print(f"  🎯 本轮总步数耗时: {episode_duration:.4f}秒")
-			#print(f"🔍 单卡训练: 奖励: {reward[0]}")
+			print(f"🔍 单卡训练: 奖励: {reward[0]}")
+
 			optimizer.step()
 			scheduler.step()
 		return 0
