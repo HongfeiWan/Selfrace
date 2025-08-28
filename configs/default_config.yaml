@@ -148,7 +148,7 @@ training:
 
   # 修正batch size (每张显卡的训练batch size)
   batch_size: 256000  # 总batch size
-  batch_size_per_gpu: 32000  # 每GPU batch size
+  batch_size_per_gpu: 4500  # 每GPU batch size
   
   # 修正其他参数
   rollout_length: 128 # 每个rollout的步数
@@ -172,14 +172,18 @@ training:
   precision: "16-bit"  # 添加16-bit AMP
   
   # 修正advantage filtering
-  advantage_filter_threshold: 0.01  # 改为阈值过滤
-  
+  advantage_filter_threshold: 0.01  # 阈值过滤
+  advantage_filter_beta: 0.25       # EWMA衰减参数
+
   # 训练参数
   total_timesteps: 1_000_000_000_000 # As per paper
   
   # 内存和性能优化
   checkpoint_interval: 100    # 检查点保存间隔
+  checkpoint_dir: "./checkpoints" # 检查点保存目录
   log_interval: 10            # 日志记录间隔
+  
+
   
   # 经验缓冲区配置
   experience_buffer_capacity: 50000  # 经验缓冲区容量
@@ -190,11 +194,6 @@ training:
     type: "orthogonal"  # 使用Orthogonal初始化
     gain: 1.0           # Orthogonal初始化的gain参数
     bias_zero: true     # bias初始化为0
-
-  # 优势过滤配置
-  advantage_filtering:
-    beta: 0.25  # EWMA衰减参数
-    enabled: true  # 启用优势过滤
 
   network:
     # 特征编码器配置

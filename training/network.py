@@ -97,8 +97,8 @@ class FeatureEncoder(nn.Module):
         self.total_input_dim = sum(self.simple_feature_dims) + sum(self.permutation_feature_dims)
         # 创建简单特征编码器 - 直接创建4个
         self.simple_encoders = nn.ModuleList([
-            SimpleFeatureEncoder(self.simple_feature_dims[0], self.encoder_dim),  # S(t): 10维
-            SimpleFeatureEncoder(self.simple_feature_dims[1], self.encoder_dim),  # G(t): 1024维
+            SimpleFeatureEncoder(self.simple_feature_dims[0], self.encoder_dim),  # S(t): 7维
+            SimpleFeatureEncoder(self.simple_feature_dims[1], self.encoder_dim),  # G(t): 256维
             SimpleFeatureEncoder(self.simple_feature_dims[2], self.encoder_dim),  # reward系数: 10维
             SimpleFeatureEncoder(self.simple_feature_dims[3], self.encoder_dim)   # 车辆风格参数: 4维
         ])
@@ -222,17 +222,138 @@ class SharedNetwork(nn.Module):
         value = self.value_head(x).squeeze(-1)
         return action_logits, value
 
+class IndependentNetwork(nn.Module):
+    """
+    独立网络类 - 包含两个完全独立的网络，参数不共享
+    分别负责输出动作和值函数，可以选择单独使用
+    """
+    def __init__(self, config):
+        super(IndependentNetwork, self).__init__()
+        
+        # 从配置文件读取参数
+        network_config = config.training.network
+        self.network_dim = network_config.network_dim
+        self.num_actions = network_config.num_actions
+        
+        # ============================== 策略网络（动作网络） ==============================
+        # 策略网络的特征编码器
+        self.policy_feature_encoder = FeatureEncoder(config)
+        policy_encoded_dim = self.policy_feature_encoder.total_output_dim
+        
+        # 策略网络的MLP
+        self.policy_network = nn.Sequential(
+            nn.Linear(policy_encoded_dim, self.network_dim),
+            nn.ReLU(),
+            nn.Linear(self.network_dim, self.network_dim),
+            nn.ReLU(),
+            nn.Linear(self.network_dim, self.network_dim),
+            nn.ReLU(),
+            nn.Linear(self.network_dim, self.num_actions)
+        )
+        
+        # ============================== 值函数网络 ==============================
+        # 值函数网络的特征编码器
+        self.value_feature_encoder = FeatureEncoder(config)
+        value_encoded_dim = self.value_feature_encoder.total_output_dim
+        
+        # 值函数网络的MLP
+        self.value_network = nn.Sequential(
+            nn.Linear(value_encoded_dim, self.network_dim),
+            nn.ReLU(),
+            nn.Linear(self.network_dim, self.network_dim),
+            nn.ReLU(),
+            nn.Linear(self.network_dim, self.network_dim),
+            nn.ReLU(),
+            nn.Linear(self.network_dim, 1)
+        )
+        
+        # 初始化权重
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        """初始化网络权重 - 使用Orthogonal初始化且bias为0"""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.orthogonal_(module.weight, gain=1.0)
+            torch.nn.init.constant_(module.bias, 0)
+    
+    def forward(self, features_tensor, mode="both"):
+        """
+        前向传播 - 可选择使用策略网络、值函数网络或两者
+        Args:
+            features_tensor: [B, M, total_input_dim] 所有特征拼接的大张量
+            mode: "policy", "value", "both" - 选择使用哪个网络
+        Returns:
+            根据mode返回不同的输出
+        """
+        if mode == "policy":
+            return self.forward_policy(features_tensor)
+        elif mode == "value":
+            return self.forward_value(features_tensor)
+        elif mode == "both":
+            return self.forward_both(features_tensor)
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Must be 'policy', 'value', or 'both'")
+    
+    def forward_policy(self, features_tensor):
+        """
+        仅策略网络前向传播
+        Args:
+            features_tensor: [B, M, total_input_dim] 所有特征拼接的大张量
+        Returns:
+            action_logits: 动作logits [B, M, num_actions]
+        """
+        # 策略网络特征编码
+        policy_encoded_features = self.policy_feature_encoder(features_tensor)
+        # 向量化NaN处理
+        if torch.isnan(policy_encoded_features).any():
+            policy_encoded_features = torch.nan_to_num(policy_encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        # 策略网络前向传播
+        action_logits = self.policy_network(policy_encoded_features)
+        return action_logits
+    
+    def forward_value(self, features_tensor):
+        """
+        仅值函数网络前向传播
+        Args:
+            features_tensor: [B, M, total_input_dim] 所有特征拼接的大张量
+        Returns:
+            value: 状态值 [B, M]
+        """
+        # 值函数网络特征编码
+        value_encoded_features = self.value_feature_encoder(features_tensor)
+        # 向量化NaN处理
+        if torch.isnan(value_encoded_features).any():
+            value_encoded_features = torch.nan_to_num(value_encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        # 值函数网络前向传播
+        value = self.value_network(value_encoded_features).squeeze(-1)
+        return value
+    
+    def forward_both(self, features_tensor):
+        """
+        两个网络同时前向传播
+        Args:
+            features_tensor: [B, M, total_input_dim] 所有特征拼接的大张量
+        Returns:
+            action_logits: 动作logits [B, M, num_actions]
+            value: 状态值 [B, M]
+        """
+        action_logits = self.forward_policy(features_tensor)
+        value = self.forward_value(features_tensor)
+        return action_logits, value
+    
 def create_network(config, network_type="shared"):
     """
     创建网络实例的工厂函数
     Args:
         config: 配置文件对象（必需）
-        network_type: 网络类型 ("shared")
+        network_type: 网络类型 ("shared" 或 "independent")
     Returns:
         网络实例
     """
     if network_type == "shared":
         return SharedNetwork(config=config)
+    elif network_type == "independent":
+        return IndependentNetwork(config=config)
     else:
         raise ValueError(f"Unknown network type: {network_type}")
 
@@ -255,23 +376,73 @@ if __name__ == "__main__":
             config_dict = yaml.safe_load(f)
         # 转换为对象
         config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
-        model = create_network(config=config, network_type="shared")
-        model = model.to(device)  # 将模型移动到GPU
-        print(f"🔍 模型参数数量: {count_parameters(model)}")
+        
+        # 测试共享网络
+        print("\n🔍 测试共享网络 (SharedNetwork)...")
+        shared_model = create_network(config=config, network_type="shared")
+        shared_model = shared_model.to(device)
+        print(f"🔍 共享网络参数数量: {count_parameters(shared_model)}")
+        
+        # 测试独立网络
+        print("\n🔍 测试独立网络 (IndependentNetwork)...")
+        independent_model = create_network(config=config, network_type="independent")
+        independent_model = independent_model.to(device)
+        print(f"🔍 独立网络参数数量: {count_parameters(independent_model)}")
+        
         # 创建示例输入用于测试
-        B = 4800
+        B = 2000
         M = 150
-        # 创建固定长度的特征张量 [B, M, total_input_dim] 并移动到GPU
-        features_tensor = torch.randn(B, M, model.feature_encoder.total_input_dim, device=device)
-        # 测试前向传播
-        action_logits, value = model(features_tensor)
-        print(f"✅ 前向传播成功")
-        print(f"Action logits shape: {action_logits.shape}")
-        print(f"Value shape: {value.shape}")
+        features_tensor = torch.randn(B, M, shared_model.feature_encoder.total_input_dim, device=device)
+        
+        # 测试共享网络前向传播
+        print("\n🧪 测试共享网络前向传播...")
+        action_logits_shared, value_shared = shared_model(features_tensor)
+        print(f"✅ 共享网络前向传播成功")
+        print(f"Action logits shape: {action_logits_shared.shape}")
+        print(f"Value shape: {value_shared.shape}")
+        
+        # 测试独立网络前向传播
+        print("\n🧪 测试独立网络前向传播...")
+        
+        # 测试同时使用两个网络
+        action_logits_indep, value_indep = independent_model(features_tensor, mode="both")
+        print(f"✅ 独立网络双网络前向传播成功")
+        print(f"Action logits shape: {action_logits_indep.shape}")
+        print(f"Value shape: {value_indep.shape}")
+        
+        # 测试仅策略网络
+        action_logits_policy = independent_model(features_tensor, mode="policy")
+        print(f"✅ 独立网络仅策略网络前向传播成功")
+        print(f"Policy Action logits shape: {action_logits_policy.shape}")
+        
+        # 测试仅值函数网络
+        value_only = independent_model(features_tensor, mode="value")
+        print(f"✅ 独立网络仅值函数网络前向传播成功")
+        print(f"Value only shape: {value_only.shape}")
+        
         # 测试反向传播
-        loss = action_logits.sum() + value.sum()
-        loss.backward()
-        print(f"✅ 反向传播成功")
+        print("\n🧪 测试反向传播...")
+        loss_shared = action_logits_shared.sum() + value_shared.sum()
+        loss_shared.backward()
+        print(f"✅ 共享网络反向传播成功")
+        
+        # 测试独立网络的反向传播
+        loss_indep_both = action_logits_indep.sum() + value_indep.sum()
+        loss_indep_both.backward()
+        print(f"✅ 独立网络双网络反向传播成功")
+        
+        # 测试仅策略网络的反向传播
+        loss_policy = action_logits_policy.sum()
+        loss_policy.backward()
+        print(f"✅ 独立网络仅策略网络反向传播成功")
+        
+        # 测试仅值函数网络的反向传播
+        loss_value = value_only.sum()
+        loss_value.backward()
+        print(f"✅ 独立网络仅值函数网络反向传播成功")
+        
+        print(f"共享网络参数数量: {count_parameters(shared_model)}, 独立网络参数数量: {count_parameters(independent_model)}")
+
     except Exception as e:
         print(f"❌ 测试失败: {e}")
         import traceback

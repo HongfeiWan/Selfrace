@@ -43,8 +43,27 @@ def gae_advantages(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Ten
     #= A(s,a) + V(s)  
     #= (Q(s,a) - V(s)) + V(s)
     #= Q(s,a)
-	advantages = (advantages-advantages.mean())/advantages.std()
+	# advantages = (advantages-advantages.mean())/advantages.std()
 	return advantages, returns #即返回A(s,a), Q(s,a)
+
+# ============================== 模型检查点保存 ==============================
+def save_checkpoint(model, policy_optimizer, value_optimizer, step: int, checkpoint_dir: str):
+	"""保存模型与优化器状态字典"""
+	try:
+		os.makedirs(checkpoint_dir, exist_ok=True)
+		# 兼容 DDP 包裹
+		save_model = model.module if hasattr(model, 'module') else model
+		state = {
+			'step': step,
+			'policy_state_dict': save_model.policy_network.state_dict(),
+			'value_state_dict': save_model.value_network.state_dict(),
+			'policy_optim_state_dict': policy_optimizer.state_dict(),
+			'value_optim_state_dict': value_optimizer.state_dict(),
+		}
+		ckpt_path = os.path.join(checkpoint_dir, f'ckpt_step_{step}.pt')
+		torch.save(state, ckpt_path)
+	except Exception as e:
+		print(f"⚠️ 保存检查点失败: {e}")
 
 # ============================== 观测数据拆解 ==============================
 def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) -> tuple:
@@ -332,121 +351,214 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		#TODO:这里写单卡训练代码，用于调试
 		device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
 		torch.cuda.set_device(device) if device.type == 'cuda' else None
+
 		config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
 
-		model = create_network(config=config, network_type="shared")
+		model = create_network(config=config, network_type="independent")
 		model = model.to(device)
+
 		simulator = TeraflowSimulator(config=config_dict, device=device)
+
 		sim_cfg = getattr(config, 'simulator')
 		training_cfg = getattr(config, 'training')
 		learning_rate = getattr(training_cfg, 'learning_rate')
 		num_iterations = getattr(training_cfg, 'batch_size_per_gpu')
 		max_episode_length = getattr(training_cfg,'max_episode_length')
 		ppo_epochs = getattr(training_cfg, 'ppo_epochs')
-		rollout_length = getattr(training_cfg, 'rollout_length')
-
 		gamma = getattr(training_cfg, 'gamma')
 		gae_lambda = getattr(training_cfg, 'gae_lambda')
-
 		clip_ratio = getattr(training_cfg, 'clip_ratio')
 		entropy_coef = getattr(training_cfg, 'entropy_coef')
 		value_loss_coef = getattr(training_cfg, 'value_loss_coef')
-
-		optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-		scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_iterations, eta_min=0.0)
+		max_grad_norm = getattr(training_cfg, 'max_grad_norm')
+		checkpoint_interval = getattr(training_cfg, 'checkpoint_interval')
+		checkpoint_dir = getattr(training_cfg, 'checkpoint_dir')
 		
+		# 分别创建策略网络和价值网络的优化器
+		policy_optimizer = optim.Adam(model.policy_network.parameters(), lr=learning_rate)
+		value_optimizer = optim.Adam(model.value_network.parameters(), lr=learning_rate)
 
+		# 分别创建策略网络和价值网络的调度器
+		policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(policy_optimizer, T_max=num_iterations, eta_min=0.0)
+		value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(value_optimizer, T_max=num_iterations, eta_min=0.0)
+		
+		# 优势过滤参数
+		beta = getattr(training_cfg, 'advantage_filter_beta', 0.25)	# EWMA衰减参数
+		advantage_filter_threshold = getattr(training_cfg, 'advantage_filter_threshold', 0.01)	# 优势过滤阈值
+		A_max_ewma = None 		# EWMA of max absolute advantage
+		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 32000)  # 每GPU的batch size
+		rollout_length = getattr(training_cfg, 'rollout_length', 128)  # rollout长度
+		
 		for k in range(num_iterations):
 			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")
 			episode_start_time = time.time()
-
-			# ============================== 采样 ==============================
-			# simulator初始化
+			# ============================== 采样（初始化） ==============================
 			initial_observation = simulator.reset()
 			path_plan = simulator.agents_path_plans
 			stop_lines = simulator.stop_lines
 			# 拆解initial_observation为网络需要的组件
 			agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(initial_observation, config)
 			# 构建网络输入特征
-			features_tensor = build_network_features(agents_state, neighbors_local, w_lanes_local, w_boundaries_local, path_plan, stop_lines, simulator.reward_calculator.sampled_params, config)
-			# =========================== 初始化本轮buffer（存每步所有agents的状态） ==============================
-			# 形状: [T+1, B, M, 7]
-			B, M, S = agents_state.shape
-			episode_states_buffer = torch.empty((max_episode_length+1, B, M, S), device=agents_state.device, dtype=agents_state.dtype)
-			episode_states_buffer[0] = agents_state
-			rewards_buffer = torch.zeros(max_episode_length, B, M, device=agents_state.device)
-			dones_buffer = torch.zeros(max_episode_length, B, M, device=agents_state.device)
-			values_buffer = torch.zeros(max_episode_length, B, M, device=agents_state.device)
-			old_log_probs_buffer = torch.zeros(max_episode_length, B, M, device=agents_state.device)
+			features_tensor = build_network_features(
+				agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
+				path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
+			)
 
-			for t in range(max_episode_length):
-				step_start_time = time.time()
-				# ============================== 执行环境步进 ==============================
-				# 使用网络进行前向传播
+			# =========================== 分段rollout：每段 rollout_length 后更新 ==============================
+			B, M, S = agents_state.shape
+			t_global = 0
+			while t_global < max_episode_length:
+				segment_steps = min(rollout_length, max_episode_length - t_global)
+				# 本段buffer
+				states_buffer = torch.empty((segment_steps + 1, B, M, S), device=agents_state.device, dtype=agents_state.dtype)
+				rewards_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
+				dones_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
+				values_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
+				old_log_probs_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
+				states_buffer[0].copy_(agents_state)
+				# 段内采样
+				for t in range(segment_steps):
+					step_start_time = time.time()
+					with torch.no_grad():
+						action_logits = model.forward_policy(features_tensor)
+						value_pred = model.forward(features_tensor, mode="value")
+					dist = torch.distributions.Categorical(logits=action_logits)
+					actions = dist.sample()
+					# 环境步进
+					observation, reward, done = simulator.step(actions)
+					# 更新观测与特征
+					agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
+					features_tensor = build_network_features(
+						agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
+						path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
+					)
+					# 写入buffer
+					states_buffer[t + 1].copy_(agents_state)
+					values_buffer[t] = value_pred.detach()
+					rewards_buffer[t] = reward
+					dones_buffer[t] = done
+					old_log_probs_buffer[t] = dist.log_prob(actions).detach()
+					print(f"\t📍 第 {t_global + t + 1}/{segment_steps} 步耗时: {time.time()-step_start_time:.4f}秒")
+
+				# 段末bootstrap并计算GAE
 				with torch.no_grad():
-					action_logits, value_pred = model(features_tensor)
-				dist = torch.distributions.Categorical(logits=action_logits)
-				actions = dist.sample()  # 根据策略分布采样动作索引 (0-11)
-				# 执行环境步进
-				observation, reward, done = simulator.step(actions)
-				# 更新观测数据用于下一步
-				agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
-				features_tensor = build_network_features(agents_state, neighbors_local, w_lanes_local, w_boundaries_local, path_plan, stop_lines, simulator.reward_calculator.sampled_params, config)
-				# ============================== 收集经验 ==================================
-				# 记录本步所有agents的状态到buffer
-				episode_states_buffer[t+1].copy_(agents_state)
-				values_buffer[t] = value_pred.detach()
-				rewards_buffer[t] = reward
-				dones_buffer[t] = done
-				old_log_probs_buffer[t] = dist.log_prob(actions).detach()
-				print(f"  📍 第 {t+1}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
-			# ============================== 计算优势 ==============================
-			with torch.no_grad():
-				_, last_value_pred = model(features_tensor)  # 最后一个状态的V_{T}
-			# 拼接为 [T+1, B, M]
-			values_tp1 = torch.cat([values_buffer, last_value_pred.unsqueeze(0)], dim=0)
-			advantages, returns = gae_advantages(rewards_buffer, values_tp1, dones_buffer, gamma, gae_lambda)
-			# ============================== 更新网络 ==============================
-			for _ in range(ppo_epochs):
-				indices = torch.randperm(max_episode_length, device=device)[:rollout_length]
-				# 重新构建网络输入特征以节约显存
-				features_batch = []
-				for idx in indices:
-					# 对每个时间步重新生成观测和特征
-					agents_state = episode_states_buffer[idx]  # [B, M, 7]
-					# 通过simulator重新生成观测
-					observation = simulator.observation_generator.generate(agents_state)
-					# 拆解观测并构建特征
-					agents_state_decomp, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
-					features = build_network_features(agents_state_decomp, neighbors_local, w_lanes_local, w_boundaries_local, path_plan, stop_lines, simulator.reward_calculator.sampled_params, config)
-					features_batch.append(features)
-					
-				features_tensor = torch.stack(features_batch, dim=0)  # [rollout_length, B, M, total_input_dim]
-				# 重塑为网络期望的输入形状 [B*rollout_length, M, total_input_dim]
-				features_tensor = features_tensor.transpose(0, 1).contiguous().view(-1, features_tensor.shape[2], features_tensor.shape[3])
-				
-				old_log_probs_batch = old_log_probs_buffer[indices].transpose(0, 1).contiguous().view(-1)  # [B*rollout_length*M]
-				advantages_batch = advantages[indices].transpose(0, 1).contiguous().view(-1)  # [B*rollout_length*M]
-				returns_batch = returns[indices].transpose(0, 1).contiguous().view(-1)  # [B*rollout_length*M]
-				action_logits, value_pred = model(features_tensor)
-				dist = torch.distributions.Categorical(logits=action_logits)
-				actions_batch = dist.sample()
-				new_log_probs = dist.log_prob(actions_batch)
-				# 确保维度匹配
-				new_log_probs = new_log_probs.view(-1)  # [B*rollout_length*M]
-				value_pred = value_pred.view(-1)  # [B*rollout_length*M]
-				ratio = torch.exp(torch.clamp(new_log_probs - old_log_probs_batch, -1, 1))
-				surr1 = ratio * advantages_batch
-				surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantages_batch
-				policy_loss = -torch.min(surr1, surr2).mean()
-				entropy = dist.entropy().mean()
-				value_loss = (value_pred - returns_batch).pow(2).mean()
-				loss = policy_loss + value_loss_coef * value_loss - entropy_coef * entropy
-				loss = torch.clamp(loss, -100, 100)
-				optimizer.zero_grad(set_to_none=True)
-				loss.backward()
-				optimizer.step()
-			scheduler.step()
+					last_value_pred = model.forward(features_tensor, mode="value")
+				values_tp1 = torch.cat([values_buffer, last_value_pred.unsqueeze(0)], dim=0)
+				advantages, returns = gae_advantages(rewards_buffer, values_tp1, dones_buffer, gamma, gae_lambda)
+
+				# 优势过滤（基于段内）
+				A_max = torch.max(torch.abs(advantages)).item()
+				if A_max_ewma is None:
+					A_max_ewma = A_max
+				else:
+					A_max_ewma = beta * A_max + (1 - beta) * A_max_ewma
+				eta = advantage_filter_threshold * A_max_ewma
+				advantage_mask = torch.abs(advantages) < eta
+				print(f"🎯 第{k+1}轮 - 段[{t_global},{t_global+segment_steps}) 最大|A|: {A_max:.4f}, EWMA: {A_max_ewma:.4f}, 阈值: {eta:.4f}")
+				print(f"📊 过滤前: {advantage_mask.numel()}, 被过滤: {advantage_mask.sum().item()}")
+
+				# 随机采样 batch_size_per_gpu 个样本并进行PPO更新
+				keep_mask = (torch.abs(advantages) >= eta)
+				cand_idx = keep_mask.nonzero(as_tuple=False)
+				if cand_idx.numel() == 0:
+					print("⚠️ 本段无可用样本，跳过更新")
+					t_global += segment_steps
+					continue
+				# 随机选择 batch_size_per_gpu 个样本（不足则放回采样）
+				N = cand_idx.shape[0]
+				K = batch_size_per_gpu
+				if N >= K:
+					rand_pos = torch.randperm(N, device=device)[:K]
+					selected_idx = cand_idx[rand_pos]
+				else:
+					rand_pos = torch.randint(0, N, (K,), device=device)
+					selected_idx = cand_idx[rand_pos]
+				selected_t = selected_idx[:, 0]
+				selected_b = selected_idx[:, 1]
+				selected_m = selected_idx[:, 2]
+				print(f"🎯 本段随机选取 {K} 个样本用于更新（候选 {N}）")
+				agent_indices_batch = selected_m.to(device)
+				old_log_probs_batch = old_log_probs_buffer[selected_t, selected_b, selected_m].view(-1)
+				advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
+				returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
+				advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+				batch_N = old_log_probs_batch.shape[0]
+
+				segment_start_time = time.time()
+				for _ in range(ppo_epochs):
+					# 直接使用整批（不再分mini-batch）
+					mb_idx = torch.arange(batch_N, device=device)
+					mb_old_logp = old_log_probs_batch[mb_idx]
+					mb_adv = advantages_batch[mb_idx]
+					mb_ret = returns_batch[mb_idx]
+					mb_agent_idx = agent_indices_batch[mb_idx]
+
+					# 基于本段状态重建整批特征
+					mb_t = selected_t[mb_idx]
+					mb_b = selected_b[mb_idx]
+					mb_m = selected_m[mb_idx]
+					uniq_tb_mb, inverse_mb = torch.unique(torch.stack([mb_t, mb_b], dim=1), dim=0, return_inverse=True)
+					t_u_mb = uniq_tb_mb[:, 0]
+					b_u_mb = uniq_tb_mb[:, 1]
+					agents_states_mb = states_buffer[t_u_mb, b_u_mb]
+					obs_mb = simulator.observation_generator.generate(agents_states_mb)
+					agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
+					path_plan_mb = path_plan[b_u_mb]
+					stop_lines_mb = stop_lines[b_u_mb] if (stop_lines is not None and stop_lines.numel() > 0) else stop_lines
+					reward_coef_mb = simulator.reward_calculator.sampled_params[b_u_mb]
+					features_u_mb = build_network_features(
+						agents_state_dec_mb,
+						neighbors_local_mb,
+						w_lanes_local_mb,
+						w_boundaries_local_mb,
+						path_plan_mb,
+						stop_lines_mb,
+						reward_coef_mb,
+						config
+					)
+					u_idx_mb = inverse_mb.to(device)
+					mb_features = features_u_mb[u_idx_mb]
+
+					# 策略更新
+					print(mb_features.shape)
+					action_logits = model.forward(mb_features, mode="policy")
+					dist = torch.distributions.Categorical(logits=action_logits)
+					actions_sampled = dist.sample()
+					row_idx = torch.arange(actions_sampled.shape[0], device=device)
+					new_log_probs = dist.log_prob(actions_sampled)[row_idx, mb_agent_idx]
+					ratio = torch.exp(torch.clamp(new_log_probs - mb_old_logp, -1, 1))
+					surr1 = ratio * mb_adv
+					surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
+					policy_loss = -torch.min(surr1, surr2).mean()
+					entropy = dist.entropy()[row_idx, mb_agent_idx].mean()
+					policy_total_loss = policy_loss - entropy_coef * entropy
+					policy_total_loss = torch.clamp(policy_total_loss, -100, 100)
+					policy_optimizer.zero_grad(set_to_none=True)
+					policy_total_loss.backward()
+					torch.nn.utils.clip_grad_norm_(model.policy_network.parameters(), max_grad_norm)
+					policy_optimizer.step()
+
+					# 价值更新
+					value_pred_full = model.forward(mb_features, mode="value").squeeze(-1)
+					value_pred = value_pred_full[row_idx, mb_agent_idx]
+					value_loss = (value_pred - mb_ret).pow(2).mean()
+					value_loss = value_loss_coef * value_loss
+					value_loss = torch.clamp(value_loss, -100, 100)
+					value_optimizer.zero_grad(set_to_none=True)
+					value_loss.backward()
+					torch.nn.utils.clip_grad_norm_(model.value_network.parameters(), max_grad_norm)
+					value_optimizer.step()
+
+				# 推进到下一段
+				t_global += segment_steps
+				print(f"🎯 第{k+1}轮 - 段[{t_global},{t_global+segment_steps}) 更新完成,耗时: {time.time()-segment_start_time:.4f}秒")
+
+			# 分别更新学习率调度器
+			policy_scheduler.step()
+			value_scheduler.step()
+			# 保存检查点
+			if (k + 1) % checkpoint_interval == 0:
+				save_checkpoint(model, policy_optimizer, value_optimizer, k + 1, checkpoint_dir)
 			print(f"🎯 本轮总步数耗时: {time.time()-episode_start_time:.4f}秒")
 		print('train done!')
 		return 0
@@ -469,7 +581,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 
 		# 载入配置并建模
 		config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
-		model = create_network(config=config, network_type="shared")
+		model = create_network(config=config, network_type="independent")
 		model = model.to(device)
 		
 		# 按原文示例的DDP签名（等价于传入本地rank）
@@ -478,107 +590,214 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		else:
 			model = DDP(model)
 
-		# 训练超参从配置读取（含回退到现有键名）
+		# ==== 与单卡保持一致的模拟器与超参数初始化 ====
+		simulator = TeraflowSimulator(config=config_dict, device=device)
 		sim_cfg = getattr(config, 'simulator', SimpleNamespace())
 		training_cfg = getattr(config, 'training', SimpleNamespace())
 		learning_rate = getattr(training_cfg, 'learning_rate', 3e-4)
-		num_iterations = getattr(training_cfg, 'num_iterations', 10)
-		# M 维度：优先使用 training.batch_M，否则回退到 simulator.max_agents_num，再否则用150
-		batch_M = getattr(training_cfg, 'batch_M', getattr(sim_cfg, 'max_agents_num', 150))
-		preempt_ratio = getattr(training_cfg, 'preempt_ratio', 0.6)
-		# 每轮采样步数：优先 training.max_experience_steps，否则回退到 training.rollout_length
-		max_experience_steps = getattr(training_cfg, 'max_experience_steps', getattr(training_cfg, 'rollout_length', 1024))
-		min_steps_fraction = getattr(training_cfg, 'min_steps_fraction', 0.25)
-		# PPO 迭代：优先 training.n_ppo_epochs，否则回退到 training.ppo_epochs
-		n_ppo_epochs = getattr(training_cfg, 'n_ppo_epochs', getattr(training_cfg, 'ppo_epochs', 2))
-		n_ppo_batch = getattr(training_cfg, 'n_ppo_batch', 4)
-		ppo_batch_size = getattr(training_cfg, 'ppo_batch_size', 32)
+		num_iterations = getattr(training_cfg, 'batch_size_per_gpu', 10)
+		max_episode_length = getattr(training_cfg, 'max_episode_length', 1024)
+		ppo_epochs = getattr(training_cfg, 'ppo_epochs', 2)
 		gamma = getattr(training_cfg, 'gamma', 0.999)
 		gae_lambda = getattr(training_cfg, 'gae_lambda', 0.95)
+		clip_ratio = getattr(training_cfg, 'clip_ratio', 0.2)
+		entropy_coef = getattr(training_cfg, 'entropy_coef', 0.01)
+		value_loss_coef = getattr(training_cfg, 'value_loss_coef', 0.5)
+		max_grad_norm = getattr(training_cfg, 'max_grad_norm', 1.0)
+		checkpoint_interval = getattr(training_cfg, 'checkpoint_interval', 1)
+		checkpoint_dir = getattr(training_cfg, 'checkpoint_dir', './checkpoints')
+		# 优势过滤参数
+		beta = getattr(training_cfg, 'advantage_filter_beta', 0.25)
+		advantage_filter_threshold = getattr(training_cfg, 'advantage_filter_threshold', 0.01)
+		A_max_ewma = None
+		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 32000)
+		rollout_length = getattr(training_cfg, 'rollout_length', 128)
 
-		optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        #TODO:这里把采样换入simulator的输入、ppo换成已经写好的test_ppo就OK了！！
-		scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_iterations, eta_min=0.0)
+		# 分别创建策略网络和价值网络的优化器（DDP下需访问 module）
+		policy_optimizer = optim.Adam(model.module.policy_network.parameters(), lr=learning_rate)
+		value_optimizer = optim.Adam(model.module.value_network.parameters(), lr=learning_rate)
+		policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(policy_optimizer, T_max=num_iterations, eta_min=0.0)
+		value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(value_optimizer, T_max=num_iterations, eta_min=0.0)
 		
-		# 每一轮迭代
+		# 每一轮迭代（分段rollout + 随机批更新）
 		for k in range(num_iterations):
-			# 注意：学习率调度器应该在优化器更新后调用
-			# 这里先不调用scheduler.step()，等优化器更新后再调用
-
-			# 2) 本轮开始：重置完成计数
+			# 2) 本轮开始：重置完成计数（保持与原多卡同步逻辑一致）
 			num_workers_done.set("done", b"0")
 
-			# 3) rollout 收集，带抢占
-			min_steps = max(1, int(max_experience_steps * min_steps_fraction))
-			preempt_threshold = max(1, int(math.ceil(preempt_ratio * gpu_count)))
-			collected_steps = 0
-			input_dim = model.module.feature_encoder.total_input_dim
-			values_steps = torch.zeros(max_experience_steps, batch_M, device=device)
-			last_features = None
-			for step in range(max_experience_steps):
-				# collect_step(model): 这里用随机张量模拟一次环境交互
-				features_tensor = torch.randn(1, batch_M, input_dim, device=device)
+			# 采样初始化
+			initial_observation = simulator.reset()
+			path_plan = simulator.agents_path_plans
+			stop_lines = simulator.stop_lines
+			agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(initial_observation, config)
+			features_tensor = build_network_features(
+				agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
+				path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
+			)
+
+			B, M, S = agents_state.shape
+			t_global = 0
+			while t_global < max_episode_length:
+				segment_steps = min(rollout_length, max_episode_length - t_global)
+				states_buffer = torch.empty((segment_steps + 1, B, M, S), device=agents_state.device, dtype=agents_state.dtype)
+				rewards_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
+				dones_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
+				values_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
+				old_log_probs_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
+				states_buffer[0].copy_(agents_state)
+
+				for t in range(segment_steps):
+					with torch.no_grad():
+						action_logits = model.module.forward_policy(features_tensor)
+						value_pred = model.module.forward(features_tensor, mode="value")
+					dist = torch.distributions.Categorical(logits=action_logits)
+					actions = dist.sample()
+					observation, reward, done = simulator.step(actions)
+					agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
+					features_tensor = build_network_features(
+						agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
+						path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
+					)
+					states_buffer[t + 1].copy_(agents_state)
+					values_buffer[t] = value_pred.detach()
+					rewards_buffer[t] = reward
+					dones_buffer[t] = done
+					old_log_probs_buffer[t] = dist.log_prob(actions).detach()
+
+				# 本段GAE
 				with torch.no_grad():
-					action_logits, values = model(features_tensor)
-				# 记录 V_t: [B]（去掉[1, B, 1]的两端维度）
-				values_steps[step] = values.squeeze(-1).squeeze(0)
-				last_features = features_tensor
-				collected_steps += 1
+					last_value_pred = model.module.forward(features_tensor, mode="value")
+				values_tp1 = torch.cat([values_buffer, last_value_pred.unsqueeze(0)], dim=0)
+				advantages, returns = gae_advantages(rewards_buffer, values_tp1, dones_buffer, gamma, gae_lambda)
 
-				# 抢占慢worker（满足：其他完成数达到阈值 且 本worker已达到最少步数）
-				try:
-					num_done = int(num_workers_done.get("done").decode())
-				except Exception:
-					num_done = 0
-				if (num_done >= preempt_threshold) and (collected_steps >= min_steps):
-					break
+				# 优势过滤
+				A_max = torch.max(torch.abs(advantages)).item()
+				if A_max_ewma is None:
+					A_max_ewma = A_max
+				else:
+					A_max_ewma = beta * A_max + (1 - beta) * A_max_ewma
+				eta = advantage_filter_threshold * A_max_ewma
+				keep_mask = (torch.abs(advantages) >= eta)
+				cand_idx = keep_mask.nonzero(as_tuple=False)
+				if cand_idx.numel() == 0:
+					# 本段无可用样本，推进到下一段
+					t_global += segment_steps
+					continue
 
-			# 4) 标记本worker完成采样
+				# 从候选中随机抽取 batch_size_per_gpu 个样本（不足放回）
+				N = cand_idx.shape[0]
+				K = batch_size_per_gpu
+				if N >= K:
+					rand_pos = torch.randperm(N, device=device)[:K]
+					selected_idx = cand_idx[rand_pos]
+				else:
+					rand_pos = torch.randint(0, N, (K,), device=device)
+					selected_idx = cand_idx[rand_pos]
+				selected_t = selected_idx[:, 0]
+				selected_b = selected_idx[:, 1]
+				selected_m = selected_idx[:, 2]
+
+				agent_indices_batch = selected_m.to(device)
+				old_log_probs_batch = old_log_probs_buffer[selected_t, selected_b, selected_m].view(-1)
+				advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
+				returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
+				advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+
+				batch_N = old_log_probs_batch.shape[0]
+				segment_start_time = time.time()
+				for _ in range(ppo_epochs):
+					# 整批更新
+					mb_idx = torch.arange(batch_N, device=device)
+					mb_old_logp = old_log_probs_batch[mb_idx]
+					mb_adv = advantages_batch[mb_idx]
+					mb_ret = returns_batch[mb_idx]
+					mb_agent_idx = agent_indices_batch[mb_idx]
+
+					# 重建整批特征（基于本段缓存）
+					mb_t = selected_t[mb_idx]
+					mb_b = selected_b[mb_idx]
+					mb_m = selected_m[mb_idx]
+					uniq_tb_mb, inverse_mb = torch.unique(torch.stack([mb_t, mb_b], dim=1), dim=0, return_inverse=True)
+					t_u_mb = uniq_tb_mb[:, 0]
+					b_u_mb = uniq_tb_mb[:, 1]
+					agents_states_mb = states_buffer[t_u_mb, b_u_mb]
+					obs_mb = simulator.observation_generator.generate(agents_states_mb)
+					agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
+					path_plan_mb = path_plan[b_u_mb]
+					stop_lines_mb = stop_lines[b_u_mb] if (stop_lines is not None and stop_lines.numel() > 0) else stop_lines
+					reward_coef_mb = simulator.reward_calculator.sampled_params[b_u_mb]
+					features_u_mb = build_network_features(
+						agents_state_dec_mb,
+						neighbors_local_mb,
+						w_lanes_local_mb,
+						w_boundaries_local_mb,
+						path_plan_mb,
+						stop_lines_mb,
+						reward_coef_mb,
+						config
+					)
+					u_idx_mb = inverse_mb.to(device)
+					mb_features = features_u_mb[u_idx_mb]
+
+					# 策略更新（DDP自动同步）
+					action_logits = model.module.forward(mb_features, mode="policy")
+					dist = torch.distributions.Categorical(logits=action_logits)
+					actions_sampled = dist.sample()
+					row_idx = torch.arange(actions_sampled.shape[0], device=device)
+					new_log_probs = dist.log_prob(actions_sampled)[row_idx, mb_agent_idx]
+					ratio = torch.exp(torch.clamp(new_log_probs - mb_old_logp, -1, 1))
+					surr1 = ratio * mb_adv
+					surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
+					policy_loss = -torch.min(surr1, surr2).mean()
+					entropy = dist.entropy()[row_idx, mb_agent_idx].mean()
+					policy_total_loss = policy_loss - entropy_coef * entropy
+					policy_total_loss = torch.clamp(policy_total_loss, -100, 100)
+					policy_optimizer.zero_grad(set_to_none=True)
+					policy_total_loss.backward()
+					torch.nn.utils.clip_grad_norm_(model.module.policy_network.parameters(), max_grad_norm)
+					policy_optimizer.step()
+
+					# 价值更新（DDP自动同步）
+					value_pred_full = model.module.forward(mb_features, mode="value").squeeze(-1)
+					value_pred = value_pred_full[row_idx, mb_agent_idx]
+					value_loss = (value_pred - mb_ret).pow(2).mean()
+					value_loss = value_loss_coef * value_loss
+					value_loss = torch.clamp(value_loss, -100, 100)
+					value_optimizer.zero_grad(set_to_none=True)
+					value_loss.backward()
+					torch.nn.utils.clip_grad_norm_(model.module.value_network.parameters(), max_grad_norm)
+					value_optimizer.step()
+
+				# 推进到下一段
+				t_global += segment_steps
+				if rank == 0:
+					print(f"[Round {k}] 段完成, 用时 {time.time()-segment_start_time:.4f}s")
+
+			# 7) 在优化器更新后调用学习率调度器（与单卡一致）
+			policy_scheduler.step()
+			value_scheduler.step()
+
+			# 标记本worker完成（保留原计数器结构）
 			try:
 				if hasattr(num_workers_done, 'add'):
 					num_workers_done.add("done", 1)
 				else:
-					# 退化：读-改-写
 					curr = int(num_workers_done.get("done").decode())
 					num_workers_done.set("done", str(curr + 1).encode())
 			except Exception:
 				pass
 
-			# 5) 计算GAE（全tensor、同device）
-			T = collected_steps
-			if T > 0:
-				# bootstrap V_{T}
-				with torch.no_grad():
-					_, v_boot = model(last_features)
-				v_boot = v_boot.squeeze(-1).squeeze(0)  # [B]
-				values_tensor = torch.stack(values_steps[:T] + [v_boot], dim=0)  # [T+1, B]
-				rewards_tensor = torch.zeros(T, values_tensor.shape[1], device=device)
-				dones_tensor = torch.zeros(T, values_tensor.shape[1], device=device)
-				advantages, returns = gae_advantages(rewards_tensor, values_tensor, dones_tensor, gamma, gae_lambda)
-
-
-			# 6) 使用PPO进行更新（占位实现）
-			for _ in range(n_ppo_epochs):
-				for _ in range(n_ppo_batch):
-					# get_batch(): 用随机批次代替
-					batch = torch.randn(ppo_batch_size, batch_M, input_dim, device=device)
-					action_logits, values = model(batch)
-					loss = (action_logits.float().mean() - values.float().mean())
-					optimizer.zero_grad(set_to_none=True)
-					loss.backward()
-					# DDP在backward中会自动AllReduce梯度
-					optimizer.step()
-			
-			# 7) 在优化器更新后调用学习率调度器
-			scheduler.step()
-
+			# 仅在主进程保存检查点并打印轮次进度
 			if is_master:
 				try:
 					num_done = int(num_workers_done.get("done").decode())
 				except Exception:
 					num_done = -1
-				print(f"[Round {k}] finished={num_done}/{gpu_count}, collected_steps(rank{rank})={collected_steps}")
-				
+				print(f"[Round {k}] finished={num_done}/{gpu_count}")
+				if (k + 1) % checkpoint_interval == 0:
+					try:
+						save_checkpoint(model, policy_optimizer, value_optimizer, k + 1, checkpoint_dir)
+					except Exception:
+						pass
 	except Exception as e:
 		print(f"[Rank {rank}] 训练异常: {e}")
 	finally:
