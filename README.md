@@ -1,4 +1,3 @@
-# Selfrace
 
 ![Selfrace Logo](https://github.com/HongfeiWan/Selfrace/blob/main/Logo.png)
 
