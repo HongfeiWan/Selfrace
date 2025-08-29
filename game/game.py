@@ -119,7 +119,7 @@ class CarGame:
             self.width = 1200
             self.height = 800
             self.screen = pygame.display.set_mode((self.width, self.height))
-            pygame.display.set_caption("汽车驾驶游戏 - GIGAFLOW奖励系统")
+            pygame.display.set_caption("汽车驾驶游戏 - selfrace奖励系统")
         else:
             # 训练模式下不初始化pygame
             self.width = 1200

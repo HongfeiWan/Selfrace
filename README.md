@@ -1,6 +1,18 @@
-![Selfrace Logo](https://github.com/HongfeiWan/Selfrace/blob/main/images/Logo.png)
+<p align="center">
+    <a href="https://github.com/HongfeiWan/Selfrace" target="_blank">
+        <img src="https://github.com/HongfeiWan/Selfrace/blob/main/images/Logo.png" width="100">
+    </a>
+</p>
+<p align="center">
+    <a href="https://github.com/pytorch/pytorch">
+        <img src="https://img.shields.io/badge/pytorch-2.8.0-brightgreen.svg">
+    </a>
+    <a href="https://github.com/NVIDIA/cuda-python">
+        <img src="https://img.shields.io/badge/cudapython-13.0.1-brightgreen.svg">
+    </a>
+</p>
 
-Selfrace is a training-tool and simulator for self-play auto-driving.
+Selfrace is a simulator for self-play end-to-end auto-driving training.
 
 ## Installation
 

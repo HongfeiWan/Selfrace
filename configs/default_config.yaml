@@ -1,4 +1,4 @@
-# Default configuration for the TeraFlow replication project
+# Default configuration for the Selfrace project
 simulator:
   # 设备配置 - 8张显卡的分布式设置
   device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
@@ -84,7 +84,7 @@ simulator:
     map_extent_m: 10000.0 # 地图范围（米），用于计算网格单元大小
     
 
-  # Reward parameters based on Appendix B.3 and GIGAFLOW paper
+  # Reward parameters based on Appendix B.3 and Selfrace paper
   reward:
     # Goal reward parameters (Rgoal)
     delta_goal_min: 2.0         # 目标距离阈值最小值
@@ -140,15 +140,13 @@ simulator:
 training:
   # 分布式训练配置
   distributed:
-    # gpu_num: 8              # 总GPU数量
-    # devices: ["cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4", "cuda:5", "cuda:6", "cuda:7"]  # 8张显卡设备列表
-    envs_per_gpu: 4800         # 每个GPU的环境数量 (38400 / 8 = 4800)
     backend: "nccl"            # 分布式后端
     init_method: "tcp://localhost:12355"  # 初始化方法
 
   # 修正batch size (每张显卡的训练batch size)
   batch_size: 256000  # 总batch size
   batch_size_per_gpu: 3000  # 每GPU batch size
+  iteration: 10000
   
   # 修正其他参数
   rollout_length: 128 # 每个rollout的步数
@@ -183,8 +181,6 @@ training:
   checkpoint_dir: "./training/checkpoints"  # 检查点保存目录
   log_interval: 10                          # 日志记录间隔
   
-
-  
   # 经验缓冲区配置
   experience_buffer_capacity: 50000  # 经验缓冲区容量
   min_buffer_size_for_training: 1000 # 开始训练的最小缓冲区大小
@@ -198,8 +194,8 @@ training:
   network:
     # 特征编码器配置
     encoder_dim: 64  # 每个编码器的输出维度
-    
     # 简单特征维度配置 - 用于SimpleFeatureEncoder
+    
     # S(t), G(t), reward系数, 车辆风格参数
     simple_feature_dims: [7, 256, 10, 4]
     # 排列不变特征维度配置 - 用于PermutationInvariantEncoder

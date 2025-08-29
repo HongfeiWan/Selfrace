@@ -146,7 +146,7 @@ def find_shortest_path(graph, start_node, end_node):
         return [], float('inf') # 未找到路径
     return path[::-1], distances[end_node]
 
-def plan_path_and_visualize(config_path='teraflow_replication/configs/default_config.yaml', visualize=True):
+def plan_path_and_visualize(config_path='./configs/default_config.yaml', visualize=True):
     """
     加载地图、构建图、规划路径并可选择性地进行可视化。
     Args:
@@ -363,5 +363,5 @@ def plan_path_and_visualize(config_path='teraflow_replication/configs/default_co
 
 if __name__ == '__main__':
     # 用户指定的路径是相对于工作区根目录的
-    config_file_path = 'teraflow_replication/configs/default_config.yaml'
+    config_file_path = './configs/default_config.yaml'
     plan_path_and_visualize(config_file_path, visualize=True) 

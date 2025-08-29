@@ -38,7 +38,7 @@ class ObservationGenerator:
         self.neighbor_feature_dim = config.get('neighbor_feature_dim', 7)  # 修改为7个特征：dx, dy, vx, vy, length, width, active 
         self.waypoint_feature_dim = config.get('waypoint_feature_dim', 2)  # 修改为2个特征：x,y
         self.boundary_feature_dim = config.get('boundary_feature_dim', 2)  # 修改为2个特征：x,y
-        # 使用来自 TeraflowSimulator 的共享哈希，仅作网格坐标与单元ID计算，不在此处重建静态索引
+        # 使用来自 SelfraceSimulator 的共享哈希，仅作网格坐标与单元ID计算，不在此处重建静态索引
         self.spatial_hash = spatial_hash
         
         # 预计算每个quad_id对应的最近w_lanes和w_boundaries的ID

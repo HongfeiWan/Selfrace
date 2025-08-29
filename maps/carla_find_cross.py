@@ -447,7 +447,7 @@ def visualize_clusters(quad_polys, final_bounding_boxes, cross_quad_ids, process
 
 if __name__ == "__main__":
     # 读取 JSON 文件
-    map_file = './teraflow_replication/maps/carla_maps/processed_map_Town01_stitched.json'
+    map_file = './maps/carla_maps/processed_map_Town01_stitched.json'
     if not os.path.exists(map_file):
         print(f"找不到地图文件: {map_file}")
         exit(1)

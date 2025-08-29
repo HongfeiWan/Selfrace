@@ -5,7 +5,7 @@ from randomize_components import RewardParameterSampler
 
 class RewardCalculator:
     """
-    该模块的设计可配置，并遵循 GIGAFLOW 论文中描述的奖励结构。
+    该模块的设计可配置，并遵循论文中描述的奖励结构。
     输入状态张量 agents_state 的完整结构 (B, M, N):
     - B: 批次大小 (batch size)
     - M: 智能体数量 (number of agents)

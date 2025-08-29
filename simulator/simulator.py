@@ -33,7 +33,7 @@ class TeraflowSimulator:
     """
     TeraFlow 模拟器核心类。
     负责管理和步进一个批次 (batch) 的交通模拟环境。
-    它的设计遵循 GigaFlow 的核心思想：批量化、可微分（未来）以及与自博弈循环的兼容性。
+    核心思想：批量化、可微分（未来）以及与自博弈循环的兼容性。
     """
     def __init__(self, config:Dict, device: torch.device):
         """

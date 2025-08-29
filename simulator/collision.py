@@ -113,6 +113,7 @@ class CollisionChecker:
         )
 
         final_collisions = dynamic_collisions
+        
         if static_obstacles is not None:
             static_collisions = self._check_static_collisions(states_t0, states_t1, static_obstacles)
             final_collisions = torch.logical_or(final_collisions, static_collisions)
