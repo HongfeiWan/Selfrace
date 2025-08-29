@@ -1,6 +1,6 @@
 # Selfrace
 
-![Selfrace Logo](https://github.com/HongfeiWan/Selfrace/Logo.png)
+![Selfrace Logo](https://github.com/HongfeiWan/Selfrace/blob/main/Logo.png)
 
 Selfrace is a training-tool and simulator for self-play auto-driving.
 
@@ -35,4 +35,4 @@ The wiki contains comprehensive information about:
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License v3.0 License - see the [LICENSE](LICENSE) file for details.
