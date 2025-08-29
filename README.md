@@ -1,5 +1,5 @@
 
-![Selfrace Logo](https://github.com/HongfeiWan/Selfrace/tree/main/images/Logo.png)
+![Selfrace Logo](https://github.com/HongfeiWan/Selfrace/blob/main/images/Logo.png)
 
 Selfrace is a training-tool and simulator for self-play auto-driving.
 
