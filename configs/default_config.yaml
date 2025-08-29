@@ -179,9 +179,9 @@ training:
   total_timesteps: 1_000_000_000_000 # As per paper
   
   # 内存和性能优化
-  checkpoint_interval: 100    # 检查点保存间隔
-  checkpoint_dir: "./checkpoints" # 检查点保存目录
-  log_interval: 10            # 日志记录间隔
+  checkpoint_interval: 100                  # 检查点保存间隔
+  checkpoint_dir: "./training/checkpoints"  # 检查点保存目录
+  log_interval: 10                          # 日志记录间隔
   
 
   

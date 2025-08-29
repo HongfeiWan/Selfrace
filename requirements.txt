@@ -1,1 +1,26 @@
- 
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+pygame>=2.1.0
+
+# Scientific computing and data processing
+scipy>=1.9.0
+scikit-learn>=1.1.0
+matplotlib>=3.5.0
+
+# Configuration and data handling
+PyYAML>=6.0
+networkx>=2.8.0
+
+# Multiprocessing and utilities
+multiprocessing-logging>=0.3.0
+
+# Optional: For advanced features
+# sympy>=1.11.0  # Uncomment if using symbolic computation features
+
+# Development and testing (optional)
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+# black>=22.0.0
+# flake8>=5.0.0 

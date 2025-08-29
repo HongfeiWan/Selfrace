@@ -610,7 +610,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		value_loss_coef = getattr(training_cfg, 'value_loss_coef', 0.5)
 		max_grad_norm = getattr(training_cfg, 'max_grad_norm', 1.0)
 		checkpoint_interval = getattr(training_cfg, 'checkpoint_interval', 1)
-		checkpoint_dir = getattr(training_cfg, 'checkpoint_dir', './checkpoints')
+		checkpoint_dir = getattr(training_cfg, 'checkpoint_dir')
 		# 优势过滤参数
 		beta = getattr(training_cfg, 'advantage_filter_beta', 0.25)
 		advantage_filter_threshold = getattr(training_cfg, 'advantage_filter_threshold', 0.01)
