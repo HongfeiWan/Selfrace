@@ -319,7 +319,6 @@ class RewardParameterSampler:
         
         return torch.stack(reward_coef_list, dim=-1)  # (B, M, 10)
 
-
 class VehicleParameterSampler:
     """
     批量车辆参数采样器类，用于world_init中多辆车的批量采样。
@@ -416,9 +415,12 @@ if __name__ == "__main__":
             # 采样所有参数
             sampled_params = sampler.sample_all_parameters()
             
-            # 存储每个参数的值
-            for param_name, param_value in sampled_params.items():
-                all_samples[param_name].append(param_value.item())
+            # 存储每个参数的值 (sampled_params 是形状为 (1, 1, 10) 的张量)
+            param_names = ['delta_goal', 'collision_alpha', 'boundary_alpha', 'comfort_alpha', 
+                          'l_align_alpha', 'vel_align_alpha', 'l_center_alpha', 'center_bias_alpha', 
+                          'reverse_alpha', 'stop_line_alpha']
+            for j, param_name in enumerate(param_names):
+                all_samples[param_name].append(sampled_params[0, 0, j].item())
         
         # 计算每个参数的统计信息
         for param_name, values in all_samples.items():
@@ -429,7 +431,10 @@ if __name__ == "__main__":
             max_val = np.max(values)
             
             print(f"\n{param_name}:")
-            print(f"  理论范围: [{sampler.reward_config.get(f'{param_name}_min', 'N/A')}, {sampler.reward_config.get(f'{param_name}_max', 'N/A')}]")
+            # 获取理论范围
+            min_range = getattr(sampler, f'{param_name}_min', 'N/A')
+            max_range = getattr(sampler, f'{param_name}_max', 'N/A')
+            print(f"  理论范围: [{min_range}, {max_range}]")
             print(f"  实际范围: [{min_val:.6f}, {max_val:.6f}]")
             print(f"  均值: {mean_val:.6f}")
             print(f"  标准差: {std_val:.6f}")
@@ -454,8 +459,8 @@ if __name__ == "__main__":
                     axes[i].set_ylabel('frequency')
                     
                     # 添加理论范围线
-                    min_range = sampler.reward_config.get(f'{param_name}_min', None)
-                    max_range = sampler.reward_config.get(f'{param_name}_max', None)
+                    min_range = getattr(sampler, f'{param_name}_min', None)
+                    max_range = getattr(sampler, f'{param_name}_max', None)
                     if min_range is not None:
                         axes[i].axvline(min_range, color='red', linestyle='--', alpha=0.7, label=f'min: {min_range}')
                     if max_range is not None:
@@ -468,9 +473,11 @@ if __name__ == "__main__":
             for i in range(len(param_names), len(axes)):
                 axes[i].set_visible(False)
             
+            # 确保 images 目录存在
+            os.makedirs('./images', exist_ok=True)
             plt.tight_layout()
-            plt.savefig('reward_parameter_distributions.png', dpi=300, bbox_inches='tight')
-            print(f"\n分布图已保存为 'reward_parameter_distributions.png'")
+            plt.savefig('./images/reward_parameter_distributions.png', dpi=300, bbox_inches='tight')
+            print(f"\n分布图已保存为 './images/reward_parameter_distributions.png'")
             
             # 显示图形
             plt.show()
@@ -485,8 +492,8 @@ if __name__ == "__main__":
         print("="*60)
         for param_name, values in all_samples.items():
             values = np.array(values)
-            min_range = sampler.reward_config.get(f'{param_name}_min', None)
-            max_range = sampler.reward_config.get(f'{param_name}_max', None)
+            min_range = getattr(sampler, f'{param_name}_min', None)
+            max_range = getattr(sampler, f'{param_name}_max', None)
             
             if min_range is not None and max_range is not None:
                 # 计算理论均值和标准差
@@ -501,7 +508,8 @@ if __name__ == "__main__":
                 print(f"  理论标准差: {theoretical_std:.6f}, 实际标准差: {actual_std:.6f}")
                 print(f"  均值误差: {abs(theoretical_mean - actual_mean):.6f}")
                 print(f"  标准差误差: {abs(theoretical_std - actual_std):.6f}")
-                print("\nRewardParameterSampler 测试完成！")
+        
+        print("\nRewardParameterSampler 测试完成！")
     
     def test_driving_style_sampler():
         """测试 DrivingStyleSampler 类的参数采样功能"""
@@ -584,7 +592,7 @@ if __name__ == "__main__":
             
             # 测试批量采样
             print("测试批量车辆参数采样...")
-            batch_size = 1000000
+            batch_size = 100000  # 减少批量大小以避免内存问题
             vehicle_params = sampler.sample_batch_vehicle_parameters(batch_size)
             
             # 打印参数统计信息
@@ -665,9 +673,13 @@ if __name__ == "__main__":
             axes[2].axvline(wheelbase_max, color='red', linestyle='--', alpha=0.8, label=f'max: {wheelbase_max:.3f}')
             axes[2].legend()
             
+            # 确保 images 目录存在
+            os.makedirs('./images', exist_ok=True)
+            
             plt.tight_layout()
+            plt.savefig('./images/vehicle_parameter_distributions.png', dpi=300, bbox_inches='tight')
+            print(f"\n分布图已保存为 './images/vehicle_parameter_distributions.png'")
             plt.show()
-
 
             print("\n✓ VehicleParameterSampler 测试完成！")
 
@@ -683,7 +695,7 @@ if __name__ == "__main__":
         # test_reward_parameter_sampler()
 
         # 测试 VehicleParameterSampler
-        # test_vehicle_parameter_sampler()
+        #  test_vehicle_parameter_sampler()
 
         print("\n所有测试完成！")
     main()

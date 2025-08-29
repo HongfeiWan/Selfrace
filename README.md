@@ -1,4 +1,3 @@
-
 ![Selfrace Logo](https://github.com/HongfeiWan/Selfrace/blob/main/images/Logo.png)
 
 Selfrace is a training-tool and simulator for self-play auto-driving.
@@ -29,9 +28,15 @@ The wiki contains comprehensive information about:
 ## Quick Start
 
 1. Follow the installation instructions above
-2. Check out the [Quick Start Guide](https://github.com/HongfeiWan/Selfrace/wiki/Quick-Start) in our wiki
-3. Explore the [Examples](https://github.com/HongfeiWan/Selfrace/wiki/Examples) section for practical usage
+```bash
+# Training
+cd Selfrace/training
+python ddppo.py
+```
 
 ## License
 
 This project is licensed under the GNU General Public License v3.0 License - see the [LICENSE](LICENSE) file for details.
+
+## References
+- [Self-Play Reinforcement Learning for Autonomous Driving](https://arxiv.org/abs/2502.03349)
