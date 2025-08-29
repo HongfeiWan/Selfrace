@@ -1,6 +1,6 @@
 <p align="center">
     <a href="https://github.com/HongfeiWan/Selfrace" target="_blank">
-        <img src="https://github.com/HongfeiWan/Selfrace/blob/main/images/Logo.png" width="100">
+        <img src="https://github.com/HongfeiWan/Selfrace/blob/main/images/Logo.png" width="1000">
     </a>
 </p>
 <p align="center">
