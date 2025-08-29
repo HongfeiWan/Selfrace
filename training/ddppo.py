@@ -549,6 +549,13 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					torch.nn.utils.clip_grad_norm_(model.value_network.parameters(), max_grad_norm)
 					value_optimizer.step()
 
+					# 打印损失信息
+					print(f"🎯 第{k+1}轮 - 段[{t_global},{t_global+segment_steps}) - PPO更新:")
+					print(f"   Policy Loss: {policy_loss.item():.6f}, Entropy: {entropy.item():.6f}")
+					print(f"   Value Loss: {value_loss.item():.6f}, Total Policy Loss: {policy_total_loss.item():.6f}")
+					print(f"   Ratio Mean: {ratio.mean().item():.4f}, Ratio Std: {ratio.std().item():.4f}")
+					print(f"   Advantage Mean: {mb_adv.mean().item():.4f}, Advantage Std: {mb_adv.std().item():.4f}")
+
 				# 推进到下一段
 				t_global += segment_steps
 				print(f"🎯 第{k+1}轮 - 段[{t_global},{t_global+segment_steps}) 更新完成,耗时: {time.time()-segment_start_time:.4f}秒")
@@ -771,6 +778,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					value_loss.backward()
 					torch.nn.utils.clip_grad_norm_(model.module.value_network.parameters(), max_grad_norm)
 					value_optimizer.step()
+
+					# 打印损失信息（多卡）
+					if rank == 0:
+						print(f"[Rank {rank}] 第{k+1}轮 - 段[{t_global},{t_global+segment_steps}) - PPO更新:")
+						print(f"   Policy Loss: {policy_loss.item():.6f}, Entropy: {entropy.item():.6f}")
+						print(f"   Value Loss: {value_loss.item():.6f}, Total Policy Loss: {policy_total_loss.item():.6f}")
+						print(f"   Ratio Mean: {ratio.mean().item():.4f}, Ratio Std: {ratio.std().item():.4f}")
+						print(f"   Advantage Mean: {mb_adv.mean().item():.4f}, Advantage Std: {mb_adv.std().item():.4f}")
 
 				# 推进到下一段
 				t_global += segment_steps
