@@ -422,8 +422,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					with torch.no_grad():
 						action_logits = model.forward_policy(features_tensor)
 						value_pred = model.forward(features_tensor, mode="value")
-					dist = torch.distributions.Categorical(logits=action_logits)
-					actions = dist.sample()
+					action_dist = torch.distributions.Categorical(logits=action_logits)
+					actions = action_dist.sample()
 					# 环境步进
 					observation, reward, done = simulator.step(actions)
 					# 更新观测与特征
@@ -437,7 +437,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					values_buffer[t] = value_pred.detach()
 					rewards_buffer[t] = reward
 					dones_buffer[t] = done
-					old_log_probs_buffer[t] = dist.log_prob(actions).detach()
+					old_log_probs_buffer[t] = action_dist.log_prob(actions).detach()
 					print(f"\t📍 第 {t_global + t + 1}/{segment_steps} 步耗时: {time.time()-step_start_time:.4f}秒")
 
 				# 段末bootstrap并计算GAE
@@ -522,15 +522,15 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					# 策略更新
 					print(mb_features.shape)
 					action_logits = model.forward(mb_features, mode="policy")
-					dist = torch.distributions.Categorical(logits=action_logits)
-					actions_sampled = dist.sample()
+					action_dist = torch.distributions.Categorical(logits=action_logits)
+					actions_sampled = action_dist.sample()
 					row_idx = torch.arange(actions_sampled.shape[0], device=device)
-					new_log_probs = dist.log_prob(actions_sampled)[row_idx, mb_agent_idx]
+					new_log_probs = action_dist.log_prob(actions_sampled)[row_idx, mb_agent_idx]
 					ratio = torch.exp(torch.clamp(new_log_probs - mb_old_logp, -1, 1))
 					surr1 = ratio * mb_adv
 					surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
 					policy_loss = -torch.min(surr1, surr2).mean()
-					entropy = dist.entropy()[row_idx, mb_agent_idx].mean()
+					entropy = action_dist.entropy()[row_idx, mb_agent_idx].mean()
 					policy_total_loss = policy_loss - entropy_coef * entropy
 					policy_total_loss = torch.clamp(policy_total_loss, -100, 100)
 					policy_optimizer.zero_grad(set_to_none=True)
@@ -566,6 +566,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 	try:
 		device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
 		torch.cuda.set_device(device) if device.type == 'cuda' else None
+		# 调试打印：确认设备映射
+		print(f"[Rank {rank}] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+		print(f"[Rank {rank}] device={device}")
+		print(f"[Rank {rank}] torch.cuda.current_device()={torch.cuda.current_device()}, name={torch.cuda.get_device_name(torch.cuda.current_device())}")
+		print(f"[Rank {rank}] torch.cuda.device_count()={torch.cuda.device_count()}")
 		# 设置环境变量
 		setup_ddp_env(rank, gpu_count, master_addr, master_port)
 		# TCPStore: rank0为主节点
@@ -649,8 +654,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					with torch.no_grad():
 						action_logits = model.module.forward_policy(features_tensor)
 						value_pred = model.module.forward(features_tensor, mode="value")
-					dist = torch.distributions.Categorical(logits=action_logits)
-					actions = dist.sample()
+					action_dist = torch.distributions.Categorical(logits=action_logits)
+					actions = action_dist.sample()
 					observation, reward, done = simulator.step(actions)
 					agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
 					features_tensor = build_network_features(
@@ -661,7 +666,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					values_buffer[t] = value_pred.detach()
 					rewards_buffer[t] = reward
 					dones_buffer[t] = done
-					old_log_probs_buffer[t] = dist.log_prob(actions).detach()
+					old_log_probs_buffer[t] = action_dist.log_prob(actions).detach()
 
 				# 本段GAE
 				with torch.no_grad():
@@ -740,15 +745,15 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 
 					# 策略更新（DDP自动同步）
 					action_logits = model.module.forward(mb_features, mode="policy")
-					dist = torch.distributions.Categorical(logits=action_logits)
-					actions_sampled = dist.sample()
+					action_dist = torch.distributions.Categorical(logits=action_logits)
+					actions_sampled = action_dist.sample()
 					row_idx = torch.arange(actions_sampled.shape[0], device=device)
-					new_log_probs = dist.log_prob(actions_sampled)[row_idx, mb_agent_idx]
+					new_log_probs = action_dist.log_prob(actions_sampled)[row_idx, mb_agent_idx]
 					ratio = torch.exp(torch.clamp(new_log_probs - mb_old_logp, -1, 1))
 					surr1 = ratio * mb_adv
 					surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
 					policy_loss = -torch.min(surr1, surr2).mean()
-					entropy = dist.entropy()[row_idx, mb_agent_idx].mean()
+					entropy = action_dist.entropy()[row_idx, mb_agent_idx].mean()
 					policy_total_loss = policy_loss - entropy_coef * entropy
 					policy_total_loss = torch.clamp(policy_total_loss, -100, 100)
 					policy_optimizer.zero_grad(set_to_none=True)
@@ -798,6 +803,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						save_checkpoint(model, policy_optimizer, value_optimizer, k + 1, checkpoint_dir)
 					except Exception:
 						pass
+					
 	except Exception as e:
 		print(f"[Rank {rank}] 训练异常: {e}")
 	finally:

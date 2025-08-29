@@ -152,7 +152,7 @@ class TeraflowSimulator:
         actions = actions.to(self.device)     #action挪到当前显卡上
         states_t0 = self.agents_state.clone() #这一时刻的状态
 
-        action_update_time=time.time()
+
         # 1. 基于收到的所有动作，更新所有激活智能体的状态
         active_mask = self.agents_state[..., 6] > 0.5
         if active_mask.any():
@@ -174,10 +174,9 @@ class TeraflowSimulator:
             updated_states = self.agents_state[active_mask]
             updated_states[:, :4] = new_active_dynamics_states
             self.agents_state[active_mask] = updated_states
-        action_update_time=time.time()-action_update_time
-        print(f"action_update_time: {action_update_time:.4f}s")
 
-        offroad_check_time=time.time()
+
+
         # 2. 离路检测
         is_on_road = torch.ones_like(active_mask) # 默认在路上
         if active_mask.any():
@@ -187,44 +186,39 @@ class TeraflowSimulator:
             active_is_on_road = self.offroad_checker.check_on_road(states_for_checker)
             is_on_road[active_mask] = active_is_on_road
         offroad_mask = ~is_on_road # (B, M)
-        offroad_update_time=time.time()-offroad_check_time
-        print(f"offroad_update_time: {offroad_update_time:.4f}s")
 
 
-        collision_check_time=time.time()
+
+
         # 3. 动态碰撞检测
         collision_check_result = self.collision_checker.check(
             states_t0, self.agents_state, debug=debug_collision, debug_env_idx=0
         )
         all_collisions = collision_check_result
-        collision_update_time=time.time()-collision_check_time
-        print(f"collision_update_time: {collision_update_time:.4f}s")
 
-        frenet_time=time.time()
+
+
+
         # 4. 计算Frenet坐标信息
         vehicle_positions = self.agents_state[..., :2]  # (B, M, 2) - x, y
         vehicle_headings = self.agents_state[..., 2]    # (B, M) - heading
         d, theta_f = self.road_network.calculate_frenet_coordinates(vehicle_positions, vehicle_headings, self.spatial_hash)
-        frenet_update_time=time.time()-frenet_time
-        print(f"frenet_update_time: {frenet_update_time:.4f}s")
 
-        observation_time=time.time()
+
+
         # 5. 生成新的观测
         observation = self.observation_generator.generate(self.agents_state)
-        observation_update_time=time.time()-observation_time
-        print(f"observation_update_time: {observation_update_time:.4f}s")
 
-        reward_time=time.time()
+
+
         # 6. 计算奖励（传入Frenet坐标和动作）
         reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
-        reward_update_time=time.time()-reward_time
-        print(f"reward_update_time: {reward_update_time:.4f}s")
 
-        done_time=time.time()
+
+
         # 7. 检查是否结束（包含目标到达判断）
         done = all_collisions|offroad_mask|goal_reached
-        done_update_time=time.time()-done_time
-        print(f"done_update_time: {done_update_time:.4f}s")
+
         return observation, reward, done
     
     def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
