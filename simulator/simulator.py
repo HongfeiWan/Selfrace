@@ -132,6 +132,7 @@ class TeraflowSimulator:
         print("Path planning initialized")
         print(f"Reset complete. World state shape: {self.agents_state.shape}")
         self.stop_lines = torch.zeros((self.num_envs, self.world_initializer.max_agents,20), dtype=torch.int32, device=self.device)
+        
         return initial_observation
     
     def step(self, actions: torch.Tensor, debug_collision: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
@@ -152,7 +153,6 @@ class TeraflowSimulator:
         actions = actions.to(self.device)     #action挪到当前显卡上
         states_t0 = self.agents_state.clone() #这一时刻的状态
 
-
         # 1. 基于收到的所有动作，更新所有激活智能体的状态
         active_mask = self.agents_state[..., 6] > 0.5
         if active_mask.any():
@@ -170,12 +170,11 @@ class TeraflowSimulator:
                 active_actions = active_actions.long()
             active_dynamics_states = active_states[:, :4]
             new_active_dynamics_states = self.dynamics_model.step(active_dynamics_states, active_actions, self.dt)
+            
             # 直接将更新后的动力学状态写回
             updated_states = self.agents_state[active_mask]
             updated_states[:, :4] = new_active_dynamics_states
             self.agents_state[active_mask] = updated_states
-
-
 
         # 2. 离路检测
         is_on_road = torch.ones_like(active_mask) # 默认在路上
@@ -187,34 +186,22 @@ class TeraflowSimulator:
             is_on_road[active_mask] = active_is_on_road
         offroad_mask = ~is_on_road # (B, M)
 
-
-
-
         # 3. 动态碰撞检测
         collision_check_result = self.collision_checker.check(
             states_t0, self.agents_state, debug=debug_collision, debug_env_idx=0
         )
         all_collisions = collision_check_result
 
-
-
-
         # 4. 计算Frenet坐标信息
         vehicle_positions = self.agents_state[..., :2]  # (B, M, 2) - x, y
         vehicle_headings = self.agents_state[..., 2]    # (B, M) - heading
         d, theta_f = self.road_network.calculate_frenet_coordinates(vehicle_positions, vehicle_headings, self.spatial_hash)
 
-
-
         # 5. 生成新的观测
         observation = self.observation_generator.generate(self.agents_state)
 
-
-
         # 6. 计算奖励（传入Frenet坐标和动作）
         reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
-
-
 
         # 7. 检查是否结束（包含目标到达判断）
         done = all_collisions|offroad_mask|goal_reached

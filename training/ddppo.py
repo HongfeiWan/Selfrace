@@ -351,12 +351,9 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		#TODO:这里写单卡训练代码，用于调试
 		device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
 		torch.cuda.set_device(device) if device.type == 'cuda' else None
-
 		config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
-
 		model = create_network(config=config, network_type="independent")
 		model = model.to(device)
-
 		simulator = TeraflowSimulator(config=config_dict, device=device)
 
 		sim_cfg = getattr(config, 'simulator')
@@ -391,6 +388,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		
 		for k in range(num_iterations):
 			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")
+
 			episode_start_time = time.time()
 			# ============================== 采样（初始化） ==============================
 			initial_observation = simulator.reset()
@@ -401,12 +399,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			# 构建网络输入特征
 			features_tensor = build_network_features(
 				agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
-				path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
-			)
-
+				path_plan, stop_lines, simulator.reward_calculator.sampled_params, config)
 			# =========================== 分段rollout：每段 rollout_length 后更新 ==============================
 			B, M, S = agents_state.shape
 			t_global = 0
+
 			while t_global < max_episode_length:
 				segment_steps = min(rollout_length, max_episode_length - t_global)
 				# 本段buffer
@@ -416,11 +413,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				values_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
 				old_log_probs_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
 				states_buffer[0].copy_(agents_state)
+
 				# 段内采样
 				for t in range(segment_steps):
 					step_start_time = time.time()
 					with torch.no_grad():
-						action_logits = model.forward_policy(features_tensor)
+						action_logits = model.forward(features_tensor, mode="policy")
 						value_pred = model.forward(features_tensor, mode="value")
 					action_dist = torch.distributions.Categorical(logits=action_logits)
 					actions = action_dist.sample()
@@ -438,6 +436,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					rewards_buffer[t] = reward
 					dones_buffer[t] = done
 					old_log_probs_buffer[t] = action_dist.log_prob(actions).detach()
+					
 					print(f"\t📍 第 {t_global + t + 1}/{segment_steps} 步耗时: {time.time()-step_start_time:.4f}秒")
 
 				# 段末bootstrap并计算GAE
@@ -483,10 +482,9 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
 				advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 				batch_N = old_log_probs_batch.shape[0]
-
 				segment_start_time = time.time()
+
 				for _ in range(ppo_epochs):
-					# 直接使用整批（不再分mini-batch）
 					mb_idx = torch.arange(batch_N, device=device)
 					mb_old_logp = old_log_probs_batch[mb_idx]
 					mb_adv = advantages_batch[mb_idx]
@@ -534,7 +532,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					policy_total_loss = policy_loss - entropy_coef * entropy
 					policy_total_loss = torch.clamp(policy_total_loss, -100, 100)
 					policy_optimizer.zero_grad(set_to_none=True)
-					policy_total_loss.backward()
+					policy_total_loss.backward()#收集所有进程的梯度，进行同步
 					torch.nn.utils.clip_grad_norm_(model.policy_network.parameters(), max_grad_norm)
 					policy_optimizer.step()
 
@@ -567,6 +565,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			if (k + 1) % checkpoint_interval == 0:
 				save_checkpoint(model, policy_optimizer, value_optimizer, k + 1, checkpoint_dir)
 			print(f"🎯 本轮总步数耗时: {time.time()-episode_start_time:.4f}秒")
+
 		print('train done!')
 		return 0
 	

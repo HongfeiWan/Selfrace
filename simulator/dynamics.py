@@ -248,6 +248,10 @@ class KinematicBicycleModel:
         new_x = x + dx
         new_y = y + dy
         new_yaw = yaw + d_yaw
+
+        # 归一化偏航角到 [-pi, pi]
+        new_yaw = torch.atan2(torch.sin(new_yaw), torch.cos(new_yaw))
+        
         # 将新状态组合成一个张量返回
         new_states = torch.stack([new_x, new_y, new_yaw, new_speed], dim=1)
         return new_states
