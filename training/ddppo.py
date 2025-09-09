@@ -412,6 +412,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				dones_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
 				values_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
 				old_log_probs_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
+				actions_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device, dtype=torch.long)
 				states_buffer[0].copy_(agents_state)
 
 				# 段内采样
@@ -436,6 +437,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					rewards_buffer[t] = reward
 					dones_buffer[t] = done
 					old_log_probs_buffer[t] = action_dist.log_prob(actions).detach()
+					actions_buffer[t] = actions.detach()
 					
 					print(f"\t📍 第 {t_global + t + 1}/{segment_steps} 步耗时: {time.time()-step_start_time:.4f}秒")
 
@@ -443,7 +445,9 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				with torch.no_grad():
 					last_value_pred = model.forward(features_tensor, mode="value")
 				values_tp1 = torch.cat([values_buffer, last_value_pred.unsqueeze(0)], dim=0)
-				advantages, returns = gae_advantages(rewards_buffer, values_tp1, dones_buffer, gamma, gae_lambda)
+				# 将dones在段内做前缀OR，避免某agent在段内的done从True回到False
+				dones_accum = (torch.cumsum(dones_buffer.to(torch.int32), dim=0) > 0)
+				advantages, returns = gae_advantages(rewards_buffer, values_tp1, dones_accum, gamma, gae_lambda)
 
 				# 优势过滤（基于段内）
 				A_max = torch.max(torch.abs(advantages)).item()
@@ -480,10 +484,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				old_log_probs_batch = old_log_probs_buffer[selected_t, selected_b, selected_m].view(-1)
 				advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
 				returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
+				actions_batch = actions_buffer[selected_t, selected_b, selected_m].view(-1)
 				advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 				batch_N = old_log_probs_batch.shape[0]
 				segment_start_time = time.time()
 
+				model.train()
 				for _ in range(ppo_epochs):
 					mb_idx = torch.arange(batch_N, device=device)
 					mb_old_logp = old_log_probs_batch[mb_idx]
@@ -520,15 +526,15 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					# 策略更新
 					print(mb_features.shape)
 					action_logits = model.forward(mb_features, mode="policy")
-					action_dist = torch.distributions.Categorical(logits=action_logits)
-					actions_sampled = action_dist.sample()
-					row_idx = torch.arange(actions_sampled.shape[0], device=device)
-					new_log_probs = action_dist.log_prob(actions_sampled)[row_idx, mb_agent_idx]
+					row_idx = torch.arange(actions_batch.shape[0], device=device)
+					logits_selected = action_logits[row_idx, mb_agent_idx]
+					dist_selected = torch.distributions.Categorical(logits=logits_selected)
+					new_log_probs = dist_selected.log_prob(actions_batch)
 					ratio = torch.exp(torch.clamp(new_log_probs - mb_old_logp, -1, 1))
 					surr1 = ratio * mb_adv
 					surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
 					policy_loss = -torch.min(surr1, surr2).mean()
-					entropy = action_dist.entropy()[row_idx, mb_agent_idx].mean()
+					entropy = dist_selected.entropy().mean()
 					policy_total_loss = policy_loss - entropy_coef * entropy
 					policy_total_loss = torch.clamp(policy_total_loss, -100, 100)
 					policy_optimizer.zero_grad(set_to_none=True)
@@ -553,6 +559,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					print(f"   Value Loss: {value_loss.item():.6f}, Total Policy Loss: {policy_total_loss.item():.6f}")
 					print(f"   Ratio Mean: {ratio.mean().item():.4f}, Ratio Std: {ratio.std().item():.4f}")
 					print(f"   Advantage Mean: {mb_adv.mean().item():.4f}, Advantage Std: {mb_adv.std().item():.4f}")
+				model.eval()
 
 				# 推进到下一段
 				t_global += segment_steps

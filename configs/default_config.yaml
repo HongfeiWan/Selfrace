@@ -7,7 +7,7 @@ simulator:
   sim_dt: 0.3             # 模拟时间步长
   max_agents_num: 150     # 最大车辆数量,定义每个环境中最大可能的智能体数量
   # num_npc_vehicles <= max_agents_num，否则会报错
-  num_npc_vehicles: 150   # NPC车辆数量,定义每个环境中实际生成的智能体数量
+  num_npc_vehicles: 5   # NPC车辆数量,定义每个环境中实际生成的智能体数量
 
   # 地图配置  
   map_path: "./maps/processed_map_Town01_stitched.json" # 地图路径
@@ -145,7 +145,7 @@ training:
 
   # 修正batch size (每张显卡的训练batch size)
   batch_size: 256000  # 总batch size
-  batch_size_per_gpu: 1000  # 每GPU batch size
+  batch_size_per_gpu: 2500  # 每GPU batch size
   iteration: 10000
   
   # 修正其他参数

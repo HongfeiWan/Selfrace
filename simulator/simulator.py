@@ -366,7 +366,6 @@ if __name__ == '__main__':
 
     # 绘制激活的智能体
     active_mask = agents_state_np[0, :, 6] > 0.5  # 第一个环境的激活智能体
-    print(active_mask)
     active_agents = agents_state_np[0, active_mask]  # 激活智能体的状态
     if len(active_agents) > 0:
         print(f"绘制 {len(active_agents)} 个激活智能体...")
@@ -438,9 +437,6 @@ if __name__ == '__main__':
             if valid_mask.any():
                 coords = path_i[valid_mask]
                 method2_paths.append(coords)
-                print(f"方法2路径 {i+1}: {len(coords)}个点")
-                print(f"  起点: {coords[0]}")
-                print(f"  终点: {coords[-1]}")
             else:
                 method2_paths.append(None)
         # 绘制方法2的路径（红虚线 + 起点圆点/终点叉号）

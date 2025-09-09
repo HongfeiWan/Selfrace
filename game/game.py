@@ -8,6 +8,8 @@ import random
 import yaml
 import torch
 import pygame
+import matplotlib
+import matplotlib.pyplot as plt
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -83,10 +85,10 @@ class CarGame:
         self.gamma = float(self.config.get('training').get('gamma', 0.999))
         self.gae_lambda = float(self.config.get('training').get('gae_lambda', 0.95))
         self.clip_ratio = float(self.config.get('training').get('clip_ratio', 0.2))
-        self.entropy_coef = float(self.config.get('training').get('entropy_coef', 0.01))
+        self.entropy_coef = float(self.config.get('training').get('entropy_coef'))
         self.value_loss_coef = float(self.config.get('training').get('value_loss_coef', 0.5))
         self.max_grad_norm = float(self.config.get('training').get('max_grad_norm', 1.0))
-        self.learning_rate = float(self.config.get('training').get('learning_rate', 3e-4))
+        self.learning_rate = float(self.config.get('training').get('learning_rate'))
         
         # 优势过滤参数（模仿ddppo.py）
         self.beta = float(self.config.get('training').get('advantage_filter_beta', 0.25))
@@ -97,9 +99,23 @@ class CarGame:
         # 初始化优化器
         self.policy_optimizer = torch.optim.Adam(self.model.policy_network.parameters(), lr=self.learning_rate)
         self.value_optimizer = torch.optim.Adam(self.model.value_network.parameters(), lr=self.learning_rate)
+        # 余弦退火学习率调度器（模仿ddppo.py）
+        try:
+            total_iterations = int(self.config.get('training').get('iteration', 1000))
+        except Exception:
+            total_iterations = 1000
+        self.policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.policy_optimizer, T_max=total_iterations, eta_min=0.0)
+        self.value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.value_optimizer, T_max=total_iterations, eta_min=0.0)
         
         # 初始化buffer
         self.reset_buffers()
+
+        # 训练度量与可视化
+        self.update_index = 0
+        self.avg_rewards_per_update = []
+        self.policy_losses_per_update = []
+        self.value_losses_per_update = []
+        self._init_plots()
 
         # 字体
         self.font = pygame.font.Font(None, 36)
@@ -140,6 +156,72 @@ class CarGame:
         returns = advantages + values[:-1]
         return advantages, returns
 
+    def _init_plots(self):
+        """初始化Matplotlib交互式窗口与轴"""
+        try:
+            # 使用交互模式，避免阻塞pygame主循环
+            plt.ion()
+            # 单独起一个窗口，两个子图：上-损失；下-平均回报
+            self.fig, (self.ax_loss, self.ax_reward) = plt.subplots(2, 1, figsize=(7, 6))
+            self.fig.canvas.manager.set_window_title("PPO Metrics")
+            # 初始空图
+            self.loss_policy_line, = self.ax_loss.plot([], [], label="Policy Loss")
+            self.loss_value_line, = self.ax_loss.plot([], [], label="Value Loss")
+            self.ax_loss.set_xlabel("Update")
+            self.ax_loss.set_ylabel("Loss")
+            self.ax_loss.legend(loc="best")
+            self.ax_loss.grid(True, linestyle=":", alpha=0.4)
+
+            self.reward_line, = self.ax_reward.plot([], [], color="tab:green", label="Avg Reward")
+            self.ax_reward.set_xlabel("Update")
+            self.ax_reward.set_ylabel("Avg Reward")
+            self.ax_reward.legend(loc="best")
+            self.ax_reward.grid(True, linestyle=":", alpha=0.4)
+
+            self.fig.tight_layout()
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+        except Exception:
+            # 可视化失败不影响训练
+            self.fig = None
+            self.ax_loss = None
+            self.ax_reward = None
+
+    def _update_plots(self):
+        """刷新曲线数据（非阻塞）"""
+        if self.ax_loss is None or self.ax_reward is None:
+            return
+        try:
+            x = list(range(1, self.update_index + 1))
+            # 更新损失
+            self.loss_policy_line.set_data(x, self.policy_losses_per_update)
+            self.loss_value_line.set_data(x, self.value_losses_per_update)
+            # 自适应坐标范围
+            if len(x) > 0:
+                self.ax_loss.set_xlim(1, max(5, self.update_index))
+                all_losses = self.policy_losses_per_update + self.value_losses_per_update
+                ymin = min(all_losses) if len(all_losses) > 0 else 0.0
+                ymax = max(all_losses) if len(all_losses) > 0 else 1.0
+                if ymin == ymax:
+                    ymax = ymin + 1.0
+                self.ax_loss.set_ylim(ymin - 0.05 * abs(ymax), ymax + 0.05 * abs(ymax))
+
+            # 更新回报
+            self.reward_line.set_data(x, self.avg_rewards_per_update)
+            if len(x) > 0:
+                self.ax_reward.set_xlim(1, max(5, self.update_index))
+                rmin = min(self.avg_rewards_per_update) if len(self.avg_rewards_per_update) > 0 else 0.0
+                rmax = max(self.avg_rewards_per_update) if len(self.avg_rewards_per_update) > 0 else 1.0
+                if rmin == rmax:
+                    rmax = rmin + 1.0
+                self.ax_reward.set_ylim(rmin - 0.05 * abs(rmax), rmax + 0.05 * abs(rmax))
+
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+            plt.pause(0.001)
+        except Exception:
+            pass
+
     def _check_all_vehicles_dead(self) -> bool:
         """检查是否所有车辆都已死亡（只检查第一个世界，用于显示控制）。"""
         if self.simulator is None:
@@ -177,40 +259,24 @@ class CarGame:
             # 检查所有世界的agents状态
             all_agents_state = self.simulator.agents_state  # (B, M, S)
             B, M, S = all_agents_state.shape
-            
-            print(f"🔍 检查所有世界存活状态: B={B}, M={M}")
-            
+            # 快速检查，无多余日志
             # 检查每个世界是否有存活的agents
             for b in range(B):
                 world_agents = all_agents_state[b]  # (M, S)
                 active_mask = world_agents[:, 6] > 0.5  # active状态
-                active_count = active_mask.sum().item()
-                
-                print(f"  世界 {b}: active agents = {active_count}")
-                
                 # 如果有active的agents，检查是否有存活的
                 if active_mask.any():
                     # 使用记录的所有世界的done状态
                     if hasattr(self, 'last_done_all_worlds') and self.last_done_all_worlds is not None:
                         world_done = self.last_done_all_worlds[b].to(active_mask.device)  # 确保设备一致
-                        done_count = world_done.sum().item()
                         alive_mask = active_mask & (~world_done)
-                        alive_count = alive_mask.sum().item()
-                        
-                        print(f"    累积done状态: {done_count}, 存活agents: {alive_count}")
-                        
                         if alive_mask.any():
-                            print(f"    ✅ 世界 {b} 还有存活agents，不开启新iteration")
                             return False  # 这个世界还有存活的agents
                     else:
                         # 没有done状态记录，只要有active的agents就认为有存活的
-                        print(f"    ✅ 世界 {b} 有active agents且无done记录，不开启新iteration")
                         return False
-            
-            print(f"    ❌ 所有世界都没有存活agents，开启新iteration")
             return True  # 所有世界都没有存活的agents
-        except Exception as e:
-            print(f"    ⚠️ 检查存活状态时出错: {e}")
+        except Exception:
             return True
 
     def _find_alive_agent_in_any_world(self) -> Tuple[int, int]:
@@ -245,42 +311,45 @@ class CarGame:
         
         return -1, -1  # 没有找到存活的智能体
 
-    def _get_player_agent_index(self) -> int:
-        """获取当前玩家智能体的索引（优先世界0，如果世界0全部done则切换到其他存活世界）。"""
-        # 首先尝试世界0
-        states = self.simulator.agents_state
-        env0 = states[0]
-        active_mask = env0[:, 6] > 0.5
-        alive_mask = active_mask
-        if hasattr(self, 'dead_mask_env0') and self.dead_mask_env0 is not None:
-            alive_mask = active_mask & (~self.dead_mask_env0.to(active_mask.device))
-        idx = torch.nonzero(alive_mask, as_tuple=False)
-        if idx.numel() > 0:
-            return idx[0, 0].item()
-        
-        # 世界0没有存活智能体，尝试其他世界
-        world_idx, agent_idx = self._find_alive_agent_in_any_world()
-        if world_idx >= 0 and agent_idx >= 0:
-            # 记录当前视角来自哪个世界
-            self._current_view_world = world_idx
-            return agent_idx
-        
-        return -1  # 没有存活的智能体
+    def _get_player_agent_bm(self) -> Tuple[int, int]:
+        """返回当前用于可视化的玩家智能体(B, M)索引。
+        优先在当前视角world内选择还活着的agent；若当前视角world无活体，则选择任意world内的活体并切换视角。
+        若均无，则返回(-1, -1)。"""
+        if self.simulator is None:
+            return -1, -1
+        all_agents_state = self.simulator.agents_state  # (B, M, S)
+        B, M, _ = all_agents_state.shape
+        # 优先当前视角world
+        view_world_idx = getattr(self, '_current_view_world', 0)
+        try_order = list(range(B))
+        if view_world_idx in try_order:
+            try_order.remove(view_world_idx)
+            try_order.insert(0, view_world_idx)
+        for b in try_order:
+            world_agents = all_agents_state[b]
+            active_mask = world_agents[:, 6] > 0.5
+            if not active_mask.any():
+                continue
+            if hasattr(self, 'last_done_all_worlds') and self.last_done_all_worlds is not None:
+                world_done = self.last_done_all_worlds[b].to(active_mask.device)
+                alive_mask = active_mask & (~world_done)
+            else:
+                alive_mask = active_mask
+            idx = torch.nonzero(alive_mask, as_tuple=False)
+            if idx.numel() > 0:
+                if getattr(self, '_current_view_world', None) != b:
+                    self._current_view_world = b
+                return b, idx[0, 0].item()
+        return -1, -1
 
     def _get_player_pose(self) -> Tuple[float, float, float]:
         """选择第一个仍然 alive 的智能体（active 且未 dead）的位姿；若无则沿用上一次视角或返回(0,0,0)。"""
-        player_idx = self._get_player_agent_index()
-        if player_idx >= 0:
-            # 确定从哪个世界获取位姿
-            if hasattr(self, '_current_view_world'):
-                world_idx = self._current_view_world
-            else:
-                world_idx = 0  # 默认世界0
-            
-            world_agents = self.simulator.agents_state[world_idx]
-            x = world_agents[player_idx, 0].item()
-            y = world_agents[player_idx, 1].item()
-            yaw = world_agents[player_idx, 2].item()
+        b, m = self._get_player_agent_bm()
+        if m >= 0 and b >= 0:
+            world_agents = self.simulator.agents_state[b]
+            x = world_agents[m, 0].item()
+            y = world_agents[m, 1].item()
+            yaw = world_agents[m, 2].item()
             self._last_camera_pose = (x, y, yaw)
             return x, y, yaw
         if hasattr(self, '_last_camera_pose'):
@@ -291,13 +360,12 @@ class CarGame:
         """使用 TeraflowSimulator 推进一步，并更新显示状态（env0）。模仿ddppo.py的buffer和rollout逻辑"""
         if self.simulator is None:
             return
-        
-        # 检查是否第一个世界的车辆都已死亡，如果是则暂停显示但继续训练
-        if self._check_all_vehicles_dead():
-            if not hasattr(self, 'first_world_dead'):
-                print("🔄 第一个世界所有车辆死亡，暂停显示但继续训练...")
-                self.first_world_dead = True
-            # 不return，继续执行训练逻辑
+        # 若所有world均无存活agent，立即处理：先训练（若buffer非空），随后重置，避免继续做昂贵计算
+        if self._check_all_worlds_no_alive_agents():
+            if self.buffer_step_count > 0:
+                self.perform_ppo_update()
+            self.reset_simulator()
+            return
 
         # 使用网络输出动作分布并采样动作（与训练一致）
         with torch.no_grad():
@@ -309,11 +377,14 @@ class CarGame:
         # 保存本步动作以便UI显示
         self.last_actions = actions.detach().to('cpu')
         
+        # 在推进环境前缓存当前状态，确保states_buffer记录的是“动作作用前”的s_t
+        pre_state = self.simulator.agents_state.clone()
+
         # 推进环境
         obs, reward, done = self.simulator.step(actions)
         
-        # 将数据存入buffer（模仿ddppo.py）
-        self.states_buffer.append(self.simulator.agents_state.clone())
+        # 将数据存入buffer（模仿ddppo.py）：存入的是step前的状态s_t
+        self.states_buffer.append(pre_state)
         self.rewards_buffer.append(reward.clone())
         self.dones_buffer.append(done.clone())
         self.values_buffer.append(value_pred.clone())
@@ -334,8 +405,12 @@ class CarGame:
             self.config_ns,
         )
 
-        # 保存本step来自simulator的原始reward（env0，逐agent）
-        self.last_reward_env0 = reward[0].detach().to('cpu')
+        # 保存本step用于UI显示的reward（当前视角玩家）
+        b_ui, m_ui = self._get_player_agent_bm()
+        if b_ui >= 0 and m_ui >= 0:
+            self.current_step_reward = float(reward[b_ui, m_ui].item())
+        else:
+            self.current_step_reward = 0.0
         # 记录所有世界的done状态用于判断是否所有世界都没有存活agents
         try:
             current_done_all = done.detach().to('cpu').bool()  # (B, M)
@@ -346,17 +421,6 @@ class CarGame:
                 self.last_done_all_worlds = current_done_all
         except Exception:
             self.last_done_all_worlds = None
-        
-        # 记录第一个世界的done状态用于显示控制
-        try:
-            current_done_env0 = done[0].detach().to('cpu').bool()
-            if hasattr(self, 'last_done_env0') and self.last_done_env0 is not None:
-                # 累积done状态：一旦done=True，就保持True
-                self.last_done_env0 = self.last_done_env0 | current_done_env0
-            else:
-                self.last_done_env0 = current_done_env0
-        except Exception:
-            self.last_done_env0 = None
 
         # 死亡（done）处理：标记并保存死亡时姿态（所有世界）
         all_done = done.detach().to('cpu').bool()  # (B, M)
@@ -388,32 +452,7 @@ class CarGame:
             # 更新死亡掩码
             self.dead_mask_all_worlds[b] = world_dead_mask | world_done
         
-        # 保持向后兼容性：世界0的死亡状态
-        self.dead_mask_env0 = self.dead_mask_all_worlds[0]
-        self.dead_pose_env0 = {}
-        for (world_idx, agent_idx), pose in self.dead_pose_all_worlds.items():
-            if world_idx == 0:
-                self.dead_pose_env0[agent_idx] = pose
-        
-        # 取当前玩家智能体的reward作为当前step显示值
-        player_idx = self._get_player_agent_index()
-        if player_idx >= 0:
-            # 确定从哪个世界获取reward
-            if hasattr(self, '_current_view_world'):
-                world_idx = self._current_view_world
-                # 从对应世界获取reward
-                world_reward = reward[world_idx]
-                self.current_step_reward = float(world_reward[player_idx].item())
-            else:
-                # 默认从世界0获取reward
-                self.current_step_reward = float(self.last_reward_env0[player_idx].item())
-        else:
-            # 没有存活的智能体，尝试显示第一个智能体的reward（包括已死亡的）
-            if self.last_reward_env0 is not None and self.last_reward_env0.numel() > 0:
-                # 显示第一个智能体的reward（可能是死亡时的reward）
-                self.current_step_reward = float(self.last_reward_env0[0].item())
-            else:
-                self.current_step_reward = 0.0
+        # current_step_reward 已在上方设置
         self.step_count += 1
         
         # 检查是否需要进行rollout更新（模仿ddppo.py）
@@ -434,8 +473,7 @@ class CarGame:
                     self.reset_simulator()
                 else:
                     print("✅ 仍有世界有存活agents，继续下一个128step...")
-                    # 重置累积的done状态，因为我们要开始新的128步收集
-                    self.last_done_all_worlds = None
+                    # 仅清空采样buffer，保留累计的dones用于可视化与死亡着色
                     self.reset_buffers()
     
     def reset_simulator(self):
@@ -459,16 +497,10 @@ class CarGame:
             self.config_ns,
         )
         
-        # 重置死亡状态
-        self.dead_mask_env0 = None
-        self.dead_pose_env0 = {}
+        # 重置死亡/完成状态（保留跨rollout的一致性从新iteration开始）
         self.dead_mask_all_worlds = None
         self.dead_pose_all_worlds = {}
-        self.last_done_env0 = None
         self.last_done_all_worlds = None
-        
-        # 重置第一个世界死亡标志
-        self.first_world_dead = False
         
         # 重置视角世界（新iteration从世界0开始）
         self._current_view_world = 0
@@ -491,7 +523,7 @@ class CarGame:
         if len(self.states_buffer) == 0:
             print("⚠️ Buffer为空，无法进行PPO更新")
             return
-        
+
         print(f"🎯 开始经验采样训练，Buffer长度: {len(self.states_buffer)}")
         
         # 将buffer转换为tensor
@@ -502,6 +534,9 @@ class CarGame:
         states_tensor = torch.stack(self.states_buffer, dim=0)  # (T, B, M, S)
         rewards_tensor = torch.stack(self.rewards_buffer, dim=0)  # (T, B, M)
         dones_tensor = torch.stack(self.dones_buffer, dim=0)  # (T, B, M)
+        # 在一个rollout段内，将done做成“不可逆”的累计done，避免done从True回到False
+        # 累计方式：沿时间维度做前缀OR
+        dones_accum = torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0
         values_tensor = torch.stack(self.values_buffer, dim=0)  # (T, B, M)
         old_log_probs_tensor = torch.stack(self.old_log_probs_buffer, dim=0)  # (T, B, M)
         actions_tensor = torch.stack(self.actions_buffer, dim=0)  # (T, B, M)
@@ -512,9 +547,8 @@ class CarGame:
         
         # 构建values_tp1用于GAE计算
         values_tp1 = torch.cat([values_tensor, last_value_pred.unsqueeze(0)], dim=0)
-        
         # 计算GAE优势
-        advantages, returns = self.gae_advantages(rewards_tensor, values_tp1, dones_tensor, self.gamma, self.gae_lambda)
+        advantages, returns = self.gae_advantages(rewards_tensor, values_tp1, dones_accum, self.gamma, self.gae_lambda)
         
         # 优势过滤（模仿ddppo.py）
         A_max = torch.max(torch.abs(advantages)).item()
@@ -527,7 +561,7 @@ class CarGame:
         cand_idx = keep_mask.nonzero(as_tuple=False)
         
         print(f"🎯 第 {self.iteration_count} 个iteration - 最大|A|: {A_max:.4f}, EWMA: {self.A_max_ewma:.4f}, 阈值: {eta:.4f}")
-        print(f"📊 过滤前: {keep_mask.numel()}, 被过滤: {keep_mask.sum().item()}")
+        print(f"📊 过滤前: {keep_mask.numel()}, 过滤后: {keep_mask.sum().item()}")
         
         if cand_idx.numel() == 0:
             print("⚠️ 无可用样本，跳过更新")
@@ -555,11 +589,14 @@ class CarGame:
         returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
         advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
         actions_batch = actions_tensor[selected_t, selected_b, selected_m].view(-1)
-        
         batch_N = old_log_probs_batch.shape[0]
         print(f"🎯 开始PPO更新，样本数量: {batch_N}")
         
+        # 训练模式
+        self.model.train()
         # PPO更新循环
+        epoch_policy_losses = []
+        epoch_value_losses = []
         for epoch in range(self.ppo_epochs):
             # 重新生成观测和特征
             mb_idx = torch.arange(batch_N, device=self.device)
@@ -612,27 +649,21 @@ class CarGame:
             u_idx_mb = inverse_mb.to(self.device)
             mb_features = features_u_mb[u_idx_mb]
             
-            # 策略更新
+            # 策略更新（逐样本-对应agent构造分布，避免跨agent维度混淆）
             action_logits = self.model.forward(mb_features, mode="policy")
-            action_dist = torch.distributions.Categorical(logits=action_logits)
-            
-            # 创建与logits形状匹配的actions tensor
-            # mb_actions形状: [3000], 需要reshape为 [3000, 1] 然后expand为 [3000, 150]
-            actions_for_log_prob = mb_actions.unsqueeze(1).expand(-1, action_logits.shape[1])
-            new_log_probs = action_dist.log_prob(actions_for_log_prob)
-            
-            # 获取对应agents的log概率
             row_idx = torch.arange(mb_actions.shape[0], device=self.device)
-            new_log_probs = new_log_probs[row_idx, mb_agent_idx]
+            logits_selected = action_logits[row_idx, mb_agent_idx]  # [N, num_actions]
+            dist_selected = torch.distributions.Categorical(logits=logits_selected)
+            new_log_probs = dist_selected.log_prob(mb_actions)  # [N]
             
             # 计算比率和损失
-            ratio = torch.exp(torch.clamp(new_log_probs - mb_old_logp, -1, 1))
+            ratio = torch.exp(new_log_probs - mb_old_logp)
             surr1 = ratio * mb_adv
             surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * mb_adv
             policy_loss = -torch.min(surr1, surr2).mean()
             
-            # 熵损失
-            entropy = action_dist.entropy()[row_idx, mb_agent_idx].mean()
+            # 熵损失（基于该agent分布）
+            entropy = dist_selected.entropy().mean()
             policy_total_loss = policy_loss - self.entropy_coef * entropy
             
             # 策略网络更新
@@ -651,10 +682,40 @@ class CarGame:
             value_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.value_network.parameters(), self.max_grad_norm)
             self.value_optimizer.step()
-            
+            epoch_policy_losses.append(float(policy_loss.item()))
+            epoch_value_losses.append(float(value_loss.item()))
             print(f"   Epoch {epoch+1}/{self.ppo_epochs}: Policy Loss: {policy_loss.item():.6f}, Value Loss: {value_loss.item():.6f}, Entropy: {entropy.item():.6f}")
         
+        # 切回评估模式
+        self.model.eval()
         print(f"✅ 第 {self.iteration_count} 个iteration - 经验采样训练完成")
+        # 学习率退火步进
+        try:
+            if hasattr(self, 'policy_scheduler') and self.policy_scheduler is not None:
+                self.policy_scheduler.step()
+            if hasattr(self, 'value_scheduler') and self.value_scheduler is not None:
+                self.value_scheduler.step()
+        except Exception:
+            pass
+
+        # 统计并记录本次更新的均值指标
+        try:
+            # 平均reward（按本次buffer的全部样本）
+            avg_reward_this_update = float(torch.stack(self.rewards_buffer, dim=0).mean().item())
+        except Exception:
+            avg_reward_this_update = 0.0
+        try:
+            mean_policy_loss = float(sum(epoch_policy_losses) / max(1, len(epoch_policy_losses)))
+            mean_value_loss = float(sum(epoch_value_losses) / max(1, len(epoch_value_losses)))
+        except Exception:
+            mean_policy_loss = 0.0
+            mean_value_loss = 0.0
+
+        self.update_index += 1
+        self.avg_rewards_per_update.append(avg_reward_this_update)
+        self.policy_losses_per_update.append(mean_policy_loss)
+        self.value_losses_per_update.append(mean_value_loss)
+        self._update_plots()
 
 # ========================= 绘图 =================================
 
@@ -676,9 +737,9 @@ class CarGame:
                 
                 world_goal_ids = goal_ids[world_idx]
                 # 取当前玩家智能体的目标
-                player_idx = self._get_player_agent_index()
-                if player_idx >= 0:
-                    goal_quad_id = int(world_goal_ids[player_idx].item())
+                b_p, m_p = self._get_player_agent_bm()
+                if m_p >= 0 and b_p == world_idx:
+                    goal_quad_id = int(world_goal_ids[m_p].item())
                     if goal_quad_id >= 0:
                         quad_centers = self.simulator.road_network.quad_centerlines.mean(dim=1)
                         gx, gy = quad_centers[goal_quad_id]
@@ -801,12 +862,12 @@ class CarGame:
                 world_idx = 0  # 默认世界0
             
             # 获取当前玩家智能体的索引（在当前视角世界中）
-            player_idx = self._get_player_agent_index()
-            if player_idx < 0:
+            b_p, m_p = self._get_player_agent_bm()
+            if m_p < 0 or b_p != world_idx:
                 return
             
             # 获取当前玩家的路径 (B, M, L, 2) -> 取 (world_idx, player_idx, :, :)
-            path_plan = self.simulator.agents_path_plans[world_idx, player_idx]  # (L, 2)
+            path_plan = self.simulator.agents_path_plans[world_idx, m_p]  # (L, 2)
             
             # 过滤有效路径点（x, y != -1）
             valid_mask = (path_plan[:, 0] != -1) & (path_plan[:, 1] != -1)
@@ -1028,58 +1089,55 @@ class CarGame:
   
     def draw_ui(self):
         """绘制用户界面"""
-        # 根据第一个世界状态显示不同的UI
-        if hasattr(self, 'first_world_dead') and self.first_world_dead:
-            # 第一个世界死亡时，显示训练继续状态
-            training_text = self.font.render("FIRST WORLD DEAD - Training continues...", True, (255, 165, 0))
-            step_text = self.font.render(f"step: {self.step_count}/{self.max_steps}", True, self.colors['text'])
-            iteration_text = self.font.render(f"Iteration: {self.iteration_count}", True, self.colors['text'])
-            buffer_text = self.font.render(f"Buffer steps: {self.buffer_step_count}/{self.rollout_length}", True, self.colors['text'])
-            self.screen.blit(training_text, (10, 10))
-            self.screen.blit(step_text, (10, 50))
-            self.screen.blit(iteration_text, (10, 90))
-            self.screen.blit(buffer_text, (10, 130))
-        else:
-            # 游戏进行中，显示正常的reward和step信息
-            step_reward = getattr(self, 'current_step_reward', 0.0)
-            reward_text = self.font.render(f"step reward: {step_reward:.4f}", True, self.colors['text'])
-            step_text = self.font.render(f"step: {self.step_count}/{self.max_steps}", True, self.colors['text'])
-            iteration_text = self.font.render(f"Iteration: {self.iteration_count}", True, self.colors['text'])
-            buffer_text = self.font.render(f"Buffer steps: {self.buffer_step_count}/{self.rollout_length}", True, self.colors['text'])
-            self.screen.blit(reward_text, (10, 10))
-            self.screen.blit(step_text, (10, 50))
-            self.screen.blit(iteration_text, (10, 90))
-            self.screen.blit(buffer_text, (10, 130))
+        # 统一显示UI：step信息 + 当前观察玩家的(B,M)
+        step_reward = getattr(self, 'current_step_reward', 0.0)
+        reward_text = self.font.render(f"step reward: {step_reward:.4f}", True, self.colors['text'])
+        step_text = self.font.render(f"step: {self.step_count}/{self.max_steps}", True, self.colors['text'])
+        iteration_text = self.font.render(f"Iteration: {self.iteration_count}", True, self.colors['text'])
+        buffer_text = self.font.render(f"Buffer steps: {self.buffer_step_count}/{self.rollout_length}", True, self.colors['text'])
+        b_obs, m_obs = self._get_player_agent_bm()
+        bm_text = self.font.render(f"View Player: B={max(b_obs,0)}, M={max(m_obs,0)}", True, (255, 100, 0))
+        self.screen.blit(reward_text, (10, 10))
+        self.screen.blit(step_text, (10, 50))
+        self.screen.blit(iteration_text, (10, 90))
+        self.screen.blit(buffer_text, (10, 130))
+        self.screen.blit(bm_text, (10, 170))
 
-        # 显示玩家车辆状态
+        # 显示玩家车辆状态（来自当前视角world）
         px, py, pyaw = self._get_player_pose()
-        if hasattr(self, 'first_world_dead') and self.first_world_dead:
-            # 第一个世界死亡时，显示静态信息
-            static_text = self.small_font.render("First world vehicles inactive", True, (255, 100, 100))
-            self.screen.blit(static_text, (10, 200))
+        # 游戏进行中，显示动态信息
+        b_cur, m_cur = self._get_player_agent_bm()
+        if b_cur >= 0 and m_cur >= 0:
+            states_cur = self.simulator.agents_state[b_cur]
+            speed_val = float(states_cur[m_cur, 3].item())
+            a_idx = 0
+            if hasattr(self, 'last_actions'):
+                actions_cpu = self.last_actions.detach().to('cpu')
+                a_idx = int(actions_cpu[b_cur, m_cur].item())
         else:
-            # 游戏进行中，显示动态信息
-            player_idx = self._get_player_agent_index()
-            if player_idx >= 0:
-                env0_states = self.simulator.agents_state[0]
-                speed_val = float(env0_states[player_idx, 3].item())
-                
-                # 显示离散动作信息（来自上一步采样的动作）
-                a_idx = 0  # 默认值
-                if hasattr(self, 'last_actions'):
-                    actions_cpu = self.last_actions
-                    a_idx = int(actions_cpu[0, player_idx].item())
+            speed_val = 0.0
+            a_idx = 0
+        # 当前观测车辆 active/done 状态
+        if b_cur >= 0 and m_cur >= 0:
+            active_bool = bool((self.simulator.agents_state[b_cur, m_cur, 6] > 0.5).item())
+            if hasattr(self, 'last_done_all_worlds') and self.last_done_all_worlds is not None and b_cur < self.last_done_all_worlds.shape[0] and m_cur < self.last_done_all_worlds.shape[1]:
+                done_bool = bool(self.last_done_all_worlds[b_cur, m_cur].item())
             else:
-                speed_val = 0.0
-                a_idx = 0
-                
-            speed_text = self.small_font.render(f"speed: {speed_val:.2f} m/s", True, self.colors['text'])
-            heading_text = self.small_font.render(f"heading: {math.degrees(pyaw):.1f}°", True, self.colors['text'])
-            action_text = self.small_font.render(f"current action idx: {a_idx}", True, self.colors['text'])
-            
-            self.screen.blit(speed_text, (10, 200))
-            self.screen.blit(heading_text, (10, 220))
-            self.screen.blit(action_text, (10, 260))
+                done_bool = False
+        else:
+            active_bool = False
+            done_bool = False
+
+        speed_text = self.small_font.render(f"speed: {speed_val:.2f} m/s", True, self.colors['text'])
+        heading_text = self.small_font.render(f"heading: {math.degrees(pyaw):.1f}°", True, self.colors['text'])
+        action_text = self.small_font.render(f"current action idx: {a_idx}", True, self.colors['text'])
+        active_text = self.small_font.render(f"active: {active_bool}", True, self.colors['text'])
+        done_text = self.small_font.render(f"done: {done_bool}", True, self.colors['text'])
+        self.screen.blit(speed_text, (10, 200))
+        self.screen.blit(heading_text, (10, 220))
+        self.screen.blit(action_text, (10, 240))
+        self.screen.blit(active_text, (10, 260))
+        self.screen.blit(done_text, (10, 280))
         
         # 显示汽车世界坐标
         car_world_pos = f"car world pos: ({px:.1f}, {py:.1f})"
@@ -1097,28 +1155,19 @@ class CarGame:
         vision_text = self.small_font.render(vision_info, True, self.colors['text'])
         self.screen.blit(vision_text, (10, 340))
         
-        # 显示车辆信息（env0 存活/死亡数量）
-        env0 = self.simulator.agents_state[0]
-        active_mask = (env0[:, 6] > 0.5).detach().to('cpu')  # active状态，转换为CPU
-        
-        # 获取done状态，如果没有则默认为False
-        if hasattr(self, 'last_done_env0') and self.last_done_env0 is not None:
-            done_mask = self.last_done_env0
+        # 显示当前视角world的车辆信息
+        view_b = getattr(self, '_current_view_world', 0)
+        world_states = self.simulator.agents_state[view_b]
+        active_mask = (world_states[:, 6] > 0.5).detach().to('cpu')
+        if hasattr(self, 'last_done_all_worlds') and self.last_done_all_worlds is not None:
+            done_mask = self.last_done_all_worlds[view_b]
         else:
             done_mask = torch.zeros_like(active_mask, dtype=torch.bool)
-        
-        # 真正存活的车辆：active=True 且 done=False
         alive_mask = active_mask & (~done_mask)
         alive_num = int(alive_mask.sum().item())
-        
-        # 死亡车辆：active=True 且 done=True（只计算原本存在但已死亡的车辆）
-        dead_mask = active_mask & done_mask
-        dead_num = int(dead_mask.sum().item())
-        
-        # 总车辆数：active=True的车辆总数
+        dead_num = int((active_mask & done_mask).sum().item())
         total_active = int(active_mask.sum().item())
-        
-        car_info = f"alive: {alive_num}, dead: {dead_num}, total: {total_active}"
+        car_info = f"World {view_b} - alive: {alive_num}, dead: {dead_num}, total: {total_active}"
         car_text = self.small_font.render(car_info, True, self.colors['text'])
         self.screen.blit(car_text, (10, 360))
         
@@ -1170,9 +1219,9 @@ class CarGame:
             self.update_game_state()
             # 绘制画面
             self.draw()
-            # 帧率限制
-            if self.clock is not None:
-                self.clock.tick(60)
+            # # 帧率限制
+            # if self.clock is not None:
+            #     self.clock.tick(60)
     
 if __name__ == "__main__":
     game = CarGame()
