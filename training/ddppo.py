@@ -132,7 +132,6 @@ def build_network_features(agents_state: torch.Tensor,
                           config: SimpleNamespace) -> torch.Tensor:
     """
     将拆解后的观测组件构建为网络输入的特征张量
-    
     Args:
         agents_state: (B, M, 7) - 智能体状态
         neighbors_local: (B, M, K, 7) - 邻居相对状态
@@ -142,7 +141,7 @@ def build_network_features(agents_state: torch.Tensor,
         stop_lines: (B, M, num_stop_lines, 20) - 停止线点
         reward_coef: (B, M, 10) - 奖励系数
         config: 配置对象
-    
+
     Returns:
         torch.Tensor: 形状为 (B, M, total_input_dim) 的网络输入特征张量
     """
@@ -162,9 +161,15 @@ def build_network_features(agents_state: torch.Tensor,
     # 1. 构建简单特征 (S(t), G(t), reward系数, 车辆风格参数)
     simple_end = sum(simple_feature_dims)
     
-    # S(t): 7维 - 直接使用agents_state
+    # S(t): 7维 - 使用agents_state，但将 yaw 替换为 cos(yaw) 保持数值稳定
     s_t_size = simple_feature_dims[0]  # 7
-    features_tensor[:, :, :s_t_size] = agents_state
+    agents_state_stable = agents_state.clone()
+    try:
+        agents_state_stable[:, :, 2] = torch.cos(agents_state_stable[:, :, 2])
+    except Exception:
+        # 若维度不符则回退为原值
+        pass 
+    features_tensor[:, :, :s_t_size] = agents_state_stable
     
     # G(t): 256维 - 使用路径规划信息
     g_t_size = simple_feature_dims[1]  # 256

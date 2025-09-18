@@ -7,7 +7,7 @@ simulator:
   sim_dt: 0.3             # 模拟时间步长
   max_agents_num: 150     # 最大车辆数量,定义每个环境中最大可能的智能体数量
   # num_npc_vehicles <= max_agents_num，否则会报错
-  num_npc_vehicles: 5   # NPC车辆数量,定义每个环境中实际生成的智能体数量
+  num_npc_vehicles: 150   # NPC车辆数量,定义每个环境中实际生成的智能体数量
 
   # 地图配置  
   map_path: "./maps/processed_map_Town01_stitched.json" # 地图路径

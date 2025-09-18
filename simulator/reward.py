@@ -112,7 +112,8 @@ class RewardCalculator:
         if goal_positions.dim() == 2 and goal_positions.shape[1] == 2:
             # 如果goal_positions是 (B*M, 2)，恢复为 (B, M, 2)
             goal_positions = goal_positions.view(B, M, 2)
-        
+
+
         # 计算距离 ||x-g||
         distances = torch.norm(agent_positions - goal_positions, dim=-1)  # (B, M)
         # 逐元素 δgoal 阈值 (B, M)
@@ -123,6 +124,7 @@ class RewardCalculator:
             pass
 
         # 距离条件: ||x-g|| < δgoal(B,M)
+
         distance_condition = distances < delta_goal_tensor
         # 速度条件: |v| < vgoal
         speed_condition = torch.abs(speeds) < self.v_goal
@@ -458,6 +460,7 @@ class RewardCalculator:
         reward += goal_rewards
         # 判断是否到达目标：如果获得了目标奖励，说明到达了目标
         goal_reached = (goal_rewards > 0)
+
 
         # 计算碰撞惩罚
         collision_penalty = self.calculate_collision_penalty(agents_state, all_collisions)

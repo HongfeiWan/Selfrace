@@ -210,11 +210,12 @@ class ObservationGenerator:
         # 3. 展平并拼接成最终的观测向量
         # 返回：自身绝对状态，邻居相对状态，车道线相对状态，边界线相对状态
         observation = torch.cat([
-            agents_state,
+            local_state,
             neighbors_local.flatten(start_dim=2),
             w_lanes_local.flatten(start_dim=2),
             w_boundaries_local.flatten(start_dim=2)
         ], dim=2)
+        
         return observation
     
     def _get_nearest_neighbors(self, agents_state: torch.Tensor) -> torch.Tensor:
@@ -242,13 +243,22 @@ class ObservationGenerator:
         batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1, 1)
         agent_idx = torch.arange(max_agents, device=self.device).view(1, max_agents, 1)
         neighbor_states = agents_state[batch_idx, topk_indices] # (B, M, K, 7)
-        # 6. 如果邻居是无效的 (距离为inf)，则其状态需要被掩码/清零
+        # 6. 如果邻居是无效的 (距离为inf)，则其状态需要被掩码；
+        #    为避免后续局部坐标计算出现 dx,dy = -ego_pos 的伪值，
+        #    将无效邻居的状态设置为等同于对应 ego 的状态（使相对量为0）。
         valid_neighbor_dists = dist_sq[batch_idx, agent_idx, topk_indices]
         is_valid_neighbor = torch.isfinite(valid_neighbor_dists) # (B, M, K)
-        neighbor_states[~is_valid_neighbor] = 0.0
+        if (~is_valid_neighbor).any():
+            K_neighbors = topk_indices.shape[-1]
+            ego_states_expanded = agents_state.unsqueeze(2).expand(-1, -1, K_neighbors, -1)  # (B, M, K, 7)
+            # 使无效邻居的相对位置/速度为0：复制ego的 [x,y,yaw,speed]
+            # 同时将尺寸与active置零，避免下游看到伪造的车辆尺寸与激活标志
+            replacement = ego_states_expanded.clone()
+            replacement[..., 4] = 0.0  # length
+            replacement[..., 5] = 0.0  # width
+            replacement[..., 6] = 0.0  # active
+            neighbor_states[~is_valid_neighbor] = replacement[~is_valid_neighbor]
         return neighbor_states
-    
-
     
     def _world_to_ego_centric(self, ego_states, neighbor_states, w_lanes_world, w_boundaries_world):
         """将世界坐标系下的状态转换为以每个 agent 为中心的坐标系。"""
