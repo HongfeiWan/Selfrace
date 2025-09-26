@@ -39,16 +39,23 @@ class SimpleFeatureEncoder(nn.Module):
 
 class PermutationInvariantEncoder(nn.Module):
     """
-    排列不变编码器 - 完全向量化，支持批量处理
+    排列不变编码器 - 支持集合输入并进行对称聚合（默认 max 池化）
     用于多特征集合 (W(t)_lane, W(t)_boundary, W(t)_stop, A(t))
+
+    使用方式：
+    - 输入 x 可为 [B, M, K, d]（K 个元素、每元素维度 d）；
+    - 也可为 [B, M, N] 的扁平向量，但需在初始化时指定 element_dim（单元素维度 d），
+      以便自动重塑为 [B, M, K=N//d, d] 并沿 K 维进行聚合（置换不变）。
     """
-    def __init__(self, feature_dim, output_dim=64):
+    def __init__(self, feature_dim, output_dim=64, element_dim=None):
         super(PermutationInvariantEncoder, self).__init__()
-        self.feature_dim = feature_dim
+        self.flat_total_dim = feature_dim
+        self.element_dim = element_dim  # 若提供，则 K = feature_dim // element_dim
         self.output_dim = output_dim
-        # 编码每个元素的MLP
+
+        element_input_dim = self.element_dim if self.element_dim is not None else feature_dim
         self.element_encoder = nn.Sequential(
-            nn.Linear(feature_dim, output_dim),
+            nn.Linear(element_input_dim, output_dim),
             nn.ReLU(),
             nn.Linear(output_dim, output_dim)
         )
@@ -61,23 +68,35 @@ class PermutationInvariantEncoder(nn.Module):
             torch.nn.init.orthogonal_(module.weight, gain=1.0)
             torch.nn.init.constant_(module.bias, 0)
     
-    def forward(self, x):
+    def forward(self, x, mask: torch.Tensor = None):
         """
-        完全向量化的前向传播，实现排列不变性
+        排列不变前向传播（对 K 维做 max 池化）
         Args:
-            x: [B, M, feature_dim] - B是batch_size，M是环境数量，feature_dim是每个元素的特征维度
+            x: [B, M, K, d] 或 [B, M, N]
+            mask: 可选，[B, M, K]，True 表示该元素有效
         Returns:
             encoded: [B, M, output_dim]
         """
-        # 输入是 [B, M, feature_dim] 格式，需要重塑为 [B, M, 1, feature_dim] 来实现排列不变性
-        B, M, feature_dim = x.shape
-        # 重塑为 [B, M, 1, feature_dim] 以保持与原始设计的兼容性
-        x_reshaped = x.unsqueeze(2)  # 添加 num_elements 维度
-        # 编码每个元素
-        encoded_elements = self.element_encoder(x_reshaped.view(-1, feature_dim))
-        # 重塑回 [B, M, 1, output_dim]
-        encoded_elements = encoded_elements.view(B, M, 1, self.output_dim)
-        # 通过maxpooling实现排列不变性，聚合多个元素的信息
+        if x.dim() == 3:
+            B, M, N = x.shape
+            if self.element_dim is not None:
+                assert N % self.element_dim == 0, \
+                    f"total_dim={N} 不能被 element_dim={self.element_dim} 整除"
+                K = N // self.element_dim
+                x = x.view(B, M, K, self.element_dim)
+            else:
+                x = x.unsqueeze(2)  # [B, M, 1, N]
+        elif x.dim() != 4:
+            raise ValueError(f"x 期望为 3D 或 4D 张量，得到 {x.dim()}D")
+
+        B, M, K, d = x.shape
+        encoded_elements = self.element_encoder(x.reshape(-1, d))  # [(B*M*K), output_dim]
+        encoded_elements = encoded_elements.reshape(B, M, K, self.output_dim)
+
+        if mask is not None:
+            neg_inf = torch.finfo(encoded_elements.dtype).min
+            encoded_elements = encoded_elements.masked_fill(~mask.unsqueeze(-1), neg_inf)
+
         encoded = torch.max(encoded_elements, dim=2)[0]  # [B, M, output_dim]
         return encoded
 
@@ -104,10 +123,10 @@ class FeatureEncoder(nn.Module):
         ])
         # 创建排列不变特征编码器 - 直接创建4个
         self.permutation_encoders = nn.ModuleList([
-            PermutationInvariantEncoder(self.permutation_feature_dims[0], self.encoder_dim),  # road_boundary: 52维
-            PermutationInvariantEncoder(self.permutation_feature_dims[1], self.encoder_dim),  # lane_points: 50维
-            PermutationInvariantEncoder(self.permutation_feature_dims[2], self.encoder_dim),  # stop_lines: 20维
-            PermutationInvariantEncoder(self.permutation_feature_dims[3], self.encoder_dim)   # other_agents: 140维
+            PermutationInvariantEncoder(self.permutation_feature_dims[0], self.encoder_dim, element_dim=2),  # road_boundary: 26x2=52
+            PermutationInvariantEncoder(self.permutation_feature_dims[1], self.encoder_dim, element_dim=2),  # lane_points: 25x2=50
+            PermutationInvariantEncoder(self.permutation_feature_dims[2], self.encoder_dim, element_dim=2),  # stop_lines: 5x2=20
+            PermutationInvariantEncoder(self.permutation_feature_dims[3], self.encoder_dim, element_dim=7)   # other_agents: 20x7=140
         ])
         # 计算总输出维度 - 固定8个编码器
         self.total_output_dim = (len(self.simple_encoders) + len(self.permutation_encoders)) * self.encoder_dim

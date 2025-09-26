@@ -122,6 +122,39 @@ def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) ->
     return agents_state, neighbors_local, w_lanes_local, w_boundaries_local
 
 # ============================== 构建网络输入特征 ==============================
+
+
+def normalize_to_minus1_1(x: torch.Tensor, min_val, max_val) -> torch.Tensor:
+    """
+    x输入可以是B,M,1批量数据
+	将输入按区间 [min_val, max_val] 线性映射到 [-1, 1] 并裁剪：
+    - x <= min_val -> -1
+    - x >= max_val -> 1
+    - 其余线性映射到 (-1, 1)
+    当 max_val == min_val 时（退化区间）：
+    - x < min_val -> -1, x > max_val -> 1, 等于 -> 0
+
+    min_val / max_val 可为标量或与 x 可广播的张量。
+    """
+    min_t = torch.as_tensor(min_val, dtype=x.dtype, device=x.device)
+    max_t = torch.as_tensor(max_val, dtype=x.dtype, device=x.device)
+    denom = max_t - min_t
+    # 避免除零：仅对非退化位置执行标准线性映射
+    denom_safe = torch.where(denom == 0, torch.ones_like(denom), denom)
+    y = (x - min_t) / denom_safe
+    y = y * 2 - 1
+    # 裁剪到 [-1, 1]
+    y = torch.clamp(y, -1.0, 1.0)
+    # 退化处理：max==min
+    deg_mask = (denom == 0)
+    if torch.any(deg_mask):
+        y_degen = torch.where(
+            x > max_t, torch.ones_like(x),
+            torch.where(x < min_t, -torch.ones_like(x), torch.zeros_like(x))
+        )
+        y = torch.where(deg_mask, y_degen, y)
+    return y
+
 def build_network_features(agents_state: torch.Tensor, 
                           neighbors_local: torch.Tensor, 
                           w_lanes_local: torch.Tensor, 
@@ -141,7 +174,6 @@ def build_network_features(agents_state: torch.Tensor,
         stop_lines: (B, M, num_stop_lines, 20) - 停止线点
         reward_coef: (B, M, 10) - 奖励系数
         config: 配置对象
-
     Returns:
         torch.Tensor: 形状为 (B, M, total_input_dim) 的网络输入特征张量
     """
@@ -149,7 +181,7 @@ def build_network_features(agents_state: torch.Tensor,
     
     # 从配置中获取网络需要的特征维度
     network_config = config.training.network
-    simple_feature_dims = network_config.simple_feature_dims  # [10, 1024, 10, 4]
+    simple_feature_dims = network_config.simple_feature_dims  # [7, 256, 10, 4]
     permutation_feature_dims = network_config.permutation_feature_dims  # [52, 50, 20, 140]
     
     # 计算总输入维度
@@ -166,8 +198,14 @@ def build_network_features(agents_state: torch.Tensor,
     agents_state_stable = agents_state.clone()
     try:
         agents_state_stable[:, :, 2] = torch.cos(agents_state_stable[:, :, 2])
+        agents_state_stable[:, :, 1] = torch.sin(agents_state_stable[:, :, 2]) # 占用一个位置写入sin(yaw)进入网络
+        # TODO:后续这里的最大最小最好改为从config中获取
+        agents_state_stable[:, :, 3] = normalize_to_minus1_1(agents_state_stable[:, :, 3], -2, 20)
+        agents_state_stable[:, :, 4] = normalize_to_minus1_1(agents_state_stable[:, :, 4], 0.8, 3)
+        agents_state_stable[:, :, 5] = normalize_to_minus1_1(agents_state_stable[:, :, 5], 0.8, 7)
     except Exception:
         # 若维度不符则回退为原值
+        print('error')
         pass 
     features_tensor[:, :, :s_t_size] = agents_state_stable
     
@@ -175,25 +213,35 @@ def build_network_features(agents_state: torch.Tensor,
     g_t_size = simple_feature_dims[1]  # 256
     g_t_start = s_t_size
     g_t_end = g_t_start + g_t_size
-    features_tensor[:, :, g_t_start:g_t_end] = path_plan.flatten(start_dim=2)  
-        
+    path_plan_stable = path_plan.clone().flatten(start_dim=2) #复制，展平
+    path_plan_stable = normalize_to_minus1_1(path_plan_stable, -100, 100) #归一化
+    features_tensor[:, :, g_t_start:g_t_end] = path_plan_stable
+
     # reward系数: 10维 - 使用传入的采样参数
     reward_coef_size = simple_feature_dims[2]  # 10
     reward_coef_start = g_t_start + g_t_size
     reward_coef_end = reward_coef_start + reward_coef_size
-    features_tensor[:, :, reward_coef_start:reward_coef_end] = reward_coef
-    
+
+    reward_coef_stable = reward_coef.clone()
+
+    reward_coef_stable[:, :, 0] = normalize_to_minus1_1(reward_coef_stable[:, :, 0], 2, 12)
+    reward_coef_stable[:, :, 1] = normalize_to_minus1_1(reward_coef_stable[:, :, 1], 0, 3)
+    reward_coef_stable[:, :, 2] = normalize_to_minus1_1(reward_coef_stable[:, :, 2], 0, 3)
+    reward_coef_stable[:, :, 3] = normalize_to_minus1_1(reward_coef_stable[:, :, 3], 0, 0.1)
+    reward_coef_stable[:, :, 4] = normalize_to_minus1_1(reward_coef_stable[:, :, 4], 0.00025, 0.025)
+    reward_coef_stable[:, :, 5] = normalize_to_minus1_1(reward_coef_stable[:, :, 5], 0, 1)
+    reward_coef_stable[:, :, 6] = normalize_to_minus1_1(reward_coef_stable[:, :, 6], 0.00025, 0.0075)
+    reward_coef_stable[:, :, 7] = normalize_to_minus1_1(reward_coef_stable[:, :, 7], -0.5, 0.5)
+    reward_coef_stable[:, :, 8] = normalize_to_minus1_1(reward_coef_stable[:, :, 8], 0.00025, 0.0075)
+    reward_coef_stable[:, :, 9] = normalize_to_minus1_1(reward_coef_stable[:, :, 9], 0, 1)
+    features_tensor[:, :, reward_coef_start:reward_coef_end] = reward_coef_stable
+
     # 车辆风格参数: 4维 - 从agents_state中提取
     vehicle_style_size = simple_feature_dims[3]  # 4
     vehicle_style_start = reward_coef_start + reward_coef_size
     vehicle_style_end = vehicle_style_start + vehicle_style_size
-    # 使用车辆的长度、宽度、速度和活跃状态
-    vehicle_style = torch.stack([
-        agents_state[:, :, 4],  # length
-        agents_state[:, :, 5],  # width
-        agents_state[:, :, 3],  # speed
-        agents_state[:, :, 6]   # active
-    ], dim=2)
+    # TODO:车辆风格暂置为四个0，后续改为传入的风格参数且要做归一化
+    vehicle_style = torch.zeros(batch_size, max_agents, vehicle_style_size, device=agents_state.device, dtype=agents_state.dtype)
     features_tensor[:, :, vehicle_style_start:vehicle_style_end] = vehicle_style
     
     # 2. 构建排列不变特征 (road_boundary, lane_points, stop_lines, other_agents)
@@ -206,6 +254,7 @@ def build_network_features(agents_state: torch.Tensor,
     
     # 将边界线展平并填充
     w_boundaries_flat = w_boundaries_local.flatten(start_dim=2)  # (B, M, N_boundaries*2)
+    w_boundaries_flat = normalize_to_minus1_1(w_boundaries_flat, -100, 100) #归一化
     if w_boundaries_flat.shape[2] <= road_boundary_size:
         features_tensor[:, :, road_boundary_start:road_boundary_start + w_boundaries_flat.shape[2]] = w_boundaries_flat
     else:
@@ -218,6 +267,7 @@ def build_network_features(agents_state: torch.Tensor,
     
     # 将车道线展平并填充
     w_lanes_flat = w_lanes_local.flatten(start_dim=2)  # (B, M, N_lanes*2)
+    w_lanes_flat = normalize_to_minus1_1(w_lanes_flat, -100, 100) #归一化
     if w_lanes_flat.shape[2] <= lane_points_size:
         features_tensor[:, :, lane_points_start:lane_points_start + w_lanes_flat.shape[2]] = w_lanes_flat
     else:
@@ -231,6 +281,7 @@ def build_network_features(agents_state: torch.Tensor,
     # 将停止线展平并填充
     if stop_lines is not None and stop_lines.numel() > 0:
         stop_lines_flat = stop_lines.flatten(start_dim=2)  # (B, M, num_stop_lines*2)
+        stop_lines_flat = normalize_to_minus1_1(stop_lines_flat, -100, 100) #归一化
         if stop_lines_flat.shape[2] <= stop_lines_size:
             features_tensor[:, :, stop_lines_start:stop_lines_start + stop_lines_flat.shape[2]] = stop_lines_flat
         else:
@@ -244,8 +295,19 @@ def build_network_features(agents_state: torch.Tensor,
     other_agents_start = stop_lines_end
     other_agents_end = other_agents_start + other_agents_size
     
-    # 将邻居信息展平并填充
-    neighbors_flat = neighbors_local.flatten(start_dim=2)  # (B, M, K*7)
+    # 将邻居信息按通道做归一化后再展平并填充
+    neighbors_proc = neighbors_local.clone()
+    try:
+        neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_proc[:, :, :, 0], -100, 100)
+        neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_proc[:, :, :, 1], -100, 100)
+        neighbors_proc[:, :, :, 2] = normalize_to_minus1_1(neighbors_proc[:, :, :, 2], -40, 40)
+        neighbors_proc[:, :, :, 3] = normalize_to_minus1_1(neighbors_proc[:, :, :, 3], -40, 40)
+        neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_proc[:, :, :, 4], 0.8, 3)
+        neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_proc[:, :, :, 5], 0.8, 7)
+        # 通道 6 为 active 标志，保持原样
+    except Exception:
+        pass
+    neighbors_flat = neighbors_proc.flatten(start_dim=2)  # (B, M, K*7)
     if neighbors_flat.shape[2] <= other_agents_size:
         features_tensor[:, :, other_agents_start:other_agents_start + neighbors_flat.shape[2]] = neighbors_flat
     else:

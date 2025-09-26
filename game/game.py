@@ -10,6 +10,7 @@ import torch
 import pygame
 import matplotlib
 import matplotlib.pyplot as plt
+import swanlab
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -29,6 +30,8 @@ from network import create_network
 
 class CarGame:
     def __init__(self):
+        
+
         # 加载默认配置（不需要传入路径）
         config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'configs', 'default_config.yaml') 
         self.config = yaml.safe_load(open(config_path, 'r', encoding='utf-8'))
@@ -133,6 +136,19 @@ class CarGame:
             'lane_markings': (0, 255, 0),
             'dead_car': (255, 215, 0)
         }
+
+        # 创建一个SwanLab项目
+        swanlab.init(
+            # 设置项目名
+            project="selfrace",
+            # 设置超参数
+            config={
+                "learning_rate": self.learning_rate,
+                "architecture": "CNN",
+                "dataset": "CIFAR-100",
+                "epochs": total_iterations
+            }
+        )
     
     def reset_buffers(self):
         """重置所有buffer，模仿ddppo.py"""
@@ -588,6 +604,18 @@ class CarGame:
             self.A_max_ewma = self.beta * A_max + (1 - self.beta) * self.A_max_ewma
         eta = self.advantage_filter_threshold * self.A_max_ewma
         keep_mask = (torch.abs(advantages) >= eta)
+
+        # 额外剔除：每个(B,M)智能体在第一次 done 之后的所有时间步（但保留第一次 done 发生的那个时间步）
+        # seen_done_inclusive[t] 表示到 t 为止是否出现过 done
+        seen_done_inclusive = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
+        # 第一次出现 done 的时间步
+        seen_done_prev = torch.roll(seen_done_inclusive, shifts=1, dims=0)
+        seen_done_prev[0] = False
+        first_done_step = dones_tensor & (~seen_done_prev)
+        # 第一次之后的所有时间步（严格在第一次 done 之后）
+        post_done_mask = seen_done_inclusive & (~first_done_step)
+        # 从候选中移除这些 post-done 样本
+        keep_mask = keep_mask & (~post_done_mask)
         cand_idx = keep_mask.nonzero(as_tuple=False)
         
         print(f"🎯 第 {self.iteration_count} 个iteration - 最大|A|: {A_max:.4f}, EWMA: {self.A_max_ewma:.4f}, 阈值: {eta:.4f}")
@@ -699,16 +727,9 @@ class CarGame:
             entropy = dist_selected.entropy().mean()
             policy_total_loss = policy_loss - self.entropy_coef * entropy
             
-            # 调试信息：打印关键统计量
-            if epoch == 0:  # 只在第一个epoch打印，避免信息过多
-                print(f"   🔍 调试信息:")
-                print(f"      - 优势范围: [{mb_adv.min().item():.4f}, {mb_adv.max().item():.4f}], 均值: {mb_adv.mean().item():.4f}")
-                print(f"      - 比率范围: [{ratio.min().item():.4f}, {ratio.max().item():.4f}], 均值: {ratio.mean().item():.4f}")
-                print(f"      - 新log_prob范围: [{new_log_probs.min().item():.4f}, {new_log_probs.max().item():.4f}]")
-                print(f"      - 旧log_prob范围: [{mb_old_logp.min().item():.4f}, {mb_old_logp.max().item():.4f}]")
-                print(f"      - surr1均值: {surr1.mean().item():.4f}, surr2均值: {surr2.mean().item():.4f}")
-                print(f"      - 被clip的样本比例: {((ratio < 1 - self.clip_ratio) | (ratio > 1 + self.clip_ratio)).float().mean().item():.2%}")
             
+
+
             # 策略网络更新
             self.policy_optimizer.zero_grad()
             policy_total_loss.backward()
@@ -727,8 +748,10 @@ class CarGame:
             self.value_optimizer.step()
             epoch_policy_losses.append(float(policy_loss.item()))
             epoch_value_losses.append(float(value_loss.item()))
-            print(f"   Epoch {epoch+1}/{self.ppo_epochs}: Policy Loss: {policy_loss.item():.6f}, Value Loss: {value_loss.item():.6f}, Entropy: {entropy.item():.6f}")
-        
+            #print(f"   Epoch {epoch+1}/{self.ppo_epochs}: Policy Loss: {policy_loss.item():.6f}, Value Loss: {value_loss.item():.6f}, Entropy: {entropy.item():.6f}")
+
+            swanlab.log({"policy_loss": policy_loss.item(), "value_loss": value_loss.item(), "entropy": entropy.item()})
+
         # 切回评估模式
         self.model.eval()
         print(f"✅ 第 {self.iteration_count} 个iteration - 经验采样训练完成")

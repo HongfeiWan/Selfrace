@@ -3,7 +3,7 @@ simulator:
   # 设备配置 - 8张显卡的分布式设置
   device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
 
-  num_envs: 100           # 总并行环境数量 (8 * 4800 = 38400)
+  num_envs: 100          # 总并行环境数量 (8 * 4800 = 38400)
   sim_dt: 0.3             # 模拟时间步长
   max_agents_num: 150     # 最大车辆数量,定义每个环境中最大可能的智能体数量
   # num_npc_vehicles <= max_agents_num，否则会报错
@@ -144,8 +144,8 @@ training:
     init_method: "tcp://localhost:12355"  # 初始化方法
 
   # 修正batch size (每张显卡的训练batch size)
-  batch_size: 256000  # 总batch size
-  batch_size_per_gpu: 2500  # 每GPU batch size
+  batch_size: 256000        # 总batch size
+  batch_size_per_gpu: 2000  # 每GPU batch size
   iteration: 10000
   
   # 修正其他参数
@@ -183,7 +183,7 @@ training:
   
   # 经验缓冲区配置
   experience_buffer_capacity: 50000  # 经验缓冲区容量
-  min_buffer_size_for_training: 1000 # 开始训练的最小缓冲区大小
+  min_buffer_size_for_training: 800  # 开始训练的最小缓冲区大小
 
   # 模型权重初始化配置
   weight_init:
