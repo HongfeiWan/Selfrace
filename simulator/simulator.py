@@ -197,9 +197,23 @@ class TeraflowSimulator:
             is_on_road[active_mask] = active_is_on_road
         offroad_mask = ~is_on_road # (B, M)
 
-        # 3. 动态碰撞检测
+        # 3. 动态碰撞检测（排除done的车辆）
+        # 临时将done车辆的状态设置为无效，避免它们参与碰撞检测
+        original_states_t0 = states_t0.clone()
+        original_states_t1 = self.agents_state.clone()
+        
+        if hasattr(self, 'last_done') and self.last_done is not None:
+            # 将done车辆的状态设置为无效（active=0）
+            states_t0_for_collision = states_t0.clone()
+            states_t1_for_collision = self.agents_state.clone()
+            states_t0_for_collision[..., 6] = torch.where(self.last_done, 0.0, states_t0_for_collision[..., 6])
+            states_t1_for_collision[..., 6] = torch.where(self.last_done, 0.0, states_t1_for_collision[..., 6])
+        else:
+            states_t0_for_collision = states_t0
+            states_t1_for_collision = self.agents_state
+        
         collision_check_result = self.collision_checker.check(
-            states_t0, self.agents_state, debug=debug_collision, debug_env_idx=0
+            states_t0_for_collision, states_t1_for_collision, debug=debug_collision, debug_env_idx=0
         )
         all_collisions = collision_check_result
 
@@ -210,9 +224,20 @@ class TeraflowSimulator:
 
         # 5. 更新path_plans的局部坐标
         self._update_path_plans_local()
+        
+        # 5.5. 检查并移除已到达的路径点
+        self._check_and_remove_reached_waypoints()
 
-        # 6. 生成新的观测
-        observation = self.observation_generator.generate(self.agents_state)
+        # 6. 生成新的观测（排除done的车辆）
+        # 临时将done车辆的状态设置为无效，避免它们参与观测生成
+        if hasattr(self, 'last_done') and self.last_done is not None:
+            # 将done车辆的状态设置为无效（active=0）
+            agents_state_for_obs = self.agents_state.clone()
+            agents_state_for_obs[..., 6] = torch.where(self.last_done, 0.0, agents_state_for_obs[..., 6])
+        else:
+            agents_state_for_obs = self.agents_state
+        
+        observation = self.observation_generator.generate(agents_state_for_obs)
 
         # 7. 计算奖励（传入Frenet坐标和动作）
         reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
@@ -310,7 +335,10 @@ class TeraflowSimulator:
 
         # 计算目标和初始化goal_reached，速度很快
         # print(self.agents_goal_quad_ids)
-        goal_positions = self.path_planner.get_quad_centers(self.agents_goal_quad_ids)
+
+        # goal_positions = self.path_planner.get_quad_centers(self.agents_goal_quad_ids)
+        goal_positions = self.goal_positions
+
         waypoint_reached = torch.ones((B, M), dtype=torch.bool, device=self.device)
 
         # 调用奖励计算器，这个速度很快
@@ -353,20 +381,81 @@ class TeraflowSimulator:
             return
         start_i32 = self.agents_start_quad_ids.to(dtype=torch.int32, device=self.device)
         goal_i32 = torch.full_like(start_i32, -1, dtype=torch.int32, device=self.device)
-        # 仅对“激活且起点有效”的样本，从最近K个quads中随机选一个作为终点
+        # 仅对"激活且起点有效"的样本，从最近K个quads中随机选一个作为终点
         valid_mask = (active_mask) & (start_i32 >= 0)
         if valid_mask.any():
-            rand_vals = torch.randint(0, self.road_network.num_quads, (int(active_mask.sum().item()),), device=self.device, dtype=torch.int32)
-            goal_i32 = goal_i32.masked_scatter(active_mask, rand_vals)
+            rand_vals = torch.randint(0, self.road_network.num_quads, (int(valid_mask.sum().item()),), device=self.device, dtype=torch.int32)
+            goal_i32 = goal_i32.masked_scatter(valid_mask, rand_vals)
         # 一次性调用 planner（形状为 (B,M,1)）
         start_3d = start_i32.unsqueeze(-1)
         goal_3d = goal_i32.unsqueeze(-1)
         prepare_time_done = time.time()
         print(f"prepare_time_done: {prepare_time_done-prepare_time:.4f}s")
-        path_plans = self.path_planner.plan_path(start_3d, goal_3d)  # 形状 (B,M,L,2)
+        
+        # 只对有效的起点和终点进行路径规划
+        valid_planning_mask = (start_i32 >= 0) & (goal_i32 >= 0) & active_mask
+        if valid_planning_mask.any():
+            # 创建临时的起点和终点，将无效的设置为-1
+            start_3d_valid = torch.where(valid_planning_mask.unsqueeze(-1), start_3d, torch.tensor([[-1]], device=self.device))
+            goal_3d_valid = torch.where(valid_planning_mask.unsqueeze(-1), goal_3d, torch.tensor([[-1]], device=self.device))
+            path_plans = self.path_planner.plan_path(start_3d_valid, goal_3d_valid)  # 形状 (B,M,L,2)
+        else:
+            # 如果没有有效的路径规划，创建空的路径
+            path_plans = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
         # 存储结果
         self.agents_goal_quad_ids = goal_i32
         self.agents_path_plans = path_plans
+        
+        # 由于收敛性问题，需要将agents_path_plans的路径逐渐放长
+        path_observation_length = 2
+        # 创建全-1的中间tensor，保持原始长度128
+        B, M, _, _ = self.agents_path_plans.shape
+        filtered_paths = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
+        # 只将前两个位置赋予有效值
+        filtered_paths[:, :, :path_observation_length, :] = self.agents_path_plans[:, :, :path_observation_length, :]
+        self.agents_path_plans = filtered_paths
+        
+        # 设置goal_positions为路径的第二个点（批量操作）
+        B, M, L, _ = self.agents_path_plans.shape
+        # 批量找到所有有效点
+        valid_mask = (self.agents_path_plans[..., 0] != -1) & (self.agents_path_plans[..., 1] != -1)  # (B, M, L)
+        # 对每个路径，找到前两个有效点的位置
+        ar = torch.arange(L, device=self.device).unsqueeze(0).unsqueeze(0).expand(B, M, -1)
+        # 将无效位置排到后面
+        big = L + 1000
+        order_score = torch.where(valid_mask, ar, ar + big)
+        order = torch.argsort(order_score, dim=2, stable=True)
+        
+        # 获取第二个有效点作为目标位置
+        second_valid_indices = order[:, :, 1]  # (B, M)
+        # 检查是否有第二个有效点
+        has_second = valid_mask.gather(2, second_valid_indices.unsqueeze(-1)).squeeze(-1)  # (B, M)
+        
+        # 如果没有第二个有效点，使用第一个有效点
+        first_valid_indices = order[:, :, 0]  # (B, M)
+        has_first = valid_mask.gather(2, first_valid_indices.unsqueeze(-1)).squeeze(-1)  # (B, M)
+        
+        # 选择目标索引：优先第二个，其次第一个，最后使用当前位置
+        target_indices = torch.where(
+            has_second, 
+            second_valid_indices,
+            torch.where(has_first, first_valid_indices, torch.zeros_like(first_valid_indices))
+        )
+        
+        # 批量获取目标位置
+        batch_indices = torch.arange(B, device=self.device).unsqueeze(1).expand(-1, M)
+        agent_indices = torch.arange(M, device=self.device).unsqueeze(0).expand(B, -1)
+        
+        # 获取目标位置
+        self.goal_positions = self.agents_path_plans[batch_indices, agent_indices, target_indices]
+        
+        # 对于没有有效点的智能体，使用当前位置
+        no_valid_points = ~(has_second | has_first)
+        if no_valid_points.any():
+            # 正确索引：no_valid_points是(B,M)的布尔mask
+            current_positions = self.agents_state[..., :2]  # (B, M, 2)
+            self.goal_positions[no_valid_points] = current_positions[no_valid_points]
+
         # 初始化path_plans的局部坐标版本
         self._update_path_plans_local()
 
@@ -429,6 +518,44 @@ class TeraflowSimulator:
         
         # 存储转换后的局部坐标
         self.agents_path_plans_local = path_plans_local
+        
+    def _check_and_remove_reached_waypoints(self):
+        """
+        检查并移除已到达的路径点。
+        当车辆与路径规划中的某个点的距离小于1米时，将该点从路径规划中移除（设置为-1, -1）。
+        使用向量化操作提高效率。
+        """
+        if self.agents_path_plans_local is None or self.agents_state is None:
+            return
+        
+        B, M, L, _ = self.agents_path_plans_local.shape
+        
+        # 获取激活掩码
+        active_mask = self.agents_state[..., 6] > 0.5  # (B, M)
+        
+        if not active_mask.any():
+            return  # 没有激活的车辆
+        
+        # 计算所有车辆到所有路径点的距离（向量化）
+        # agents_path_plans_local: (B, M, L, 2)
+        # 计算每个路径点的模长（距离）
+        distances = torch.norm(self.agents_path_plans_local, dim=-1)  # (B, M, L)
+        
+        # 找到有效的路径点（不是-1, -1）且距离小于1米的点
+        valid_waypoints = (self.agents_path_plans_local[..., 0] != -1) & (self.agents_path_plans_local[..., 1] != -1)  # (B, M, L)
+        reached_waypoints = valid_waypoints & (distances < 1.0)  # (B, M, L)
+        
+        # 只对激活的车辆处理
+        reached_waypoints = reached_waypoints & active_mask.unsqueeze(-1)  # (B, M, L)
+        
+        if reached_waypoints.any():
+            # 将到达的路径点设置为-1, -1
+            invalid_fill = torch.full_like(self.agents_path_plans, -1.0)
+            self.agents_path_plans = torch.where(reached_waypoints.unsqueeze(-1), invalid_fill, self.agents_path_plans)
+            self.agents_path_plans_local = torch.where(reached_waypoints.unsqueeze(-1), invalid_fill, self.agents_path_plans_local)
+            
+            # 重新更新局部坐标（因为agents_path_plans可能已经改变）
+            self._update_path_plans_local()
 
 if __name__ == '__main__':
     # 这是一个简单的使用示例，用于测试模拟器的基本功能

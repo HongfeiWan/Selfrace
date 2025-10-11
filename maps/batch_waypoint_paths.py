@@ -367,7 +367,7 @@ class WaypointGraphGPU:
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='随机批量测试 WaypointGraphGPU 寻路')
-    parser.add_argument('--graph', type=str, default='maps/cross_data_processed_map_Town01_stitched.json', help='包含 waypoint_graph 的 cross_data_* JSON 路径')
+    parser.add_argument('--graph', type=str, default='./maps/cross_data_processed_map_Town01_stitched.json', help='包含 waypoint_graph 的 cross_data_* JSON 路径')
     parser.add_argument('--num_pairs', type=int, default=360000, help='随机生成的 (start,end) 对数')
     parser.add_argument('--fixed_len', type=int, default=100, help='固定路径长度 L')
     parser.add_argument('--device', type=str, default=None, help='cuda 或 cpu，默认自动')

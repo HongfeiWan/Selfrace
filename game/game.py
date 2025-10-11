@@ -8,7 +8,6 @@ import random
 import yaml
 import torch
 import pygame
-import matplotlib
 import matplotlib.pyplot as plt
 import swanlab
 
@@ -29,9 +28,8 @@ from ddppo import decompose_observation, build_network_features
 from network import create_network
 
 class CarGame:
-    def __init__(self):
-        
 
+    def __init__(self):
         # 加载默认配置（不需要传入路径）
         config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'configs', 'default_config.yaml') 
         self.config = yaml.safe_load(open(config_path, 'r', encoding='utf-8'))
@@ -72,6 +70,10 @@ class CarGame:
             self.simulator.reward_calculator.sampled_params,
             self.config_ns,
         )
+        # 缓存用于可视化的邻居观测
+        self.last_neighbors_local = neighbors_local
+        # 缓存用于可视化的边界观测（oob参考）
+        self.last_w_boundaries_local = w_boundaries_local
 
         # 游戏状态
         self.clock = pygame.time.Clock()
@@ -137,6 +139,17 @@ class CarGame:
             'dead_car': (255, 215, 0)
         }
 
+        # 控制模式：默认人工键盘；按F1切换为自动(网络)
+        self.auto_mode = False
+        # 待执行的手动动作索引（按键触发后生效一次）
+        self.pending_manual_action_idx = None
+        # 键位映射到动作索引（qwertyuiop[] -> 12个离散动作）
+        self.key_to_action = {
+            pygame.K_q: 0,  pygame.K_w: 1,  pygame.K_e: 2,  pygame.K_r: 3,
+            pygame.K_t: 4,  pygame.K_y: 5,  pygame.K_u: 6,  pygame.K_i: 7,
+            pygame.K_o: 8,  pygame.K_p: 9,  pygame.K_LEFTBRACKET: 10,  pygame.K_RIGHTBRACKET: 11,
+        }
+
         # 创建一个SwanLab项目
         swanlab.init(
             # 设置项目名
@@ -166,13 +179,11 @@ class CarGame:
         done_mask = dones.to(rewards.dtype)
         advantages = torch.zeros_like(rewards)
         gae = torch.zeros_like(rewards[0])
-        
         # 从最后一个时间步开始向前计算
         for t in range(T - 1, -1, -1):
             # 计算TD误差：delta = r_t + γ * V(s_{t+1}) * (1 - done_t) - V(s_t)
             # 注意：done_t表示在时间步t之后是否结束，所以done_t=1时，V(s_{t+1})应该为0
             delta = rewards[t] + gamma * values[t + 1] * (1.0 - done_mask[t]) - values[t]
-            
             # 计算GAE：gae_t = delta_t + γ * λ * (1 - done_t) * gae_{t+1}
             gae = delta + gamma * gae_lambda * (1.0 - done_mask[t]) * gae
             advantages[t] = gae
@@ -186,9 +197,9 @@ class CarGame:
         try:
             # 使用交互模式，避免阻塞pygame主循环
             plt.ion()
-            # 单独起一个窗口，两个子图：上-损失；下-平均回报
-            self.fig, (self.ax_loss, self.ax_reward) = plt.subplots(2, 1, figsize=(7, 6))
-            self.fig.canvas.manager.set_window_title("PPO Metrics")
+            # 单独起一个窗口，三个子图：上-损失；中-平均回报；下-动作概率分布
+            self.fig, (self.ax_loss, self.ax_reward, self.ax_action_prob) = plt.subplots(3, 1, figsize=(8, 10))
+            self.fig.canvas.manager.set_window_title("PPO Metrics & Action Probabilities")
             # 初始空图（左右双坐标轴）：左轴-Value Loss；右轴-Policy Loss
             self.ax_loss_right = self.ax_loss.twinx()
             self.loss_value_line, = self.ax_loss.plot([], [], label="Value Loss", color="tab:blue")
@@ -208,6 +219,23 @@ class CarGame:
             self.ax_reward.legend(loc="best")
             self.ax_reward.grid(True, linestyle=":", alpha=0.4)
 
+            # 动作概率分布子图
+            self.ax_action_prob.set_xlabel("Action Index")
+            self.ax_action_prob.set_ylabel("Probability")
+            self.ax_action_prob.set_title("Current Vehicle Action Probability Distribution")
+            self.ax_action_prob.grid(True, linestyle=":", alpha=0.4)
+            # 初始化12个动作的条形图
+            self.action_bars = self.ax_action_prob.bar(range(12), [0]*12, color='skyblue', alpha=0.7)
+            self.ax_action_prob.set_xlim(-0.5, 11.5)
+            self.ax_action_prob.set_ylim(0, 1.0)
+            # 设置x轴标签
+            self.ax_action_prob.set_xticks(range(12))
+            self.ax_action_prob.set_xticklabels([f'A{i}' for i in range(12)])
+            # 添加文本显示当前观测车辆信息
+            self.vehicle_info_text = self.ax_action_prob.text(0.02, 0.95, '', transform=self.ax_action_prob.transAxes, 
+                                                             verticalalignment='top', fontsize=10, 
+                                                             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
             self.fig.tight_layout()
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
@@ -217,6 +245,7 @@ class CarGame:
             self.ax_loss = None
             self.ax_loss_right = None
             self.ax_reward = None
+            self.ax_action_prob = None
 
     def _update_plots(self):
         """刷新曲线数据（非阻塞）"""
@@ -262,11 +291,89 @@ class CarGame:
                     rmax = rmin + 1.0
                 self.ax_reward.set_ylim(rmin - 0.05 * abs(rmax), rmax + 0.05 * abs(rmax))
 
+            # 更新动作概率分布
+            if hasattr(self, 'ax_action_prob') and self.ax_action_prob is not None:
+                self._update_action_probabilities()
+
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
             plt.pause(0.001)
         except Exception:
             pass
+
+    def _update_action_probabilities(self):
+        """更新当前观测车辆的动作概率分布显示"""
+        try:
+            # 获取当前观测的车辆索引
+            b_obs, m_obs = self._get_player_agent_bm()
+            if b_obs == -1 or m_obs == -1:
+                # 没有可观测的车辆，显示零概率
+                for i, bar in enumerate(self.action_bars):
+                    bar.set_height(0.0)
+                if hasattr(self, 'vehicle_info_text'):
+                    self.vehicle_info_text.set_text('No active vehicle')
+                return
+
+            # 更新车辆信息文本
+            if hasattr(self, 'vehicle_info_text'):
+                mode_text = 'Auto' if self.auto_mode else 'Manual'
+                self.vehicle_info_text.set_text(f'Vehicle B={b_obs}, M={m_obs} ({mode_text})')
+
+            # 获取当前车辆的动作概率
+            action_probs = self._get_current_action_probabilities(b_obs, m_obs)
+            
+            # 更新条形图高度
+            for i, bar in enumerate(self.action_bars):
+                if i < len(action_probs):
+                    bar.set_height(action_probs[i])
+                else:
+                    bar.set_height(0.0)
+            
+            # 高亮当前选择的动作
+            if hasattr(self, 'last_actions') and self.last_actions is not None:
+                if b_obs < self.last_actions.shape[0] and m_obs < self.last_actions.shape[1]:
+                    current_action = self.last_actions[b_obs, m_obs].item()
+                    # 重置所有条形颜色
+                    for bar in self.action_bars:
+                        bar.set_color('skyblue')
+                    # 高亮当前动作
+                    if 0 <= current_action < len(self.action_bars):
+                        self.action_bars[current_action].set_color('red')
+                        
+        except Exception as e:
+            # 如果出错，显示零概率
+            for bar in self.action_bars:
+                bar.set_height(0.0)
+            if hasattr(self, 'vehicle_info_text'):
+                self.vehicle_info_text.set_text('Error loading probabilities')
+
+    def _get_current_action_probabilities(self, b_idx, m_idx):
+        """获取指定车辆的动作概率分布"""
+        try:
+            if not self.auto_mode:
+                # 手动模式：返回one-hot分布
+                if hasattr(self, 'last_actions') and self.last_actions is not None:
+                    if b_idx < self.last_actions.shape[0] and m_idx < self.last_actions.shape[1]:
+                        current_action = self.last_actions[b_idx, m_idx].item()
+                        probs = [0.0] * 12
+                        if 0 <= current_action < 12:
+                            probs[current_action] = 1.0
+                        return probs
+                return [0.0] * 12
+            
+            # 自动模式：通过网络获取概率分布
+            if hasattr(self, 'features_tensor') and self.features_tensor is not None:
+                with torch.no_grad():
+                    # 获取当前车辆的特征
+                    if b_idx < self.features_tensor.shape[0] and m_idx < self.features_tensor.shape[1]:
+                        vehicle_features = self.features_tensor[b_idx:b_idx+1, m_idx:m_idx+1]
+                        action_logits = self.model.forward(vehicle_features, mode="policy")
+                        action_probs = torch.softmax(action_logits, dim=-1)
+                        return action_probs[0, 0].cpu().numpy().tolist()
+            
+            return [0.0] * 12
+        except Exception:
+            return [0.0] * 12
 
     def _check_all_worlds_no_alive_agents(self) -> bool:
         """检查是否所有世界都没有存活agents（用于决定是否开启新iteration）。"""
@@ -276,7 +383,6 @@ class CarGame:
             # 检查所有世界的agents状态
             all_agents_state = self.simulator.agents_state  # (B, M, S)
             B, M, S = all_agents_state.shape
-            
             # 如果没有done状态记录，检查是否有active的agents
             if not hasattr(self, 'cumulative_done_all') or self.cumulative_done_all is None:
                 # 初始化时，只要有active的agents就认为有存活的
@@ -286,7 +392,6 @@ class CarGame:
                     if active_mask.any():
                         return False  # 有active的agents，认为有存活的
                 return True  # 没有active的agents
-                
             # 快速检查，无多余日志
             # 检查每个世界是否有存活的agents
             for b in range(B):
@@ -402,38 +507,58 @@ class CarGame:
         return 0.0, 0.0, 0.0
 
     def update_game_state(self):
-        """使用 TeraflowSimulator 推进一步，并更新显示状态（env0）。模仿ddppo.py的buffer和rollout逻辑"""
+        """推进一步：默认人工模式仅在按下动作键时推进；F1切换自动模式后按原逻辑连续推进。"""
         if self.simulator is None:
             return
-        # 若所有world均无存活agent，立即处理：先训练（若buffer非空），随后重置，避免继续做昂贵计算
+        # 若所有world均无存活agent
         if self._check_all_worlds_no_alive_agents():
-            if self.buffer_step_count > 0:
+            if self.auto_mode and self.buffer_step_count > 0:
                 self.perform_ppo_update()
             self.reset_simulator()
             return
 
-        # 使用网络输出动作分布并采样动作（与训练一致）
-        with torch.no_grad():
-            action_logits = self.model.forward(self.features_tensor, mode="policy")
-            value_pred = self.model.forward(self.features_tensor, mode="value")
-        action_dist = torch.distributions.Categorical(logits=action_logits)
-        actions = action_dist.sample()
-        
-        # 保存本步动作以便UI显示
-        self.last_actions = actions.detach().to('cpu')
-        
-        # 在推进环境前缓存当前状态，确保states_buffer记录的是“动作作用前”的s_t
+        # 选择动作：自动模式 -> 网络；人工模式 -> 等待按键
+        if self.auto_mode:
+            with torch.no_grad():
+                action_logits = self.model.forward(self.features_tensor, mode="policy")
+                value_pred = self.model.forward(self.features_tensor, mode="value")
+            action_dist = torch.distributions.Categorical(logits=action_logits)
+            actions = action_dist.sample()
+            self.last_actions = actions.detach().to('cpu')
+        else:
+            # 未按键则不推进
+            if self.pending_manual_action_idx is None:
+                return
+            # 构造整批动作：所有激活智能体同一个动作（简单手动控制）
+            B, M, _ = self.simulator.agents_state.shape
+            act = int(self.pending_manual_action_idx)
+            actions = torch.full((B, M), act, dtype=torch.long, device=self.device)
+            self.last_actions = actions.detach().to('cpu')
+            value_pred = torch.zeros((B, M), device=self.device)
+            # 清除一次性按键
+            self.pending_manual_action_idx = None
+
+        # 在推进环境前缓存当前状态
         pre_state = self.simulator.agents_state.clone()
 
-        # 推进环境
+        # 推进一步
         obs, reward, done = self.simulator.step(actions)
-        
-        # 将数据存入buffer（模仿ddppo.py）：存入的是step前的状态s_t
+
+        # 写入训练buffer（手动/自动均写入；手动模式用0占位的value，并存动作概率为one-hot）
         self.states_buffer.append(pre_state)
         self.rewards_buffer.append(reward.clone())
         self.dones_buffer.append(done.clone())
         self.values_buffer.append(value_pred.clone())
-        self.old_log_probs_buffer.append(action_dist.log_prob(actions).clone())
+        if self.auto_mode and 'action_dist' in locals():
+            # 存储整分布概率 (B,M,A)
+            self.old_log_probs_buffer.append(action_dist.probs.detach().clone())
+        else:
+            # 手动模式：构造one-hot概率分布 (B,M,A)
+            B, M = actions.shape
+            num_actions = int(self.simulator.dynamics_model.discrete_action_space.num_actions)
+            probs = torch.zeros((B, M, num_actions), device=self.device)
+            probs.scatter_(-1, actions.long().unsqueeze(-1), 1.0)
+            self.old_log_probs_buffer.append(probs)
         self.actions_buffer.append(actions.clone())
         self.buffer_step_count += 1
         
@@ -449,6 +574,10 @@ class CarGame:
             self.simulator.reward_calculator.sampled_params,
             self.config_ns,
         )
+        # 更新可视化用邻居观测
+        self.last_neighbors_local = neighbors_local
+        # 更新可视化用边界观测
+        self.last_w_boundaries_local = w_boundaries_local
 
         # 保存本step用于UI显示的reward（当前视角玩家）
         b_ui, m_ui = self._get_player_agent_bm()
@@ -498,8 +627,8 @@ class CarGame:
         # current_step_reward 已在上方设置
         self.step_count += 1
         
-        # 检查是否需要进行rollout更新（模仿ddppo.py）
-        if self.buffer_step_count >= self.rollout_length or self.step_count >= self.max_steps:
+        # 仅在自动模式下根据rollout进行更新
+        if self.auto_mode and (self.buffer_step_count >= self.rollout_length or self.step_count >= self.max_steps):
             if self.step_count >= self.max_steps:
                 print(f"🎯 第 {self.iteration_count} 个iteration - 达到最大步数 {self.max_steps}，强制开始PPO更新...")
                 # 达到最大步数，训练完毕后直接进入新iteration
@@ -509,7 +638,7 @@ class CarGame:
             else:
                 print(f"🎯 第 {self.iteration_count} 个iteration - 达到rollout长度 {self.rollout_length}，开始PPO更新...")
                 self.perform_ppo_update()
-                
+    
                 # 检查是否所有世界都没有存活agents，如果是则开启新iteration
                 if self._check_all_worlds_no_alive_agents():
                     print("🔄 所有世界都没有存活agents，开启新iteration...")
@@ -518,6 +647,10 @@ class CarGame:
                     print("✅ 仍有世界有存活agents，继续下一个128step...")
                     # 仅清空采样buffer，保留累计的dones用于可视化与死亡着色
                     self.reset_buffers()
+        
+        # 每步都更新动作概率分布显示
+        if hasattr(self, 'ax_action_prob') and self.ax_action_prob is not None:
+            self._update_action_probabilities()
     
     def reset_simulator(self):
         """重置simulator，模仿ddppo.py - 相当于进入新的iteration"""
@@ -538,6 +671,10 @@ class CarGame:
             self.simulator.reward_calculator.sampled_params,
             self.config_ns,
         )
+        # 重置可视化用邻居观测
+        self.last_neighbors_local = neighbors_local
+        # 重置可视化用边界观测
+        self.last_w_boundaries_local = w_boundaries_local
         
         # 重置死亡/完成状态（保留跨rollout的一致性从新iteration开始）
         self.dead_mask_all_worlds = None
@@ -566,7 +703,6 @@ class CarGame:
         if len(self.states_buffer) == 0:
             print("⚠️ Buffer为空，无法进行PPO更新")
             return
-
         print(f"🎯 开始经验采样训练，Buffer长度: {len(self.states_buffer)}")
         
         # 将buffer转换为tensor
@@ -577,11 +713,8 @@ class CarGame:
         states_tensor = torch.stack(self.states_buffer, dim=0)  # (T, B, M, S)
         rewards_tensor = torch.stack(self.rewards_buffer, dim=0)  # (T, B, M)
         dones_tensor = torch.stack(self.dones_buffer, dim=0)  # (T, B, M)
-        # 直接使用原始的done状态，不进行累积
-        # 每个时间步的done状态应该独立处理
-        dones_accum = dones_tensor
         values_tensor = torch.stack(self.values_buffer, dim=0)  # (T, B, M)
-        old_log_probs_tensor = torch.stack(self.old_log_probs_buffer, dim=0)  # (T, B, M)
+        old_log_probs_tensor = torch.stack(self.old_log_probs_buffer, dim=0)  # (T, B, M) or (T, B, M, A)
         actions_tensor = torch.stack(self.actions_buffer, dim=0)  # (T, B, M)
         
         # 计算最后一个状态的价值（bootstrap）
@@ -593,7 +726,8 @@ class CarGame:
         if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
             last_value_pred = last_value_pred.squeeze(-1)  # (B, M)
         values_tp1 = torch.cat([values_tensor, last_value_pred.unsqueeze(0)], dim=0)
-        # 计算GAE优势
+        # 计算GAE优势（使用段内前缀 OR 的累计 done 掩码，符合PPO定义）
+        dones_accum = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
         advantages, returns = self.gae_advantages(rewards_tensor, values_tp1, dones_accum, self.gamma, self.gae_lambda)
         
         # 优势过滤（模仿ddppo.py）
@@ -620,7 +754,6 @@ class CarGame:
         
         print(f"🎯 第 {self.iteration_count} 个iteration - 最大|A|: {A_max:.4f}, EWMA: {self.A_max_ewma:.4f}, 阈值: {eta:.4f}")
         print(f"📊 过滤前: {keep_mask.numel()}, 过滤后: {keep_mask.sum().item()}")
-        
         if cand_idx.numel() == 0:
             print("⚠️ 无可用样本，跳过更新")
             return
@@ -642,7 +775,17 @@ class CarGame:
         
         # 提取选中的样本
         agent_indices_batch = selected_m.to(self.device)
-        old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
+        # old_log_probs 兼容两种格式：
+        # 1) 标量对数概率 (T,B,M)
+        # 2) 概率分布 (T,B,M,A) —— 需按所选动作提取并取log
+        if old_log_probs_tensor.dim() == 4:
+            action_idx_flat = actions_tensor[selected_t, selected_b, selected_m]
+            probs_selected = old_log_probs_tensor[selected_t, selected_b, selected_m, action_idx_flat]
+            old_log_probs_batch = torch.log(torch.clamp(probs_selected, min=1e-8))
+        else:
+            # (T,B,M) 标量logp
+            old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m]
+        old_log_probs_batch = old_log_probs_batch.view(-1)
         advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
         returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
         advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
@@ -727,9 +870,6 @@ class CarGame:
             entropy = dist_selected.entropy().mean()
             policy_total_loss = policy_loss - self.entropy_coef * entropy
             
-            
-
-
             # 策略网络更新
             self.policy_optimizer.zero_grad()
             policy_total_loss.backward()
@@ -767,7 +907,9 @@ class CarGame:
         # 统计并记录本次更新的均值指标
         try:
             # 平均reward（按本次buffer的全部样本）
-            avg_reward_this_update = float(torch.stack(self.rewards_buffer, dim=0).mean().item())
+            #avg_reward_this_update = float(torch.stack(self.rewards_buffer, dim=0).mean().item())
+            rewards_tensor = torch.stack(self.rewards_buffer, dim=0)
+            avg_reward_this_update = float(rewards_tensor[selected_t, selected_b, selected_m].mean().item())
         except Exception:
             avg_reward_this_update = 0.0
         try:
@@ -776,6 +918,17 @@ class CarGame:
         except Exception:
             mean_policy_loss = 0.0
             mean_value_loss = 0.0
+
+        # 记录到 SwanLab
+        try:
+            swanlab.log({
+                "avg_reward": avg_reward_this_update,
+                "mean_policy_loss": mean_policy_loss,
+                "mean_value_loss": mean_value_loss,
+                "update_index": self.update_index + 1,
+            })
+        except Exception:
+            pass
 
         self.update_index += 1
         self.avg_rewards_per_update.append(avg_reward_this_update)
@@ -791,73 +944,130 @@ class CarGame:
         self.screen.fill(self.colors['grass'])
         # 绘制道路
         self.draw_road_from_network()
-        # 绘制目标（来自 simulator 的 agents_goal_quad_ids -> quad centers）
-        try:
-            goal_ids = getattr(self.simulator, 'agents_goal_quad_ids', None)
-            if goal_ids is not None:
-                # 确定当前视角来自哪个世界
-                if hasattr(self, '_current_view_world'):
-                    world_idx = self._current_view_world
-                else:
-                    world_idx = 0  # 默认世界0
-                
-                world_goal_ids = goal_ids[world_idx]
-                # 取当前玩家智能体的目标
-                b_p, m_p = self._get_player_agent_bm()
-                if m_p >= 0 and b_p == world_idx:
-                    goal_quad_id = int(world_goal_ids[m_p].item())
-                    if goal_quad_id >= 0:
-                        quad_centers = self.simulator.road_network.quad_centerlines.mean(dim=1)
-                        gx, gy = quad_centers[goal_quad_id]
-                        goal_screen_pos = self.convert_world_to_screen(torch.tensor([[gx, gy]], dtype=torch.float32, device=self.device))
-                        if goal_screen_pos:
-                            pygame.draw.circle(self.screen, self.colors['goal'], goal_screen_pos[0], int(10.0))
-                        else:
-                            self.draw_goal_indicator()
-        except Exception:
-            pass
-        
-        # 绘制玩家路径（模仿simulator.py中的路径绘制）
-        self.draw_player_path()
-        
+        # 绘制视野虚线圆
+        self.draw_vision_circle()
+        # 已移除导航目标与路径绘制
         # 绘制来自模拟器的智能体（当前视角世界内激活体）；死亡的车辆变色并停在死亡时姿态
         # 确定当前视角来自哪个世界
         if hasattr(self, '_current_view_world'):
             view_world_idx = self._current_view_world
         else:
             view_world_idx = 0  # 默认世界0
-        
-        current_world = self.simulator.agents_state[view_world_idx]
-        active_mask = current_world[:, 6] > 0.5
-        active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(-1).tolist()
-        
-        for order, agent_idx in enumerate(active_indices):
-            # 检查是否死亡（检查当前视角世界的死亡状态）
-            is_dead = False
-            if hasattr(self, 'dead_mask_all_worlds') and self.dead_mask_all_worlds is not None:
-                if view_world_idx < self.dead_mask_all_worlds.shape[0] and agent_idx < self.dead_mask_all_worlds.shape[1]:
-                    is_dead = bool(self.dead_mask_all_worlds[view_world_idx, agent_idx].item())
+        # 仅可视化：玩家车辆 + 通过观测重建的邻居车辆 + oob观测点（边界）
+        b_p, m_p = self._get_player_agent_bm()
+        if b_p >= 0 and m_p >= 0 and b_p == view_world_idx:
+            # 绘制玩家车辆
+            self.draw_car(m_p, is_player=True, color_override=None, world_idx=view_world_idx)
+            # 绘制玩家的导航信息：绘制路径规划中的所有有效点（局部->世界，散点显示，不连线）
+            try:
+                if hasattr(self.simulator, 'agents_path_plans_local') and self.simulator.agents_path_plans_local is not None:
+                    path_local = self.simulator.agents_path_plans_local[b_p, m_p]  # (L, 2)
+                    # 有效点：排除占位的(0,0)
+                    if path_local.ndim >= 2 and path_local.shape[-1] >= 2:
+                        valid_mask = (path_local[..., 0] != 0) | (path_local[..., 1] != 0)
+                        valid_pts_local = path_local[valid_mask]
+                        if valid_pts_local.shape[0] > 0:
+                            pts_local = valid_pts_local[:, :2]
+                            # 局部->世界
+                            player_state = self.simulator.agents_state[b_p, m_p]
+                            px = float(player_state[0].item())
+                            py = float(player_state[1].item())
+                            pyaw = float(player_state[2].item())
+                            cos_y = math.cos(pyaw)
+                            sin_y = math.sin(pyaw)
+                            rot = torch.tensor([[cos_y, -sin_y],[sin_y, cos_y]], dtype=torch.float32, device=self.device)
+                            world_pts = pts_local @ rot.T + torch.tensor([px, py], dtype=torch.float32, device=self.device)
+                            screen_pts = self.convert_world_to_screen(world_pts)
+                            # 散点显示所有路径点
+                            for sp in screen_pts:
+                                pygame.draw.circle(self.screen, (0, 180, 0), sp, 3)
+            except Exception:
+                pass
+
+            # 绘制观测到的邻居（基于 neighbors_local 的局部相对量重建世界坐标）
+            try:
+                if hasattr(self, 'last_neighbors_local') and self.last_neighbors_local is not None:
+                    neigh_local = self.last_neighbors_local[b_p, m_p]  # (K, 7)
+                    player_state = self.simulator.agents_state[b_p, m_p]
+                    px = float(player_state[0].item())
+                    py = float(player_state[1].item())
+                    pyaw = float(player_state[2].item())
+                    cos_y = math.cos(pyaw)
+                    sin_y = math.sin(pyaw)
+                    rot = torch.tensor([[cos_y, -sin_y],[sin_y, cos_y]], dtype=torch.float32, device=self.device)
+                    for k in range(neigh_local.shape[0]):
+                        active_k = float(neigh_local[k, 6].item()) > 0.5
+                        if not active_k:
+                            continue
+                        # 局部相对位置与相对速度
+                        dx = float(neigh_local[k, 0].item())
+                        dy = float(neigh_local[k, 1].item())
+                        dvx_local = float(neigh_local[k, 2].item())
+                        dvy_local = float(neigh_local[k, 3].item())
+                        length = float(neigh_local[k, 4].item())
+                        width = float(neigh_local[k, 5].item())
+                        # 局部中心 -> 世界中心
+                        local_pt = torch.tensor([[dx, dy]], dtype=torch.float32, device=self.device)
+                        world_pt = (local_pt @ rot.T).squeeze(0) + torch.tensor([px, py], dtype=torch.float32, device=self.device)
+                        # 自车绝对速度（世界）
+                        ego_speed = float(player_state[3].item())
+                        vx_ego = ego_speed * cos_y
+                        vy_ego = ego_speed * sin_y
+                        # 相对速度(局部) -> 世界相对速度
+                        rv = torch.tensor([[dvx_local, dvy_local]], dtype=torch.float32, device=self.device)
+                        rv_world = (rv @ rot.T).squeeze(0)
+                        rvx_world = float(rv_world[0].item())
+                        rvy_world = float(rv_world[1].item())
+                        # 近似邻居绝对速度 = 自车绝对速度 + 相对世界速度
+                        nvx_world = vx_ego + rvx_world
+                        nvy_world = vy_ego + rvy_world
+                        speed_mag = math.hypot(nvx_world, nvy_world)
+                        if speed_mag > 1e-2:
+                            yaw_world = math.atan2(nvy_world, nvx_world)
+                        else:
+                            yaw_world = pyaw
+                        half_l = max(0.1, length * 0.5)
+                        half_w = max(0.1, width * 0.5)
+                        local_box = torch.tensor([
+                            [-half_l, -half_w],
+                            [ half_l, -half_w],
+                            [ half_l,  half_w],
+                            [-half_l,  half_w],
+                        ], dtype=torch.float32, device=self.device)
+                        cos_n = math.cos(yaw_world)
+                        sin_n = math.sin(yaw_world)
+                        rot_n = torch.tensor([[cos_n, -sin_n],[sin_n, cos_n]], dtype=torch.float32, device=self.device)
+                        world_box = local_box @ rot_n.T + world_pt
+                        pts = self.convert_world_to_screen(world_box)
+                        if len(pts) >= 4:
+                            pygame.draw.polygon(self.screen, self.colors['other_car'], pts, width=0)
+            except Exception:
+                pass
             
-            if is_dead and hasattr(self, 'dead_pose_all_worlds') and (view_world_idx, agent_idx) in self.dead_pose_all_worlds:
-                # 直接在此处按缓存姿态绘制（避免额外函数）
-                x, y, yaw, length, width = self.dead_pose_all_worlds[(view_world_idx, agent_idx)]
-                half_l = max(0.1, length * 0.5)
-                half_w = max(0.1, width * 0.5)
-                local = torch.tensor([
-                    [-half_l, -half_w],
-                    [ half_l, -half_w],
-                    [ half_l,  half_w],
-                    [-half_l,  half_w],
-                ], dtype=torch.float32, device=self.device)
-                cos_y = math.cos(yaw)
-                sin_y = math.sin(yaw)
-                rot = torch.tensor([[cos_y, -sin_y],[sin_y, cos_y]], dtype=torch.float32, device=self.device)
-                world = local @ rot.T + torch.tensor([x, y], dtype=torch.float32, device=self.device)
-                pts = self.convert_world_to_screen(world)
-                if len(pts) >= 4:
-                    pygame.draw.polygon(self.screen, self.colors['dead_car'], pts, width=0)
-            else:
-                self.draw_car(agent_idx, is_player=(order == 0), color_override=None, world_idx=view_world_idx)
+            # 绘制边界观测点（oob观测）：将 w_boundaries_local 从局部坐标变换到世界坐标并绘制散点
+            try:
+                if hasattr(self, 'last_w_boundaries_local') and self.last_w_boundaries_local is not None:
+                    bounds_local = self.last_w_boundaries_local[b_p, m_p]  # (Nb, 2)
+                    player_state = self.simulator.agents_state[b_p, m_p]
+                    px = float(player_state[0].item())
+                    py = float(player_state[1].item())
+                    pyaw = float(player_state[2].item())
+                    cos_y = math.cos(pyaw)
+                    sin_y = math.sin(pyaw)
+                    rot = torch.tensor([[cos_y, -sin_y],[sin_y, cos_y]], dtype=torch.float32, device=self.device)
+                    # 有效边界点：排除 (0,0) 占位
+                    if bounds_local.ndim >= 2 and bounds_local.shape[-1] >= 2:
+                        valid = (bounds_local[..., 0] != 0) | (bounds_local[..., 1] != 0)
+                        pts_local = bounds_local[valid][..., :2]
+                        if pts_local.numel() > 0:
+                            # (N,2) -> 旋转平移到世界坐标
+                            world_pts = pts_local @ rot.T + torch.tensor([px, py], dtype=torch.float32, device=self.device)
+                            screen_pts = self.convert_world_to_screen(world_pts)
+                            for sp in screen_pts:
+                                pygame.draw.circle(self.screen, (0, 0, 0), sp, 2)
+            except Exception:
+                pass
+
         # 绘制UI
         self.draw_ui()
         # 更新显示
@@ -912,165 +1122,7 @@ class CarGame:
         
         except Exception as e:
             print(f"警告: 获取视野边界点失败: {e}")
-            return torch.empty((0, 2), device=self.device)
-    
-    def draw_player_path(self):
-        """绘制当前玩家智能体的路径（使用局部坐标路径）"""
-        try:
-            # 获取路径规划数据
-            if not hasattr(self.simulator, 'agents_path_plans_local') or self.simulator.agents_path_plans_local is None:
-                return
-            
-            # 确定当前视角来自哪个世界
-            if hasattr(self, '_current_view_world'):
-                world_idx = self._current_view_world
-            else:
-                world_idx = 0  # 默认世界0
-            
-            # 获取当前玩家智能体的索引（在当前视角世界中）
-            b_p, m_p = self._get_player_agent_bm()
-            if m_p < 0 or b_p != world_idx:
-                return
-            
-            # 获取当前玩家的局部路径 (B, M, L, 2) -> 取 (world_idx, player_idx, :, :)
-            path_plan_local = self.simulator.agents_path_plans_local[world_idx, m_p]  # (L, 2)
-            
-            # 获取当前玩家的世界坐标位置
-            player_state = self.simulator.agents_state[world_idx, m_p]
-            player_x = player_state[0].item()
-            player_y = player_state[1].item()
-            player_yaw = player_state[2].item()
-            
-            # 将局部坐标转换为世界坐标
-            cos_yaw = math.cos(player_yaw)
-            sin_yaw = math.sin(player_yaw)
-            
-            # 旋转矩阵（从局部坐标系到世界坐标系）
-            rot_matrix = torch.tensor([
-                [cos_yaw, -sin_yaw],
-                [sin_yaw, cos_yaw]
-            ], dtype=torch.float32, device=self.device)
-            
-            # 将局部路径转换为世界坐标
-            path_plan = torch.zeros_like(path_plan_local)
-            for i, local_point in enumerate(path_plan_local):
-                if local_point[0] != 0 or local_point[1] != 0:  # 有效路径点
-                    world_point = local_point @ rot_matrix.T + torch.tensor([player_x, player_y], device=self.device)
-                    path_plan[i] = world_point
-            
-            # 过滤有效路径点（x, y != 0）
-            valid_mask = (path_plan[:, 0] != 0) & (path_plan[:, 1] != 0)
-            if not valid_mask.any():
-                return
-            
-            valid_path = path_plan[valid_mask]  # (N_valid, 2)
-            
-            # 将路径点转换为屏幕坐标
-            screen_path_points = []
-            for point in valid_path:
-                world_point = torch.tensor([[point[0].item(), point[1].item()]], dtype=torch.float32, device=self.device)
-                screen_points = self.convert_world_to_screen(world_point)
-                if screen_points:
-                    screen_path_points.append(screen_points[0])
-            
-            # 绘制路径线（红色虚线，模仿simulator.py）
-            if len(screen_path_points) >= 2:
-                for i in range(len(screen_path_points) - 1):
-                    start_point = screen_path_points[i]
-                    end_point = screen_path_points[i + 1]
-                    # 使用虚线效果（每隔几个像素画一个点）
-                    self.draw_dashed_line(start_point, end_point, (255, 0, 0), 2)
-            
-            # 绘制起点（红色圆点）
-            if screen_path_points:
-                pygame.draw.circle(self.screen, (255, 0, 0), screen_path_points[0], 5)
-            
-            # 绘制终点（红色叉号）
-            if len(screen_path_points) >= 2:
-                end_point = screen_path_points[-1]
-                # 绘制叉号
-                cross_size = 2
-                pygame.draw.line(self.screen, (255, 0, 0), 
-                               (end_point[0] - cross_size, end_point[1] - cross_size),
-                               (end_point[0] + cross_size, end_point[1] + cross_size), 3)
-                pygame.draw.line(self.screen, (255, 0, 0), 
-                               (end_point[0] - cross_size, end_point[1] + cross_size),
-                               (end_point[0] + cross_size, end_point[1] - cross_size), 3)
-                
-        except Exception as e:
-            print(f"警告: 绘制玩家路径失败: {e}")
-    
-    def draw_dashed_line(self, start_point, end_point, color, width):
-        """绘制虚线"""
-        try:
-            x1, y1 = start_point
-            x2, y2 = end_point
-            # 计算距离和方向
-            dx = x2 - x1
-            dy = y2 - y1
-            distance = math.sqrt(dx*dx + dy*dy)
-            if distance == 0:
-                return
-            # 虚线参数
-            dash_length = 8
-            gap_length = 4
-            # 单位方向向量
-            unit_x = dx / distance
-            unit_y = dy / distance
-            # 绘制虚线
-            current_distance = 0
-            while current_distance < distance:
-                # 计算当前段的起点和终点
-                start_dist = current_distance
-                end_dist = min(current_distance + dash_length, distance)
-                start_x = int(x1 + start_dist * unit_x)
-                start_y = int(y1 + start_dist * unit_y)
-                end_x = int(x1 + end_dist * unit_x)
-                end_y = int(y1 + end_dist * unit_y)
-                # 绘制线段
-                pygame.draw.line(self.screen, color, (start_x, start_y), (end_x, end_y), width)
-                # 移动到下一个段
-                current_distance += dash_length + gap_length
-                
-        except Exception as e:
-            print(f"警告: 绘制虚线失败: {e}")
-
-    def draw_goal_indicator(self):
-        """在屏幕边缘绘制目标指示器"""
-        try:
-            # 从模拟器获取玩家当前位置与目标位置
-            px, py, _ = self._get_player_pose()
-            goal_ids = getattr(self.simulator, 'agents_goal_quad_ids', None)
-            
-            # 确定当前视角来自哪个世界
-            if hasattr(self, '_current_view_world'):
-                world_idx = self._current_view_world
-            else:
-                world_idx = 0  # 默认世界0
-            
-            world_goal_ids = goal_ids[world_idx]
-            world_states = self.simulator.agents_state[world_idx]
-            active_mask = world_states[:, 6] > 0.5
-            
-            first_idx = int(torch.nonzero(active_mask, as_tuple=False)[0].item())
-            goal_quad_id = int(world_goal_ids[first_idx].item())
-            
-            quad_centers = self.simulator.road_network.quad_centerlines.mean(dim=1)
-            gx, gy = quad_centers[goal_quad_id]
-            dx = float(gx.item() - px)
-            dy = float(gy.item() - py)
-            # 计算方向角度
-            angle = math.atan2(dy, dx)
-            # 在屏幕边缘绘制指示器
-            screen_center_x = self.width // 2
-            screen_center_y = self.height // 2
-            indicator_radius = min(self.width, self.height) // 2 - 30
-            indicator_x = screen_center_x + int(indicator_radius * math.cos(angle))
-            indicator_y = screen_center_y + int(indicator_radius * math.sin(angle))
-            # 绘制指示器
-            pygame.draw.circle(self.screen, (255, 255, 0), (indicator_x, indicator_y), 5)
-        except Exception as e:
-            print(f"警告: 绘制目标指示器失败: {e}")
+            return torch.empty((0, 2), device=self.device) 
     
     def draw_boundary_points(self, screen_points: List[Tuple[int, int]]):
         """绘制边界点作为散点（优化版本）"""
@@ -1106,10 +1158,8 @@ class CarGame:
         else:
             # 获取汽车位置作为视野中心
             car_x, car_y, _ = self._get_player_pose()
-
             # 视野范围（米）
             vision_radius = 100.0
-            
             # 计算缩放比例，留出边距
             margin = 50
             scale_x = (self.width - 2 * margin) / (2 * vision_radius)
@@ -1120,7 +1170,6 @@ class CarGame:
             # 缓存参数
             self._cached_scale_params = (scale_x, scale_y, car_x, car_y)
             self._last_scale_car_pos = current_car_pos
-        
         # 转换坐标（使用向量化操作）不翻转地图（世界y向上 => 屏幕y减小）
         screen_points = []
         for point in world_points:
@@ -1167,25 +1216,67 @@ class CarGame:
         front_screen = self.convert_world_to_screen(front_world)
         if center_screen and front_screen:
             pygame.draw.line(self.screen, (255, 255, 0), center_screen[0], front_screen[0], 2)
+
+    def draw_dashed_circle(self, center: Tuple[int, int], radius: int, color: Tuple[int, int, int], width: int = 1, dash_deg: float = 8.0, gap_deg: float = 6.0):
+        """绘制虚线圆（通过短线段近似）。"""
+        try:
+            cx, cy = center
+            angle = 0.0
+            total_deg = 360.0
+            while angle < total_deg:
+                start_deg = angle
+                end_deg = min(angle + dash_deg, total_deg)
+                # 将弧段用两端点连线近似
+                start_rad = math.radians(start_deg)
+                end_rad = math.radians(end_deg)
+                x1 = int(cx + radius * math.cos(start_rad))
+                y1 = int(cy + radius * math.sin(start_rad))
+                x2 = int(cx + radius * math.cos(end_rad))
+                y2 = int(cy + radius * math.sin(end_rad))
+                pygame.draw.line(self.screen, color, (x1, y1), (x2, y2), width)
+                angle += (dash_deg + gap_deg)
+        except Exception:
+            pass
+
+    def draw_vision_circle(self):
+        """在屏幕中心绘制与观测半径相同的虚线圆，用于可视化视野大小。"""
+        # 从缓存参数读取缩放与中心（convert_world_to_screen 中已缓存）
+        if not hasattr(self, '_cached_scale_params') or self._cached_scale_params is None:
+            # 触发一次坐标转换以填充缓存
+            visible_boundary_points = self.get_visible_boundary_points()
+            _ = self.convert_world_to_screen(visible_boundary_points[:1])
+        if not hasattr(self, '_cached_scale_params') or self._cached_scale_params is None:
+            return
+        scale_x, scale_y, car_x, car_y = self._cached_scale_params
+        # 与 convert_world_to_screen 中一致的视野半径
+        vision_radius_m = 100.0
+        # 使用较小的缩放保持宽高比，convert_world_to_screen 已做 min(scale_x, scale_y)
+        scale = min(scale_x, scale_y)
+        radius_px = int(vision_radius_m * scale)
+        center = (self.width // 2, self.height // 2)
+        self.draw_dashed_circle(center, radius_px, (0, 0, 0), width=1, dash_deg=8.0, gap_deg=6.0)
   
     def draw_ui(self):
         """绘制用户界面"""
         # 统一显示UI：step信息 + 当前观察玩家的(B,M)
-        step_reward = getattr(self, 'current_step_reward', 0.0)
-        reward_text = self.font.render(f"step reward: {step_reward:.4f}", True, self.colors['text'])
         step_text = self.font.render(f"step: {self.step_count}/{self.max_steps}", True, self.colors['text'])
         iteration_text = self.font.render(f"Iteration: {self.iteration_count}", True, self.colors['text'])
         buffer_text = self.font.render(f"Buffer steps: {self.buffer_step_count}/{self.rollout_length}", True, self.colors['text'])
         b_obs, m_obs = self._get_player_agent_bm()
         bm_text = self.font.render(f"View Player: B={max(b_obs,0)}, M={max(m_obs,0)}", True, (255, 100, 0))
-        self.screen.blit(reward_text, (10, 10))
-        self.screen.blit(step_text, (10, 50))
-        self.screen.blit(iteration_text, (10, 90))
-        self.screen.blit(buffer_text, (10, 130))
-        self.screen.blit(bm_text, (10, 170))
+        mode_text = self.font.render(f"Mode: {'Auto(F1)' if self.auto_mode else 'Manual(F1)'}", True, (0, 128, 255))
+        step_reward_text = self.small_font.render(f"step reward: {getattr(self, 'current_step_reward', 0.0):.4f}", True, self.colors['text'])
+        # 调整左上角位置：去掉 step reward 后上移
+        self.screen.blit(step_text, (10, 10))
+        self.screen.blit(iteration_text, (10, 50))
+        self.screen.blit(buffer_text, (10, 90))
+        self.screen.blit(bm_text, (10, 130))
+        self.screen.blit(step_reward_text, (10, 270))
+        self.screen.blit(mode_text, (10, 290))
 
         # 显示玩家车辆状态（来自当前视角world）
         px, py, pyaw = self._get_player_pose()
+
         # 游戏进行中，显示动态信息
         b_cur, m_cur = self._get_player_agent_bm()
         if b_cur >= 0 and m_cur >= 0:
@@ -1198,6 +1289,7 @@ class CarGame:
         else:
             speed_val = 0.0
             a_idx = 0
+
         # 当前观测车辆 active/done 状态
         if b_cur >= 0 and m_cur >= 0:
             active_bool = bool((self.simulator.agents_state[b_cur, m_cur, 6] > 0.5).item())
@@ -1209,33 +1301,31 @@ class CarGame:
             active_bool = False
             done_bool = False
 
-        speed_text = self.small_font.render(f"speed: {speed_val:.2f} m/s", True, self.colors['text'])
-        heading_text = self.small_font.render(f"heading: {math.degrees(pyaw):.1f}°", True, self.colors['text'])
-        action_text = self.small_font.render(f"current action idx: {a_idx}", True, self.colors['text'])
-        active_text = self.small_font.render(f"active: {active_bool}", True, self.colors['text'])
-        done_text = self.small_font.render(f"done: {done_bool}", True, self.colors['text'])
-        self.screen.blit(speed_text, (10, 200))
-        self.screen.blit(heading_text, (10, 220))
-        self.screen.blit(action_text, (10, 240))
-        self.screen.blit(active_text, (10, 260))
-        self.screen.blit(done_text, (10, 280))
-        
-        # 显示汽车世界坐标
+        # 车世界坐标（放到 speed 上方，字体与 speed 相同）
         car_world_pos = f"car world pos: ({px:.1f}, {py:.1f})"
         car_pos_text = self.small_font.render(car_world_pos, True, self.colors['text'])
-        self.screen.blit(car_pos_text, (10, 300))
-        
+        speed_text = self.small_font.render(f"speed: {speed_val:.2f} m/s", True, self.colors['text'])
+        heading_text = self.small_font.render(f"heading: {math.degrees(pyaw):.1f}°", True, self.colors['text'])
+        active_text = self.small_font.render(f"active: {active_bool}", True, self.colors['text'])
+        done_text = self.small_font.render(f"done: {done_bool}", True, self.colors['text'])
+        # 先绘制车世界坐标，再绘制速度等
+        self.screen.blit(car_pos_text, (10, 180))
+        self.screen.blit(speed_text, (10, 200))
+        self.screen.blit(heading_text, (10, 220))
+        self.screen.blit(active_text, (10, 240))
+        self.screen.blit(done_text, (10, 260))
         # 显示目标世界坐标
         if hasattr(self, 'goal') and self.goal:
             goal_world_pos = f"goal world pos: ({self.goal['x']:.1f}, {self.goal['y']:.1f})"
             goal_pos_text = self.small_font.render(goal_world_pos, True, self.colors['text'])
             self.screen.blit(goal_pos_text, (10, 320))
-        
-        # 显示视野信息
-        vision_info = f"vision radius: 100m, visible points: {len(self.get_visible_boundary_points())}"
-        vision_text = self.small_font.render(vision_info, True, self.colors['text'])
-        self.screen.blit(vision_text, (10, 340))
-        
+        else:
+            # 手动控制提示
+            help1 = self.small_font.render("Manual: q w e r t y u i o p [ ] -> actions", True, self.colors['text'])
+            help2 = self.small_font.render("F1 toggle Auto; ESC quit", True, self.colors['text'])
+            self.screen.blit(help1, (10, 320))
+            self.screen.blit(help2, (10, 340))
+    
         # 显示当前视角world的车辆信息
         view_b = getattr(self, '_current_view_world', 0)
         world_states = self.simulator.agents_state[view_b]
@@ -1250,42 +1340,8 @@ class CarGame:
         total_active = int(active_mask.sum().item())
         car_info = f"World {view_b} - alive: {alive_num}, dead: {dead_num}, total: {total_active}"
         car_text = self.small_font.render(car_info, True, self.colors['text'])
-        self.screen.blit(car_text, (10, 360))
-        
-        # 显示多世界状态信息
-        try:
-            all_agents_state = self.simulator.agents_state  # (B, M, S)
-            B, M, S = all_agents_state.shape
-            
-            # 显示当前视角世界信息
-            if hasattr(self, '_current_view_world'):
-                current_view_world = self._current_view_world
-            else:
-                current_view_world = 0
-            
-            world_info = f"Worlds: {B}, Agents per world: {M}, View: World {current_view_world}"
-            world_text = self.small_font.render(world_info, True, self.colors['text'])
-            self.screen.blit(world_text, (10, 380))
-            
-            # 显示每个世界的存活状态
-            alive_worlds = 0
-            for b in range(B):
-                world_agents = all_agents_state[b]
-                active_mask = world_agents[:, 6] > 0.5
-                if active_mask.any():
-                    if hasattr(self, 'cumulative_done_all') and self.cumulative_done_all is not None:
-                        world_done = self.cumulative_done_all[b]
-                        alive_mask = active_mask & (~world_done)
-                        if alive_mask.any():
-                            alive_worlds += 1
-                    else:
-                        alive_worlds += 1
-            
-            alive_worlds_info = f"Alive worlds: {alive_worlds}/{B}"
-            alive_worlds_text = self.small_font.render(alive_worlds_info, True, self.colors['text'])
-            self.screen.blit(alive_worlds_text, (10, 400))
-        except Exception:
-            pass
+        # 显示在 car world pos 之上，字体与其一致
+        self.screen.blit(car_text, (10, 160))
         
     def run(self):
         """运行游戏主循环（可视化）。"""
@@ -1294,8 +1350,18 @@ class CarGame:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.running = False
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    self.running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self.running = False
+                    elif event.key == pygame.K_F1:
+                        # 切换自动/人工模式
+                        self.auto_mode = not self.auto_mode
+                        mode = 'Auto' if self.auto_mode else 'Manual'
+                        print(f"切换模式: {mode}")
+                    else:
+                        # 人工模式下记录一次性动作
+                        if not self.auto_mode and event.key in self.key_to_action:
+                            self.pending_manual_action_idx = self.key_to_action[event.key]
             # 推进模拟器并绘制
             self.update_game_state()
             # 绘制画面
