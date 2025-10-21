@@ -122,6 +122,11 @@ class CarGame:
         self.policy_losses_per_update = []
         self.value_losses_per_update = []
         self._init_plots()
+        
+        # 路径观察长度动态调整相关
+        self.path_observation_length = 2  # 初始路径观察长度
+        self.reward_positive_count = 0  # 连续正奖励计数
+        self.reward_positive_threshold = 1  # 需要连续3次正奖励才增加路径长度
 
         # 字体
         self.font = pygame.font.Font(None, 36)
@@ -139,8 +144,8 @@ class CarGame:
             'dead_car': (255, 215, 0)
         }
 
-        # 控制模式：默认人工键盘；按F1切换为自动(网络)
-        self.auto_mode = False
+        # 控制模式：默认自动模式（相当于启动时自动按F1）
+        self.auto_mode = True
         # 待执行的手动动作索引（按键触发后生效一次）
         self.pending_manual_action_idx = None
         # 键位映射到动作索引（qwertyuiop[] -> 12个离散动作）
@@ -934,7 +939,43 @@ class CarGame:
         self.avg_rewards_per_update.append(avg_reward_this_update)
         self.policy_losses_per_update.append(mean_policy_loss)
         self.value_losses_per_update.append(mean_value_loss)
+        
+        # 检查平均奖励并调整路径观察长度
+        self._check_and_adjust_path_length(avg_reward_this_update)
+        
         self._update_plots()
+    
+    def _check_and_adjust_path_length(self, avg_reward: float):
+        """
+        检查平均奖励并动态调整路径观察长度
+        
+        Args:
+            avg_reward (float): 当前更新的平均奖励
+        """
+        # 如果平均奖励大于0，增加连续正奖励计数
+        if avg_reward > 0:
+            self.reward_positive_count += 1
+            print(f"🎯 平均奖励为正: {avg_reward:.4f}, 连续正奖励计数: {self.reward_positive_count}")
+        else:
+            # 如果平均奖励不为正，重置计数
+            self.reward_positive_count = 0
+        
+        # 当连续正奖励达到阈值且当前路径长度小于最大值时，增加路径长度
+        if (self.reward_positive_count >= self.reward_positive_threshold and 
+            self.path_observation_length < 128):
+            
+            # 渐进式增加路径长度，每次增加1
+            new_length = min(128, self.path_observation_length + 1)
+            self.path_observation_length = new_length
+            
+            # 更新simulator中的路径观察长度
+            if hasattr(self.simulator, 'set_path_observation_length'):
+                self.simulator.set_path_observation_length(new_length)
+            
+            print(f"🚀 路径观察长度已增加到: {self.path_observation_length}")
+            
+            # 重置计数，避免连续增加
+            self.reward_positive_count = 0
 
 # ========================= 绘图 =================================
 

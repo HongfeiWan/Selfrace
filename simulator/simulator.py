@@ -407,11 +407,14 @@ class TeraflowSimulator:
         self.agents_path_plans = path_plans
         
         # 由于收敛性问题，需要将agents_path_plans的路径逐渐放长
-        path_observation_length = 2
+        # 使用动态的path_observation_length，可以通过外部设置
+        if not hasattr(self, 'path_observation_length'):
+            self.path_observation_length = 2  # 初始值
+        path_observation_length = self.path_observation_length
         # 创建全-1的中间tensor，保持原始长度128
         B, M, _, _ = self.agents_path_plans.shape
         filtered_paths = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
-        # 只将前两个位置赋予有效值
+        # 只将前path_observation_length个位置赋予有效值
         filtered_paths[:, :, :path_observation_length, :] = self.agents_path_plans[:, :, :path_observation_length, :]
         self.agents_path_plans = filtered_paths
         
@@ -457,6 +460,37 @@ class TeraflowSimulator:
             self.goal_positions[no_valid_points] = current_positions[no_valid_points]
 
         # 初始化path_plans的局部坐标版本
+        self._update_path_plans_local()
+    
+    def set_path_observation_length(self, length: int):
+        """
+        动态设置路径观察长度
+        
+        Args:
+            length (int): 新的路径观察长度，范围[2, 128]
+        """
+        length = max(2, min(128, length))  # 限制在合理范围内
+        self.path_observation_length = length
+        print(f"路径观察长度已更新为: {self.path_observation_length}")
+        
+        # 如果当前有路径规划，需要重新应用新的长度
+        if hasattr(self, 'agents_path_plans') and self.agents_path_plans is not None:
+            self._apply_path_observation_length()
+    
+    def _apply_path_observation_length(self):
+        """
+        应用当前的path_observation_length到现有的路径规划
+        """
+        if not hasattr(self, 'agents_path_plans') or self.agents_path_plans is None:
+            return
+            
+        B, M, _, _ = self.agents_path_plans.shape
+        filtered_paths = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
+        # 只将前path_observation_length个位置赋予有效值
+        filtered_paths[:, :, :self.path_observation_length, :] = self.agents_path_plans[:, :, :self.path_observation_length, :]
+        self.agents_path_plans = filtered_paths
+        
+        # 重新更新局部坐标
         self._update_path_plans_local()
 
     def _update_path_plans_local(self):
