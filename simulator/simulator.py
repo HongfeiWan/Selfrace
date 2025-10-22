@@ -600,7 +600,10 @@ if __name__ == '__main__':
     from matplotlib.patches import Polygon, Circle
     from matplotlib.collections import PatchCollection
     
-    config_path = 'configs/default_config.yaml'
+    # 基于文件位置解析项目根目录，避免依赖当前工作目录
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    _proj_root = os.path.dirname(_this_dir)
+    config_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 

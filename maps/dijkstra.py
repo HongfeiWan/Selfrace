@@ -146,7 +146,7 @@ def find_shortest_path(graph, start_node, end_node):
         return [], float('inf') # 未找到路径
     return path[::-1], distances[end_node]
 
-def plan_path_and_visualize(config_path='./configs/default_config.yaml', visualize=True):
+def plan_path_and_visualize(config_path=None, visualize=True):
     """
     加载地图、构建图、规划路径并可选择性地进行可视化。
     Args:
@@ -154,6 +154,11 @@ def plan_path_and_visualize(config_path='./configs/default_config.yaml', visuali
         visualize (bool): 是否启动 Matplotlib 可视化。
     """
     # 1. 读取配置文件
+    if config_path is None:
+        # 基于文件位置解析项目根目录
+        _this_dir = os.path.dirname(os.path.abspath(__file__))
+        _proj_root = os.path.dirname(_this_dir)
+        config_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
@@ -362,6 +367,4 @@ def plan_path_and_visualize(config_path='./configs/default_config.yaml', visuali
     plt.show()
 
 if __name__ == '__main__':
-    # 用户指定的路径是相对于工作区根目录的
-    config_file_path = './configs/default_config.yaml'
-    plan_path_and_visualize(config_file_path, visualize=True) 
+    plan_path_and_visualize(None, visualize=True)

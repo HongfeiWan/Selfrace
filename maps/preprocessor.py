@@ -1007,12 +1007,15 @@ def preprocess_map(stage1_data_path, output_path):
 
 
 if __name__ == '__main__':
-    # 使用默认配置文件中的地图路径
+    # 使用默认配置文件中的地图路径（基于文件位置解析项目根目录）
     import yaml
-    with open('configs/default_config.yaml', 'r', encoding='utf-8') as f:
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    _proj_root = os.path.dirname(_this_dir)
+    _cfg_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
+    with open(_cfg_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     map_path = config['simulator']['map_path'] #导出路径
-    stage1_path = "maps/carla_map_data_Town01_stitched.json"
+    stage1_path = os.path.join(_proj_root, "maps", "carla_map_data_Town01_stitched.json")
     output_path = map_path                     #导出路径
     print(f"Using default map path: {map_path}")
     print(f"Output path: {output_path}")

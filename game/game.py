@@ -931,6 +931,7 @@ class CarGame:
                 "mean_policy_loss": mean_policy_loss,
                 "mean_value_loss": mean_value_loss,
                 "update_index": self.update_index + 1,
+                "path_observation_length": self.path_observation_length,
             })
         except Exception:
             pass
@@ -973,6 +974,15 @@ class CarGame:
                 self.simulator.set_path_observation_length(new_length)
             
             print(f"🚀 路径观察长度已增加到: {self.path_observation_length}")
+            
+            # 记录路径长度变化到SwanLab
+            try:
+                swanlab.log({
+                    "path_observation_length": self.path_observation_length,
+                    "path_length_increase": True,
+                })
+            except Exception:
+                pass
             
             # 重置计数，避免连续增加
             self.reward_positive_count = 0

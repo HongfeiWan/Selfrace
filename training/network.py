@@ -390,8 +390,12 @@ if __name__ == "__main__":
         # 设置设备为 cuda:0
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         print(f"🔧 使用设备: {device}")
-        # 读取配置文件
-        with open('configs/default_config.yaml', 'r', encoding='utf-8') as f:
+        # 读取配置文件（基于文件位置解析项目根目录）
+        import os
+        _this_dir = os.path.dirname(os.path.abspath(__file__))
+        _proj_root = os.path.dirname(_this_dir)
+        _cfg_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
+        with open(_cfg_path, 'r', encoding='utf-8') as f:
             config_dict = yaml.safe_load(f)
         # 转换为对象
         config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))

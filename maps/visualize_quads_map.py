@@ -162,11 +162,13 @@ if __name__ == '__main__':
     if args.unified_json_file is not None:
         unified_json_path = os.path.abspath(args.unified_json_file)
     else:
-        # 没有输入参数时，读取 configs/default_config.yaml
-        with open('configs/default_config.yaml', 'r', encoding='utf-8') as f:
+        # 没有输入参数时，读取项目根目录下的 configs/default_config.yaml
+        _this_dir = os.path.dirname(os.path.abspath(__file__))
+        _proj_root = os.path.dirname(_this_dir)
+        _cfg_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
+        with open(_cfg_path, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
-        unified_json_path = config['simulator']['map_path']
-        unified_json_path = os.path.abspath(unified_json_path)
+        unified_json_path = os.path.abspath(config['simulator']['map_path'])
         #print(f"未指定输入文件，自动读取默认配置: {unified_json_path}")
 
     visualize_map(unified_json_path)

@@ -387,6 +387,388 @@ def check_gpu_info(print_info: bool = True, **kwargs):
 		log("💡 请确保已正确安装CUDA和对应版本的PyTorch")
 		return False, []
 
+# ============================== 检查是否所有世界无存活agent ==============================
+def all_worlds_no_alive_agents(simulator, cumulative_done_all=None) -> bool:
+	"""
+	检查是否所有世界都没有存活的智能体。
+	与game.py的_check_all_worlds_no_alive_agents逻辑完全一致。
+	"""
+	try:
+		states = simulator.agents_state  # (B, M, S)
+		B, M, S = states.shape
+		
+		# 如果没有done状态记录，检查是否有active的agents
+		if cumulative_done_all is None:
+			# 初始化时，只要有active的agents就认为有存活的
+			for b in range(B):
+				world_agents = states[b]  # (M, S)
+				active_mask = world_agents[:, 6] > 0.5  # active状态
+				if active_mask.any():
+					return False  # 有active的agents，认为有存活的
+			return True  # 没有active的agents
+		
+		# 检查每个世界是否有存活的agents
+		for b in range(B):
+			world_agents = states[b]  # (M, S)
+			active_mask = world_agents[:, 6] > 0.5  # active状态
+			# 如果有active的agents，检查是否有存活的
+			if active_mask.any():
+				world_done = cumulative_done_all[b].to(active_mask.device)  # 使用累积done状态
+				alive_mask = active_mask & (~world_done)
+				if alive_mask.any():
+					return False  # 这个世界还有存活的agents
+		return True  # 所有世界都没有存活的agents
+	except Exception:
+		return True
+
+# ============================== 单卡PPO更新函数 ==============================
+def perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer, 
+								 states_buffer, rewards_buffer, dones_buffer, 
+								 values_buffer, old_log_probs_buffer, actions_buffer,
+								 features_tensor, simulator, config, iteration):
+	"""执行PPO更新，模仿game.py的逻辑"""
+	if len(states_buffer) == 0:
+		print("⚠️ Buffer为空，无法进行PPO更新")
+		return
+	print(f"🎯 开始经验采样训练，Buffer长度: {len(states_buffer)}")
+	
+	# 将buffer转换为tensor
+	T = len(states_buffer)
+	B, M, S = states_buffer[0].shape
+	
+	# 构建tensor buffer
+	states_tensor = torch.stack(states_buffer, dim=0)  # (T, B, M, S)
+	rewards_tensor = torch.stack(rewards_buffer, dim=0)  # (T, B, M)
+	dones_tensor = torch.stack(dones_buffer, dim=0)  # (T, B, M)
+	values_tensor = torch.stack(values_buffer, dim=0)  # (T, B, M)
+	old_log_probs_tensor = torch.stack(old_log_probs_buffer, dim=0)  # (T, B, M)
+	actions_tensor = torch.stack(actions_buffer, dim=0)  # (T, B, M)
+	
+	# 计算最后一个状态的价值（bootstrap）
+	with torch.no_grad():
+		last_value_pred = model.forward(features_tensor, mode="value")
+	
+	# 构建values_tp1用于GAE计算
+	if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
+		last_value_pred = last_value_pred.squeeze(-1)  # (B, M)
+	values_tp1 = torch.cat([values_tensor, last_value_pred.unsqueeze(0)], dim=0)
+	
+	# 计算GAE优势（使用段内前缀 OR 的累计 done 掩码，符合PPO定义）
+	dones_accum = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
+	advantages, returns = gae_advantages(rewards_tensor, values_tp1, dones_accum, 0.999, 0.95)
+	
+	# 优势过滤
+	A_max = torch.max(torch.abs(advantages)).item()
+	eta = 0.01 * A_max
+	keep_mask = (torch.abs(advantages) >= eta)
+	
+	# 额外剔除：每个(B,M)智能体在第一次 done 之后的所有时间步
+	seen_done_inclusive = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
+	seen_done_prev = torch.roll(seen_done_inclusive, shifts=1, dims=0)
+	seen_done_prev[0] = False
+	first_done_step = dones_tensor & (~seen_done_prev)
+	post_done_mask = seen_done_inclusive & (~first_done_step)
+	keep_mask = keep_mask & (~post_done_mask)
+	cand_idx = keep_mask.nonzero(as_tuple=False)
+	
+	print(f"🎯 第 {iteration} 个iteration - 最大|A|: {A_max:.4f}, 阈值: {eta:.4f}")
+	print(f"📊 过滤前: {keep_mask.numel()}, 过滤后: {keep_mask.sum().item()}")
+	if cand_idx.numel() == 0:
+		print("⚠️ 无可用样本，跳过更新")
+		return
+	
+	# 随机选择样本进行更新
+	N = cand_idx.shape[0]
+	K = min(2000, N)  # batch_size_per_gpu
+	if N >= K:
+		rand_pos = torch.randperm(N, device=states_tensor.device)[:K]
+		selected_idx = cand_idx[rand_pos]
+	else:
+		rand_pos = torch.randint(0, N, (K,), device=states_tensor.device)
+		selected_idx = cand_idx[rand_pos]
+	
+	selected_t = selected_idx[:, 0]
+	selected_b = selected_idx[:, 1]
+	selected_m = selected_idx[:, 2]
+	print(f"🎯 随机选取 {K} 个样本用于更新（候选 {N}）")
+	
+	# 提取选中的样本
+	agent_indices_batch = selected_m.to(states_tensor.device)
+	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
+	advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
+	returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
+	actions_batch = actions_tensor[selected_t, selected_b, selected_m].view(-1)
+	advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+	
+	batch_N = old_log_probs_batch.shape[0]
+	print(f"🎯 开始PPO更新，样本数量: {batch_N}")
+	
+	# 训练模式
+	model.train()
+	# PPO更新循环
+	for epoch in range(3):  # ppo_epochs
+		# 重新生成观测和特征
+		mb_idx = torch.arange(batch_N, device=states_tensor.device)
+		mb_old_logp = old_log_probs_batch[mb_idx]
+		mb_adv = advantages_batch[mb_idx]
+		mb_ret = returns_batch[mb_idx]
+		mb_agent_idx = agent_indices_batch[mb_idx]
+		mb_actions = actions_batch[mb_idx]
+		
+		# 基于选中的样本重建特征
+		mb_t = selected_t[mb_idx]
+		mb_b = selected_b[mb_idx]
+		mb_m = selected_m[mb_idx]
+		
+		# 获取唯一的状态组合
+		uniq_tbm, inverse_mb = torch.unique(torch.stack([mb_t, mb_b, mb_m], dim=1), dim=0, return_inverse=True)
+		t_u_mb = uniq_tbm[:, 0]
+		b_u_mb = uniq_tbm[:, 1]
+		m_u_mb = uniq_tbm[:, 2]
+		
+		# 为每个唯一的(t,b,m)组合生成观测
+		agents_states_mb = states_tensor[t_u_mb, b_u_mb]  # (unique_samples, M, S)
+		
+		# 生成观测
+		obs_mb = simulator.observation_generator.generate(agents_states_mb)
+		agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
+		
+		# 构建特征
+		path_plan_mb = simulator.agents_path_plans[b_u_mb]
+		stop_lines_mb = simulator.stop_lines[b_u_mb] if (simulator.stop_lines is not None and simulator.stop_lines.numel() > 0) else simulator.stop_lines
+		reward_coef_mb = simulator.reward_calculator.sampled_params[b_u_mb]
+		
+		features_u_mb = build_network_features(
+			agents_state_dec_mb,
+			neighbors_local_mb,
+			w_lanes_local_mb,
+			w_boundaries_local_mb,
+			path_plan_mb,
+			stop_lines_mb,
+			reward_coef_mb,
+			config
+		)
+		u_idx_mb = inverse_mb.to(states_tensor.device)
+		mb_features = features_u_mb[u_idx_mb]
+		
+		# 策略更新
+		action_logits = model.forward(mb_features, mode="policy")
+		row_idx = torch.arange(mb_actions.shape[0], device=states_tensor.device)
+		logits_selected = action_logits[row_idx, mb_agent_idx]
+		dist_selected = torch.distributions.Categorical(logits=logits_selected)
+		new_log_probs = dist_selected.log_prob(mb_actions)
+		
+		# 计算比率和损失
+		ratio = torch.exp(new_log_probs - mb_old_logp)
+		surr1 = ratio * mb_adv
+		surr2 = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * mb_adv
+		policy_loss = -torch.min(surr1, surr2).mean()
+		
+		# 熵损失
+		entropy = dist_selected.entropy().mean()
+		policy_total_loss = policy_loss - 0.01 * entropy
+		
+		# 策略网络更新
+		policy_optimizer.zero_grad()
+		policy_total_loss.backward()
+		torch.nn.utils.clip_grad_norm_(model.policy_network.parameters(), 1.0)
+		policy_optimizer.step()
+		
+		# 价值网络更新
+		value_pred_full = model.forward(mb_features, mode="value").squeeze(-1)
+		value_pred = value_pred_full[row_idx, mb_agent_idx]
+		value_loss = (value_pred - mb_ret).pow(2).mean()
+		value_loss = 0.5 * value_loss
+		
+		value_optimizer.zero_grad()
+		value_loss.backward()
+		torch.nn.utils.clip_grad_norm_(model.value_network.parameters(), 1.0)
+		value_optimizer.step()
+		
+		print(f"   Epoch {epoch+1}/2: Policy Loss: {policy_loss.item():.6f}, Value Loss: {value_loss.item():.6f}, Entropy: {entropy.item():.6f}")
+	
+	# 切回评估模式
+	model.eval()
+	print(f"✅ 第 {iteration} 个iteration - 经验采样训练完成")
+
+# ============================== 多卡PPO更新函数 ==============================
+def perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer, 
+								states_buffer, rewards_buffer, dones_buffer, 
+								values_buffer, old_log_probs_buffer, actions_buffer,
+								features_tensor, simulator, config, iteration, rank):
+	"""执行多卡PPO更新，模仿game.py的逻辑"""
+	if len(states_buffer) == 0:
+		if rank == 0:
+			print("⚠️ Buffer为空，无法进行PPO更新")
+		return
+	if rank == 0:
+		print(f"🎯 开始经验采样训练，Buffer长度: {len(states_buffer)}")
+	
+	# 将buffer转换为tensor
+	T = len(states_buffer)
+	B, M, S = states_buffer[0].shape
+	
+	# 构建tensor buffer
+	states_tensor = torch.stack(states_buffer, dim=0)  # (T, B, M, S)
+	rewards_tensor = torch.stack(rewards_buffer, dim=0)  # (T, B, M)
+	dones_tensor = torch.stack(dones_buffer, dim=0)  # (T, B, M)
+	values_tensor = torch.stack(values_buffer, dim=0)  # (T, B, M)
+	old_log_probs_tensor = torch.stack(old_log_probs_buffer, dim=0)  # (T, B, M)
+	actions_tensor = torch.stack(actions_buffer, dim=0)  # (T, B, M)
+	
+	# 计算最后一个状态的价值（bootstrap）
+	with torch.no_grad():
+		last_value_pred = model.module.forward(features_tensor, mode="value")
+	
+	# 构建values_tp1用于GAE计算
+	if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
+		last_value_pred = last_value_pred.squeeze(-1)  # (B, M)
+	values_tp1 = torch.cat([values_tensor, last_value_pred.unsqueeze(0)], dim=0)
+	
+	# 计算GAE优势（使用段内前缀 OR 的累计 done 掩码，符合PPO定义）
+	dones_accum = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
+	advantages, returns = gae_advantages(rewards_tensor, values_tp1, dones_accum, 0.999, 0.95)
+	
+	# 优势过滤
+	A_max = torch.max(torch.abs(advantages)).item()
+	eta = 0.01 * A_max
+	keep_mask = (torch.abs(advantages) >= eta)
+	
+	# 额外剔除：每个(B,M)智能体在第一次 done 之后的所有时间步
+	seen_done_inclusive = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
+	seen_done_prev = torch.roll(seen_done_inclusive, shifts=1, dims=0)
+	seen_done_prev[0] = False
+	first_done_step = dones_tensor & (~seen_done_prev)
+	post_done_mask = seen_done_inclusive & (~first_done_step)
+	keep_mask = keep_mask & (~post_done_mask)
+	cand_idx = keep_mask.nonzero(as_tuple=False)
+	
+	if rank == 0:
+		print(f"🎯 第 {iteration} 个iteration - 最大|A|: {A_max:.4f}, 阈值: {eta:.4f}")
+		print(f"📊 过滤前: {keep_mask.numel()}, 过滤后: {keep_mask.sum().item()}")
+	if cand_idx.numel() == 0:
+		if rank == 0:
+			print("⚠️ 无可用样本，跳过更新")
+		return
+	
+	# 随机选择样本进行更新
+	N = cand_idx.shape[0]
+	K = min(2000, N)  # batch_size_per_gpu
+	if N >= K:
+		rand_pos = torch.randperm(N, device=states_tensor.device)[:K]
+		selected_idx = cand_idx[rand_pos]
+	else:
+		rand_pos = torch.randint(0, N, (K,), device=states_tensor.device)
+		selected_idx = cand_idx[rand_pos]
+	
+	selected_t = selected_idx[:, 0]
+	selected_b = selected_idx[:, 1]
+	selected_m = selected_idx[:, 2]
+	if rank == 0:
+		print(f"🎯 随机选取 {K} 个样本用于更新（候选 {N}）")
+	
+	# 提取选中的样本
+	agent_indices_batch = selected_m.to(states_tensor.device)
+	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
+	advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
+	returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
+	actions_batch = actions_tensor[selected_t, selected_b, selected_m].view(-1)
+	advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+	
+	batch_N = old_log_probs_batch.shape[0]
+	if rank == 0:
+		print(f"🎯 开始PPO更新，样本数量: {batch_N}")
+	
+	# 训练模式
+	model.train()
+	# PPO更新循环
+	for epoch in range(3):  # ppo_epochs
+		# 重新生成观测和特征
+		mb_idx = torch.arange(batch_N, device=states_tensor.device)
+		mb_old_logp = old_log_probs_batch[mb_idx]
+		mb_adv = advantages_batch[mb_idx]
+		mb_ret = returns_batch[mb_idx]
+		mb_agent_idx = agent_indices_batch[mb_idx]
+		mb_actions = actions_batch[mb_idx]
+		
+		# 基于选中的样本重建特征
+		mb_t = selected_t[mb_idx]
+		mb_b = selected_b[mb_idx]
+		mb_m = selected_m[mb_idx]
+		
+		# 获取唯一的状态组合
+		uniq_tbm, inverse_mb = torch.unique(torch.stack([mb_t, mb_b, mb_m], dim=1), dim=0, return_inverse=True)
+		t_u_mb = uniq_tbm[:, 0]
+		b_u_mb = uniq_tbm[:, 1]
+		m_u_mb = uniq_tbm[:, 2]
+		
+		# 为每个唯一的(t,b,m)组合生成观测
+		agents_states_mb = states_tensor[t_u_mb, b_u_mb]  # (unique_samples, M, S)
+		
+		# 生成观测
+		obs_mb = simulator.observation_generator.generate(agents_states_mb)
+		agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
+		
+		# 构建特征
+		path_plan_mb = simulator.agents_path_plans[b_u_mb]
+		stop_lines_mb = simulator.stop_lines[b_u_mb] if (simulator.stop_lines is not None and simulator.stop_lines.numel() > 0) else simulator.stop_lines
+		reward_coef_mb = simulator.reward_calculator.sampled_params[b_u_mb]
+		
+		features_u_mb = build_network_features(
+			agents_state_dec_mb,
+			neighbors_local_mb,
+			w_lanes_local_mb,
+			w_boundaries_local_mb,
+			path_plan_mb,
+			stop_lines_mb,
+			reward_coef_mb,
+			config
+		)
+		u_idx_mb = inverse_mb.to(states_tensor.device)
+		mb_features = features_u_mb[u_idx_mb]
+		
+		# 策略更新（DDP自动同步）
+		action_logits = model.module.forward(mb_features, mode="policy")
+		row_idx = torch.arange(mb_actions.shape[0], device=states_tensor.device)
+		logits_selected = action_logits[row_idx, mb_agent_idx]
+		dist_selected = torch.distributions.Categorical(logits=logits_selected)
+		new_log_probs = dist_selected.log_prob(mb_actions)
+		
+		# 计算比率和损失
+		ratio = torch.exp(new_log_probs - mb_old_logp)
+		surr1 = ratio * mb_adv
+		surr2 = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * mb_adv
+		policy_loss = -torch.min(surr1, surr2).mean()
+		
+		# 熵损失
+		entropy = dist_selected.entropy().mean()
+		policy_total_loss = policy_loss - 0.01 * entropy
+		
+		# 策略网络更新
+		policy_optimizer.zero_grad()
+		policy_total_loss.backward()
+		torch.nn.utils.clip_grad_norm_(model.module.policy_network.parameters(), 1.0)
+		policy_optimizer.step()
+		
+		# 价值网络更新（DDP自动同步）
+		value_pred_full = model.module.forward(mb_features, mode="value").squeeze(-1)
+		value_pred = value_pred_full[row_idx, mb_agent_idx]
+		value_loss = (value_pred - mb_ret).pow(2).mean()
+		value_loss = 0.5 * value_loss
+		
+		value_optimizer.zero_grad()
+		value_loss.backward()
+		torch.nn.utils.clip_grad_norm_(model.module.value_network.parameters(), 1.0)
+		value_optimizer.step()
+		
+		if rank == 0:
+			print(f"   Epoch {epoch+1}/2: Policy Loss: {policy_loss.item():.6f}, Value Loss: {value_loss.item():.6f}, Entropy: {entropy.item():.6f}")
+	
+	# 切回评估模式
+	model.eval()
+	if rank == 0:
+		print(f"✅ 第 {iteration} 个iteration - 经验采样训练完成")
+		
 # ============================== 寻找空闲端口 ==============================
 def _find_free_port() -> int:
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -450,7 +832,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		beta = getattr(training_cfg, 'advantage_filter_beta', 0.25)	# EWMA衰减参数
 		advantage_filter_threshold = getattr(training_cfg, 'advantage_filter_threshold', 0.01)	# 优势过滤阈值
 		A_max_ewma = None 		# EWMA of max absolute advantage
-		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 32000)  # 每GPU的batch size
+		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 2000)  # 每GPU的batch size
 		rollout_length = getattr(training_cfg, 'rollout_length', 128)  # rollout长度
 		
 		for k in range(num_iterations):
@@ -467,170 +849,109 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			features_tensor = build_network_features(
 				agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
 				path_plan, stop_lines, simulator.reward_calculator.sampled_params, config)
-			# =========================== 分段rollout：每段 rollout_length 后更新 ==============================
+			
+			# =========================== 步进式训练：与game.py完全一致 ==============================
 			B, M, S = agents_state.shape
-			t_global = 0
+			step_count = 0
+			
+			# 初始化全局buffer（与game.py一致）
+			states_buffer = []
+			rewards_buffer = []
+			dones_buffer = []
+			values_buffer = []
+			old_log_probs_buffer = []
+			actions_buffer = []
+			buffer_step_count = 0
+			
+			# 初始化累积done状态（与game.py一致）
+			cumulative_done_all = None
 
-			while t_global < max_episode_length:
-				segment_steps = min(rollout_length, max_episode_length - t_global)
-				# 本段buffer
-				states_buffer = torch.empty((segment_steps + 1, B, M, S), device=agents_state.device, dtype=agents_state.dtype)
-				rewards_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
-				dones_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
-				values_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
-				old_log_probs_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
-				actions_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device, dtype=torch.long)
-				states_buffer[0].copy_(agents_state)
-
-				# 段内采样
-				for t in range(segment_steps):
-					step_start_time = time.time()
-					with torch.no_grad():
-						action_logits = model.forward(features_tensor, mode="policy")
-						value_pred = model.forward(features_tensor, mode="value")
-					action_dist = torch.distributions.Categorical(logits=action_logits)
-					actions = action_dist.sample()
-					# 环境步进
-					observation, reward, done = simulator.step(actions)
-					# 更新观测与特征
-					agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
-					features_tensor = build_network_features(
-						agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
-						path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
-					)
-					# 写入buffer
-					states_buffer[t + 1].copy_(agents_state)
-					values_buffer[t] = value_pred.detach()
-					rewards_buffer[t] = reward
-					dones_buffer[t] = done
-					old_log_probs_buffer[t] = action_dist.log_prob(actions).detach()
-					actions_buffer[t] = actions.detach()
-					
-					print(f"\t📍 第 {t_global + t + 1}/{segment_steps} 步耗时: {time.time()-step_start_time:.4f}秒")
-
-				# 段末bootstrap并计算GAE
+			while step_count < max_episode_length:
+				# 全局死亡检测：如果所有世界都没有存活agents，执行PPO更新后开始新iteration
+				if all_worlds_no_alive_agents(simulator, cumulative_done_all):
+					if buffer_step_count > 0:
+						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
+						perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer, 
+													states_buffer, rewards_buffer, dones_buffer, 
+													values_buffer, old_log_probs_buffer, actions_buffer,
+													features_tensor, simulator, config, k+1)
+					else:
+						print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
+					break
+				
+				# 单步训练（与game.py的update_game_state一致）
+				step_start_time = time.time()
 				with torch.no_grad():
-					last_value_pred = model.forward(features_tensor, mode="value")
-				values_tp1 = torch.cat([values_buffer, last_value_pred.unsqueeze(0)], dim=0)
-				# 将dones在段内做前缀OR，避免某agent在段内的done从True回到False
-				dones_accum = (torch.cumsum(dones_buffer.to(torch.int32), dim=0) > 0)
-				advantages, returns = gae_advantages(rewards_buffer, values_tp1, dones_accum, gamma, gae_lambda)
-
-				# 优势过滤（基于段内）
-				A_max = torch.max(torch.abs(advantages)).item()
-				if A_max_ewma is None:
-					A_max_ewma = A_max
+					action_logits = model.forward(features_tensor, mode="policy")
+					value_pred = model.forward(features_tensor, mode="value")
+				action_dist = torch.distributions.Categorical(logits=action_logits)
+				actions = action_dist.sample()
+				
+				# 在推进环境前缓存当前状态
+				pre_state = agents_state.clone()
+				
+				# 环境步进
+				observation, reward, done = simulator.step(actions)
+				
+				# 写入训练buffer（与game.py一致）
+				states_buffer.append(pre_state)
+				rewards_buffer.append(reward.clone())
+				dones_buffer.append(done.clone())
+				values_buffer.append(value_pred.clone())
+				old_log_probs_buffer.append(action_dist.log_prob(actions).detach().clone())
+				actions_buffer.append(actions.clone())
+				buffer_step_count += 1
+				
+				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
+				current_done_all = done.detach().to('cpu').bool()  # (B, M)
+				if cumulative_done_all is None:
+					cumulative_done_all = current_done_all.clone()
 				else:
-					A_max_ewma = beta * A_max + (1 - beta) * A_max_ewma
-				eta = advantage_filter_threshold * A_max_ewma
-				advantage_mask = torch.abs(advantages) < eta
-				print(f"🎯 第{k+1}轮 - 段[{t_global},{t_global+segment_steps}) 最大|A|: {A_max:.4f}, EWMA: {A_max_ewma:.4f}, 阈值: {eta:.4f}")
-				print(f"📊 过滤前: {advantage_mask.numel()}, 被过滤: {advantage_mask.sum().item()}")
+					cumulative_done_all = cumulative_done_all | current_done_all
+				
+				# 更新观测与特征
+				agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
+				features_tensor = build_network_features(
+					agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
+					path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
+				)
+				
+				step_count += 1
+				print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
+				
+				# 检查是否需要PPO更新（与game.py一致）
+				if buffer_step_count >= rollout_length or step_count >= max_episode_length:
+					if step_count >= max_episode_length:
+						print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
+						perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer, 
+													states_buffer, rewards_buffer, dones_buffer, 
+													values_buffer, old_log_probs_buffer, actions_buffer,
+													features_tensor, simulator, config, k+1)
+						print("🔄 达到最大步数，强制开启新iteration...")
+						break
+					else:
+						print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
+						perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer, 
+													states_buffer, rewards_buffer, dones_buffer, 
+													values_buffer, old_log_probs_buffer, actions_buffer,
+													features_tensor, simulator, config, k+1)
+						
+						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
+						if all_worlds_no_alive_agents(simulator):
+							print("🔄 所有世界都没有存活agents，开启新iteration...")
+							break
+						else:
+							print("✅ 仍有世界有存活agents，继续下一个128step...")
+							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
+							states_buffer = []
+							rewards_buffer = []
+							dones_buffer = []
+							values_buffer = []
+							old_log_probs_buffer = []
+							actions_buffer = []
+							buffer_step_count = 0
+							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 
-				# 随机采样 batch_size_per_gpu 个样本并进行PPO更新
-				keep_mask = (torch.abs(advantages) >= eta)
-				cand_idx = keep_mask.nonzero(as_tuple=False)
-				if cand_idx.numel() == 0:
-					print("⚠️ 本段无可用样本，跳过更新")
-					t_global += segment_steps
-					continue
-				# 随机选择 batch_size_per_gpu 个样本（不足则放回采样）
-				N = cand_idx.shape[0]
-				K = batch_size_per_gpu
-				if N >= K:
-					rand_pos = torch.randperm(N, device=device)[:K]
-					selected_idx = cand_idx[rand_pos]
-				else:
-					rand_pos = torch.randint(0, N, (K,), device=device)
-					selected_idx = cand_idx[rand_pos]
-				selected_t = selected_idx[:, 0]
-				selected_b = selected_idx[:, 1]
-				selected_m = selected_idx[:, 2]
-				print(f"🎯 本段随机选取 {K} 个样本用于更新（候选 {N}）")
-				agent_indices_batch = selected_m.to(device)
-				old_log_probs_batch = old_log_probs_buffer[selected_t, selected_b, selected_m].view(-1)
-				advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
-				returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
-				actions_batch = actions_buffer[selected_t, selected_b, selected_m].view(-1)
-				advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
-				batch_N = old_log_probs_batch.shape[0]
-				segment_start_time = time.time()
-
-				model.train()
-				for _ in range(ppo_epochs):
-					mb_idx = torch.arange(batch_N, device=device)
-					mb_old_logp = old_log_probs_batch[mb_idx]
-					mb_adv = advantages_batch[mb_idx]
-					mb_ret = returns_batch[mb_idx]
-					mb_agent_idx = agent_indices_batch[mb_idx]
-
-					# 基于本段状态重建整批特征
-					mb_t = selected_t[mb_idx]
-					mb_b = selected_b[mb_idx]
-					mb_m = selected_m[mb_idx]
-					uniq_tb_mb, inverse_mb = torch.unique(torch.stack([mb_t, mb_b], dim=1), dim=0, return_inverse=True)
-					t_u_mb = uniq_tb_mb[:, 0]
-					b_u_mb = uniq_tb_mb[:, 1]
-					agents_states_mb = states_buffer[t_u_mb, b_u_mb]
-					obs_mb = simulator.observation_generator.generate(agents_states_mb)
-					agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
-					path_plan_mb = path_plan[b_u_mb]
-					stop_lines_mb = stop_lines[b_u_mb] if (stop_lines is not None and stop_lines.numel() > 0) else stop_lines
-					reward_coef_mb = simulator.reward_calculator.sampled_params[b_u_mb]
-					features_u_mb = build_network_features(
-						agents_state_dec_mb,
-						neighbors_local_mb,
-						w_lanes_local_mb,
-						w_boundaries_local_mb,
-						path_plan_mb,
-						stop_lines_mb,
-						reward_coef_mb,
-						config
-					)
-					u_idx_mb = inverse_mb.to(device)
-					mb_features = features_u_mb[u_idx_mb]
-
-					# 策略更新
-					print(mb_features.shape)
-					action_logits = model.forward(mb_features, mode="policy")
-					row_idx = torch.arange(actions_batch.shape[0], device=device)
-					logits_selected = action_logits[row_idx, mb_agent_idx]
-					dist_selected = torch.distributions.Categorical(logits=logits_selected)
-					new_log_probs = dist_selected.log_prob(actions_batch)
-					ratio = torch.exp(torch.clamp(new_log_probs - mb_old_logp, -1, 1))
-					surr1 = ratio * mb_adv
-					surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
-					policy_loss = -torch.min(surr1, surr2).mean()
-					entropy = dist_selected.entropy().mean()
-					policy_total_loss = policy_loss - entropy_coef * entropy
-					policy_total_loss = torch.clamp(policy_total_loss, -100, 100)
-					policy_optimizer.zero_grad(set_to_none=True)
-					policy_total_loss.backward()#收集所有进程的梯度，进行同步
-					torch.nn.utils.clip_grad_norm_(model.policy_network.parameters(), max_grad_norm)
-					policy_optimizer.step()
-
-					# 价值更新
-					value_pred_full = model.forward(mb_features, mode="value").squeeze(-1)
-					value_pred = value_pred_full[row_idx, mb_agent_idx]
-					value_loss = (value_pred - mb_ret).pow(2).mean()
-					value_loss = value_loss_coef * value_loss
-					value_loss = torch.clamp(value_loss, -100, 100)
-					value_optimizer.zero_grad(set_to_none=True)
-					value_loss.backward()
-					torch.nn.utils.clip_grad_norm_(model.value_network.parameters(), max_grad_norm)
-					value_optimizer.step()
-
-					# 打印损失信息
-					print(f"🎯 第{k+1}轮 - 段[{t_global},{t_global+segment_steps}) - PPO更新:")
-					print(f"   Policy Loss: {policy_loss.item():.6f}, Entropy: {entropy.item():.6f}")
-					print(f"   Value Loss: {value_loss.item():.6f}, Total Policy Loss: {policy_total_loss.item():.6f}")
-					print(f"   Ratio Mean: {ratio.mean().item():.4f}, Ratio Std: {ratio.std().item():.4f}")
-					print(f"   Advantage Mean: {mb_adv.mean().item():.4f}, Advantage Std: {mb_adv.std().item():.4f}")
-				model.eval()
-
-				# 推进到下一段
-				t_global += segment_steps
-				print(f"🎯 第{k+1}轮 - 段[{t_global},{t_global+segment_steps}) 更新完成,耗时: {time.time()-segment_start_time:.4f}秒")
 
 			# 分别更新学习率调度器
 			policy_scheduler.step()
@@ -695,7 +1016,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		beta = getattr(training_cfg, 'advantage_filter_beta', 0.25)
 		advantage_filter_threshold = getattr(training_cfg, 'advantage_filter_threshold', 0.01)
 		A_max_ewma = None
-		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 32000)
+		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 2000)
 		rollout_length = getattr(training_cfg, 'rollout_length', 128)
 
 		# 分别创建策略网络和价值网络的优化器（DDP下需访问 module）
@@ -704,7 +1025,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(policy_optimizer, T_max=num_iterations, eta_min=0.0)
 		value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(value_optimizer, T_max=num_iterations, eta_min=0.0)
 		
-		# 每一轮迭代（分段rollout + 随机批更新）
+		# 每一轮迭代（步进式训练：与game.py完全一致）
 		for k in range(num_iterations):
 			# 2) 本轮开始：重置完成计数（保持与原多卡同步逻辑一致）
 			num_workers_done.set("done", b"0")
@@ -719,151 +1040,115 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
 			)
 
+			# =========================== 步进式训练：与game.py完全一致 ==============================
 			B, M, S = agents_state.shape
-			t_global = 0
-			while t_global < max_episode_length:
-				segment_steps = min(rollout_length, max_episode_length - t_global)
-				states_buffer = torch.empty((segment_steps + 1, B, M, S), device=agents_state.device, dtype=agents_state.dtype)
-				rewards_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
-				dones_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
-				values_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
-				old_log_probs_buffer = torch.zeros(segment_steps, B, M, device=agents_state.device)
-				states_buffer[0].copy_(agents_state)
+			step_count = 0
+			
+			# 初始化全局buffer（与game.py一致）
+			states_buffer = []
+			rewards_buffer = []
+			dones_buffer = []
+			values_buffer = []
+			old_log_probs_buffer = []
+			actions_buffer = []
+			buffer_step_count = 0
+			
+			# 初始化累积done状态（与game.py一致）
+			cumulative_done_all = None
 
-				for t in range(segment_steps):
-					with torch.no_grad():
-						action_logits = model.module.forward_policy(features_tensor)
-						value_pred = model.module.forward(features_tensor, mode="value")
-					action_dist = torch.distributions.Categorical(logits=action_logits)
-					actions = action_dist.sample()
-					observation, reward, done = simulator.step(actions)
-					agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
-					features_tensor = build_network_features(
-						agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
-						path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
-					)
-					states_buffer[t + 1].copy_(agents_state)
-					values_buffer[t] = value_pred.detach()
-					rewards_buffer[t] = reward
-					dones_buffer[t] = done
-					old_log_probs_buffer[t] = action_dist.log_prob(actions).detach()
-
-				# 本段GAE
+			while step_count < max_episode_length:
+				# 全局死亡检测：如果所有世界都没有存活agents，执行PPO更新后开始新iteration
+				if all_worlds_no_alive_agents(simulator, cumulative_done_all):
+					if buffer_step_count > 0:
+						if rank == 0:
+							print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
+						perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer, 
+													states_buffer, rewards_buffer, dones_buffer, 
+													values_buffer, old_log_probs_buffer, actions_buffer,
+													features_tensor, simulator, config, k+1, rank)
+					else:
+						if rank == 0:
+							print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
+					break
+				
+				# 单步训练（与game.py的update_game_state一致）
+				step_start_time = time.time()
 				with torch.no_grad():
-					last_value_pred = model.module.forward(features_tensor, mode="value")
-				values_tp1 = torch.cat([values_buffer, last_value_pred.unsqueeze(0)], dim=0)
-				advantages, returns = gae_advantages(rewards_buffer, values_tp1, dones_buffer, gamma, gae_lambda)
-
-				# 优势过滤
-				A_max = torch.max(torch.abs(advantages)).item()
-				if A_max_ewma is None:
-					A_max_ewma = A_max
+					action_logits = model.module.forward(features_tensor, mode="policy")
+					value_pred = model.module.forward(features_tensor, mode="value")
+				action_dist = torch.distributions.Categorical(logits=action_logits)
+				actions = action_dist.sample()
+				
+				# 在推进环境前缓存当前状态
+				pre_state = agents_state.clone()
+				
+				# 环境步进
+				observation, reward, done = simulator.step(actions)
+				
+				# 写入训练buffer（与game.py一致）
+				states_buffer.append(pre_state)
+				rewards_buffer.append(reward.clone())
+				dones_buffer.append(done.clone())
+				values_buffer.append(value_pred.clone())
+				old_log_probs_buffer.append(action_dist.log_prob(actions).detach().clone())
+				actions_buffer.append(actions.clone())
+				buffer_step_count += 1
+				
+				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
+				current_done_all = done.detach().to('cpu').bool()  # (B, M)
+				if cumulative_done_all is None:
+					cumulative_done_all = current_done_all.clone()
 				else:
-					A_max_ewma = beta * A_max + (1 - beta) * A_max_ewma
-				eta = advantage_filter_threshold * A_max_ewma
-				keep_mask = (torch.abs(advantages) >= eta)
-				cand_idx = keep_mask.nonzero(as_tuple=False)
-				if cand_idx.numel() == 0:
-					# 本段无可用样本，推进到下一段
-					t_global += segment_steps
-					continue
-
-				# 从候选中随机抽取 batch_size_per_gpu 个样本（不足放回）
-				N = cand_idx.shape[0]
-				K = batch_size_per_gpu
-				if N >= K:
-					rand_pos = torch.randperm(N, device=device)[:K]
-					selected_idx = cand_idx[rand_pos]
-				else:
-					rand_pos = torch.randint(0, N, (K,), device=device)
-					selected_idx = cand_idx[rand_pos]
-				selected_t = selected_idx[:, 0]
-				selected_b = selected_idx[:, 1]
-				selected_m = selected_idx[:, 2]
-
-				agent_indices_batch = selected_m.to(device)
-				old_log_probs_batch = old_log_probs_buffer[selected_t, selected_b, selected_m].view(-1)
-				advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
-				returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
-				advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
-
-				batch_N = old_log_probs_batch.shape[0]
-				segment_start_time = time.time()
-				for _ in range(ppo_epochs):
-					# 整批更新
-					mb_idx = torch.arange(batch_N, device=device)
-					mb_old_logp = old_log_probs_batch[mb_idx]
-					mb_adv = advantages_batch[mb_idx]
-					mb_ret = returns_batch[mb_idx]
-					mb_agent_idx = agent_indices_batch[mb_idx]
-
-					# 重建整批特征（基于本段缓存）
-					mb_t = selected_t[mb_idx]
-					mb_b = selected_b[mb_idx]
-					mb_m = selected_m[mb_idx]
-					uniq_tb_mb, inverse_mb = torch.unique(torch.stack([mb_t, mb_b], dim=1), dim=0, return_inverse=True)
-					t_u_mb = uniq_tb_mb[:, 0]
-					b_u_mb = uniq_tb_mb[:, 1]
-					agents_states_mb = states_buffer[t_u_mb, b_u_mb]
-					obs_mb = simulator.observation_generator.generate(agents_states_mb)
-					agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
-					path_plan_mb = path_plan[b_u_mb]
-					stop_lines_mb = stop_lines[b_u_mb] if (stop_lines is not None and stop_lines.numel() > 0) else stop_lines
-					reward_coef_mb = simulator.reward_calculator.sampled_params[b_u_mb]
-					features_u_mb = build_network_features(
-						agents_state_dec_mb,
-						neighbors_local_mb,
-						w_lanes_local_mb,
-						w_boundaries_local_mb,
-						path_plan_mb,
-						stop_lines_mb,
-						reward_coef_mb,
-						config
-					)
-					u_idx_mb = inverse_mb.to(device)
-					mb_features = features_u_mb[u_idx_mb]
-
-					# 策略更新（DDP自动同步）
-					action_logits = model.module.forward(mb_features, mode="policy")
-					action_dist = torch.distributions.Categorical(logits=action_logits)
-					actions_sampled = action_dist.sample()
-					row_idx = torch.arange(actions_sampled.shape[0], device=device)
-					new_log_probs = action_dist.log_prob(actions_sampled)[row_idx, mb_agent_idx]
-					ratio = torch.exp(torch.clamp(new_log_probs - mb_old_logp, -1, 1))
-					surr1 = ratio * mb_adv
-					surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
-					policy_loss = -torch.min(surr1, surr2).mean()
-					entropy = action_dist.entropy()[row_idx, mb_agent_idx].mean()
-					policy_total_loss = policy_loss - entropy_coef * entropy
-					policy_total_loss = torch.clamp(policy_total_loss, -100, 100)
-					policy_optimizer.zero_grad(set_to_none=True)
-					policy_total_loss.backward()
-					torch.nn.utils.clip_grad_norm_(model.module.policy_network.parameters(), max_grad_norm)
-					policy_optimizer.step()
-
-					# 价值更新（DDP自动同步）
-					value_pred_full = model.module.forward(mb_features, mode="value").squeeze(-1)
-					value_pred = value_pred_full[row_idx, mb_agent_idx]
-					value_loss = (value_pred - mb_ret).pow(2).mean()
-					value_loss = value_loss_coef * value_loss
-					value_loss = torch.clamp(value_loss, -100, 100)
-					value_optimizer.zero_grad(set_to_none=True)
-					value_loss.backward()
-					torch.nn.utils.clip_grad_norm_(model.module.value_network.parameters(), max_grad_norm)
-					value_optimizer.step()
-
-					# 打印损失信息（多卡）
-					if rank == 0:
-						print(f"[Rank {rank}] 第{k+1}轮 - 段[{t_global},{t_global+segment_steps}) - PPO更新:")
-						print(f"   Policy Loss: {policy_loss.item():.6f}, Entropy: {entropy.item():.6f}")
-						print(f"   Value Loss: {value_loss.item():.6f}, Total Policy Loss: {policy_total_loss.item():.6f}")
-						print(f"   Ratio Mean: {ratio.mean().item():.4f}, Ratio Std: {ratio.std().item():.4f}")
-						print(f"   Advantage Mean: {mb_adv.mean().item():.4f}, Advantage Std: {mb_adv.std().item():.4f}")
-
-				# 推进到下一段
-				t_global += segment_steps
+					cumulative_done_all = cumulative_done_all | current_done_all
+				
+				# 更新观测与特征
+				agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
+				features_tensor = build_network_features(
+					agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
+					path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
+				)
+				
+				step_count += 1
 				if rank == 0:
-					print(f"[Round {k}] 段完成, 用时 {time.time()-segment_start_time:.4f}s")
+					print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
+				
+				# 检查是否需要PPO更新（与game.py一致）
+				if buffer_step_count >= rollout_length or step_count >= max_episode_length:
+					if step_count >= max_episode_length:
+						if rank == 0:
+							print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
+						perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer, 
+													states_buffer, rewards_buffer, dones_buffer, 
+													values_buffer, old_log_probs_buffer, actions_buffer,
+													features_tensor, simulator, config, k+1, rank)
+						if rank == 0:
+							print("🔄 达到最大步数，强制开启新iteration...")
+						break
+					else:
+						if rank == 0:
+							print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
+						perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer, 
+													states_buffer, rewards_buffer, dones_buffer, 
+													values_buffer, old_log_probs_buffer, actions_buffer,
+													features_tensor, simulator, config, k+1, rank)
+						
+						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
+						if all_worlds_no_alive_agents(simulator, cumulative_done_all):
+							if rank == 0:
+								print("🔄 所有世界都没有存活agents，开启新iteration...")
+							break
+						else:
+							if rank == 0:
+								print("✅ 仍有世界有存活agents，继续下一个128step...")
+							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
+							states_buffer = []
+							rewards_buffer = []
+							dones_buffer = []
+							values_buffer = []
+							old_log_probs_buffer = []
+							actions_buffer = []
+							buffer_step_count = 0
+							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 
 			# 7) 在优化器更新后调用学习率调度器（与单卡一致）
 			policy_scheduler.step()
@@ -931,6 +1216,10 @@ if __name__ == "__main__":
 	if not ok or not ranks:
 		raise SystemExit("无可用GPU，退出")
 	# 默认使用全部可用卡
-	with open('configs/default_config.yaml', 'r', encoding='utf-8') as f:
+	# 基于文件位置解析项目根目录，避免依赖当前工作目录
+	_this_dir = os.path.dirname(os.path.abspath(__file__))
+	_proj_root = os.path.dirname(_this_dir)
+	_config_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
+	with open(_config_path, 'r', encoding='utf-8') as f:
 		cfg = yaml.safe_load(f)
 	run_distributed_ddppo(cfg, ranks)
