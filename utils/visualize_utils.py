@@ -52,8 +52,8 @@ def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points
     ax.autoscale()
 
     # 存放各层的绘图元素与是否已生成
-    rendered = {"line": False, "circle": False, "arc": False, "oob": False}
-    artists = {"line": [], "circle": [], "arc": [], "oob": []}
+    rendered = {"line": False, "circle": False, "arc": False, "oob": False, "direction": False}
+    artists = {"line": [], "circle": [], "arc": [], "oob": [], "direction": []}
 
     def render_lines():
         if rendered["line"]:
@@ -127,11 +127,29 @@ def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points
         artists["oob"].append(scatter)
         rendered["oob"] = True
 
+    def render_directions():
+        if rendered["direction"]:
+            return
+        for poly_data in polygons_data:
+            center = poly_data['center']
+            direction_angle = poly_data.get('direction_angle', 0.0)
+            
+            # 计算箭头端点
+            arrow_length = 0.1  # 箭头长度
+            end_x = center[0] + arrow_length * math.cos(direction_angle)
+            end_y = center[1] + arrow_length * math.sin(direction_angle)
+            
+            # 绘制方向箭头
+            arrow = ax.annotate('', xy=(end_x, end_y), xytext=(center[0], center[1]),
+                              arrowprops=dict(arrowstyle='->', color='red', lw=0.2, alpha=0.3))
+            artists["direction"].append(arrow)
+        rendered["direction"] = True
+
     # 复选框放置在右侧
     fig = ax.figure
     cb_ax = fig.add_axes([0.86, 0.6, 0.12, 0.2])  # [left, bottom, width, height]
-    labels = ['line', 'circle', 'arc', 'oob']
-    visibility = [False, False, False, False]
+    labels = ['line', 'circle', 'arc', 'oob', 'direction']
+    visibility = [False, False, False, False, False]
     check = CheckButtons(cb_ax, labels, visibility)
     cb_ax.set_title('Layers')
 
@@ -159,6 +177,13 @@ def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points
                 render_oob()
             else:
                 for a in artists['oob']:
+                    vis = a.get_visible()
+                    a.set_visible(not vis)
+        elif label == 'direction':
+            if not rendered['direction']:
+                render_directions()
+            else:
+                for a in artists['direction']:
                     vis = a.get_visible()
                     a.set_visible(not vis)
         ax.figure.canvas.draw_idle()
@@ -189,7 +214,8 @@ def visualize_map_from_json(json_path: str):
             'poly_id': q.get('poly_Id'),
             'road_id': q.get('road_id'),
             'center': tuple(q.get('center', [0.0, 0.0, 0.0])[:2]),
-            'vertices': [tuple(v) for v in q.get('vertices', [])]
+            'vertices': [tuple(v) for v in q.get('vertices', [])],
+            'direction_angle': q.get('direction_angle', 0.0)
         })
 
     # 解析 OOB 点
@@ -239,3 +265,6 @@ def visualize_map_from_json(json_path: str):
     visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points, ax)
     plt.show()
 
+if __name__ == "__main__":
+    json_path = os.path.join(os.path.dirname(__file__), "..", "maps", "town2.json")
+    visualize_map_from_json(json_path)

@@ -4,8 +4,6 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='torch.cuda')
 import ezdxf, math
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Circle, Arc, Polygon
-
 from collections import defaultdict
 import torch
 import json
@@ -69,62 +67,6 @@ def increment_road_id():
     road_id_counter += 1
     return road_id_counter - 1
 
-# ==================== 方向箭头绘制 ====================
-def draw_road_direction_arrows(ax, lines_data, circles_data, arcs_data):
-    """在已有坐标轴上为每条道路绘制方向箭头。"""
-    # 直线：起点 -> 终点
-    for line in lines_data:
-        sx, sy = line['start'][0], line['start'][1]
-        ex, ey = line['end'][0], line['end'][1]
-        ax.annotate('', xy=(ex, ey), xytext=(sx, sy),
-                    arrowprops=dict(arrowstyle='->', color='blue', lw=0.8))
-
-    # 圆形：默认逆时针，取角度0°到45°处画一个小箭头
-    for c in circles_data:
-        cx, cy = c['center'][0], c['center'][1]
-        r = c['radius']
-        ang0 = 0.0
-        ang1 = math.radians(45.0)
-        x0, y0 = cx + r * math.cos(ang0), cy + r * math.sin(ang0)
-        x1, y1 = cx + r * math.cos(ang1), cy + r * math.sin(ang1)
-        ax.annotate('', xy=(x1, y1), xytext=(x0, y0),
-                    arrowprops=dict(arrowstyle='->', color='pink', lw=0.8))
-
-    # 圆弧：在弧线中点绘制箭头，方向反了就把箭头反过来
-    for a in arcs_data:
-        cx, cy = a['center'][0], a['center'][1]
-        r = a['radius']
-        # 角度统一到[0,360)
-        def norm_deg(d):
-            d = d % 360.0
-            return d + 360.0 if d < 0 else d
-
-        start_deg = norm_deg(a['start_angle'])
-        end_deg = norm_deg(a['end_angle'])
-        direction = a.get('direction', 1)
-        
-        # 几何弧按 CCW 从 start 到 end；取几何中点角度
-        diff_ccw = (end_deg - start_deg) % 360.0
-        if diff_ccw == 0.0:
-            diff_ccw = 360.0
-        mid_deg = norm_deg(start_deg + diff_ccw * 0.5)
-        
-        # 箭头位置固定在中点，根据方向决定箭头指向
-        delta = 3.0  # 箭头长度角度跨度
-        if direction >= 0:
-            # 正向：从 mid-delta 指向 mid
-            pre_deg = norm_deg(mid_deg - delta)
-        else:
-            # 反向：从 mid+delta 指向 mid（箭头反过来）
-            pre_deg = norm_deg(mid_deg + delta)
-        
-        ang0 = math.radians(pre_deg)
-        ang1 = math.radians(mid_deg)
-        x0, y0 = cx + r * math.cos(ang0), cy + r * math.sin(ang0)
-        x1, y1 = cx + r * math.cos(ang1), cy + r * math.sin(ang1)
-        ax.annotate('', xy=(x1, y1), xytext=(x0, y0),
-                    arrowprops=dict(arrowstyle='->', color='green', lw=0.8))
-
 # ==================== 路网方向校正（GPU加速） ====================
 def adjust_road_directions_gpu(lines_data, arcs_data, tolerance: float, device: str = DEVICE):
     """
@@ -184,6 +126,13 @@ def adjust_road_directions_gpu(lines_data, arcs_data, tolerance: float, device: 
             r = arc_map[rid]
             # 仅反转行驶方向，保持几何：不要更改 start/end 角度
             r['direction'] = - r.get('direction', 1)
+        
+        # 同时反转该道路上所有四边形的方向角度
+        if rid in road_to_quads:
+            for quad in road_to_quads[rid]:
+                # 将方向角度反转180度
+                current_angle = quad.get('direction_angle', 0.0)
+                quad['direction_angle'] = (current_angle + math.pi) % (2 * math.pi)
 
     # 点是否在 quad 内（带容差：允许点到多边形最近边的距离 < tolerance 也认为命中）
     def point_hits_quad(px, py, quad):
@@ -836,7 +785,7 @@ def sample_arc_points(center, radius, start_angle, end_angle, sample_distance):
     
     return points, arc_length
 
-def generate_oob_points_cpu(quads, grid, quads_by_id, nudge_distance=0.1):
+def generate_oob_points_cpu(quads, grid, quads_by_id, nudge_distance=OOB_NUDGE_DISTANCE):
     """CPU版本的OOB点生成（原始实现）"""
     print("Generating Out-of-Bounds (OOB) points using CPU...")
     oob_points = []
@@ -868,7 +817,7 @@ def generate_oob_points_cpu(quads, grid, quads_by_id, nudge_distance=0.1):
     print(f"\nGenerated {len(oob_points)} OOB points.")
     return oob_points
 
-def generate_oob_points_gpu(quads, grid, quads_by_id, device='cuda', batch_size=500, nudge_distance=0.1):
+def generate_oob_points_gpu(quads, grid, quads_by_id, device='cuda', batch_size=500, nudge_distance=OOB_NUDGE_DISTANCE):
     """内存友好的GPU加速版本 - 智能分批处理避免OOM"""
     print(f"Generating Out-of-Bounds (OOB) points using memory-friendly GPU processing ({device})...")
     
@@ -1002,7 +951,7 @@ def generate_oob_points_gpu(quads, grid, quads_by_id, device='cuda', batch_size=
     print(f"\nGenerated {len(valid_oob_points)} OOB points using memory-friendly GPU processing.")
     return valid_oob_points
 
-def generate_oob_points(quads, grid, quads_by_id, use_gpu=True, nudge_distance=0.1):
+def generate_oob_points(quads, grid, quads_by_id, use_gpu=True, nudge_distance=OOB_NUDGE_DISTANCE):
     """OOB点生成主函数，支持GPU加速"""
     if use_gpu and torch.cuda.is_available():
         return generate_oob_points_gpu(quads, grid, quads_by_id, nudge_distance=nudge_distance)
@@ -1622,6 +1571,12 @@ for arc_data in arcs_data:
         prev_vertices = vertices
         poly_id_counter += 1
 
+# TODO: 添加同类型路的车道
+# 在这里，每个road_id会对应一批quads，这些quads组成了road_id这条路
+# 我们需要看这些quads都与哪些四边形有重叠（所以这里要写一个单独的判断梯形相交的函数,在geometry_utils.py内），通过哈希去加速这个判断（对每个哈希块内的quads进行一次彼此相交判断）。最后统计每个road_id的quads跟别的road_id重叠的数量。应该有一个分布
+# 然后我们再对每一个road_id进行统计（看这条路上的矩形都与哪些road_id相交了，取80%梯形重叠的road_id作为同一路），重新进行road_id和lane_id的分配（如果确认若干个车道彼此是相交的，则他们共享一个road_id，分配不同lane_id）
+# 然后再把这些信息更新到每条路的quads信息内去，quads信息就包含road_id,lane_id了。
+
 # =========================== OOB点生成 ===========================
 print("\n=== 开始生成OOB点 ===")
 # 构建四边形字典，用于快速查找
@@ -1637,11 +1592,10 @@ oob_points = generate_oob_points(polygons_data, grid, quads_by_id, use_gpu=use_g
 print("\n=== 开始路网方向校正 ===")
 adjust_road_directions_gpu(lines_data, arcs_data, tolerance=TOLERANCE, device=DEVICE)
 
-# 方向校正后再可视化并绘制箭头（确保箭头基于最新方向）
-print("\n=== 方向校正后可视化并绘制方向箭头 ===")
+# 方向校正后使用matplotlib可视化
+print("\n=== 方向校正后使用matplotlib可视化 ===")
 visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points, ax)
-draw_road_direction_arrows(ax, lines_data, circles_data, arcs_data)
-print("\n=== 已绘制方向箭头，关闭图窗后将继续导出JSON ===")
+print("\n=== 已绘制图形，关闭图窗后将继续导出JSON ===")
 plt.show()
 
 # =========================== 导出地图JSON ===========================
@@ -1654,9 +1608,10 @@ export_quads = []
 for quad in polygons_data:
     export_quads.append({
         "poly_Id": quad["poly_id"],
+        "road_id": quad["road_id"],
         "center": [float(quad["center"][0]), float(quad["center"][1]), 0.0],
         "vertices": [[float(v[0]), float(v[1]), float(v[2])] for v in quad["vertices"]],
-        "road_id": quad["road_id"]
+        "direction_angle": float(quad["direction_angle"])
     })
 # 导出OOB点数据
 export_oob_points = []
@@ -1706,6 +1661,6 @@ with open(json_output_path, "w", encoding="utf-8") as f:
     json.dump(export_payload, f, ensure_ascii=False, indent=2)
 print(f"已导出地图JSON: {json_output_path}")
 
-# =========================== 统一可视化（从JSON） ===========================
-print("\n=== 开始可视化（从JSON） ===")
+# =========================== 统一可视化（从JSON，使用matplotlib） ===========================
+print("\n=== 开始可视化（从JSON，使用matplotlib） ===")
 visualize_map_from_json(json_output_path)
