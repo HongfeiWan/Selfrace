@@ -14,7 +14,8 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.geometry_utils import (
     calculate_distance, is_point_in_quad_2d, is_points_in_quads_gpu,
-    normalize_angle, angle_difference, normalize_angle_degrees, SpatialGrid3D
+    normalize_angle, angle_difference, normalize_angle_degrees, SpatialGrid3D,
+    quads_intersection_matrix_gpu
 )
 from utils.visualize_utils import visualize_map_from_json, visualize_map
 
@@ -48,9 +49,8 @@ RECTANGLE_LENGTH = config['preprocessor']['rectangle_length']
 RECTANGLE_WIDTH = config['preprocessor']['rectangle_width']
 OOB_NUDGE_DISTANCE = config['preprocessor']['oob_nudge_distance']
 CELL_SIZE = config['preprocessor']['cell_size']
+W_LANE_SAMPLE_DISTANCE = config['preprocessor']['w_lane_sample_distance']
 
-# 车道ID计数器
-lane_id_counter = 1
 # 道路ID计数器
 road_id_counter = 1
 # 四边形ID计数器
@@ -1571,11 +1571,211 @@ for arc_data in arcs_data:
         prev_vertices = vertices
         poly_id_counter += 1
 
-# TODO: 添加同类型路的车道
-# 在这里，每个road_id会对应一批quads，这些quads组成了road_id这条路
-# 我们需要看这些quads都与哪些四边形有重叠（所以这里要写一个单独的判断梯形相交的函数,在geometry_utils.py内），通过哈希去加速这个判断（对每个哈希块内的quads进行一次彼此相交判断）。最后统计每个road_id的quads跟别的road_id重叠的数量。应该有一个分布
-# 然后我们再对每一个road_id进行统计（看这条路上的矩形都与哪些road_id相交了，取80%梯形重叠的road_id作为同一路），重新进行road_id和lane_id的分配（如果确认若干个车道彼此是相交的，则他们共享一个road_id，分配不同lane_id）
-# 然后再把这些信息更新到每条路的quads信息内去，quads信息就包含road_id,lane_id了。
+def _compute_road_bboxes(road_to_quads):
+    bboxes = {}
+    for rid, quads in road_to_quads.items():
+        if not quads:
+            bboxes[rid] = (0, 0, 0, 0)
+            continue
+        xs = []
+        ys = []
+        for q in quads:
+            for v in q['vertices']:
+                xs.append(v[0])
+                ys.append(v[1])
+        bboxes[rid] = (min(xs), min(ys), max(xs), max(ys))
+    return bboxes
+
+def _boxes_overlap(a, b, pad=0.0):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    return not (ax2 < bx1 - pad or bx2 < ax1 - pad or ay2 < by1 - pad or by2 < ay1 - pad)
+
+def group_roads_by_overlap(polygons_data, threshold=0.8, device=DEVICE):
+    # 聚合每条路的quads
+    road_to_quads = {}
+    for q in polygons_data:
+        road_to_quads.setdefault(q['road_id'], []).append(q)
+    road_ids = sorted(road_to_quads.keys())
+    if len(road_ids) <= 1:
+        return [[rid] for rid in road_ids]
+
+    # 预计算每条路的quads顶点数组 (M,4,2)
+    road_to_vertices = {}
+    for rid, quads in road_to_quads.items():
+        verts = []
+        for q in quads:
+            verts.append([[v[0], v[1]] for v in q['vertices']])
+        road_to_vertices[rid] = np.array(verts, dtype=np.float32) if len(verts) > 0 else np.zeros((0,4,2), dtype=np.float32)
+
+    # AABB 粗筛
+    bboxes = _compute_road_bboxes(road_to_quads)
+
+    # 建图（邻接：同组）
+    rid_index = {rid: i for i, rid in enumerate(road_ids)}
+    n = len(road_ids)
+    adj = [[False]*n for _ in range(n)]
+    for i in range(n):
+        adj[i][i] = True
+
+    for i in range(n):
+        rid_i = road_ids[i]
+        verts_i = road_to_vertices[rid_i]
+        if verts_i.shape[0] == 0:
+            continue
+        for j in range(i+1, n):
+            rid_j = road_ids[j]
+            if not _boxes_overlap(bboxes[rid_i], bboxes[rid_j], pad=0.0):
+                continue
+            verts_j = road_to_vertices[rid_j]
+            if verts_j.shape[0] == 0:
+                continue
+            # GPU 相交矩阵
+            try:
+                inter_mat = quads_intersection_matrix_gpu(verts_i, verts_j, device=device)
+            except Exception:
+                # 回退到CPU
+                inter_mat = quads_intersection_matrix_gpu(verts_i, verts_j, device='cpu')
+            # 计算相交比例
+            # A视角：A每个quad是否与B任意quad相交
+            if inter_mat.size == 0:
+                continue
+            hit_a = (inter_mat.any(axis=1)).astype(np.float32)
+            hit_b = (inter_mat.any(axis=0)).astype(np.float32)
+            ratio_a = float(hit_a.mean()) if hit_a.size > 0 else 0.0
+            ratio_b = float(hit_b.mean()) if hit_b.size > 0 else 0.0
+            if max(ratio_a, ratio_b) >= float(threshold):
+                adj[i][j] = True
+                adj[j][i] = True
+
+    # BFS 连通分量
+    visited = [False]*n
+    groups = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        queue = [i]
+        visited[i] = True
+        comp = [road_ids[i]]
+        while queue:
+            u = queue.pop(0)
+            for v in range(n):
+                if not visited[v] and adj[u][v]:
+                    visited[v] = True
+                    queue.append(v)
+                    comp.append(road_ids[v])
+        groups.append(sorted(comp))
+    return groups
+
+def reassign_road_lane_ids(polygons_data, groups):
+    # 组内第k条路 -> lane_id = k+1；组的road_id取该组最小旧rid
+    rid_to_groupmin = {}
+    rid_to_lane = {}
+    for group in groups:
+        base_rid = min(group)
+        for idx, rid in enumerate(sorted(group)):
+            rid_to_groupmin[rid] = base_rid
+            rid_to_lane[rid] = idx + 1
+
+    # 更新polygons_data
+    for q in polygons_data:
+        old = q['road_id']
+        if old in rid_to_groupmin:
+            q['road_id'] = rid_to_groupmin[old]
+            q['lane_id'] = rid_to_lane[old]
+        else:
+            q['lane_id'] = 1
+    return polygons_data
+
+# =========================== W_lane 采样 ===========================
+# TODO: 添加W_lane的采样。
+# 对于每一个road_id,lane_id对应的路，我们需要采样W_lane,每个路的开头点，结尾点一定是W_lane,在这一段路中间按照W_LANE_SAMPLE_DISTANCE=40m间隔采样W_lane
+# W_lane是某个quad的center，所以可以继承部分信息：
+# 0. W_lane_id
+# 1. road_id
+# 2. lane_id
+# 3. center
+# 4. direction_angle
+# 5. 当前车道宽度(得算一下梯形的前面两个点和后面两个点距离的宽度平均值作为宽度)
+# (以下是每次初始化的时候填入的。)
+# 6. 对于下一个goal的相对归一化距离（跟别的跟坐标有关系的一起做归一化）和绝对归一化距离(需要goal出来之后迅速计算) 关于所有的goal的距离，不过每次放出来观测的是当前的下一个goal是哪一个goal的信息
+def _compute_quad_width_avg(quad_vertices):
+    # 顶点顺序为: [0,1,2,3]，上底(0-1)、下底(2-3)
+    x0, y0 = quad_vertices[0][0], quad_vertices[0][1]
+    x1, y1 = quad_vertices[1][0], quad_vertices[1][1]
+    x2, y2 = quad_vertices[2][0], quad_vertices[2][1]
+    x3, y3 = quad_vertices[3][0], quad_vertices[3][1]
+    top_len = math.hypot(x1 - x0, y1 - y0)
+    bottom_len = math.hypot(x3 - x2, y3 - y2)
+    return 0.5 * (top_len + bottom_len)
+
+def _group_quads_by_road_lane(polygons_data):
+    groups = {}
+    for q in polygons_data:
+        rid = q.get('road_id')
+        lid = q.get('lane_id', 1)
+        groups.setdefault((rid, lid), []).append(q)
+    # 维持生成顺序：按 poly_id 升序
+    for k in groups.keys():
+        groups[k].sort(key=lambda it: it['poly_id'])
+    return groups
+
+def sample_w_lanes(polygons_data, sample_distance_m=W_LANE_SAMPLE_DISTANCE):
+    groups = _group_quads_by_road_lane(polygons_data)
+    w_lanes = []
+    w_lane_id = 1
+    for (rid, lid), quads in groups.items():
+        if len(quads) == 0:
+            continue
+        # 按quad中心构建折线长度
+        centers = [tuple(q['center']) for q in quads]
+        cum = [0.0]
+        for i in range(1, len(centers)):
+            prev = centers[i-1]
+            cur = centers[i]
+            cum.append(cum[-1] + math.hypot(cur[0]-prev[0], cur[1]-prev[1]))
+        total_len = cum[-1] if cum else 0.0
+
+        # 目标采样位置: 0, step, 2*step, ..., total_len
+        targets = []
+        t = 0.0
+        if total_len <= 1e-6:
+            targets = [0.0]
+        else:
+            while t < total_len - 1e-6:
+                targets.append(t)
+                t += float(sample_distance_m)
+            targets.append(total_len)
+
+        # 为每个目标找到最近的索引
+        idx_used = set()
+        for T in targets:
+            # 二分或线性搜索最近
+            # 简洁起见线性搜索（len通常不大）
+            best_i = 0
+            best_d = float('inf')
+            for i, c in enumerate(cum):
+                d = abs(c - T)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+            idx_used.add(best_i)
+
+        # 生成W_lane点
+        for i in sorted(idx_used):
+            q = quads[i]
+            width = _compute_quad_width_avg(q['vertices'])
+            w_lanes.append({
+                'w_lane_id': w_lane_id,
+                'road_id': rid,
+                'lane_id': lid,
+                'center': (float(q['center'][0]), float(q['center'][1])),
+                'direction_angle': float(q.get('direction_angle', 0.0)),
+                'width': float(width),
+                'poly_id': q['poly_id']
+            })
+            w_lane_id += 1
+    return w_lanes
 
 # =========================== OOB点生成 ===========================
 print("\n=== 开始生成OOB点 ===")
@@ -1592,11 +1792,23 @@ oob_points = generate_oob_points(polygons_data, grid, quads_by_id, use_gpu=use_g
 print("\n=== 开始路网方向校正 ===")
 adjust_road_directions_gpu(lines_data, arcs_data, tolerance=TOLERANCE, device=DEVICE)
 
+# =========================== W_lane 采样 ===========================
+print("\n=== 开始W_lane采样 ===")
+w_lanes = sample_w_lanes(polygons_data, sample_distance_m=W_LANE_SAMPLE_DISTANCE)
+print(f"W_lane生成: {len(w_lanes)} 个")
+
 # 方向校正后使用matplotlib可视化
 print("\n=== 方向校正后使用matplotlib可视化 ===")
-visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points, ax)
+visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points, ax, w_lanes=w_lanes)
 print("\n=== 已绘制图形，关闭图窗后将继续导出JSON ===")
 plt.show()
+
+# =========================== 重叠分组与ID重排 ===========================
+print("\n=== 基于GPU相交检测进行道路分组与ID/LANE重排 ===")
+INTERSECTION_THRESHOLD = config['preprocessor'].get('intersection_threshold')
+groups = group_roads_by_overlap(polygons_data, threshold=INTERSECTION_THRESHOLD, device=DEVICE)
+print(f"分到 {len(groups)} 组: {groups}")
+polygons_data = reassign_road_lane_ids(polygons_data, groups)
 
 # =========================== 导出地图JSON ===========================
 # 使用 dxf 文件名生成同名 json 文件（同目录）
@@ -1609,6 +1821,7 @@ for quad in polygons_data:
     export_quads.append({
         "poly_Id": quad["poly_id"],
         "road_id": quad["road_id"],
+        'lane_id': quad['lane_id'],
         "center": [float(quad["center"][0]), float(quad["center"][1]), 0.0],
         "vertices": [[float(v[0]), float(v[1]), float(v[2])] for v in quad["vertices"]],
         "direction_angle": float(quad["direction_angle"])
@@ -1626,6 +1839,18 @@ export_payload = {
     "map_name": json_file_name,
     "quads": export_quads,
     "oob_points": export_oob_points,
+    "w_lanes": [
+        {
+            "w_lane_id": item['w_lane_id'],
+            "road_id": item['road_id'],
+            "lane_id": item['lane_id'],
+            "poly_id": item['poly_id'],
+            "center": [item['center'][0], item['center'][1], 0.0],
+            "direction_angle": item['direction_angle'],
+            "width": item['width']
+        }
+        for item in w_lanes
+    ],
     "geometry": {
         "lines": [
             {

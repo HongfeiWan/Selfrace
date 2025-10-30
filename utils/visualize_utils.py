@@ -6,8 +6,7 @@ from matplotlib.patches import Circle, Polygon
 from matplotlib.widgets import CheckButtons
 import matplotlib.pyplot as plt
 
-
-def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points, ax):
+def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points, ax, w_lanes=None):
     """
     统一的可视化函数，将所有可视化逻辑集中管理
     参数:
@@ -52,8 +51,10 @@ def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points
     ax.autoscale()
 
     # 存放各层的绘图元素与是否已生成
-    rendered = {"line": False, "circle": False, "arc": False, "oob": False, "direction": False}
-    artists = {"line": [], "circle": [], "arc": [], "oob": [], "direction": []}
+    if w_lanes is None:
+        w_lanes = []
+    rendered = {"line": False, "circle": False, "arc": False, "oob": False, "direction": False, "road_color": False, "w_lane": False}
+    artists = {"line": [], "circle": [], "arc": [], "oob": [], "direction": [], "road_color": [], "w_lane": []}
 
     def render_lines():
         if rendered["line"]:
@@ -145,11 +146,55 @@ def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points
             artists["direction"].append(arrow)
         rendered["direction"] = True
 
+    def render_road_color():
+        if rendered["road_color"]:
+            return
+        # 使用离散色图为不同road_id赋色
+        cmap = plt.get_cmap('tab20')
+        # 收集所有road_id并建立索引
+        road_ids = sorted(list({p.get('road_id') for p in polygons_data}))
+        rid_to_idx = {rid: i for i, rid in enumerate(road_ids)}
+        n_colors = max(1, len(road_ids))
+        for poly_data in polygons_data:
+            vertices = poly_data['vertices']
+            vertices_2d = [(v[0], v[1]) for v in vertices]
+            rid = poly_data.get('road_id')
+            idx = rid_to_idx.get(rid, 0)
+            color = cmap(float(idx % 20) / 20.0)  # tab20循环使用
+            polygon = Polygon(vertices_2d, closed=True,
+                              facecolor=color, edgecolor='none',
+                              alpha=0.35, linewidth=0.0)
+            ax.add_patch(polygon)
+            artists["road_color"].append(polygon)
+        rendered["road_color"] = True
+
+    def render_w_lanes():
+        if rendered["w_lane"]:
+            return
+        if len(w_lanes) == 0:
+            rendered["w_lane"] = True
+            return
+        xs = [float(item.get('center', (0.0, 0.0))[0]) for item in w_lanes]
+        ys = [float(item.get('center', (0.0, 0.0))[1]) for item in w_lanes]
+        scatter = ax.scatter(xs, ys, s=8, c='red', alpha=0.9)
+        artists["w_lane"].append(scatter)
+        # 为每个w_lane绘制一个小方向箭头
+        arrow_len = 0.15
+        for item in w_lanes:
+            cx, cy = float(item.get('center', (0.0, 0.0))[0]), float(item.get('center', (0.0, 0.0))[1])
+            ang = float(item.get('direction_angle', 0.0))
+            ex = cx + arrow_len * math.cos(ang)
+            ey = cy + arrow_len * math.sin(ang)
+            arr = ax.annotate('', xy=(ex, ey), xytext=(cx, cy),
+                              arrowprops=dict(arrowstyle='->', color='red', lw=0.4, alpha=0.9))
+            artists["w_lane"].append(arr)
+        rendered["w_lane"] = True
+
     # 复选框放置在右侧
     fig = ax.figure
     cb_ax = fig.add_axes([0.86, 0.6, 0.12, 0.2])  # [left, bottom, width, height]
-    labels = ['line', 'circle', 'arc', 'oob', 'direction']
-    visibility = [False, False, False, False, False]
+    labels = ['line', 'circle', 'arc', 'oob', 'direction', 'road_color', 'w_lane']
+    visibility = [False, False, False, False, False, False, False]
     check = CheckButtons(cb_ax, labels, visibility)
     cb_ax.set_title('Layers')
 
@@ -186,8 +231,21 @@ def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points
                 for a in artists['direction']:
                     vis = a.get_visible()
                     a.set_visible(not vis)
+        elif label == 'road_color':
+            if not rendered['road_color']:
+                render_road_color()
+            else:
+                for a in artists['road_color']:
+                    vis = a.get_visible()
+                    a.set_visible(not vis)
+        elif label == 'w_lane':
+            if not rendered['w_lane']:
+                render_w_lanes()
+            else:
+                for a in artists['w_lane']:
+                    vis = a.get_visible()
+                    a.set_visible(not vis)
         ax.figure.canvas.draw_idle()
-
     check.on_clicked(on_clicked)
 
     # 防止被垃圾回收：将引用挂到 figure 上
@@ -220,6 +278,20 @@ def visualize_map_from_json(json_path: str):
 
     # 解析 OOB 点
     oob_points = payload.get('oob_points', [])
+
+    # 解析 W_lane
+    w_lanes_raw = payload.get('w_lanes', [])
+    w_lanes = []
+    for item in w_lanes_raw:
+        w_lanes.append({
+            'w_lane_id': item.get('w_lane_id'),
+            'road_id': item.get('road_id'),
+            'lane_id': item.get('lane_id'),
+            'center': tuple(item.get('center', [0.0, 0.0, 0.0])[:2]),
+            'direction_angle': item.get('direction_angle', 0.0),
+            'width': item.get('width', 0.0),
+            'poly_id': item.get('poly_id')
+        })
 
     # 解析几何（可选）
     geometry = payload.get('geometry', {})
@@ -262,7 +334,7 @@ def visualize_map_from_json(json_path: str):
     # 创建画布并调用统一可视化
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.set_aspect('equal')
-    visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points, ax)
+    visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points, ax, w_lanes=w_lanes)
     plt.show()
 
 if __name__ == "__main__":
