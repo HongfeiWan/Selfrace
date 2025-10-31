@@ -53,8 +53,8 @@ def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points
     # 存放各层的绘图元素与是否已生成
     if w_lanes is None:
         w_lanes = []
-    rendered = {"line": False, "circle": False, "arc": False, "oob": False, "direction": False, "road_color": False, "w_lane": False}
-    artists = {"line": [], "circle": [], "arc": [], "oob": [], "direction": [], "road_color": [], "w_lane": []}
+    rendered = {"line": False, "circle": False, "arc": False, "oob": False, "direction": False, "road_color": False, "w_lane": False, "s_label": False, "curvature": False}
+    artists = {"line": [], "circle": [], "arc": [], "oob": [], "direction": [], "road_color": [], "w_lane": [], "s_label": [], "curvature": []}
 
     def render_lines():
         if rendered["line"]:
@@ -190,11 +190,111 @@ def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points
             artists["w_lane"].append(arr)
         rendered["w_lane"] = True
 
+    def render_s_labels():
+        if rendered["s_label"]:
+            return
+        if len(polygons_data) == 0:
+            rendered["s_label"] = True
+            return
+        # 先按 (road_id, lane_id) 分组
+        road_lane_to_quads = {}
+        for q in polygons_data:
+            rid = q.get('road_id')
+            lid = q.get('lane_id', 1)
+            road_lane_to_quads.setdefault((rid, lid), []).append(q)
+
+        rid_to_lanes = {}
+        for (rid, lid), quads in road_lane_to_quads.items():
+            rid_to_lanes.setdefault(rid, []).append((lid, quads))
+
+        for rid, lanes in rid_to_lanes.items():
+            if not lanes:
+                continue
+            # 选择 lane_id == 1 的那条车道，若不存在则选择 lane_id 最小者
+            lanes.sort(key=lambda x: x[0])
+            selected = None
+            for lid_i, qs in lanes:
+                if lid_i == 1:
+                    selected = (lid_i, qs)
+                    break
+            if selected is None:
+                selected = lanes[0]
+            lid, quads = selected
+            # 要求该lane具备 s 字段
+            if not any('s' in q for q in quads):
+                continue
+            # 按 poly_id 排序，稳定采样
+            quads.sort(key=lambda it: it.get('poly_id', 0) if isinstance(it.get('poly_id', 0), (int, float)) else 0)
+            n = len(quads)
+            if n == 0:
+                continue
+            # 只在中间段取5个（不含首末两端）。若中段不足5个，尽量均匀取。
+            middle_count = max(0, n - 2)
+            if middle_count <= 0:
+                continue
+            k = min(5, middle_count)
+            if k == 1:
+                idxs = [1]
+            else:
+                idxs = [1 + int(round(i*(middle_count-1)/(k-1))) for i in range(k)]
+            for n_i, i in enumerate(idxs):
+                q = quads[i]
+                cx, cy = q['center']
+                sval = float(q.get('s', 0.0))
+                # 1) 在中心画一个小点
+                dot = ax.scatter([cx], [cy], s=10, c='blue', alpha=0.9, zorder=3)
+                artists["s_label"].append(dot)
+                # 2) 文本框偏移位置 + 连接线
+                # 交替选择偏移方向，避免重叠
+                sign = 1 if (n_i % 2 == 0) else -1
+                dx = 0.8 * sign
+                dy = 0.6
+                ann = ax.annotate(
+                    f"s={sval:.1f}",
+                    xy=(cx, cy),
+                    xytext=(cx + dx, cy + dy),
+                    textcoords='data',
+                    fontsize=6,
+                    ha='left' if sign > 0 else 'right',
+                    va='center',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='blue', linewidth=0.4),
+                    arrowprops=dict(arrowstyle='-', color='blue', lw=0.6)
+                )
+                artists["s_label"].append(ann)
+        rendered["s_label"] = True
+
+    def render_curvature():
+        if rendered["curvature"]:
+            return
+        if len(polygons_data) == 0:
+            rendered["curvature"] = True
+            return
+        # 收集曲率绝对值的最大值用于归一化
+        curvs = [abs(float(p.get('curvature', 0.0))) for p in polygons_data]
+        kmax = max(curvs) if len(curvs) > 0 else 0.0
+        if kmax <= 0.0:
+            rendered["curvature"] = True
+            return
+        for p in polygons_data:
+            k = float(p.get('curvature', 0.0))
+            if k == 0.0:
+                continue  # 保持原色
+            inten = min(1.0, abs(k) / kmax)
+            if k > 0:
+                color = (0.0, inten, 0.0, 0.45)  # 绿色，强度随曲率
+            else:
+                color = (0.0, 0.0, inten, 0.45)  # 蓝色
+            vertices_2d = [(v[0], v[1]) for v in p['vertices']]
+            poly = Polygon(vertices_2d, closed=True, facecolor=color, edgecolor='none', alpha=color[3], linewidth=0.0)
+            ax.add_patch(poly)
+            artists["curvature"].append(poly)
+        rendered["curvature"] = True
+
     # 复选框放置在右侧
     fig = ax.figure
     cb_ax = fig.add_axes([0.86, 0.6, 0.12, 0.2])  # [left, bottom, width, height]
-    labels = ['line', 'circle', 'arc', 'oob', 'direction', 'road_color', 'w_lane']
-    visibility = [False, False, False, False, False, False, False]
+    labels = ['line', 'circle', 'arc', 'oob', 'direction', 'road_color', 'w_lane', 's_label', 'curvature']
+    visibility = [False, False, False, False, False, False, False, False, False]
     check = CheckButtons(cb_ax, labels, visibility)
     cb_ax.set_title('Layers')
 
@@ -245,6 +345,18 @@ def visualize_map(lines_data, circles_data, arcs_data, polygons_data, oob_points
                 for a in artists['w_lane']:
                     vis = a.get_visible()
                     a.set_visible(not vis)
+        elif label == 's_label':
+            if not rendered['s_label']:
+                render_s_labels()
+            else:
+                for a in artists['s_label']:
+                    a.set_visible(not a.get_visible())
+        elif label == 'curvature':
+            if not rendered['curvature']:
+                render_curvature()
+            else:
+                for a in artists['curvature']:
+                    a.set_visible(not a.get_visible())
         ax.figure.canvas.draw_idle()
     check.on_clicked(on_clicked)
 
@@ -269,11 +381,14 @@ def visualize_map_from_json(json_path: str):
     polygons_data = []
     for q in quads:
         polygons_data.append({
-            'poly_id': q.get('poly_Id'),
+            'poly_id': q.get('poly_id', q.get('poly_Id')),
             'road_id': q.get('road_id'),
+            'lane_id': q.get('lane_id', 1),
             'center': tuple(q.get('center', [0.0, 0.0, 0.0])[:2]),
             'vertices': [tuple(v) for v in q.get('vertices', [])],
-            'direction_angle': q.get('direction_angle', 0.0)
+            'direction_angle': q.get('direction_angle', 0.0),
+            's': q.get('s', 0.0),
+            'curvature': q.get('curvature', 0.0)
         })
 
     # 解析 OOB 点
