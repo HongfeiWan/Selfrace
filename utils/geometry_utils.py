@@ -2,38 +2,9 @@
 几何计算工具函数模块
 包含可复用的几何计算函数，用于地图处理和GPU加速计算
 """
-
 import numpy as np
 import torch
-from collections import defaultdict
-
-class SpatialGrid3D:
-    """3D空间网格，用于快速查找候选四边形"""
-    def __init__(self, quads, cell_size, name="quads"):
-        self.cell_size = cell_size
-        self.grid = defaultdict(list)
-        all_verts_2d = np.array([[v[0], v[1]] for q in quads for v in q['vertices']])
-        if all_verts_2d.shape[0] == 0:
-            self.min_coord, self.max_coord = np.array([0,0]), np.array([0,0])
-        else:
-            self.min_coord = np.min(all_verts_2d, axis=0) - cell_size
-            self.max_coord = np.max(all_verts_2d, axis=0) + cell_size
-        print(f"Populating 3D spatial grid for {name}...")
-        for i, quad in enumerate(quads):
-            if (i + 1) % 100 == 0 or i + 1 == len(quads):
-                print(f"\rGrid processing for {name}: {i+1}/{len(quads)}", end="")
-            poly_id = quad['poly_id']
-            verts_2d = np.array([[v[0], v[1]] for v in quad['vertices']])
-            min_q, max_q = np.min(verts_2d, axis=0), np.max(verts_2d, axis=0)
-            for i_grid in range(int((min_q[0] - self.min_coord[0]) // self.cell_size), int((max_q[0] - self.min_coord[0]) // self.cell_size) + 1):
-                for j_grid in range(int((min_q[1] - self.min_coord[1]) // self.cell_size), int((max_q[1] - self.min_coord[1]) // self.cell_size) + 1):
-                    self.grid[(i_grid, j_grid)].append(poly_id)
-        print(f"\n{name.capitalize()} grid populated.")
-
-    def get_candidates(self, point_2d):
-        grid_x = int((point_2d[0] - self.min_coord[0]) // self.cell_size)
-        grid_y = int((point_2d[1] - self.min_coord[1]) // self.cell_size)
-        return self.grid.get((grid_x, grid_y), [])
+from typing import Tuple
 
 def calculate_distance(point1, point2):
     """计算两点之间的距离"""
@@ -223,3 +194,132 @@ def normalize_angle_degrees(angle):
     """将角度标准化到[0, 360)范围（度数）"""
     return angle % 360
 
+# ===要用hash加速的版本===
+def find_nearest_lanes(device, quad_centerlines: torch.Tensor, points: torch.Tensor, k: int = 1, spatial_hash=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    为一批输入点找到最近的 k 个车道 (quads)。
+    Args:
+        device (torch.device): 计算设备。
+        quad_centerlines (torch.Tensor): 形状为 (Q, 2, 2) 的中心线张量。
+        points (torch.Tensor): 形状为 (N, 2) 或 (2,) 的点坐标张量。
+        k (int): 为每个点返回的最近车道数量。
+        spatial_hash (SpatialHash, optional): 空间哈希对象。若提供，使用其候选；否则暴力搜索。
+    Returns:
+        distances: (N, k)，欧氏距离
+        indices:   (N, k)，最近车道索引
+    """
+    if points.ndim == 1:
+        points = points.unsqueeze(0)
+    N = points.shape[0]
+
+    if quad_centerlines.numel() == 0:
+        return (
+            torch.full((N, k), float('inf'), device=device),
+            torch.full((N, k), -1, dtype=torch.long, device=device),
+        )
+
+    pts = points.to(device)
+    centers = quad_centerlines.to(device).mean(dim=1)  # (Q,2)
+
+    if spatial_hash is not None:
+        candidate_pairs = spatial_hash.query_points(pts)  # (num_candidates, 2) -> (point_idx, quad_idx)
+        if candidate_pairs.numel() == 0:
+            distances = torch.full((N, k), float('inf'), device=device)
+            indices = torch.full((N, k), -1, dtype=torch.long, device=device)
+            return distances, indices
+
+        point_indices = candidate_pairs[:, 0]
+        quad_indices = candidate_pairs[:, 1]
+
+        candidate_points = pts[point_indices]               # (C,2)
+        candidate_quad_centers = centers[quad_indices]       # (C,2)
+        diff = candidate_points - candidate_quad_centers     # (C,2)
+        candidate_distances = torch.sum(diff * diff, dim=-1) # (C,)
+
+        distances = torch.full((N, k), float('inf'), device=device)
+        indices = torch.full((N, k), -1, dtype=torch.long, device=device)
+
+        if point_indices.numel() > 0:
+            point_counts = torch.bincount(point_indices, minlength=N)
+            max_cand = point_counts.max().item()
+            if max_cand > 0:
+                order = torch.argsort(point_indices)
+                p_sorted = point_indices[order]
+                d_sorted = candidate_distances[order]
+                q_sorted = quad_indices[order]
+
+                starts = torch.cumsum(torch.nn.functional.pad(point_counts, (1, 0)), dim=0)[:-1]
+                mat_d = torch.full((N, max_cand), float('inf'), device=device)
+                mat_i = torch.full((N, max_cand), -1, dtype=torch.long, device=device)
+                pos = torch.arange(len(order), device=device) - starts[p_sorted]
+                mat_d[p_sorted, pos] = d_sorted
+                mat_i[p_sorted, pos] = q_sorted
+
+                topk_d, topk_idx = torch.topk(mat_d, k=min(k, max_cand), dim=1, largest=False)
+                vk = min(k, max_cand)
+                distances[:, :vk] = torch.sqrt(topk_d)
+                indices[:, :vk] = torch.gather(mat_i, 1, topk_idx)
+        return distances, indices
+
+    # 暴力搜索
+    diff = pts.unsqueeze(1) - centers.unsqueeze(0)  # (N,Q,2)
+    dist_sq = torch.sum(diff * diff, dim=-1)        # (N,Q)
+    k_eff = min(k, dist_sq.shape[1])
+    distances, indices = torch.topk(dist_sq, k=k_eff, dim=1, largest=False)
+    if k_eff < k:
+        pad = k - k_eff
+        distances = torch.cat([distances, torch.full((N, pad), float('inf'), device=device)], dim=1)
+        indices = torch.cat([indices, torch.full((N, pad), -1, dtype=torch.long, device=device)], dim=1)
+    return torch.sqrt(distances), indices
+
+def calculate_frenet_coordinates(device: torch.device,
+                                 quad_directions: torch.Tensor,
+                                 quad_centerlines: torch.Tensor,
+                                 vehicle_positions: torch.Tensor,
+                                 vehicle_headings: torch.Tensor,
+                                 k: int = 1,
+                                 spatial_hash=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    计算车辆在Frenet坐标系中的横向距离 d 与航向角误差 theta_f（左正右负）。
+    参数：
+      - device: 计算设备
+      - quad_directions: (Q,2) 单位方向向量
+      - quad_centerlines: (Q,2,2)
+      - vehicle_positions: (B,M,2) 或 (N,2) 或 (2,)
+      - vehicle_headings:  (B,M)   或 (N,)  或 ()
+      - k: 最近lane数量（默认1）
+      - spatial_hash: 可选的空间哈希，用于加速最近邻查询
+    返回：
+      - d: (B,M)
+      - theta_f: (B,M)
+    """
+    if vehicle_positions.ndim == 1:
+        vehicle_positions = vehicle_positions.unsqueeze(0).unsqueeze(0)  # (2,) -> (1,1,2)
+        vehicle_headings = vehicle_headings.unsqueeze(0).unsqueeze(0)
+    elif vehicle_positions.ndim == 2:
+        vehicle_positions = vehicle_positions.unsqueeze(0)  # (N,2) -> (1,N,2)
+        if vehicle_headings.ndim == 1:
+            vehicle_headings = vehicle_headings.unsqueeze(0)
+    B, M, _ = vehicle_positions.shape
+
+    pts_flat = vehicle_positions.reshape(-1, 2)
+    distances, indices = find_nearest_lanes(device, quad_centerlines, pts_flat, k=max(1, k), spatial_hash=spatial_hash)
+    nearest_idx = indices[:, 0].view(B, M)
+
+    road_dirs = quad_directions.to(device)[nearest_idx]              # (B,M,2)
+    veh_dirs = torch.stack([torch.cos(vehicle_headings),
+                            torch.sin(vehicle_headings)], dim=-1).to(device)  # (B,M,2)
+    centerlines = quad_centerlines.to(device)[nearest_idx]           # (B,M,2,2)
+    # 根据quad方向与中心线方向一致性选择起点：
+    # 若 (centerlines[1]-centerlines[0]) · road_dir >= 0，则起点为centerlines[0]；否则为centerlines[1]
+    v_cl = centerlines[:, :, 1, :] - centerlines[:, :, 0, :]           # (B,M,2)
+    dot = torch.sum(v_cl * road_dirs, dim=-1)                          # (B,M)
+    use_first = (dot >= 0).unsqueeze(-1)                               # (B,M,1)
+    road_starts = torch.where(use_first, centerlines[:, :, 0, :], centerlines[:, :, 1, :])
+    AP = vehicle_positions.to(device) - road_starts                  # (B,M,2)
+
+    d = (AP[:, :, 0] * road_dirs[:, :, 1] - AP[:, :, 1] * road_dirs[:, :, 0])
+    cross_heading = (veh_dirs[:, :, 0] * road_dirs[:, :, 1] - veh_dirs[:, :, 1] * road_dirs[:, :, 0])
+    dot_heading = torch.sum(road_dirs * veh_dirs, dim=-1)
+    theta_f = torch.atan2(cross_heading, dot_heading)
+    return d, theta_f

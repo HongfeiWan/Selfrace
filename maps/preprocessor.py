@@ -14,9 +14,10 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.geometry_utils import (
     calculate_distance, is_point_in_quad_2d, is_points_in_quads_gpu,
-    normalize_angle, angle_difference, normalize_angle_degrees, SpatialGrid3D,
+    normalize_angle, angle_difference, normalize_angle_degrees,
     quads_intersection_matrix_gpu
 )
+from utils.spatial_hash import SpatialHash
 from utils.visualize_utils import visualize_map_from_json, visualize_map
 
 # 加载配置文件
@@ -91,10 +92,45 @@ def adjust_road_directions_gpu(lines_data, arcs_data, tolerance: float, device: 
     # 本地四边形索引
     quads_by_id = {q['poly_id']: q for q in polygons_data}
 
-    try:
-        grid = SpatialGrid3D(polygons_data, CELL_SIZE, name="quads-dir")
-    except Exception:
-        grid = None
+    # 使用 SpatialHash 构建适配器，提供 get_candidates(point_2d) 接口
+    idx_to_poly_id = [q['poly_id'] for q in polygons_data]
+    # 计算全局 bounds 与每个quad的AABB
+    if polygons_data:
+        verts_all = np.array([[v[0], v[1]] for q in polygons_data for v in q['vertices']], dtype=np.float32)
+        min_bounds = torch.tensor(verts_all.min(axis=0), dtype=torch.float32, device=DEVICE)
+        max_bounds = torch.tensor(verts_all.max(axis=0), dtype=torch.float32, device=DEVICE)
+        # 每个quad AABB
+        quad_mins = []
+        quad_maxs = []
+        for q in polygons_data:
+            v2 = np.array([[v[0], v[1]] for v in q['vertices']], dtype=np.float32)
+            quad_mins.append(v2.min(axis=0))
+            quad_maxs.append(v2.max(axis=0))
+        static_bounds = torch.tensor(np.stack([np.stack([quad_mins[i], quad_maxs[i]], axis=0) for i in range(len(polygons_data))], axis=0), dtype=torch.float32, device=DEVICE)
+        try:
+            sh = SpatialHash(cell_size=float(CELL_SIZE), min_bounds=min_bounds, max_bounds=max_bounds, device=torch.device(DEVICE))
+            sh.build_static_index(static_bounds)
+        except Exception:
+            sh = None
+    else:
+        sh = None
+
+    class _HashAdapter:
+        def __init__(self, h, device, idx_to_pid):
+            self.h = h
+            self.device = device
+            self.idx_to_pid = idx_to_pid
+        def get_candidates(self, point_2d):
+            if self.h is None:
+                return []
+            pt = torch.tensor([[float(point_2d[0]), float(point_2d[1])]], dtype=torch.float32, device=self.h.device)
+            pairs = self.h.query_points(pt)
+            if pairs.numel() == 0:
+                return []
+            item_idx = pairs[:, 1].tolist()
+            return [self.idx_to_pid[i] for i in item_idx if 0 <= i < len(self.idx_to_pid)]
+
+    grid = _HashAdapter(sh, DEVICE, idx_to_poly_id)
 
     # 便捷 map
     line_map = {r['road_id']: r for r in lines_data}
@@ -128,12 +164,19 @@ def adjust_road_directions_gpu(lines_data, arcs_data, tolerance: float, device: 
             # 仅反转行驶方向，保持几何：不要更改 start/end 角度
             r['direction'] = - r.get('direction', 1)
         
-        # 同时反转该道路上所有四边形的方向角度
+        # 同时反转该道路上所有四边形的方向角度，并调整顶点定义（0<->2, 1<->3）
         if rid in road_to_quads:
             for quad in road_to_quads[rid]:
-                # 将方向角度反转180度
+                # 方向角反转180度
                 current_angle = quad.get('direction_angle', 0.0)
                 quad['direction_angle'] = (current_angle + math.pi) % (2 * math.pi)
+                # 顶点顺序交换以匹配左右翻转：0<->2, 1<->3
+                verts = list(quad.get('vertices', []))
+                if len(verts) == 4:
+                    v0, v1, v2, v3 = verts
+                    verts_swapped = [v2, v3, v0, v1]
+                    quad['vertices'] = verts_swapped
+                    
         # 记录该道路已发生反转，用于最后调整poly_id顺序
         reversed_rids.add(rid)
 
@@ -1304,7 +1347,6 @@ for line in msp.query("LINE"):
             'center': ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
         })
         increment_road_id()
-
 # 处理环岛
 for c in msp.query("CIRCLE"):
     center = c.dxf.center.xyz
@@ -1330,7 +1372,6 @@ for c in msp.query("CIRCLE"):
             'radius': radius
         })
         increment_road_id()   
-
 # 处理弯道
 for a in msp.query("ARC"):
     center = a.dxf.center.xyz
@@ -1897,8 +1938,40 @@ for arc_data in arcs_data:
 print("\n=== 开始生成OOB点 ===")
 # 构建四边形字典，用于快速查找
 quads_by_id = {quad['poly_id']: quad for quad in polygons_data}
-# 创建空间网格
-grid = SpatialGrid3D(polygons_data, CELL_SIZE, name="quads")
+# 创建空间哈希并适配为 get_candidates 接口
+idx_to_poly_id = [q['poly_id'] for q in polygons_data]
+if polygons_data:
+    verts_all = np.array([[v[0], v[1]] for q in polygons_data for v in q['vertices']], dtype=np.float32)
+    min_bounds = torch.tensor(verts_all.min(axis=0), dtype=torch.float32, device=DEVICE)
+    max_bounds = torch.tensor(verts_all.max(axis=0), dtype=torch.float32, device=DEVICE)
+    quad_mins = []
+    quad_maxs = []
+    for q in polygons_data:
+        v2 = np.array([[v[0], v[1]] for v in q['vertices']], dtype=np.float32)
+        quad_mins.append(v2.min(axis=0))
+        quad_maxs.append(v2.max(axis=0))
+    static_bounds = torch.tensor(np.stack([np.stack([quad_mins[i], quad_maxs[i]], axis=0) for i in range(len(polygons_data))], axis=0), dtype=torch.float32, device=DEVICE)
+    spatial_hash = SpatialHash(cell_size=float(CELL_SIZE), min_bounds=min_bounds, max_bounds=max_bounds, device=torch.device(DEVICE))
+    spatial_hash.build_static_index(static_bounds)
+else:
+    spatial_hash = None
+
+class _HashAdapter2:
+    def __init__(self, h, idx_to_pid):
+        self.h = h
+        self.idx_to_pid = idx_to_pid
+    def get_candidates(self, point_2d):
+        if self.h is None:
+            return []
+        pt = torch.tensor([[float(point_2d[0]), float(point_2d[1])]], dtype=torch.float32, device=self.h.device)
+        pairs = self.h.query_points(pt)
+        if pairs.numel() == 0:
+            return []
+        item_idx = pairs[:, 1].tolist()
+        return [self.idx_to_pid[i] for i in item_idx if 0 <= i < len(self.idx_to_pid)]
+
+grid = _HashAdapter2(spatial_hash, idx_to_poly_id)
+
 # 生成OOB点（支持GPU加速）
 use_gpu = torch.cuda.is_available()
 print(f"GPU加速状态: {'启用' if use_gpu else '禁用'}")
@@ -1933,8 +2006,10 @@ compute_lane_s_for_quads(polygons_data)
 
 # TODO: 添加曲率计算 
 # 对于每一条road_id,lane_id对应的路，从start到end有n个采样点，计算quads的曲率，并写入quads的curvature字段
+
 print("\n=== 计算每条车道的曲率 curvature ===")
 compute_lane_curvature(polygons_data)
+
 
 # =========================== 导出地图JSON ===========================
 # 使用 dxf 文件名生成同名 json 文件（同目录）

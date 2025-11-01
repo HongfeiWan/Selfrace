@@ -1,5 +1,53 @@
 {
   "map_path": "./maps",
+  "default_map": "town2.json",
+  "device": "cuda",
+
+  "simulator": {
+    "sim_dt": 0.3,
+    "B": 1320,
+    "M": 150,
+    "num_npc_vehicles": 150,
+
+    "dynamics": {
+      "max_velocity": 20.0,
+      "min_velocity": -2.0,
+
+      "vehicle_length_min": 0.8,
+      "vehicle_length_max": 7.0,
+      "vehicle_width_min": 0.8,
+      "vehicle_width_max": 3.0
+    },
+
+    "observation": {
+      "num_neighbors": 20,
+      "horizon": 200.0,
+
+      "local_state_dim": 7,
+      "num_w_lanes":80,
+      "num_w_boundaries":80
+    },
+
+    "hash": {
+      "cell_size": 5,
+      "grid_width": 1000,
+      "grid_height": 1000,
+      "map_extent_m": 20000.0
+    },
+
+    "reward": {
+    },
+
+    "traffic": {
+    },
+
+    "policy": {
+    }
+
+  },
+  
+  "training": {
+  },
 
   "preprocessor": {
     "tolerance": 0.1,
