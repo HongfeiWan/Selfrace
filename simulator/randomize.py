@@ -9,9 +9,10 @@ import traceback
 class DrivingStyleSampler:
     """
     车辆行驶风格抽样器
-    从混合均匀分布 X(a) = 0.5U(a-1,1) + 0.5U(1,a) 中采样 Cthrottle、Csteer 和 Cacc
+    从加权求和均匀分布 X(a) = 0.5U(a^(-1), 1) + 0.5U(1, a) 中采样 Cthrottle、Csteer 和 Cacc, Cvel
+    即：对两个均匀分布的采样结果进行加权求和（0.5 * U1 + 0.5 * U2）
     其中 a > 1，用于生成不同的车辆行驶风格
-    其中 Cthrottle 和 Csteer 从 X(1.25) 采样，Cacc 从 X(1.5) 采样
+    其中 Cthrottle 和 Csteer 从 X(1.25) 采样，Cacc 和 Cvel 从 X(1.5) 采样
     """
     def __init__(self, device: torch.device = None):
         """
@@ -23,9 +24,10 @@ class DrivingStyleSampler:
 
     def sample_mixed_uniform(self, a: float, size: int = 1) -> torch.Tensor:
         """
-        从混合均匀分布 X(a) = 0.5U(a-1,1) + 0.5U(1,a) 中采样
+        从加权求和均匀分布 X(a) = 0.5U(a^(-1), 1) + 0.5U(1, a) 中采样
+        即：从两个均匀分布分别采样，然后对结果进行加权求和（0.5 * U1 + 0.5 * U2）
         Args:
-            a (float): 混合均匀分布参数，必须大于1
+            a (float): 分布参数，必须大于1
             size (int): 采样数量
         Returns:
             torch.Tensor: 采样的值，形状为 (size,)
@@ -33,89 +35,54 @@ class DrivingStyleSampler:
         if a <= 1:
             raise ValueError("Parameter 'a' must be greater than 1")
         # 计算混合均匀分布的参数
-        lower_bound_1 = a - 1  # 第一个均匀分布的下界
-        upper_bound_1 = 1.0    # 第一个均匀分布的上界
-        lower_bound_2 = 1.0    # 第二个均匀分布的下界
-        upper_bound_2 = a      # 第二个均匀分布的上界
-        # 生成随机数决定使用哪个均匀分布
-        uniform_choice = np.random.random(size)
-        # 初始化结果数组
-        samples = np.zeros(size)
-        # 50% 的概率从第一个均匀分布采样
-        mask_1 = uniform_choice < 0.5
-        if np.any(mask_1):
-            samples[mask_1] = np.random.uniform(
-                lower_bound_1, 
-                upper_bound_1, 
-                size=np.sum(mask_1)
-            )
-        # 50% 的概率从第二个均匀分布采样
-        mask_2 = uniform_choice >= 0.5
-        if np.any(mask_2):
-            samples[mask_2] = np.random.uniform(
-                lower_bound_2, 
-                upper_bound_2, 
-                size=np.sum(mask_2)
-            )
+        lower_bound_1 = 1.0 / a  # 第一个均匀分布的下界：a^(-1)
+        upper_bound_1 = 1.0      # 第一个均匀分布的上界
+        lower_bound_2 = 1.0      # 第二个均匀分布的下界
+        upper_bound_2 = a        # 第二个均匀分布的上界
+        # 从两个均匀分布分别采样，然后加权求和：X = 0.5 * U1 + 0.5 * U2
+        samples_1 = np.random.uniform(lower_bound_1, upper_bound_1, size=size)
+        samples_2 = np.random.uniform(lower_bound_2, upper_bound_2, size=size)
+        # 加权求和
+        samples = 0.5 * samples_1 + 0.5 * samples_2
         return torch.tensor(samples, dtype=torch.float32, device=self.device)
     
-    def sample_driving_style(self, size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample_driving_style(self, size: int = 1) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        采样车辆行驶风格参数 Cthrottle 和 Csteer，从 X(1.25) 分布采样
+        采样车辆行驶风格参数
+        Cthrottle 和 Csteer 从 X(1.25) 分布采样，Cacc 和 Cvel 从 X(1.5) 分布采样
         
         Args:
             size (int): 采样数量
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (Cthrottle, Csteer) 参数对
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: (Cthrottle, Csteer, Cacc, Cvel) 参数
         """
         Cthrottle = self.sample_mixed_uniform(a=1.25, size=size)
         Csteer = self.sample_mixed_uniform(a=1.25, size=size)
-        return Cthrottle, Csteer    
-    
-    def sample_driving_Cacc(self, size: int = 1) -> torch.Tensor:
-        """
-        采样车辆行驶风格参数 Cacc，从 X(1.5) 分布采样
-        Args:
-            size (int): 采样数量
-        Returns:
-            torch.Tensor: Cacc 参数
-        """
         Cacc = self.sample_mixed_uniform(a=1.5, size=size)
-        return Cacc    
-    
-    def sample_driving_Cvel(self, size: int = 1) -> torch.Tensor:
-        """
-        采样车辆行驶风格参数 Cvel，从 X(1.5) 分布采样
-        
-        Args:
-            size (int): 采样数量
-        Returns:
-            torch.Tensor: Cvel 参数
-        """
         Cvel = self.sample_mixed_uniform(a=1.5, size=size)
-        return Cvel    
-    
+        return Cthrottle, Csteer, Cacc, Cvel    
+     
     def get_distribution_info(self, a: float) -> Dict:
         """
         获取分布信息
         Args:
-            a (float): 混合均匀分布参数
+            a (float): 加权求和均匀分布参数
         Returns:
             Dict: 包含分布参数的字典
         """
         if a <= 1:
             raise ValueError("Parameter 'a' must be greater than 1")
         
-        lower_bound_1 = a - 1
+        lower_bound_1 = 1.0 / a  # a^(-1)
         upper_bound_1 = 1.0
         lower_bound_2 = 1.0
         upper_bound_2 = a
         
         return {
             'a': a,
-            'distribution': f"X({a}) = 0.5U({lower_bound_1:.2f}, {upper_bound_1:.2f}) + 0.5U({lower_bound_2:.2f}, {upper_bound_2:.2f})",
-            'support': f"[{lower_bound_1:.2f}, {upper_bound_2:.2f}]",
-            'expected_value': 1.0  # 混合均匀分布的期望值
+            'distribution': f"X({a}) = 0.5U({lower_bound_1:.4f}, {upper_bound_1:.2f}) + 0.5U({lower_bound_2:.2f}, {upper_bound_2:.2f})",
+            'support': f"[{lower_bound_1:.4f}, {upper_bound_2:.2f}]",
+            'expected_value': 1.0  # 加权求和均匀分布的期望值
         }
 
 class RewardParameterSampler:
@@ -128,153 +95,71 @@ class RewardParameterSampler:
         初始化参数采样器。
         Args:
             config (Dict): 包含奖励参数的配置字典。
+                支持从simulator.reward子配置中读取参数，也支持直接从根级别的reward读取（向后兼容）。
             device (torch.device): 计算设备。
         """
         self.device = device
-        self.reward_config = config.get('reward', {})
+        # 获取reward配置，支持嵌套配置结构
+        # 首先尝试从 simulator.reward 获取，如果没有则从根级别的 reward 获取
+        if 'simulator' in config and isinstance(config.get('simulator'), dict):
+            simulator_config = config['simulator']
+            self.reward_config = simulator_config.get('reward', {})
+        else:
+            self.reward_config = config.get('reward', {})
+        if not self.reward_config:
+            raise ValueError("配置中未找到 'reward' 配置，请检查配置文件")
+        
         # 从配置中加载参数范围
         self._load_parameter_ranges()
         
     def _load_parameter_ranges(self):
         """加载所有参数的范围配置。"""
         # Rgoal相关参数
-        self.delta_goal_min = self.reward_config.get('delta_goal_min', 2.0)
-        self.delta_goal_max = self.reward_config.get('delta_goal_max', 12.0)
-        # 碰撞相关参数
-        self.collision_alpha_min = self.reward_config.get('collision_alpha_min', 0.0)
-        self.collision_alpha_max = self.reward_config.get('collision_alpha_max', 3.0)
-        # 边界相关参数
-        self.boundary_alpha_min = self.reward_config.get('boundary_alpha_min', 0.0)
-        self.boundary_alpha_max = self.reward_config.get('boundary_alpha_max', 3.0)
-        # 舒适度相关参数
-        self.comfort_alpha_min = self.reward_config.get('comfort_alpha_min', 0.0)
-        self.comfort_alpha_max = self.reward_config.get('comfort_alpha_max', 0.1)
+        self.delta_goal_min = self.reward_config.get('delta_goal_min')
+        self.delta_goal_max = self.reward_config.get('delta_goal_max')
+        # 碰撞相关参数（如果配置中没有，使用默认值）
+        self.collision_alpha_min = self.reward_config.get('collision_alpha_min')
+        self.collision_alpha_max = self.reward_config.get('collision_alpha_max')
+        # 边界相关参数（如果配置中没有，使用默认值）
+        self.boundary_alpha_min = self.reward_config.get('boundary_alpha_min')
+        self.boundary_alpha_max = self.reward_config.get('boundary_alpha_max')
+        # 舒适度相关参数（如果配置中没有，使用默认值）
+        self.comfort_alpha_min = self.reward_config.get('comfort_alpha_min')
+        self.comfort_alpha_max = self.reward_config.get('comfort_alpha_max')
         # 车道对齐相关参数
-        self.l_align_alpha_min = self.reward_config.get('l_align_alpha_min', 2.5e-4)
-        self.l_align_alpha_max = self.reward_config.get('l_align_alpha_max', 2.5e-2)
-        self.vel_align_alpha_min = self.reward_config.get('vel_align_alpha_min', 0.0)
-        self.vel_align_alpha_max = self.reward_config.get('vel_align_alpha_max', 1.0)
-        # 车道中心对齐相关参数
-        self.l_center_alpha_min = self.reward_config.get('l_center_alpha_min', 2.5e-4)
-        self.l_center_alpha_max = self.reward_config.get('l_center_alpha_max', 7.5e-3)
-        self.center_bias_alpha_min = self.reward_config.get('center_bias_alpha_min', -0.5)
-        self.center_bias_alpha_max = self.reward_config.get('center_bias_alpha_max', 0.5)
+        self.l_align_alpha_min = self.reward_config.get('l_align_alpha_min')
+        self.l_align_alpha_max = self.reward_config.get('l_align_alpha_max')
+        self.vel_align_alpha_min = self.reward_config.get('vel_align_alpha_min')
+        self.vel_align_alpha_max = self.reward_config.get('vel_align_alpha_max')
+        # 车道中心对齐相关参数（如果配置中没有，使用默认值）
+        self.l_center_alpha_min = self.reward_config.get('l_center_alpha_min')
+        self.l_center_alpha_max = self.reward_config.get('l_center_alpha_max')
+        self.center_bias_alpha_min = self.reward_config.get('center_bias_alpha_min')
+        self.center_bias_alpha_max = self.reward_config.get('center_bias_alpha_max')
         # 倒车相关参数
-        self.reverse_alpha_min = self.reward_config.get('reverse_alpha_min', 2.5e-4)
-        self.reverse_alpha_max = self.reward_config.get('reverse_alpha_max', 7.5e-3)
+        self.reverse_alpha_min = self.reward_config.get('reverse_alpha_min')
+        self.reverse_alpha_max = self.reward_config.get('reverse_alpha_max')
         # 停止线相关参数
-        self.stop_line_alpha_min = self.reward_config.get('stop_line_alpha_min', 0.0)
-        self.stop_line_alpha_max = self.reward_config.get('stop_line_alpha_max', 1.0)
-    
-    def sample_delta_goal(self) -> torch.Tensor:
-        """
-        从均匀分布采样delta_goal值。
+        self.stop_line_alpha_min = self.reward_config.get('stop_line_alpha_min')
+        self.stop_line_alpha_max = self.reward_config.get('stop_line_alpha_max')
         
-        Returns:
-            torch.Tensor: 采样的delta_goal值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.delta_goal_min, self.delta_goal_max
-        )
-    
-    def sample_collision_alpha(self) -> torch.Tensor:
-        """
-        从均匀分布采样碰撞alpha值。
+        # 验证必需的参数是否都存在（不能为None）
+        required_params = {
+            'delta_goal_min': self.delta_goal_min,
+            'delta_goal_max': self.delta_goal_max,
+            'l_align_alpha_min': self.l_align_alpha_min,
+            'l_align_alpha_max': self.l_align_alpha_max,
+            'vel_align_alpha_min': self.vel_align_alpha_min,
+            'vel_align_alpha_max': self.vel_align_alpha_max,
+            'reverse_alpha_min': self.reverse_alpha_min,
+            'reverse_alpha_max': self.reverse_alpha_max,
+            'stop_line_alpha_min': self.stop_line_alpha_min,
+            'stop_line_alpha_max': self.stop_line_alpha_max,
+        }
         
-        Returns:
-            torch.Tensor: 采样的alpha值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.collision_alpha_min, self.collision_alpha_max
-        )
-    
-    def sample_boundary_alpha(self) -> torch.Tensor:
-        """
-        从均匀分布采样边界alpha值。
-        
-        Returns:
-            torch.Tensor: 采样的alpha值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.boundary_alpha_min, self.boundary_alpha_max
-        )
-    
-    def sample_comfort_alpha(self) -> torch.Tensor:
-        """
-        从均匀分布采样舒适度alpha值。
-        
-        Returns:
-            torch.Tensor: 采样的alpha值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.comfort_alpha_min, self.comfort_alpha_max
-        )
-    
-    def sample_l_align_alpha(self) -> torch.Tensor:
-        """
-        从均匀分布采样车道对齐alpha值。
-        
-        Returns:
-            torch.Tensor: 采样的alpha值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.l_align_alpha_min, self.l_align_alpha_max
-        )
-    
-    def sample_vel_align_alpha(self) -> torch.Tensor:
-        """
-        从均匀分布采样速度对齐alpha值。
-        
-        Returns:
-            torch.Tensor: 采样的alpha值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.vel_align_alpha_min, self.vel_align_alpha_max
-        )
-    
-    def sample_l_center_alpha(self) -> torch.Tensor:
-        """
-        从均匀分布采样车道中心对齐alpha值。
-        
-        Returns:
-            torch.Tensor: 采样的alpha值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.l_center_alpha_min, self.l_center_alpha_max
-        )
-    
-    def sample_center_bias_alpha(self) -> torch.Tensor:
-        """
-        从均匀分布采样中心偏置alpha值。
-        
-        Returns:
-            torch.Tensor: 采样的alpha值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.center_bias_alpha_min, self.center_bias_alpha_max
-        )
-    
-    def sample_reverse_alpha(self) -> torch.Tensor:
-        """
-        从均匀分布采样倒车alpha值。
-        
-        Returns:
-            torch.Tensor: 采样的alpha值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.reverse_alpha_min, self.reverse_alpha_max
-        )
-    
-    def sample_stop_line_alpha(self) -> torch.Tensor:
-        """
-        从均匀分布采样停止线alpha值。
-        
-        Returns:
-            torch.Tensor: 采样的alpha值
-        """
-        return torch.empty(1, device=self.device).uniform_(
-            self.stop_line_alpha_min, self.stop_line_alpha_max
-        )
+        missing_params = [name for name, value in required_params.items() if value is None]
+        if missing_params:
+            raise ValueError(f"配置中缺少以下必需的reward参数: {', '.join(missing_params)}")
     
     def sample_all_parameters(self, B: int = 1, M: int = 1) -> torch.Tensor:
         """
@@ -286,10 +171,15 @@ class RewardParameterSampler:
             torch.Tensor: 形状为 (B, M, 10) 的reward系数张量
         """
         device = self.device
-        def uniform(min_v, max_v):
+        def uniform(min_v, max_v, default_min=0.0, default_max=1.0):
+            # 如果参数为None，使用默认值
+            if min_v is None:
+                min_v = default_min
+            if max_v is None:
+                max_v = default_max
             return torch.empty(B, M, device=device).uniform_(min_v, max_v)
         
-        # 采样所有参数
+        # 采样所有参数（缺失的参数使用默认值[0.0, 1.0]）
         params = {
             'delta_goal': uniform(self.delta_goal_min, self.delta_goal_max),
             'collision_alpha': uniform(self.collision_alpha_min, self.collision_alpha_max),
@@ -325,13 +215,45 @@ class VehicleParameterSampler:
     支持批量采样车辆长度、宽度和轴距，并应用约束条件。
     """
     def __init__(self, config: Dict, device: torch.device):
+        """
+        初始化车辆参数采样器。
+        Args:
+            config (Dict): 包含车辆参数的配置字典。
+                支持从simulator.dynamics子配置中读取参数，也支持直接从根级别的dynamics读取（向后兼容）。
+            device (torch.device): 计算设备。
+        """
         self.device = device
-        dynamics_config = config.get('dynamics', {})
-        self.vehicle_length_min = dynamics_config.get('vehicle_length_min', 0.8)
-        self.vehicle_length_max = dynamics_config.get('vehicle_length_max', 7.0)
-        self.vehicle_width_min = dynamics_config.get('vehicle_width_min', 0.8)
-        self.vehicle_width_max = dynamics_config.get('vehicle_width_max', 3.0)
-        self.wheelbase_ratio = 0.6  # 轴距为长度的0.6倍
+        # 获取dynamics配置，支持嵌套配置结构
+        # 首先尝试从 simulator.dynamics 获取，如果没有则从根级别的 dynamics 获取
+        if 'simulator' in config and isinstance(config.get('simulator'), dict):
+            simulator_config = config['simulator']
+            dynamics_config = simulator_config.get('dynamics', {})
+            if not dynamics_config:  # 如果simulator.dynamics不存在，尝试直接使用simulator配置
+                dynamics_config = simulator_config
+        else:
+            dynamics_config = config.get('dynamics', config)
+        
+        if not dynamics_config:
+            raise ValueError("配置中未找到 'dynamics' 配置，请检查配置文件")
+        
+        self.vehicle_length_min = dynamics_config.get('vehicle_length_min')
+        self.vehicle_length_max = dynamics_config.get('vehicle_length_max')
+        self.vehicle_width_min = dynamics_config.get('vehicle_width_min')
+        self.vehicle_width_max = dynamics_config.get('vehicle_width_max')
+        self.wheelbase_ratio = dynamics_config.get('wheelbase_ratio')
+        
+        # 验证必需的参数是否都存在
+        required_params = {
+            'vehicle_length_min': self.vehicle_length_min,
+            'vehicle_length_max': self.vehicle_length_max,
+            'vehicle_width_min': self.vehicle_width_min,
+            'vehicle_width_max': self.vehicle_width_max,
+            'wheelbase_ratio': self.wheelbase_ratio,
+        }
+        
+        missing_params = [name for name, value in required_params.items() if value is None]
+        if missing_params:
+            raise ValueError(f"配置中缺少以下必需的dynamics参数: {', '.join(missing_params)}")
 
     def sample_batch_vehicle_parameters(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """
@@ -366,21 +288,21 @@ if __name__ == "__main__":
     import numpy as np
     import matplotlib.pyplot as plt
     from collections import defaultdict
-    import yaml
+    import json
     import os
     
-    def load_config_from_yaml(config_path: str) -> dict:
-        """从YAML文件加载配置"""
+    def load_config_from_json(config_path: str) -> dict:
+        """从JSON文件加载配置"""
         try:
             with open(config_path, 'r', encoding='utf-8') as file:
-                config = yaml.safe_load(file)
+                config = json.load(file)
             print(f"成功从 {config_path} 加载配置")
             return config
         except FileNotFoundError:
             print(f"警告: 配置文件 {config_path} 未找到，使用默认配置")
             return {}
-        except yaml.YAMLError as e:
-            print(f"错误: 解析YAML文件时出错: {e}")
+        except json.JSONDecodeError as e:
+            print(f"错误: 解析JSON文件时出错: {e}")
             return {}
     
     def test_reward_parameter_sampler():
@@ -390,8 +312,8 @@ if __name__ == "__main__":
         print("="*60)
         
         # 从配置文件加载配置
-        config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'configs', 'default_config.yaml')
-        test_config = load_config_from_yaml(config_path)
+        config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'configs', 'default_config.json')
+        test_config = load_config_from_json(config_path)
         
         if not test_config:
             print("错误: 无法加载配置，测试终止")
@@ -402,7 +324,7 @@ if __name__ == "__main__":
         sampler = RewardParameterSampler(test_config, device)
         
         # 采样次数
-        n_samples = 10000
+        n_samples = 1000
         
         # 存储所有采样结果
         all_samples = defaultdict(list)
@@ -461,12 +383,17 @@ if __name__ == "__main__":
                     # 添加理论范围线
                     min_range = getattr(sampler, f'{param_name}_min', None)
                     max_range = getattr(sampler, f'{param_name}_max', None)
+                    has_labels = False
                     if min_range is not None:
                         axes[i].axvline(min_range, color='red', linestyle='--', alpha=0.7, label=f'min: {min_range}')
+                        has_labels = True
                     if max_range is not None:
                         axes[i].axvline(max_range, color='red', linestyle='--', alpha=0.7, label=f'max: {max_range}')
+                        has_labels = True
                     
-                    axes[i].legend()
+                    # 只有在有标签时才显示图例
+                    if has_labels:
+                        axes[i].legend()
                     axes[i].grid(True, alpha=0.3)
             
             # 隐藏多余的子图
@@ -522,7 +449,7 @@ if __name__ == "__main__":
         sampler = DrivingStyleSampler(device=device)
         
         # 采样次数
-        n_samples = 1000
+        n_samples = 10000
         
         print("测试 sample_mixed_uniform...")
         try:
@@ -536,28 +463,14 @@ if __name__ == "__main__":
         
         print("测试 sample_driving_style...")
         try:
-            Cthrottle, Csteer = sampler.sample_driving_style(size=n_samples)
+            Cthrottle, Csteer, Cacc, Cvel = sampler.sample_driving_style(size=n_samples)
             print(f"  Cthrottle 范围: [{Cthrottle.min():.3f}, {Cthrottle.max():.3f}]")
             print(f"  Csteer 范围: [{Csteer.min():.3f}, {Csteer.max():.3f}]")
+            print(f"  Cacc 范围: [{Cacc.min():.3f}, {Cacc.max():.3f}]")
+            print(f"  Cvel 范围: [{Cvel.min():.3f}, {Cvel.max():.3f}]")
             print("  ✓ sample_driving_style 测试通过")
         except Exception as e:
             print(f"  ✗ sample_driving_style 测试失败: {e}")
-        
-        print("测试 sample_driving_Cacc...")
-        try:
-            Cacc = sampler.sample_driving_Cacc(size=n_samples)
-            print(f"  Cacc 范围: [{Cacc.min():.3f}, {Cacc.max():.3f}]")
-            print("  ✓ sample_driving_Cacc 测试通过")
-        except Exception as e:
-            print(f"  ✗ sample_driving_Cacc 测试失败: {e}")
-        
-        print("测试 sample_driving_Cvel...")
-        try:
-            Cvel = sampler.sample_driving_Cvel(size=n_samples)
-            print(f"  Cvel 范围: [{Cvel.min():.3f}, {Cvel.max():.3f}]")
-            print("  ✓ sample_driving_Cvel 测试通过")
-        except Exception as e:
-            print(f"  ✗ sample_driving_Cvel 测试失败: {e}")
         
         print("测试 get_distribution_info...")
         try:
@@ -579,8 +492,8 @@ if __name__ == "__main__":
         
         try:
             # 从配置文件加载配置
-            config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'configs', 'default_config.yaml')
-            test_config = load_config_from_yaml(config_path)
+            config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'configs', 'default_config.json')
+            test_config = load_config_from_json(config_path)
             if not test_config:
                 print("错误: 无法加载配置，测试终止")
                 return
@@ -689,10 +602,10 @@ if __name__ == "__main__":
 
     def main():
         # 测试 DrivingStyleSampler
-        test_driving_style_sampler()
+        # test_driving_style_sampler()
         
         # 测试 RewardParameterSampler
-        # test_reward_parameter_sampler()
+        test_reward_parameter_sampler()
 
         # 测试 VehicleParameterSampler
         #  test_vehicle_parameter_sampler()

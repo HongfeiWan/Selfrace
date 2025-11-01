@@ -176,7 +176,7 @@ def adjust_road_directions_gpu(lines_data, arcs_data, tolerance: float, device: 
                     v0, v1, v2, v3 = verts
                     verts_swapped = [v2, v3, v0, v1]
                     quad['vertices'] = verts_swapped
-                    
+
         # 记录该道路已发生反转，用于最后调整poly_id顺序
         reversed_rids.add(rid)
 
@@ -2039,6 +2039,7 @@ for oob_point in oob_points:
         "y": float(oob_point['y']),
         "z": float(oob_point['z'])
     })
+
 
 export_payload = {
     "map_name": json_file_name,

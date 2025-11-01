@@ -10,13 +10,26 @@
     "num_npc_vehicles": 150,
 
     "dynamics": {
+
       "max_velocity": 20.0,
       "min_velocity": -2.0,
-
+      
       "vehicle_length_min": 0.8,
       "vehicle_length_max": 7.0,
       "vehicle_width_min": 0.8,
-      "vehicle_width_max": 3.0
+      "vehicle_width_max": 3.0,
+      "wheelbase_ratio": 0.6,
+
+      "max_steering_rate": 0.6,
+      "vehicle_max_steer_angle":35.0,
+
+      "max_longitudinal_accel":2.5,
+      "min_longitudinal_accel":-5.0,
+      "max_lateral_accel":4.0,
+      "min_lateral_accel":-4.0,
+
+      "curvature_epsilon":1e-5
+
     },
 
     "observation": {
@@ -24,8 +37,12 @@
       "horizon": 200.0,
 
       "local_state_dim": 7,
+      "neighbor_feature_dim": 7,
+      "waypoint_feature_dim": 2,
+      "boundary_feature_dim": 2,
       "num_w_lanes":80,
       "num_w_boundaries":80
+
     },
 
     "hash": {
@@ -36,6 +53,40 @@
     },
 
     "reward": {
+      "v_goal": 3.0,    
+      "goal_reward": 1.0,    
+      "delta_goal_min": 2.0,         
+      "delta_goal_max": 12.0, 
+      
+      "collision_alpha_min": 0.0,
+      "collision_alpha_max": 3.0,
+      "collision_speed_mult": 0.1,
+
+      "boundary_alpha_min": 0.0,
+      "boundary_alpha_max": 3.0,
+
+      "comfort_alpha_min": 0.0,
+      "comfort_alpha_max": 0.1,
+
+      "l_align_alpha_min": 2.5e-4,  
+      "l_align_alpha_max": 2.5e-2, 
+      "vel_align_alpha_min": 0.0,   
+      "vel_align_alpha_max": 1.0, 
+
+      "l_center_alpha_min": 2.5e-4,
+      "l_center_alpha_max": 7.5e-3,
+      "center_bias_alpha_min": -0.5,
+      "center_bias_alpha_max": 0.5,
+
+      "velocity_alpha":2.5e-3,
+
+      "reverse_alpha_min": 2.5e-4, 
+      "reverse_alpha_max": 7.5e-3, 
+
+      "stop_line_alpha_min": 0.0,   
+      "stop_line_alpha_max": 1.0,   
+
+      "timestep_alpha": 2.5e-5     
     },
 
     "traffic": {
