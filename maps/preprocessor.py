@@ -1304,13 +1304,21 @@ def sample_w_lanes(polygons_data, sample_distance_m=W_LANE_SAMPLE_DISTANCE):
                     best_d = d
                     best_i = i
             idx_used.add(best_i)
+        
+        # 将采样索引排序，并分配w_lane_id
+        sorted_idx_list = sorted(idx_used)
+        idx_to_w_lane_id = {}  # 记录每个采样索引对应的w_lane_id
+        for idx in sorted_idx_list:
+            idx_to_w_lane_id[idx] = w_lane_id
+            w_lane_id += 1
 
         # 生成W_lane点
-        for i in sorted(idx_used):
-            q = quads[i]
+        for idx in sorted_idx_list:
+            q = quads[idx]
             width = _compute_quad_width_avg(q['vertices'])
+            current_w_lane_id = idx_to_w_lane_id[idx]
             w_lanes.append({
-                'w_lane_id': w_lane_id,
+                'w_lane_id': current_w_lane_id,
                 'road_id': rid,
                 'lane_id': lid,
                 'center': (float(q['center'][0]), float(q['center'][1])),
@@ -1318,7 +1326,62 @@ def sample_w_lanes(polygons_data, sample_distance_m=W_LANE_SAMPLE_DISTANCE):
                 'width': float(width),
                 'poly_id': q['poly_id']
             })
-            w_lane_id += 1
+        
+        # 为所有quads添加next_w_lane_id和prev_w_lane_id
+        for quad_idx, quad in enumerate(quads):
+            # 如果这个quad是采样点（waypoint）
+            if quad_idx in idx_to_w_lane_id:
+                current_w_lane_id = idx_to_w_lane_id[quad_idx]
+                # prev_w_lane_id指向自己
+                quad['prev_w_lane_id'] = current_w_lane_id
+                # next_w_lane_id指向下一个waypoint（如果存在）
+                pos = sorted_idx_list.index(quad_idx)
+                if pos + 1 < len(sorted_idx_list):
+                    quad['next_w_lane_id'] = idx_to_w_lane_id[sorted_idx_list[pos + 1]]
+                else:
+                    # 最后一个waypoint，next_w_lane_id指向自己
+                    quad['next_w_lane_id'] = current_w_lane_id
+            else:
+                # 这个quad在两个waypoint之间
+                # 找到前一个waypoint（小于等于quad_idx的最大索引）
+                prev_w_lane_id = None
+                for i in range(len(sorted_idx_list) - 1, -1, -1):
+                    w_idx = sorted_idx_list[i]
+                    if w_idx <= quad_idx:
+                        prev_w_lane_id = idx_to_w_lane_id[w_idx]
+                        break
+                
+                # 找到后一个waypoint（大于quad_idx的最小索引）
+                next_w_lane_id = None
+                for w_idx in sorted_idx_list:
+                    if w_idx > quad_idx:
+                        next_w_lane_id = idx_to_w_lane_id[w_idx]
+                        break
+                
+                # 设置prev_w_lane_id和next_w_lane_id
+                if prev_w_lane_id is not None:
+                    quad['prev_w_lane_id'] = prev_w_lane_id
+                elif len(sorted_idx_list) > 0:
+                    # 如果前面没有waypoint，使用第一个waypoint
+                    quad['prev_w_lane_id'] = idx_to_w_lane_id[sorted_idx_list[0]]
+                else:
+                    quad['prev_w_lane_id'] = None
+                
+                if next_w_lane_id is not None:
+                    quad['next_w_lane_id'] = next_w_lane_id
+                elif len(sorted_idx_list) > 0:
+                    # 如果后面没有waypoint，使用最后一个waypoint
+                    quad['next_w_lane_id'] = idx_to_w_lane_id[sorted_idx_list[-1]]
+                else:
+                    quad['next_w_lane_id'] = None
+    
+    # 确保所有quads都有prev_w_lane_id和next_w_lane_id字段（防止某些quads没有被处理）
+    for quad in polygons_data:
+        if 'prev_w_lane_id' not in quad:
+            quad['prev_w_lane_id'] = None
+        if 'next_w_lane_id' not in quad:
+            quad['next_w_lane_id'] = None
+    
     return w_lanes
 
 # =========================== 数据初始化 ===========================
@@ -2020,7 +2083,7 @@ json_output_path = os.path.join(os.path.dirname(dxf_path), json_file_name)
 # 仅导出所需字段：poly_Id, vertices, road_id
 export_quads = []
 for quad in polygons_data:
-    export_quads.append({
+    export_quad = {
         "poly_id": quad["poly_id"],
         "road_id": quad["road_id"],
         'lane_id': quad['lane_id'],
@@ -2029,7 +2092,16 @@ for quad in polygons_data:
         "direction_angle": float(quad["direction_angle"]),
         "s": float(quad.get("s", 0.0)),
         "curvature": float(quad.get("curvature", 0.0))
-    })
+    }
+    # 添加prev_w_lane_id和next_w_lane_id（所有quads在sample_w_lanes中都已添加这些字段）
+    prev_w_lane_id = quad.get("prev_w_lane_id", None)
+    next_w_lane_id = quad.get("next_w_lane_id", None)
+    if prev_w_lane_id is not None:
+        export_quad["prev_w_lane_id"] = int(prev_w_lane_id)
+    if next_w_lane_id is not None:
+        export_quad["next_w_lane_id"] = int(next_w_lane_id)
+    export_quads.append(export_quad)
+
 
 # 导出OOB点数据
 export_oob_points = []
