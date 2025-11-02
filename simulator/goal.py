@@ -41,6 +41,9 @@ class PathPlanner:
         quads = map_data['quads']
         # 创建quad的查找表，用于快速访问
         quads_by_id = {q['poly_id']: q for q in quads}
+        
+        # 存储quads数据以便后续使用
+        self.quads_by_id = quads_by_id
         # 按 road_id, lane_id 分组 w_lanes，并找出每个分组的 start 和 end
         lane_groups = defaultdict(list)
         for w_lane in w_lanes:
@@ -78,7 +81,6 @@ class PathPlanner:
         # 一次性转换为GPU tensor
         all_w_lane_positions = torch.from_numpy(coords_array).to(device=self.device, dtype=torch.float32)  # (n_w_lanes, 2)
 
-
         # 构建start和end位置tensor
         start_indices = [w_lane_id_to_idx[lane_start_end_dict[key]['start']] for key in self.lane_keys]
         end_indices = [w_lane_id_to_idx[lane_start_end_dict[key]['end']] for key in self.lane_keys]
@@ -101,13 +103,11 @@ class PathPlanner:
         # adjacency_matrix[i][j] = 1 表示 lane_i 的 end 可以导向 lane_j 的 start
         CONNECTION_THRESHOLD = 5.0
         self.end_to_start_matrix = (distances < CONNECTION_THRESHOLD).float()  # (n_lanes, n_lanes)
-        
         # 预计算边权重矩阵：连接存在的边权重为距离，不存在的为INF
         # 这样在Dijkstra中就不需要重复计算了
         INF = 1e10
         self.edge_weights = torch.where(self.end_to_start_matrix > 0, distances, 
                                         torch.full_like(distances, INF))
-        
         # 5. 图结构已构建完成
         # end_to_start_matrix[i][j] = 1 表示 lane_i 的 end 可以导向 lane_j 的 start
         # 由于每个lane内部 start->end 是天然导通的，因此：
@@ -117,6 +117,25 @@ class PathPlanner:
         self.lane_start_end = lane_start_end_dict
         # 为了兼容BFS接口，将邻接矩阵统一命名为adjacency_matrix
         self.adjacency_matrix = self.end_to_start_matrix
+        
+        # 创建poly_id到lane_idx的映射
+        # 每个poly_id对应一个quad，每个quad有road_id和lane_id
+        self.poly_id_to_lane_idx = {}
+        max_poly_id = max(quads_by_id.keys()) if quads_by_id else 0
+        
+        # 创建GPU tensor用于快速查找
+        # poly_id_lookup[i] 存储poly_id=i对应的lane_idx，如果不存在则为-1
+        poly_id_lookup_cpu = np.full(max_poly_id + 1, -1, dtype=np.int64)
+        for poly_id, quad in quads_by_id.items():
+            road_id = quad['road_id']
+            lane_id = quad['lane_id']
+            key = (road_id, lane_id)
+            if key in self.lane_to_idx:
+                lane_idx = self.lane_to_idx[key]
+                self.poly_id_to_lane_idx[poly_id] = lane_idx
+                poly_id_lookup_cpu[poly_id] = lane_idx
+        # 转换为GPU tensor
+        self.poly_id_lookup = torch.from_numpy(poly_id_lookup_cpu).to(device=self.device, dtype=torch.long)
         
         # 6. 预计算所有起点到终点的最短路径并存储在显存中
         print(f"开始预计算所有 {self.n_lanes} x {self.n_lanes} = {self.n_lanes * self.n_lanes} 条路径...")
@@ -181,11 +200,9 @@ class PathPlanner:
         """
         if self.prev_matrix[start_lane_idx, target_lane_idx] < 0:
             return None
-        
         # 反向追踪前驱节点构建路径
         path_list = []
         current = target_lane_idx
-        
         # 从前驱矩阵中构建路径（反向追踪）
         # 注意：前驱矩阵中的值表示从start到current的路径上，current的前驱节点
         path_list.append(current)
@@ -194,10 +211,51 @@ class PathPlanner:
             if current < 0:
                 return None
             path_list.append(current)
-        
         # 反转路径（从start到target）
         path_list.reverse()
         return torch.tensor(path_list, device=self.device, dtype=torch.long)
+    
+    def path_plan(self, start_poly_ids, end_poly_ids):
+        """
+        批量路径规划：从poly_id到poly_id的最短路径
+        
+        Args:
+            start_poly_ids: (B, M) 起点poly_id的tensor
+            end_poly_ids: (B, M) 终点poly_id的tensor
+            
+        Returns:
+            List[List[torch.Tensor]]: (B, M) 每条路径的结果
+                每个元素是一个torch.Tensor，包含该路径经过的所有lane_idx
+                如果路径不存在则返回None
+        """
+        B, M = start_poly_ids.shape
+        
+        # 确保输入tensor在正确设备上
+        start_poly_ids = start_poly_ids.to(self.device)
+        end_poly_ids = end_poly_ids.to(self.device)
+        
+        # 使用GPU加速批量转换poly_id到lane_idx
+        # poly_id_lookup[i] 存储poly_id=i对应的lane_idx，如果不存在则为-1
+        start_lane_indices = self.poly_id_lookup[start_poly_ids]  # (B, M)
+        end_lane_indices = self.poly_id_lookup[end_poly_ids]  # (B, M)
+        
+        # 批量查询最短路径
+        results = []
+        for b in range(B):
+            batch_results = []
+            for m in range(M):
+                start_lane_idx = start_lane_indices[b, m].item()
+                end_lane_idx = end_lane_indices[b, m].item()
+                
+                # 检查有效性
+                if start_lane_idx < 0 or end_lane_idx < 0:
+                    batch_results.append(None)
+                else:
+                    # 调用find_shortest_path查询路径
+                    path = self.find_shortest_path(start_lane_idx, end_lane_idx)
+                    batch_results.append(path)
+            results.append(batch_results)
+        return results
     
 if __name__ == '__main__':
     import random
@@ -205,29 +263,42 @@ if __name__ == '__main__':
     print(f"总共 {len(planner.lane_start_end)} 个 (road_id, lane_id) 组合")
     print(f"邻接矩阵形状: {planner.adjacency_matrix.shape}")
     print(f"联通数量: {planner.adjacency_matrix.sum().item()}")
-    # 随机选择两个不同的lane索引
-    start_lane_idx = random.randint(0, planner.n_lanes - 1)
-    target_lane_idx = random.randint(0, planner.n_lanes - 1)
-    while target_lane_idx == start_lane_idx:
-        target_lane_idx = random.randint(0, planner.n_lanes - 1)
+    # 加载地图数据以获取所有poly_id
+    with open('maps/town2.json', 'r', encoding='utf-8') as f:
+        map_data = json.load(f)
+    all_quads = map_data['quads']
+    all_poly_ids = [quad['poly_id'] for quad in all_quads if quad['poly_id'] in planner.poly_id_to_lane_idx]
+    # 随机选择两个不同的poly_id
+    start_poly_id = random.choice(all_poly_ids)
+    end_poly_id = random.choice(all_poly_ids)
+    while end_poly_id == start_poly_id:
+        end_poly_id = random.choice(all_poly_ids)
     print(f"\n随机选择路径:")
-    print(f"  起点: {planner.lane_keys[start_lane_idx]} 的 end (索引 {start_lane_idx})")
-    print(f"  终点: {planner.lane_keys[target_lane_idx]} 的 start (索引 {target_lane_idx})")
-    # 查找最短路径
-    path = planner.find_shortest_path(start_lane_idx, target_lane_idx)
+    print(f"  起点poly_id: {start_poly_id}")
+    print(f"  终点poly_id: {end_poly_id}")
+    # 使用path_plan查询路径
+    start_poly_tensor = torch.tensor([[start_poly_id]], dtype=torch.long)
+    end_poly_tensor = torch.tensor([[end_poly_id]], dtype=torch.long)
+    paths = planner.path_plan(start_poly_tensor, end_poly_tensor)
+    path = paths[0][0]
     if path is None:
         print("未找到路径，尝试其他随机起点和终点...")
         # 尝试多次找到有路径的点
         for _ in range(10):
-            start_lane_idx = random.randint(0, planner.n_lanes - 1)
-            target_lane_idx = random.randint(0, planner.n_lanes - 1)
-            while target_lane_idx == start_lane_idx:
-                target_lane_idx = random.randint(0, planner.n_lanes - 1)
-            path = planner.find_shortest_path(start_lane_idx, target_lane_idx)
+            start_poly_id = random.choice(all_poly_ids)
+            end_poly_id = random.choice(all_poly_ids)
+            while end_poly_id == start_poly_id:
+                end_poly_id = random.choice(all_poly_ids)
+        
+            start_poly_tensor = torch.tensor([[start_poly_id]], dtype=torch.long)
+            end_poly_tensor = torch.tensor([[end_poly_id]], dtype=torch.long)
+            paths = planner.path_plan(start_poly_tensor, end_poly_tensor)
+            path = paths[0][0]
+        
             if path is not None:
                 print(f"\n重新选择路径:")
-                print(f"  起点: {planner.lane_keys[start_lane_idx]} 的 end (索引 {start_lane_idx})")
-                print(f"  终点: {planner.lane_keys[target_lane_idx]} 的 start (索引 {target_lane_idx})")
+                print(f"  起点poly_id: {start_poly_id}")
+                print(f"  终点poly_id: {end_poly_id}")
                 break
     if path is None:
         print("未找到任何路径，退出")
@@ -235,16 +306,14 @@ if __name__ == '__main__':
     print(f"\n找到路径 (共 {len(path)} 个lane):")
     for i, lane_idx in enumerate(path.cpu().tolist()):
         print(f"  {i+1}. {planner.lane_keys[lane_idx]}")
-    
+    # 获取起点和终点的lane_idx用于可视化
+    start_lane_idx = planner.poly_id_to_lane_idx[start_poly_id]
+    target_lane_idx = planner.poly_id_to_lane_idx[end_poly_id]
     # 可视化路径
     print("\n开始可视化路径...")
     fig, ax = plt.subplots(figsize=(12, 8))
-    
-    # 加载地图数据用于绘制背景
-    with open('maps/town2.json', 'r', encoding='utf-8') as f:
-        map_data = json.load(f)
-    quads = map_data['quads']
-    
+    # 地图数据已在前面加载
+    quads = all_quads
     # 绘制 quads 作为背景
     for quad in quads:
         vertices = quad['vertices']
@@ -253,29 +322,56 @@ if __name__ == '__main__':
                          facecolor='lightgray', edgecolor='gray',
                          alpha=0.1, linewidth=0.1)
         ax.add_patch(polygon)
-    
     # 转换 tensor 到 numpy 用于绘制
     start_pos = planner.start_positions.cpu().numpy()
     end_pos = planner.end_positions.cpu().numpy()
-    
-    # 绘制路径中的跨lane连接（蓝色箭头）：从end到start
-    for i in range(len(path) - 1):
-        idx_from = path[i]
-        idx_to = path[i + 1]
-        # 从 end 到 start 添加箭头指示方向
-        ax.annotate('', xy=(start_pos[idx_to, 0], start_pos[idx_to, 1]), 
-                   xytext=(end_pos[idx_from, 0], end_pos[idx_from, 1]),
-                   arrowprops=dict(arrowstyle='->', color='blue', lw=3, alpha=0.8, zorder=4))
-    # 绘制中间lane内部的start到end（橙色箭头）
-    # 注意：跳过第一个lane（起点已经是end位置）和最后一个lane（终点是start位置）
+    # 提取中间路径上的所有waypoints（从第二个到倒数第二个lane）
+    all_w_lanes = map_data['w_lanes']
+    quads_by_id = {q['poly_id']: q for q in all_quads}
+    # 按road_id和lane_id分组w_lanes
+    lane_groups = defaultdict(list)
+    for w_lane in all_w_lanes:
+        key = (w_lane['road_id'], w_lane['lane_id'])
+        lane_groups[key].append(w_lane)
+    # 绘制中间路径上的waypoints（从第二个到倒数第二个lane）
     for i, lane_idx in enumerate(path):
         if i == 0 or i == len(path) - 1:
-            # 跳过起点lane和终点lane的内部箭头
+            # 跳过第一个和最后一个lane
             continue
-        # 绘制中间lane从start到end的箭头
-        ax.annotate('', xy=(end_pos[lane_idx, 0], end_pos[lane_idx, 1]), 
-                   xytext=(start_pos[lane_idx, 0], start_pos[lane_idx, 1]),
-                   arrowprops=dict(arrowstyle='->', color='orange', lw=2, alpha=0.5, zorder=3))
+        
+        # 获取当前lane的(road_id, lane_id)
+        road_id, lane_id = planner.lane_keys[lane_idx]
+        
+        # 获取该lane的所有waypoints
+        w_lanes_in_lane = lane_groups[(road_id, lane_id)]
+        
+        # 按poly_id的s值排序
+        w_lanes_with_s = []
+        for w_lane in w_lanes_in_lane:
+            poly_id = w_lane['poly_id']
+            quad = quads_by_id[poly_id]
+            s = quad.get('s', 0.0)
+            w_lanes_with_s.append((w_lane, s))
+        w_lanes_with_s.sort(key=lambda x: x[1])
+        
+        # 提取坐标并绘制
+        waypoint_positions = []
+        for w_lane, s in w_lanes_with_s:
+            center = w_lane['center']
+            waypoint_positions.append([center[0], center[1]])
+        
+        if len(waypoint_positions) > 1:
+            waypoint_positions = np.array(waypoint_positions)
+            # 绘制waypoints（小圆点）
+            ax.scatter(waypoint_positions[:, 0], waypoint_positions[:, 1], 
+                      c='purple', s=20, alpha=0.7, zorder=5, marker='o')
+            
+            # 用箭头连接waypoints
+            for j in range(len(waypoint_positions) - 1):
+                ax.annotate('', xy=(waypoint_positions[j+1, 0], waypoint_positions[j+1, 1]), 
+                           xytext=(waypoint_positions[j, 0], waypoint_positions[j, 1]),
+                           arrowprops=dict(arrowstyle='->', color='purple', lw=1.5, alpha=0.6, zorder=4))
+    
     # 绘制起点（绿色大圆圈）- 起点在起始lane的end位置
     ax.scatter(end_pos[start_lane_idx, 0], end_pos[start_lane_idx, 1], 
               c='green', s=100, alpha=0.9, label='Start (end)', zorder=6, edgecolors='black', linewidth=2)
@@ -284,7 +380,7 @@ if __name__ == '__main__':
               c='red', s=100, alpha=0.9, label='Target (start)', zorder=6, edgecolors='black', linewidth=2)
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
-    ax.set_title(f'Shortest Path: from {planner.lane_keys[start_lane_idx]}\'s end to {planner.lane_keys[target_lane_idx]}\'s start')
+    ax.set_title(f'Shortest Path: from poly_id {start_poly_id} to poly_id {end_poly_id}')
     ax.legend()
     ax.grid(True, alpha=0.3)
     ax.set_aspect('equal')
