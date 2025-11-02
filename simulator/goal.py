@@ -21,19 +21,31 @@ class PathPlanner:
     - 自然流动：每个lane内部从start到end是自然导通的，不需要显式表示
     通过这个图结构，可以计算出从任意lane的end到任意lane的end的所有路径
     """
-    def __init__(self, map_path: str, device: str = 'cuda'):
+    def __init__(self, map_path: str, device: str = 'cuda', max_path_length: int = None):
         """
         初始化路径规划器（全部数据存储在GPU tensor上）
         Args:
             map_path: 地图 JSON 文件路径
             device: 计算设备 ('cuda' 或 'cpu')
+            max_path_length: 最大路径长度（从配置读取或指定）
         """
+        # 定义无效路径标记值（使用一个足够大的负数，避免与有效索引混淆）
+        self.INVALID_PATH_MARKER = -999999
+        
         # 检查设备可用性
         if device == 'cuda' and not torch.cuda.is_available():
             print("CUDA不可用，使用CPU")
             device = 'cpu'
         self.device = torch.device(device)
         self.map_path = map_path
+        
+        # 加载配置获取最大路径长度
+        if max_path_length is None:
+            config_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'default_config.json')
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            max_path_length = config['simulator']['observation']['navigation_feature_dim']
+        self.max_path_length = max_path_length
         # 加载地图数据（临时，仅用于读取，不存储）
         with open(map_path, 'r', encoding='utf-8') as f:
             map_data = json.load(f)
@@ -144,118 +156,209 @@ class PathPlanner:
 
     def _precompute_all_paths(self):
         """
-        预计算所有起点到终点的最短路径前驱矩阵
-        优化方案：使用Floyd-Warshall算法的前驱矩阵
-        存储优化：只存储前驱矩阵而不是完整路径，大大减少显存占用
-        原方案：存储所有完整路径 O(n^2 * L) - 大量冗余
-        优化方案：存储前驱矩阵 O(n^2) - 无冗余，快速重建路径
-        时间复杂度：O(n^3)，空间复杂度：O(n^2)
+        预计算所有起点到终点的最短路径
+        两套方案：
+        1. prev_matrix (O(n^2)): 前驱矩阵用于重建路径（适用于稀疏查询）
+        2. path_matrix (O(n^2 * L_max)): 预先存储所有完整路径（适用于GPU批量查询）
+        当空间足够时，使用path_matrix实现极致查询速度
+        时间：O(n^3) + O(n^2 * L_avg * L_max)
+        空间：O(n^2 * L_max)
         """
-        print("  使用Floyd-Warshall算法优化计算...")
+        print("  使用Floyd-Warshall算法计算前驱矩阵...")
         INF = 1e10
         # 初始化距离矩阵和前驱矩阵
-        # dist[i,j] 存储从i到j的最短距离
-        # prev[i,j] 存储从i到j的最短路径上，j的前驱节点
         dist = self.edge_weights.clone()  # (n_lanes, n_lanes)
         prev = torch.full((self.n_lanes, self.n_lanes), -1, dtype=torch.long, device=self.device)
         # 初始化：自己到自己是0，直接连通的边设置前驱
         for i in range(self.n_lanes):
-            dist[i, i] = 0  # 自己到自己是0
-            prev[i, i] = i  # 自己到自己的前驱是自己
+            dist[i, i] = 0
+            prev[i, i] = i
             for j in range(self.n_lanes):
                 if i != j and self.edge_weights[i, j] < INF:
-                    prev[i, j] = i  # 直接连通的前驱是起点
-        # Floyd-Warshall主循环：动态规划
-        # 考虑通过节点k中转，更新所有(i,j)对的最短路径
+                    prev[i, j] = i
+        # Floyd-Warshall主循环
         for k in range(self.n_lanes):
-            # 向量化更新：对于所有(i,j)，尝试通过k中转
-            dist_ik = dist[:, k:k+1].expand(-1, self.n_lanes)  # (n_lanes, n_lanes)
-            dist_kj = dist[k:k+1, :].expand(self.n_lanes, -1)  # (n_lanes, n_lanes)
-            dist_ikj = dist_ik + dist_kj  # (n_lanes, n_lanes)
-            # 找到通过k中转更短的路径
+            dist_ik = dist[:, k:k+1].expand(-1, self.n_lanes)
+            dist_kj = dist[k:k+1, :].expand(self.n_lanes, -1)
+            dist_ikj = dist_ik + dist_kj
             better_mask = dist_ikj < dist
-            # 更新距离和前驱
             dist = torch.where(better_mask, dist_ikj, dist)
-            # 如果通过k中转更短，则j的前驱变为k的前驱
             prev_kj = prev[k:k+1, :].expand(self.n_lanes, -1)
             prev = torch.where(better_mask, prev_kj, prev)
-        # 存储前驱矩阵和距离矩阵（用于快速重建路径）
-        self.prev_matrix = prev  # (n_lanes, n_lanes)
-        self.dist_matrix = dist  # (n_lanes, n_lanes)
-        # 统计连通性
+        self.prev_matrix = prev
+        self.dist_matrix = dist
+        # 第二阶段：GPU向量化构建所有路径
+        print("  预计算完整路径矩阵（GPU向量化）...")
+        self.path_matrix = self._build_path_matrix_vectorized(prev)
+        # 统计信息
         valid_paths_count = (prev >= 0).sum().item()
         max_dist = dist[dist < INF].max().item() if (dist < INF).any() else 0
         print(f"  有效路径数: {valid_paths_count}")
         print(f"  最大路径距离: {max_dist:.2f}")
+        print(f"  路径矩阵形状: {self.path_matrix.shape}")
+        print(f"  路径矩阵显存占用: {self.path_matrix.numel() * 4 / 1024**2:.2f} MB")
     
-    def find_shortest_path(self, start_lane_idx, target_lane_idx):
+    def _build_path_matrix_vectorized(self, prev):
         """
-        从前驱矩阵重建完整路径
+        GPU向量化构建所有路径矩阵 - 完全向量化版本
+        使用逐层扩散的方法，所有路径同时展开
+        时间复杂度：O(L_max * n^2)，但所有操作都是向量化的
+        """
+        n = self.n_lanes
+        max_len_estimate = self.max_path_length
         
-        Args:
-            start_lane_idx: 起始lane索引
-            target_lane_idx: 目标lane索引
-        Returns:
-            torch.Tensor: 路径tensor，如果不可达返回None
-        """
-        if self.prev_matrix[start_lane_idx, target_lane_idx] < 0:
-            return None
-        # 反向追踪前驱节点构建路径
-        path_list = []
-        current = target_lane_idx
-        # 从前驱矩阵中构建路径（反向追踪）
-        # 注意：前驱矩阵中的值表示从start到current的路径上，current的前驱节点
-        path_list.append(current)
-        while current != start_lane_idx:
-            current = self.prev_matrix[start_lane_idx, current]
-            if current < 0:
-                return None
-            path_list.append(current)
-        # 反转路径（从start到target）
-        path_list.reverse()
-        return torch.tensor(path_list, device=self.device, dtype=torch.long)
+        # 预分配路径矩阵: (n, n, max_len)
+        print(f"    使用最大路径长度: {max_len_estimate}")
+        path_matrix = torch.full((n, n, max_len_estimate), self.INVALID_PATH_MARKER, dtype=torch.long, device=self.device)
+        
+        # 初始化：每个路径的第一层就是终点本身
+        # path_matrix[i, j, 0] = j (对于所有有效的i->j路径)
+        valid_mask = prev >= 0  # (n, n)
+        path_matrix[:, :, 0] = torch.where(valid_mask, 
+                                           torch.arange(n, device=self.device).unsqueeze(0).expand(n, -1),
+                                           torch.full((n, n), self.INVALID_PATH_MARKER, device=self.device))
+        
+        # 迭代展开路径：逐层扩散
+        # 关键：使用高级gather进行完全向量化
+        current_layer = path_matrix[:, :, 0]  # (n, n)
+        # 跟踪已完成的路径（已完成的不再扩展）
+        completed_paths = torch.zeros((n, n), dtype=torch.bool, device=self.device)
+        
+        for layer in range(1, max_len_estimate):
+            # 只对未完成的路径进行扩展
+            active_mask = ~completed_paths & (current_layer != self.INVALID_PATH_MARKER)
+            
+            # 完全向量化的下一层计算
+            # 对于每个起点i和终点j，我们需要查找 prev[i, current_layer[i, j]]
+            indices_2d = torch.clamp(current_layer, 0, n - 1).long()  # (n, n)
+            next_layer = torch.gather(prev, 1, indices_2d)  # (n, n)
+            
+            # 检查哪些路径已完成（到达起点）
+            # 当next_layer[i, j] == i时，路径i->j完成
+            start_indices = torch.arange(n, device=self.device).unsqueeze(1).expand(n, n)  # (n, n)
+            newly_completed = (next_layer == start_indices) & active_mask  # (n, n)
+            
+            # 检查循环：如果下一个节点等于当前节点（且不是起点），可能是循环，应该停止
+            # 对于路径i->j，如果next_layer[i, j] == current_layer[i, j]且不是起点i，则可能是循环
+            cycle_detected = (next_layer == current_layer) & active_mask & (next_layer != start_indices)
+            
+            # 更新已完成路径标记（包括到达起点和检测到循环的路径）
+            completed_paths = completed_paths | newly_completed | cycle_detected
+            
+            # 对于完成的路径（到达起点），写入起点；对于检测到循环的路径，写入无效标记
+            next_layer = torch.where(newly_completed, next_layer,  # 到达起点：写入起点
+                            torch.where(cycle_detected, torch.full_like(next_layer, self.INVALID_PATH_MARKER),  # 循环：写入无效标记
+                            torch.where(active_mask, next_layer, torch.full_like(next_layer, self.INVALID_PATH_MARKER))))  # 未完成：正常扩展
+            
+            path_matrix[:, :, layer] = next_layer
+            # 检查是否所有路径都已完成
+            if completed_paths.all() or (active_mask.sum() == 0):
+                print(f"    所有路径完成，最大路径长度: {layer + 1}")
+                # 不截断，保持max_path_length的长度，剩余层都是无效标记
+                # 继续循环填充无效标记，或者直接返回（剩余层已经是无效标记了）
+                break
+            # 更新当前层（只考虑活跃的路径，已完成的不再更新）
+            current_layer = torch.where(active_mask & ~newly_completed & ~cycle_detected, next_layer, current_layer)
+        # 翻转路径（从终点到起点 -> 从起点到终点）
+        print("    翻转路径方向...")
+        
+        # 完全向量化提取有效部分并左对齐
+        # path_matrix 形状: (n, n, max_len)
+        
+        # 1. 创建有效路径的 mask（标记所有有效位置）
+        valid_mask = (path_matrix != self.INVALID_PATH_MARKER)  # (n, n, max_len)
+        
+        # 2. 找到每个路径的长度（第一个无效标记的位置）
+        # 使用 argmax 找到第一个无效位置
+        invalid_indicator = (~valid_mask).long()  # (n, n, max_len) 1表示无效，0表示有效
+        # 在末尾添加一个 1，确保全有效路径也能正确找到长度
+        invalid_with_end = torch.cat([invalid_indicator, 
+                                     torch.ones((n, n, 1), dtype=torch.long, device=self.device)], 
+                                    dim=2)  # (n, n, max_len+1)
+        first_invalid_pos = torch.argmax(invalid_with_end, dim=2)  # (n, n)
+        path_lengths = first_invalid_pos  # (n, n) 每个路径的有效长度
+        
+        # 3. 翻转整个 path_matrix（在最后一个维度）
+        flipped_matrix = torch.flip(path_matrix, [2])  # (n, n, max_len) 从后往前翻转
+        
+        # 4. 向量化提取并左对齐
+        # 创建索引矩阵：对于每个路径，需要从翻转后的矩阵中提取有效部分
+        # 由于已经翻转，我们需要从翻转后的路径中提取前 path_len 个元素（从后往前数的后 path_len 个）
+        # 实际上翻转后，原来的 [0:path_len] 变成了 [max_len-path_len:max_len]
+        # 但我们想要的是翻转后的前 path_len 个，即原路径的后 path_len 个翻转后的结果
+        
+        # 更简单的方法：对于每个路径，我们已经知道有效长度 path_len
+        # 在翻转后的矩阵中，有效部分在 [max_len - path_len : max_len] 位置
+        # 但我们想要左对齐，所以需要重新排列
+        
+        # 使用 gather 来重新排列：为每个路径创建索引
+        # 对于路径 (i,j) 长度为 L：
+        # - 翻转后的有效部分在 flipped_matrix[i, j, max_len-L:max_len]
+        # - 需要左对齐到 final_matrix[i, j, 0:L]
+        # - 即：final_matrix[i, j, k] = flipped_matrix[i, j, max_len-L+k] (0 <= k < L)
+        
+        # 创建索引矩阵：(n, n, max_len)
+        # 对于每个路径 (i,j)，长度为 L，索引 k 对应 flipped_matrix[i, j, max_len-L+k]
+        pos_indices = torch.arange(max_len_estimate, device=self.device).unsqueeze(0).unsqueeze(0).expand(n, n, -1)  # (n, n, max_len) [0, 1, 2, ..., max_len-1]
+        offset = max_len_estimate - path_lengths.unsqueeze(2)  # (n, n, 1) [max_len-L, max_len-L, ...]
+        gather_indices = pos_indices + offset  # (n, n, max_len) 对于路径长度为L，[max_len-L, max_len-L+1, ..., max_len-1, max_len, ...]
+        
+        # 创建长度 mask：对于路径长度为 L，只有 [0:L] 是有效的
+        length_mask = pos_indices < path_lengths.unsqueeze(2)  # (n, n, max_len) True for k < L
+        
+        # 对于超出路径长度的位置（k >= L），索引无效，但我们仍然需要有效索引值
+        # 限制索引范围避免越界（超出部分会被 mask 覆盖，所以值不重要）
+        gather_indices = torch.clamp(gather_indices, 0, max_len_estimate - 1)
+        
+        # 使用 gather 提取并重新排列
+        final_matrix = torch.gather(flipped_matrix, 2, gather_indices)  # (n, n, max_len)
+        
+        # 将超出路径长度的部分设为无效标记
+        final_matrix = torch.where(length_mask, final_matrix,
+                                  torch.full_like(final_matrix, self.INVALID_PATH_MARKER))
+        
+        return final_matrix
     
     def path_plan(self, start_poly_ids, end_poly_ids):
         """
-        批量路径规划：从poly_id到poly_id的最短路径
+        批量路径规划：从poly_id到poly_id的最短路径（完全GPU并行化）
         
         Args:
             start_poly_ids: (B, M) 起点poly_id的tensor
             end_poly_ids: (B, M) 终点poly_id的tensor
             
         Returns:
-            List[List[torch.Tensor]]: (B, M) 每条路径的结果
-                每个元素是一个torch.Tensor，包含该路径经过的所有lane_idx
-                如果路径不存在则返回None
+            torch.Tensor: (B, M, max_path_len) 批量路径结果，无路径用INVALID_PATH_MARKER填充
         """
         B, M = start_poly_ids.shape
-        
         # 确保输入tensor在正确设备上
         start_poly_ids = start_poly_ids.to(self.device)
         end_poly_ids = end_poly_ids.to(self.device)
-        
         # 使用GPU加速批量转换poly_id到lane_idx
-        # poly_id_lookup[i] 存储poly_id=i对应的lane_idx，如果不存在则为-1
         start_lane_indices = self.poly_id_lookup[start_poly_ids]  # (B, M)
         end_lane_indices = self.poly_id_lookup[end_poly_ids]  # (B, M)
+        # 检查有效性并处理无效索引（替换为0，后续会检查）
+        valid_mask = (start_lane_indices >= 0) & (end_lane_indices >= 0)  # (B, M)
+        # 使用高级索引批量获取路径：path_matrix[start_lane_idx, end_lane_idx, :]
+        # 注意：必须先将索引展平，然后使用展平后的索引查询，最后reshape回(B, M, max_path_len)
+        batch_size = B * M
+        start_lane_flat = start_lane_indices.flatten()  # (B*M,)
+        end_lane_flat = end_lane_indices.flatten()  # (B*M,)
+        # 批量查询：使用展平的索引
+        # path_matrix[start_lane_idx, end_lane_idx, :] 返回 (max_path_len,)
+        # 我们需要对每个(start_lane_idx, end_lane_idx)对获取完整路径
+        max_path_len = self.path_matrix.shape[2]
+        # 使用高级索引批量获取所有路径
+        # 创建索引对：(start_idx, end_idx) -> (path_matrix维度0的索引, path_matrix维度1的索引)
+        paths_flat = self.path_matrix[start_lane_flat, end_lane_flat, :]  # (B*M, max_path_len)
+        # 将无效路径（第一元素为无效标记）全部设为无效标记
+        valid_mask_flat = valid_mask.flatten()  # (B*M,)
+        paths_flat = torch.where(valid_mask_flat.unsqueeze(1), paths_flat, 
+                                 torch.full_like(paths_flat, self.INVALID_PATH_MARKER))
+        # reshape回(B, M, max_path_len)
+        paths = paths_flat.reshape(B, M, max_path_len)  # (B, M, max_path_len)
         
-        # 批量查询最短路径
-        results = []
-        for b in range(B):
-            batch_results = []
-            for m in range(M):
-                start_lane_idx = start_lane_indices[b, m].item()
-                end_lane_idx = end_lane_indices[b, m].item()
-                
-                # 检查有效性
-                if start_lane_idx < 0 or end_lane_idx < 0:
-                    batch_results.append(None)
-                else:
-                    # 调用find_shortest_path查询路径
-                    path = self.find_shortest_path(start_lane_idx, end_lane_idx)
-                    batch_results.append(path)
-            results.append(batch_results)
-        return results
+        return paths
     
 if __name__ == '__main__':
     import random
@@ -279,9 +382,27 @@ if __name__ == '__main__':
     # 使用path_plan查询路径
     start_poly_tensor = torch.tensor([[start_poly_id]], dtype=torch.long)
     end_poly_tensor = torch.tensor([[end_poly_id]], dtype=torch.long)
-    paths = planner.path_plan(start_poly_tensor, end_poly_tensor)
-    path = paths[0][0]
-    if path is None:
+    paths = planner.path_plan(start_poly_tensor, end_poly_tensor)  # (1, 1, max_path_len)
+    
+    # 从返回的张量中提取路径：paths 形状为 (1, 1, max_path_len)
+    path_tensor = paths[0, 0, :]  # (max_path_len,) tensor
+    path_np = path_tensor.cpu().numpy()  # 转换为 numpy 数组
+    
+    # 提取有效路径：找到第一个无效标记的位置
+    # 路径从起点到终点存储，遇到 INVALID_PATH_MARKER 就结束
+    valid_path_indices = []
+    for i, val in enumerate(path_np):
+        if val == planner.INVALID_PATH_MARKER:
+            break
+        # 检查索引是否有效（应该在 0 到 n_lanes-1 之间）
+        if 0 <= val < planner.n_lanes:
+            valid_path_indices.append(int(val))
+        else:
+            # 如果遇到无效索引，停止
+            break
+    
+    # 检查是否找到有效路径
+    if len(valid_path_indices) == 0:
         print("未找到路径，尝试其他随机起点和终点...")
         # 尝试多次找到有路径的点
         for _ in range(10):
@@ -289,27 +410,44 @@ if __name__ == '__main__':
             end_poly_id = random.choice(all_poly_ids)
             while end_poly_id == start_poly_id:
                 end_poly_id = random.choice(all_poly_ids)
-        
+            
             start_poly_tensor = torch.tensor([[start_poly_id]], dtype=torch.long)
             end_poly_tensor = torch.tensor([[end_poly_id]], dtype=torch.long)
             paths = planner.path_plan(start_poly_tensor, end_poly_tensor)
-            path = paths[0][0]
-        
-            if path is not None:
+            path_tensor = paths[0, 0, :]
+            path_np = path_tensor.cpu().numpy()
+            
+            # 重新提取有效路径
+            valid_path_indices = []
+            for i, val in enumerate(path_np):
+                if val == planner.INVALID_PATH_MARKER:
+                    break
+                if 0 <= val < planner.n_lanes:
+                    valid_path_indices.append(int(val))
+                else:
+                    break
+            
+            if len(valid_path_indices) > 0:
                 print(f"\n重新选择路径:")
                 print(f"  起点poly_id: {start_poly_id}")
                 print(f"  终点poly_id: {end_poly_id}")
                 break
-    if path is None:
+    
+    if len(valid_path_indices) == 0:
         print("未找到任何路径，退出")
         exit(0)
-    print(f"\n找到路径 (共 {len(path)} 个lane):")
-    for i, lane_idx in enumerate(path.cpu().tolist()):
+    
+    # valid_path_indices 现在包含有效的 lane 索引
+    valid_path = valid_path_indices
+    
+    print(f"\n找到路径 (共 {len(valid_path)} 个lane):")
+    for i, lane_idx in enumerate(valid_path):
         print(f"  {i+1}. {planner.lane_keys[lane_idx]}")
     # 获取起点和终点的lane_idx用于可视化
     start_lane_idx = planner.poly_id_to_lane_idx[start_poly_id]
     target_lane_idx = planner.poly_id_to_lane_idx[end_poly_id]
-    # 可视化路径
+    
+    # 可视化路径使用valid_path
     print("\n开始可视化路径...")
     fig, ax = plt.subplots(figsize=(12, 8))
     # 地图数据已在前面加载
@@ -328,23 +466,153 @@ if __name__ == '__main__':
     # 提取中间路径上的所有waypoints（从第二个到倒数第二个lane）
     all_w_lanes = map_data['w_lanes']
     quads_by_id = {q['poly_id']: q for q in all_quads}
+    # 创建w_lane_id到w_lane的映射
+    w_lanes_by_id = {w_lane['w_lane_id']: w_lane for w_lane in all_w_lanes}
     # 按road_id和lane_id分组w_lanes
     lane_groups = defaultdict(list)
     for w_lane in all_w_lanes:
         key = (w_lane['road_id'], w_lane['lane_id'])
         lane_groups[key].append(w_lane)
-    # 绘制中间路径上的waypoints（从第二个到倒数第二个lane）
-    for i, lane_idx in enumerate(path):
-        if i == 0 or i == len(path) - 1:
-            # 跳过第一个和最后一个lane
-            continue
-        
-        # 获取当前lane的(road_id, lane_id)
-        road_id, lane_id = planner.lane_keys[lane_idx]
-        
-        # 获取该lane的所有waypoints
+    # 获取起点和终点的quad（用于后续绘制）
+    start_quad = quads_by_id[start_poly_id]
+    end_quad = quads_by_id[end_poly_id]
+    
+    # 收集路径上的关键waypoints用于绘制点
+    # start_poly的那条路上的w_lane只显示end
+    # end_poly的那条路上的w_lane只显示start
+    # 中间的lane显示完整的waypoints
+    waypoints = []
+    
+    # 从start_quad遍历next_w_lane_id，直到找到第一条lane的end w_lane_id
+    if len(valid_path) > 0:
+        first_lane_idx = valid_path[0]
+        road_id, lane_id = planner.lane_keys[first_lane_idx]
         w_lanes_in_lane = lane_groups[(road_id, lane_id)]
+        # 按poly_id的s值排序
+        w_lanes_with_s = []
+        for w_lane in w_lanes_in_lane:
+            poly_id = w_lane['poly_id']
+            quad = quads_by_id[poly_id]
+            s = quad.get('s', 0.0)
+            w_lanes_with_s.append((w_lane, s))
+        w_lanes_with_s.sort(key=lambda x: x[1])
+        # 找到第一条lane的end w_lane_id
+        end_w_lane_id = None
+        if w_lanes_with_s:
+            end_w_lane = w_lanes_with_s[-1][0]
+            end_w_lane_id = end_w_lane['w_lane_id']
         
+        # 从start_quad开始遍历next_w_lane_id
+        if end_w_lane_id is not None and start_quad.get('next_w_lane_id') is not None:
+            current_w_lane_id = start_quad['next_w_lane_id']
+            visited = set()  # 防止循环
+            start_waypoints = []
+            
+            while current_w_lane_id is not None and current_w_lane_id != end_w_lane_id:
+                if current_w_lane_id in visited:
+                    break  # 检测到循环，退出
+                visited.add(current_w_lane_id)
+                
+                if current_w_lane_id in w_lanes_by_id:
+                    w_lane = w_lanes_by_id[current_w_lane_id]
+                    center = w_lane['center']
+                    direction_angle = w_lane.get('direction_angle', 0.0)
+                    start_waypoints.append({
+                        'center': center,
+                        'direction_angle': direction_angle
+                    })
+                    
+                    # 找到对应的quad，获取next_w_lane_id
+                    quad_for_w_lane = quads_by_id.get(w_lane['poly_id'])
+                    if quad_for_w_lane and quad_for_w_lane.get('next_w_lane_id') is not None:
+                        current_w_lane_id = quad_for_w_lane['next_w_lane_id']
+                    else:
+                        break
+                else:
+                    break
+            
+            # 将这些waypoints添加到waypoints列表的开头
+            waypoints = start_waypoints + waypoints
+    
+    # 中间的lanes：显示完整的waypoints
+    if len(valid_path) > 2:
+        for i in range(1, len(valid_path) - 1):
+            lane_idx = valid_path[i]
+            road_id, lane_id = planner.lane_keys[lane_idx]
+            w_lanes_in_lane = lane_groups[(road_id, lane_id)]
+            # 按poly_id的s值排序
+            w_lanes_with_s = []
+            for w_lane in w_lanes_in_lane:
+                poly_id = w_lane['poly_id']
+                quad = quads_by_id[poly_id]
+                s = quad.get('s', 0.0)
+                w_lanes_with_s.append((w_lane, s))
+            w_lanes_with_s.sort(key=lambda x: x[1])
+            
+            # 添加所有waypoints
+            for w_lane, s in w_lanes_with_s:
+                center = w_lane['center']
+                direction_angle = w_lane.get('direction_angle', 0.0)
+                waypoints.append({
+                    'center': center,
+                    'direction_angle': direction_angle
+                })
+    
+    # 最后一条lane（包含end_poly）：从end_quad遍历prev_w_lane_id，直到找到最后一条lane的start w_lane_id
+    if len(valid_path) > 1:
+        last_lane_idx = valid_path[-1]
+        road_id, lane_id = planner.lane_keys[last_lane_idx]
+        w_lanes_in_lane = lane_groups[(road_id, lane_id)]
+        # 按poly_id的s值排序
+        w_lanes_with_s = []
+        for w_lane in w_lanes_in_lane:
+            poly_id = w_lane['poly_id']
+            quad = quads_by_id[poly_id]
+            s = quad.get('s', 0.0)
+            w_lanes_with_s.append((w_lane, s))
+        w_lanes_with_s.sort(key=lambda x: x[1])
+        # 找到最后一条lane的start w_lane_id
+        start_w_lane_id = None
+        if w_lanes_with_s:
+            start_w_lane = w_lanes_with_s[0][0]
+            start_w_lane_id = start_w_lane['w_lane_id']
+        
+        # 从end_quad开始遍历prev_w_lane_id
+        if start_w_lane_id is not None and end_quad.get('prev_w_lane_id') is not None:
+            current_w_lane_id = end_quad['prev_w_lane_id']
+            visited = set()  # 防止循环
+            end_waypoints = []
+            
+            while current_w_lane_id is not None and current_w_lane_id != start_w_lane_id:
+                if current_w_lane_id in visited:
+                    break  # 检测到循环，退出
+                visited.add(current_w_lane_id)
+                
+                if current_w_lane_id in w_lanes_by_id:
+                    w_lane = w_lanes_by_id[current_w_lane_id]
+                    center = w_lane['center']
+                    direction_angle = w_lane.get('direction_angle', 0.0)
+                    end_waypoints.append({
+                        'center': center,
+                        'direction_angle': direction_angle
+                    })
+                    
+                    # 找到对应的quad，获取prev_w_lane_id
+                    quad_for_w_lane = quads_by_id.get(w_lane['poly_id'])
+                    if quad_for_w_lane and quad_for_w_lane.get('prev_w_lane_id') is not None:
+                        current_w_lane_id = quad_for_w_lane['prev_w_lane_id']
+                    else:
+                        break
+                else:
+                    break
+            
+            # 将这些waypoints添加到waypoints列表的末尾
+            waypoints = waypoints + end_waypoints
+    elif len(valid_path) == 1:
+        # 如果只有一条lane，需要从start_quad和end_quad分别遍历
+        lane_idx = valid_path[0]
+        road_id, lane_id = planner.lane_keys[lane_idx]
+        w_lanes_in_lane = lane_groups[(road_id, lane_id)]
         # 按poly_id的s值排序
         w_lanes_with_s = []
         for w_lane in w_lanes_in_lane:
@@ -354,30 +622,111 @@ if __name__ == '__main__':
             w_lanes_with_s.append((w_lane, s))
         w_lanes_with_s.sort(key=lambda x: x[1])
         
-        # 提取坐标并绘制
-        waypoint_positions = []
-        for w_lane, s in w_lanes_with_s:
-            center = w_lane['center']
-            waypoint_positions.append([center[0], center[1]])
-        
-        if len(waypoint_positions) > 1:
-            waypoint_positions = np.array(waypoint_positions)
-            # 绘制waypoints（小圆点）
-            ax.scatter(waypoint_positions[:, 0], waypoint_positions[:, 1], 
-                      c='purple', s=20, alpha=0.7, zorder=5, marker='o')
+        if w_lanes_with_s:
+            start_w_lane = w_lanes_with_s[0][0]
+            end_w_lane = w_lanes_with_s[-1][0]
+            start_w_lane_id = start_w_lane['w_lane_id']
+            end_w_lane_id = end_w_lane['w_lane_id']
             
-            # 用箭头连接waypoints
-            for j in range(len(waypoint_positions) - 1):
-                ax.annotate('', xy=(waypoint_positions[j+1, 0], waypoint_positions[j+1, 1]), 
-                           xytext=(waypoint_positions[j, 0], waypoint_positions[j, 1]),
-                           arrowprops=dict(arrowstyle='->', color='purple', lw=1.5, alpha=0.6, zorder=4))
+            # 从start_quad开始遍历next_w_lane_id，直到找到end w_lane_id
+            if start_quad.get('next_w_lane_id') is not None:
+                current_w_lane_id = start_quad['next_w_lane_id']
+                visited = set()
+                start_waypoints = []
+                
+                while current_w_lane_id is not None and current_w_lane_id != end_w_lane_id:
+                    if current_w_lane_id in visited:
+                        break
+                    visited.add(current_w_lane_id)
+                    
+                    if current_w_lane_id in w_lanes_by_id:
+                        w_lane = w_lanes_by_id[current_w_lane_id]
+                        center = w_lane['center']
+                        direction_angle = w_lane.get('direction_angle', 0.0)
+                        start_waypoints.append({
+                            'center': center,
+                            'direction_angle': direction_angle
+                        })
+                        
+                        quad_for_w_lane = quads_by_id.get(w_lane['poly_id'])
+                        if quad_for_w_lane and quad_for_w_lane.get('next_w_lane_id') is not None:
+                            current_w_lane_id = quad_for_w_lane['next_w_lane_id']
+                        else:
+                            break
+                    else:
+                        break
+                
+                waypoints = start_waypoints
+            
+            # 从end_quad开始遍历prev_w_lane_id，直到找到start w_lane_id
+            if end_quad.get('prev_w_lane_id') is not None:
+                current_w_lane_id = end_quad['prev_w_lane_id']
+                visited = set()
+                end_waypoints = []
+                
+                while current_w_lane_id is not None and current_w_lane_id != start_w_lane_id:
+                    if current_w_lane_id in visited:
+                        break
+                    visited.add(current_w_lane_id)
+                    
+                    if current_w_lane_id in w_lanes_by_id:
+                        w_lane = w_lanes_by_id[current_w_lane_id]
+                        center = w_lane['center']
+                        direction_angle = w_lane.get('direction_angle', 0.0)
+                        end_waypoints.append({
+                            'center': center,
+                            'direction_angle': direction_angle
+                        })
+                        
+                        quad_for_w_lane = quads_by_id.get(w_lane['poly_id'])
+                        if quad_for_w_lane and quad_for_w_lane.get('prev_w_lane_id') is not None:
+                            current_w_lane_id = quad_for_w_lane['prev_w_lane_id']
+                        else:
+                            break
+                    else:
+                        break
+                
+                waypoints = waypoints + end_waypoints
     
-    # 绘制起点（绿色大圆圈）- 起点在起始lane的end位置
+    # 绘制路径上的所有waypoints箭头
+    if len(waypoints) > 0:
+        arrow_length = 10.0  # 箭头长度
+        for i, wp in enumerate(waypoints):
+            center = wp['center']
+            direction_angle = wp['direction_angle']
+            
+            # 计算箭头的起点和终点
+            x, y = center[0], center[1]
+            dx = arrow_length * np.cos(direction_angle)
+            dy = arrow_length * np.sin(direction_angle)
+            
+            # 绘制箭头
+            ax.arrow(x, y, dx, dy,
+                    head_width=2, head_length=3,
+                    fc='purple', ec='purple', alpha=0.7,
+                    length_includes_head=True, zorder=3, label='Path Waypoints' if i == 0 else '')
+    
+    # 绘制起点（绿色poly）和终点（红色poly）
+    start_vertices = start_quad['vertices']
+    start_vertices_2d = [(v[0], v[1]) for v in start_vertices]
+    start_polygon = Polygon(start_vertices_2d, closed=True,
+                           facecolor='green', edgecolor='darkgreen',
+                           alpha=0.5, linewidth=2, label='Start', zorder=6)
+    ax.add_patch(start_polygon)
+    
+    end_vertices = end_quad['vertices']
+    end_vertices_2d = [(v[0], v[1]) for v in end_vertices]
+    end_polygon = Polygon(end_vertices_2d, closed=True,
+                         facecolor='red', edgecolor='darkred',
+                         alpha=0.5, linewidth=2, label='Target', zorder=6)
+    ax.add_patch(end_polygon)
+    
+    # 绘制当前的红绿点作为中间点
     ax.scatter(end_pos[start_lane_idx, 0], end_pos[start_lane_idx, 1], 
-              c='green', s=100, alpha=0.9, label='Start (end)', zorder=6, edgecolors='black', linewidth=2)
-    # 绘制终点（红色大圆圈）- 终点在目标lane的start位置
+              c='green', s=10, alpha=0.9, label='Start Waypoint', zorder=2, edgecolors='black', linewidth=2, marker='o')
     ax.scatter(start_pos[target_lane_idx, 0], start_pos[target_lane_idx, 1], 
-              c='red', s=100, alpha=0.9, label='Target (start)', zorder=6, edgecolors='black', linewidth=2)
+              c='red', s=10, alpha=0.9, label='Target Waypoint', zorder=2, edgecolors='black', linewidth=2, marker='o')
+    
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_title(f'Shortest Path: from poly_id {start_poly_id} to poly_id {end_poly_id}')
