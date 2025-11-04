@@ -708,40 +708,38 @@ class PathPlanner:
                 break
         
         if reverse:
+            # 暂时禁用反转逻辑，直接返回原始chain_waypoints以查看效果
             # 向量化反转有效部分
             # 计算每个链的有效长度（第一个无效标记的位置）
-            invalid_mask = (chain_waypoints[:, :, 0] == self.INVALID_WAYPOINT_MARKER)  # (B, max_chain_len)
-            # 找到每个链的有效长度
-            invalid_indicator = invalid_mask.long()  # (B, max_chain_len)
-            # 在末尾添加一个1，确保全有效路径也能正确找到长度
-            invalid_with_end = torch.cat([invalid_indicator, 
-                                         torch.ones((B, 1), dtype=torch.long, device=device)], 
-                                        dim=1)  # (B, max_chain_len+1)
-            first_invalid_pos = torch.argmax(invalid_with_end, dim=1)  # (B,)
-            valid_lengths = first_invalid_pos  # (B,) 每个链的有效长度
-            
-            # 为每个batch反转有效部分
-            # 对于长度为L的链，反转[0:L]部分，即[L-1, L-2, ..., 1, 0, L, L+1, ...]
-            # 创建反转索引：对于batch b，如果valid_lengths[b]=L，则reverse_indices[b] = [L-1, L-2, ..., 0, L, L+1, ...]
-            pos_indices = torch.arange(max_chain_len, device=device).unsqueeze(0).expand(B, -1)  # (B, max_chain_len)
-            # 对于每个batch，计算反转索引
-            # 如果pos < valid_lengths，反转索引 = valid_lengths - 1 - pos
-            # 否则，保持原样
-            reverse_pos = valid_lengths.unsqueeze(1) - 1 - pos_indices  # (B, max_chain_len)
-            # 对于需要反转的位置（pos < valid_lengths），使用reverse_pos；否则使用pos_indices
-            need_reverse = pos_indices < valid_lengths.unsqueeze(1)  # (B, max_chain_len)
-            reverse_indices = torch.where(need_reverse, 
-                                         torch.clamp(reverse_pos, 0, max_chain_len - 1),
-                                         pos_indices)
-            
-            # 使用gather反转
-            reversed_chain = torch.gather(chain_waypoints, 1, reverse_indices.unsqueeze(2).expand(-1, -1, 3))
-            
-            # 只对有效部分应用反转：前valid_lengths个元素反转
-            valid_pos_mask = need_reverse.unsqueeze(2)  # (B, max_chain_len, 1)
-            valid_reverse = valid_mask.unsqueeze(1).unsqueeze(2) & valid_pos_mask  # (B, max_chain_len, 1)
-            chain_waypoints = torch.where(valid_reverse, reversed_chain, chain_waypoints)
-        
+            # invalid_mask = (chain_waypoints[:, :, 0] == self.INVALID_WAYPOINT_MARKER)  # (B, max_chain_len)
+            # # 找到每个链的有效长度
+            # invalid_indicator = invalid_mask.long()  # (B, max_chain_len)
+            # # 在末尾添加一个1，确保全有效路径也能正确找到长度
+            # invalid_with_end = torch.cat([invalid_indicator, 
+            #                              torch.ones((B, 1), dtype=torch.long, device=device)], 
+            #                             dim=1)  # (B, max_chain_len+1)
+            # first_invalid_pos = torch.argmax(invalid_with_end, dim=1)  # (B,)
+            # valid_lengths = first_invalid_pos  # (B,) 每个链的有效长度
+            # # 为每个batch反转有效部分
+            # # 对于长度为L的链，反转[0:L]部分，即[L-1, L-2, ..., 1, 0, L, L+1, ...]
+            # # 创建反转索引：对于batch b，如果valid_lengths[b]=L，则reverse_indices[b] = [L-1, L-2, ..., 0, L, L+1, ...]
+            # pos_indices = torch.arange(max_chain_len, device=device).unsqueeze(0).expand(B, -1)  # (B, max_chain_len)
+            # # 对于每个batch，计算反转索引
+            # # 如果pos < valid_lengths，反转索引 = valid_lengths - 1 - pos
+            # # 否则，保持原样
+            # reverse_pos = valid_lengths.unsqueeze(1) - 1 - pos_indices  # (B, max_chain_len)
+            # # 对于需要反转的位置（pos < valid_lengths），使用reverse_pos；否则使用pos_indices
+            # need_reverse = pos_indices < valid_lengths.unsqueeze(1)  # (B, max_chain_len)
+            # reverse_indices = torch.where(need_reverse, 
+            #                              torch.clamp(reverse_pos, 0, max_chain_len - 1),
+            #                              pos_indices)
+            # # 使用gather反转
+            # reversed_chain = torch.gather(chain_waypoints, 1, reverse_indices.unsqueeze(2).expand(-1, -1, 3))
+            # # 只对有效部分应用反转：前valid_lengths个元素反转
+            # valid_pos_mask = need_reverse.unsqueeze(2)  # (B, max_chain_len, 1)
+            # valid_reverse = valid_mask.unsqueeze(1).unsqueeze(2) & valid_pos_mask  # (B, max_chain_len, 1)
+            # chain_waypoints = torch.where(valid_reverse, reversed_chain, chain_waypoints)
+            pass  # 不进行反转，直接返回原始chain_waypoints
         return chain_waypoints
     
 if __name__ == '__main__':

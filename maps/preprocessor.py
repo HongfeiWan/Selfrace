@@ -1229,7 +1229,136 @@ def reassign_road_lane_ids(polygons_data, groups):
             q['lane_id'] = rid_to_lane[old]
         else:
             q['lane_id'] = 1
-    return polygons_data
+    # 返回 polygons 以及两个映射，供几何基元层回填
+    return polygons_data, rid_to_groupmin, rid_to_lane
+
+def apply_mapping_to_geometry(lines_data, circles_data, arcs_data, rid_to_groupmin, rid_to_lane):
+    """将 (旧 road_id) -> (新 road_id, lane_id) 的映射回填给几何基元层。"""
+    for item in lines_data:
+        old = item.get('road_id')
+        if old in rid_to_groupmin:
+            item['road_id'] = rid_to_groupmin[old]
+            item['lane_id'] = rid_to_lane[old]
+        else:
+            item['lane_id'] = item.get('lane_id', 1)
+    
+    for item in circles_data:
+        old = item.get('road_id')
+        if old in rid_to_groupmin:
+            item['road_id'] = rid_to_groupmin[old]
+            item['lane_id'] = rid_to_lane[old]
+        else:
+            item['lane_id'] = item.get('lane_id', 1)
+    
+    for item in arcs_data:
+        old = item.get('road_id')
+        if old in rid_to_groupmin:
+            item['road_id'] = rid_to_groupmin[old]
+            item['lane_id'] = rid_to_lane[old]
+        else:
+            item['lane_id'] = item.get('lane_id', 1)
+
+def attach_geometry_end_poly_ids(lines_data, circles_data, arcs_data, polygons_data):
+    """为每个几何元素添加 start_poly_id / end_poly_id。
+    根据 geometry 的 start/end 坐标，在相同 (road_id, lane_id) 的 polygons 中
+    找到距离最近的 poly，将其 poly_id 作为 start_poly_id 和 end_poly_id。
+    """
+    # 构建 (road_id, lane_id) -> quads 列表，便于按坐标查找
+    groups = {}
+    # 同时构建 road_id -> quads 列表，作为回退
+    road_groups = {}
+    for q in polygons_data:
+        rid = q.get('road_id')
+        lid = q.get('lane_id', 1)
+        groups.setdefault((rid, lid), []).append(q)
+        road_groups.setdefault(rid, []).append(q)
+    
+    def find_nearest_poly_id(target_point_2d, candidate_quads):
+        """在候选 quads 中找到 center 距离目标点最近的 poly_id"""
+        if not candidate_quads:
+            return None
+        min_dist = float('inf')
+        nearest_pid = None
+        tx, ty = float(target_point_2d[0]), float(target_point_2d[1])
+        for q in candidate_quads:
+            cx, cy = float(q['center'][0]), float(q['center'][1])
+            dist = math.hypot(tx - cx, ty - cy)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_pid = int(q['poly_id'])
+        return nearest_pid
+    
+    # 处理 lines: 使用 start 和 end 坐标
+    for item in lines_data:
+        rid = item.get('road_id')
+        lid = item.get('lane_id', 1)
+        candidate_quads = groups.get((rid, lid), [])
+        # 回退：如果按 (road_id, lane_id) 找不到，则按 road_id 查找
+        if not candidate_quads:
+            candidate_quads = road_groups.get(rid, [])
+        
+        start_point = item.get('start', [])
+        end_point = item.get('end', [])
+        
+        if len(start_point) >= 2 and len(end_point) >= 2:
+            item['start_poly_id'] = find_nearest_poly_id(start_point[:2], candidate_quads)
+            item['end_poly_id'] = find_nearest_poly_id(end_point[:2], candidate_quads)
+        else:
+            item['start_poly_id'] = None
+            item['end_poly_id'] = None
+    
+    # 处理 arcs: 计算起点和终点坐标
+    for item in arcs_data:
+        rid = item.get('road_id')
+        lid = item.get('lane_id', 1)
+        candidate_quads = groups.get((rid, lid), [])
+        # 回退：如果按 (road_id, lane_id) 找不到，则按 road_id 查找
+        if not candidate_quads:
+            candidate_quads = road_groups.get(rid, [])
+        
+        center = item.get('center', [])
+        radius = float(item.get('radius', 0))
+        start_angle = float(item.get('start_angle', 0))
+        end_angle = float(item.get('end_angle', 0))
+        
+        if len(center) >= 2 and radius > 0:
+            # 计算圆弧起点和终点坐标
+            cx, cy = float(center[0]), float(center[1])
+            start_angle_rad = math.radians(start_angle)
+            end_angle_rad = math.radians(end_angle)
+            
+            start_point = (cx + radius * math.cos(start_angle_rad), 
+                          cy + radius * math.sin(start_angle_rad))
+            end_point = (cx + radius * math.cos(end_angle_rad), 
+                        cy + radius * math.sin(end_angle_rad))
+            
+            item['start_poly_id'] = find_nearest_poly_id(start_point, candidate_quads)
+            item['end_poly_id'] = find_nearest_poly_id(end_point, candidate_quads)
+        else:
+            item['start_poly_id'] = None
+            item['end_poly_id'] = None
+    
+    # 处理 circles: 圆形是闭合的，可能需要特殊处理
+    # 暂时使用圆心作为参考点，但可能需要根据实际需求调整
+    for item in circles_data:
+        rid = item.get('road_id')
+        lid = item.get('lane_id', 1)
+        candidate_quads = groups.get((rid, lid), [])
+        # 回退：如果按 (road_id, lane_id) 找不到，则按 road_id 查找
+        if not candidate_quads:
+            candidate_quads = road_groups.get(rid, [])
+        
+        center = item.get('center', [])
+        if len(center) >= 2:
+            # 对于圆形，可以找一个参考点，或者使用第一个和最后一个 poly
+            # 这里先使用圆心作为参考，但可能需要根据实际需求调整
+            center_point = center[:2]
+            nearest_pid = find_nearest_poly_id(center_point, candidate_quads)
+            item['start_poly_id'] = nearest_pid
+            item['end_poly_id'] = nearest_pid  # 圆形闭合，起点和终点相同
+        else:
+            item['start_poly_id'] = None
+            item['end_poly_id'] = None
 
 # =========================== W_lane 采样 ===========================
 # TODO: 添加W_lane的采样。
@@ -2060,7 +2189,9 @@ print("\n=== 基于GPU相交检测进行道路分组与ID/LANE重排 ===")
 INTERSECTION_THRESHOLD = config['preprocessor'].get('intersection_threshold')
 groups = group_roads_by_overlap(polygons_data, threshold=INTERSECTION_THRESHOLD, device=DEVICE)
 print(f"分到 {len(groups)} 组: {groups}")
-polygons_data = reassign_road_lane_ids(polygons_data, groups)
+polygons_data, rid_to_groupmin, rid_to_lane = reassign_road_lane_ids(polygons_data, groups)
+apply_mapping_to_geometry(lines_data, circles_data, arcs_data, rid_to_groupmin, rid_to_lane)
+attach_geometry_end_poly_ids(lines_data, circles_data, arcs_data, polygons_data)
 
 # TODO: 添加每条路quad的s值(frenet坐标系下的s值)
 # 从每条路的start开始，计算每一个quad在这条路上的s值（frenet坐标，关于start点的曲线长度）
@@ -2133,6 +2264,9 @@ export_payload = {
         "lines": [
             {
                 "road_id": item["road_id"],
+                "lane_id": int(item.get("lane_id", 1)),
+                "start_poly_id": item.get("start_poly_id"),
+                "end_poly_id": item.get("end_poly_id"),
                 "layer": str(item.get("layer", "")),
                 "start": [float(item["start"][0]), float(item["start"][1]), float(item["start"][2])],
                 "end": [float(item["end"][0]), float(item["end"][1]), float(item["end"][2])],
@@ -2143,6 +2277,9 @@ export_payload = {
         "circles": [
             {
                 "road_id": item["road_id"],
+                "lane_id": int(item.get("lane_id", 1)),
+                "start_poly_id": item.get("start_poly_id"),
+                "end_poly_id": item.get("end_poly_id"),
                 "center": [float(item["center"][0]), float(item["center"][1]), float(item["center"][2])],
                 "radius": float(item["radius"]) 
             }
@@ -2151,6 +2288,9 @@ export_payload = {
         "arcs": [
             {
                 "road_id": item["road_id"],
+                "lane_id": int(item.get("lane_id", 1)),
+                "start_poly_id": item.get("start_poly_id"),
+                "end_poly_id": item.get("end_poly_id"),
                 "center": [float(item["center"][0]), float(item["center"][1]), float(item["center"][2])],
                 "radius": float(item["radius"]),
                 "start_angle": float(item["start_angle"]),

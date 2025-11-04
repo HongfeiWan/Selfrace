@@ -742606,6 +742606,9 @@
     "lines": [
       {
         "road_id": 1,
+        "lane_id": 1,
+        "start_poly_id": 1,
+        "end_poly_id": 74,
         "layer": "0",
         "start": [
           -126.1259291343377,
@@ -742620,7 +742623,10 @@
         "length": 73.0
       },
       {
-        "road_id": 2,
+        "road_id": 1,
+        "lane_id": 2,
+        "start_poly_id": 75,
+        "end_poly_id": 145,
         "layer": "0",
         "start": [
           -196.1259291343378,
@@ -742636,6 +742642,9 @@
       },
       {
         "road_id": 3,
+        "lane_id": 1,
+        "start_poly_id": 146,
+        "end_poly_id": 219,
         "layer": "0",
         "start": [
           1.499999999999938,
@@ -742650,7 +742659,10 @@
         "length": 73.0
       },
       {
-        "road_id": 4,
+        "road_id": 3,
+        "lane_id": 2,
+        "start_poly_id": 220,
+        "end_poly_id": 293,
         "layer": "0",
         "start": [
           -1.50000000000011,
@@ -742666,6 +742678,9 @@
       },
       {
         "road_id": 5,
+        "lane_id": 1,
+        "start_poly_id": 294,
+        "end_poly_id": 367,
         "layer": "0",
         "start": [
           126.1259291343377,
@@ -742680,7 +742695,10 @@
         "length": 73.0
       },
       {
-        "road_id": 6,
+        "road_id": 5,
+        "lane_id": 2,
+        "start_poly_id": 368,
+        "end_poly_id": 441,
         "layer": "0",
         "start": [
           199.1259291343379,
@@ -742696,6 +742714,9 @@
       },
       {
         "road_id": 7,
+        "lane_id": 1,
+        "start_poly_id": 442,
+        "end_poly_id": 515,
         "layer": "0",
         "start": [
           -1.499999999999928,
@@ -742710,7 +742731,10 @@
         "length": 73.0
       },
       {
-        "road_id": 8,
+        "road_id": 7,
+        "lane_id": 2,
+        "start_poly_id": 516,
+        "end_poly_id": 589,
         "layer": "0",
         "start": [
           1.500000000000025,
@@ -742726,6 +742750,9 @@
       },
       {
         "road_id": 9,
+        "lane_id": 1,
+        "start_poly_id": 590,
+        "end_poly_id": 754,
         "layer": "0",
         "start": [
           -226.1259291343378,
@@ -742740,7 +742767,10 @@
         "length": 164.62592913433775
       },
       {
-        "road_id": 10,
+        "road_id": 9,
+        "lane_id": 2,
+        "start_poly_id": 755,
+        "end_poly_id": 922,
         "layer": "0",
         "start": [
           -229.1259291343378,
@@ -742756,6 +742786,9 @@
       },
       {
         "road_id": 11,
+        "lane_id": 1,
+        "start_poly_id": 923,
+        "end_poly_id": 1087,
         "layer": "0",
         "start": [
           -31.49999999999997,
@@ -742770,7 +742803,10 @@
         "length": 164.62592913433772
       },
       {
-        "road_id": 12,
+        "road_id": 11,
+        "lane_id": 2,
+        "start_poly_id": 1088,
+        "end_poly_id": 1255,
         "layer": "0",
         "start": [
           -196.1259291343377,
@@ -742785,7 +742821,10 @@
         "length": 167.62592913433772
       },
       {
-        "road_id": 13,
+        "road_id": 1,
+        "lane_id": 3,
+        "start_poly_id": 1256,
+        "end_poly_id": 1326,
         "layer": "0",
         "start": [
           -126.1259291343379,
@@ -742800,7 +742839,10 @@
         "length": 70.0
       },
       {
-        "road_id": 14,
+        "road_id": 1,
+        "lane_id": 4,
+        "start_poly_id": 1327,
+        "end_poly_id": 1400,
         "layer": "0",
         "start": [
           -199.1259291343379,
@@ -742816,6 +742858,9 @@
       },
       {
         "road_id": 15,
+        "lane_id": 1,
+        "start_poly_id": 1401,
+        "end_poly_id": 1565,
         "layer": "0",
         "start": [
           -196.1259291343378,
@@ -742830,7 +742875,10 @@
         "length": 164.6259291343378
       },
       {
-        "road_id": 16,
+        "road_id": 15,
+        "lane_id": 2,
+        "start_poly_id": 1566,
+        "end_poly_id": 1733,
         "layer": "0",
         "start": [
           -28.5,
@@ -742846,6 +742894,9 @@
       },
       {
         "road_id": 17,
+        "lane_id": 1,
+        "start_poly_id": 1734,
+        "end_poly_id": 1898,
         "layer": "0",
         "start": [
           -226.1259291343379,
@@ -742860,7 +742911,10 @@
         "length": 164.62592913433778
       },
       {
-        "road_id": 18,
+        "road_id": 17,
+        "lane_id": 2,
+        "start_poly_id": 1899,
+        "end_poly_id": 2066,
         "layer": "0",
         "start": [
           -229.1259291343378,
@@ -742875,7 +742929,10 @@
         "length": 167.62592913433778
       },
       {
-        "road_id": 19,
+        "road_id": 3,
+        "lane_id": 3,
+        "start_poly_id": 2067,
+        "end_poly_id": 2137,
         "layer": "0",
         "start": [
           1.49999999999984,
@@ -742891,6 +742948,9 @@
       },
       {
         "road_id": 20,
+        "lane_id": 1,
+        "start_poly_id": 2138,
+        "end_poly_id": 2302,
         "layer": "0",
         "start": [
           226.1259291343378,
@@ -742905,7 +742965,10 @@
         "length": 164.62592913433778
       },
       {
-        "road_id": 21,
+        "road_id": 20,
+        "lane_id": 2,
+        "start_poly_id": 2303,
+        "end_poly_id": 2470,
         "layer": "0",
         "start": [
           229.1259291343378,
@@ -742921,6 +742984,9 @@
       },
       {
         "road_id": 22,
+        "lane_id": 1,
+        "start_poly_id": 2471,
+        "end_poly_id": 2635,
         "layer": "0",
         "start": [
           31.4999999999999,
@@ -742935,7 +743001,10 @@
         "length": 164.6259291343378
       },
       {
-        "road_id": 23,
+        "road_id": 22,
+        "lane_id": 2,
+        "start_poly_id": 2636,
+        "end_poly_id": 2803,
         "layer": "0",
         "start": [
           196.1259291343377,
@@ -742950,7 +743019,10 @@
         "length": 167.6259291343378
       },
       {
-        "road_id": 24,
+        "road_id": 5,
+        "lane_id": 3,
+        "start_poly_id": 2804,
+        "end_poly_id": 2874,
         "layer": "0",
         "start": [
           126.1259291343379,
@@ -742966,6 +743038,9 @@
       },
       {
         "road_id": 25,
+        "lane_id": 1,
+        "start_poly_id": 2875,
+        "end_poly_id": 3039,
         "layer": "0",
         "start": [
           196.1259291343378,
@@ -742980,7 +743055,10 @@
         "length": 164.6259291343377
       },
       {
-        "road_id": 26,
+        "road_id": 25,
+        "lane_id": 2,
+        "start_poly_id": 3040,
+        "end_poly_id": 3207,
         "layer": "0",
         "start": [
           28.50000000000012,
@@ -742996,6 +743074,9 @@
       },
       {
         "road_id": 27,
+        "lane_id": 1,
+        "start_poly_id": 3208,
+        "end_poly_id": 3372,
         "layer": "0",
         "start": [
           226.1259291343379,
@@ -743010,7 +743091,10 @@
         "length": 164.62592913433775
       },
       {
-        "road_id": 28,
+        "road_id": 27,
+        "lane_id": 2,
+        "start_poly_id": 3373,
+        "end_poly_id": 3540,
         "layer": "0",
         "start": [
           229.1259291343379,
@@ -743026,6 +743110,9 @@
       },
       {
         "road_id": 29,
+        "lane_id": 1,
+        "start_poly_id": 3541,
+        "end_poly_id": 3710,
         "layer": "0",
         "start": [
           -226.1259291343377,
@@ -743040,7 +743127,10 @@
         "length": 170.0000000000001
       },
       {
-        "road_id": 30,
+        "road_id": 29,
+        "lane_id": 2,
+        "start_poly_id": 3711,
+        "end_poly_id": 3880,
         "layer": "0",
         "start": [
           -229.1259291343377,
@@ -743056,6 +743146,9 @@
       },
       {
         "road_id": 31,
+        "lane_id": 1,
+        "start_poly_id": 3881,
+        "end_poly_id": 4050,
         "layer": "0",
         "start": [
           226.1259291343379,
@@ -743070,7 +743163,10 @@
         "length": 170.00000000000023
       },
       {
-        "road_id": 32,
+        "road_id": 31,
+        "lane_id": 2,
+        "start_poly_id": 4051,
+        "end_poly_id": 4220,
         "layer": "0",
         "start": [
           229.1259291343379,
@@ -743086,6 +743182,9 @@
       },
       {
         "road_id": 33,
+        "lane_id": 1,
+        "start_poly_id": 4221,
+        "end_poly_id": 4390,
         "layer": "0",
         "start": [
           -366.1259291343379,
@@ -743100,7 +743199,10 @@
         "length": 170.0000000000001
       },
       {
-        "road_id": 34,
+        "road_id": 33,
+        "lane_id": 2,
+        "start_poly_id": 4391,
+        "end_poly_id": 4560,
         "layer": "0",
         "start": [
           -196.1259291343378,
@@ -743116,6 +743218,9 @@
       },
       {
         "road_id": 35,
+        "lane_id": 1,
+        "start_poly_id": 4561,
+        "end_poly_id": 4730,
         "layer": "0",
         "start": [
           -196.1259291343377,
@@ -743130,7 +743235,10 @@
         "length": 170.00000000000023
       },
       {
-        "road_id": 36,
+        "road_id": 35,
+        "lane_id": 2,
+        "start_poly_id": 4731,
+        "end_poly_id": 4900,
         "layer": "0",
         "start": [
           -366.1259291343379,
@@ -743146,6 +743254,9 @@
       },
       {
         "road_id": 37,
+        "lane_id": 1,
+        "start_poly_id": 4901,
+        "end_poly_id": 5070,
         "layer": "0",
         "start": [
           226.1259291343378,
@@ -743160,7 +743271,10 @@
         "length": 170.0000000000001
       },
       {
-        "road_id": 38,
+        "road_id": 37,
+        "lane_id": 2,
+        "start_poly_id": 5071,
+        "end_poly_id": 5240,
         "layer": "0",
         "start": [
           229.1259291343377,
@@ -743176,6 +743290,9 @@
       },
       {
         "road_id": 39,
+        "lane_id": 1,
+        "start_poly_id": 5241,
+        "end_poly_id": 5410,
         "layer": "0",
         "start": [
           -226.1259291343379,
@@ -743190,7 +743307,10 @@
         "length": 170.00000000000023
       },
       {
-        "road_id": 40,
+        "road_id": 39,
+        "lane_id": 2,
+        "start_poly_id": 5411,
+        "end_poly_id": 5580,
         "layer": "0",
         "start": [
           -229.1259291343378,
@@ -743206,6 +743326,9 @@
       },
       {
         "road_id": 41,
+        "lane_id": 1,
+        "start_poly_id": 5581,
+        "end_poly_id": 5750,
         "layer": "0",
         "start": [
           366.1259291343379,
@@ -743220,7 +743343,10 @@
         "length": 170.0000000000001
       },
       {
-        "road_id": 42,
+        "road_id": 41,
+        "lane_id": 2,
+        "start_poly_id": 5751,
+        "end_poly_id": 5920,
         "layer": "0",
         "start": [
           196.1259291343378,
@@ -743236,6 +743362,9 @@
       },
       {
         "road_id": 43,
+        "lane_id": 1,
+        "start_poly_id": 5921,
+        "end_poly_id": 6090,
         "layer": "0",
         "start": [
           196.1259291343378,
@@ -743250,7 +743379,10 @@
         "length": 170.0000000000001
       },
       {
-        "road_id": 44,
+        "road_id": 43,
+        "lane_id": 2,
+        "start_poly_id": 6091,
+        "end_poly_id": 6260,
         "layer": "0",
         "start": [
           366.1259291343379,
@@ -743266,6 +743398,9 @@
       },
       {
         "road_id": 45,
+        "lane_id": 1,
+        "start_poly_id": 6261,
+        "end_poly_id": 6425,
         "layer": "0",
         "start": [
           -396.1259291343379,
@@ -743281,6 +743416,9 @@
       },
       {
         "road_id": 46,
+        "lane_id": 1,
+        "start_poly_id": 6426,
+        "end_poly_id": 6590,
         "layer": "0",
         "start": [
           -399.1259291343379,
@@ -743296,6 +743434,9 @@
       },
       {
         "road_id": 47,
+        "lane_id": 1,
+        "start_poly_id": 6591,
+        "end_poly_id": 6760,
         "layer": "0",
         "start": [
           -366.1259291343379,
@@ -743310,7 +743451,10 @@
         "length": 170.0000000000001
       },
       {
-        "road_id": 48,
+        "road_id": 47,
+        "lane_id": 2,
+        "start_poly_id": 6761,
+        "end_poly_id": 6930,
         "layer": "0",
         "start": [
           -196.1259291343379,
@@ -743325,7 +743469,10 @@
         "length": 170.00000000000003
       },
       {
-        "road_id": 49,
+        "road_id": 46,
+        "lane_id": 2,
+        "start_poly_id": 6931,
+        "end_poly_id": 7158,
         "layer": "0",
         "start": [
           -396.1259291343379,
@@ -743340,7 +743487,10 @@
         "length": 227.62592913433787
       },
       {
-        "road_id": 50,
+        "road_id": 45,
+        "lane_id": 2,
+        "start_poly_id": 7159,
+        "end_poly_id": 7386,
         "layer": "0",
         "start": [
           -399.1259291343379,
@@ -743356,6 +743506,9 @@
       },
       {
         "road_id": 51,
+        "lane_id": 1,
+        "start_poly_id": 7387,
+        "end_poly_id": 7551,
         "layer": "0",
         "start": [
           -196.1259291343378,
@@ -743371,6 +743524,9 @@
       },
       {
         "road_id": 52,
+        "lane_id": 1,
+        "start_poly_id": 7552,
+        "end_poly_id": 7716,
         "layer": "0",
         "start": [
           196.1259291343378,
@@ -743386,6 +743542,9 @@
       },
       {
         "road_id": 53,
+        "lane_id": 1,
+        "start_poly_id": 7717,
+        "end_poly_id": 7886,
         "layer": "0",
         "start": [
           -1.500000000000065,
@@ -743400,7 +743559,10 @@
         "length": 170.0000000000001
       },
       {
-        "road_id": 54,
+        "road_id": 53,
+        "lane_id": 2,
+        "start_poly_id": 7887,
+        "end_poly_id": 8056,
         "layer": "0",
         "start": [
           1.499999999999938,
@@ -743415,7 +743577,10 @@
         "length": 170.00000000000003
       },
       {
-        "road_id": 55,
+        "road_id": 52,
+        "lane_id": 2,
+        "start_poly_id": 8057,
+        "end_poly_id": 8284,
         "layer": "0",
         "start": [
           -31.50000000000006,
@@ -743430,7 +743595,10 @@
         "length": 227.62592913433787
       },
       {
-        "road_id": 56,
+        "road_id": 51,
+        "lane_id": 2,
+        "start_poly_id": 8285,
+        "end_poly_id": 8512,
         "layer": "0",
         "start": [
           31.50000000000025,
@@ -743446,6 +743614,9 @@
       },
       {
         "road_id": 57,
+        "lane_id": 1,
+        "start_poly_id": 8513,
+        "end_poly_id": 8677,
         "layer": "0",
         "start": [
           396.1259291343379,
@@ -743461,6 +743632,9 @@
       },
       {
         "road_id": 58,
+        "lane_id": 1,
+        "start_poly_id": 8678,
+        "end_poly_id": 8842,
         "layer": "0",
         "start": [
           399.1259291343379,
@@ -743476,6 +743650,9 @@
       },
       {
         "road_id": 59,
+        "lane_id": 1,
+        "start_poly_id": 8843,
+        "end_poly_id": 9012,
         "layer": "0",
         "start": [
           366.1259291343379,
@@ -743490,7 +743667,10 @@
         "length": 170.0000000000001
       },
       {
-        "road_id": 60,
+        "road_id": 59,
+        "lane_id": 2,
+        "start_poly_id": 9013,
+        "end_poly_id": 9182,
         "layer": "0",
         "start": [
           196.1259291343379,
@@ -743505,7 +743685,10 @@
         "length": 170.00000000000003
       },
       {
-        "road_id": 61,
+        "road_id": 58,
+        "lane_id": 2,
+        "start_poly_id": 9183,
+        "end_poly_id": 9410,
         "layer": "0",
         "start": [
           396.1259291343379,
@@ -743520,7 +743703,10 @@
         "length": 227.6259291343378
       },
       {
-        "road_id": 62,
+        "road_id": 57,
+        "lane_id": 2,
+        "start_poly_id": 9411,
+        "end_poly_id": 9638,
         "layer": "0",
         "start": [
           399.1259291343379,
@@ -743536,6 +743722,9 @@
       },
       {
         "road_id": 63,
+        "lane_id": 1,
+        "start_poly_id": 9639,
+        "end_poly_id": 9803,
         "layer": "0",
         "start": [
           196.1259291343377,
@@ -743551,6 +743740,9 @@
       },
       {
         "road_id": 64,
+        "lane_id": 1,
+        "start_poly_id": 9804,
+        "end_poly_id": 9968,
         "layer": "0",
         "start": [
           -196.1259291343378,
@@ -743566,6 +743758,9 @@
       },
       {
         "road_id": 65,
+        "lane_id": 1,
+        "start_poly_id": 9969,
+        "end_poly_id": 10138,
         "layer": "0",
         "start": [
           1.499999999999999,
@@ -743580,7 +743775,10 @@
         "length": 170.0000000000001
       },
       {
-        "road_id": 66,
+        "road_id": 65,
+        "lane_id": 2,
+        "start_poly_id": 10139,
+        "end_poly_id": 10308,
         "layer": "0",
         "start": [
           -1.49999999999993,
@@ -743595,7 +743793,10 @@
         "length": 170.00000000000003
       },
       {
-        "road_id": 67,
+        "road_id": 64,
+        "lane_id": 2,
+        "start_poly_id": 10309,
+        "end_poly_id": 10536,
         "layer": "0",
         "start": [
           31.49999999999999,
@@ -743610,7 +743811,10 @@
         "length": 227.6259291343378
       },
       {
-        "road_id": 68,
+        "road_id": 63,
+        "lane_id": 2,
+        "start_poly_id": 10537,
+        "end_poly_id": 10764,
         "layer": "0",
         "start": [
           -31.50000000000033,
@@ -743629,6 +743833,9 @@
     "arcs": [
       {
         "road_id": 69,
+        "lane_id": 1,
+        "start_poly_id": 10873,
+        "end_poly_id": 10765,
         "center": [
           0.0,
           0.0,
@@ -743639,7 +743846,10 @@
         "end_angle": 255.9772176472858
       },
       {
-        "road_id": 70,
+        "road_id": 69,
+        "lane_id": 2,
+        "start_poly_id": 10986,
+        "end_poly_id": 10874,
         "center": [
           0.0,
           0.0,
@@ -743651,6 +743861,9 @@
       },
       {
         "road_id": 71,
+        "lane_id": 1,
+        "start_poly_id": 11099,
+        "end_poly_id": 10987,
         "center": [
           0.0,
           0.0,
@@ -743661,7 +743874,10 @@
         "end_angle": 166.2997665116284
       },
       {
-        "road_id": 72,
+        "road_id": 71,
+        "lane_id": 2,
+        "start_poly_id": 11208,
+        "end_poly_id": 11100,
         "center": [
           0.0,
           0.0,
@@ -743673,6 +743889,9 @@
       },
       {
         "road_id": 73,
+        "lane_id": 1,
+        "start_poly_id": 11321,
+        "end_poly_id": 11209,
         "center": [
           0.0,
           0.0,
@@ -743683,7 +743902,10 @@
         "end_angle": 76.2997665116284
       },
       {
-        "road_id": 74,
+        "road_id": 73,
+        "lane_id": 2,
+        "start_poly_id": 11430,
+        "end_poly_id": 11322,
         "center": [
           0.0,
           0.0,
@@ -743695,6 +743917,9 @@
       },
       {
         "road_id": 75,
+        "lane_id": 1,
+        "start_poly_id": 11543,
+        "end_poly_id": 11431,
         "center": [
           0.0,
           0.0,
@@ -743705,7 +743930,10 @@
         "end_angle": 346.2997665116283
       },
       {
-        "road_id": 76,
+        "road_id": 75,
+        "lane_id": 2,
+        "start_poly_id": 11652,
+        "end_poly_id": 11544,
         "center": [
           0.0,
           0.0,
@@ -743717,6 +743945,9 @@
       },
       {
         "road_id": 77,
+        "lane_id": 1,
+        "start_poly_id": 11653,
+        "end_poly_id": 11692,
         "center": [
           -126.125929,
           31.5,
@@ -743727,7 +743958,10 @@
         "end_angle": 345.9772176472857
       },
       {
-        "road_id": 78,
+        "road_id": 77,
+        "lane_id": 2,
+        "start_poly_id": 11693,
+        "end_poly_id": 11732,
         "center": [
           -129.215905,
           31.5,
@@ -743739,6 +743973,9 @@
       },
       {
         "road_id": 79,
+        "lane_id": 1,
+        "start_poly_id": 11733,
+        "end_poly_id": 11772,
         "center": [
           -126.125929,
           -31.5,
@@ -743749,7 +743986,10 @@
         "end_angle": 90.0
       },
       {
-        "road_id": 80,
+        "road_id": 79,
+        "lane_id": 2,
+        "start_poly_id": 11773,
+        "end_poly_id": 11812,
         "center": [
           -129.215905,
           -31.5,
@@ -743761,6 +744001,9 @@
       },
       {
         "road_id": 81,
+        "lane_id": 1,
+        "start_poly_id": 11813,
+        "end_poly_id": 11852,
         "center": [
           -31.5,
           -126.125929,
@@ -743771,7 +744014,10 @@
         "end_angle": 75.9772176472857
       },
       {
-        "road_id": 82,
+        "road_id": 81,
+        "lane_id": 2,
+        "start_poly_id": 11853,
+        "end_poly_id": 11892,
         "center": [
           -31.5,
           -129.215905,
@@ -743783,6 +744029,9 @@
       },
       {
         "road_id": 83,
+        "lane_id": 1,
+        "start_poly_id": 11893,
+        "end_poly_id": 11932,
         "center": [
           31.5,
           -126.125929,
@@ -743793,7 +744042,10 @@
         "end_angle": 180.0
       },
       {
-        "road_id": 84,
+        "road_id": 83,
+        "lane_id": 2,
+        "start_poly_id": 11933,
+        "end_poly_id": 11972,
         "center": [
           31.5,
           -129.215905,
@@ -743805,6 +744057,9 @@
       },
       {
         "road_id": 85,
+        "lane_id": 1,
+        "start_poly_id": 11973,
+        "end_poly_id": 12012,
         "center": [
           126.125929,
           -31.5,
@@ -743815,7 +744070,10 @@
         "end_angle": 165.9772176472857
       },
       {
-        "road_id": 86,
+        "road_id": 85,
+        "lane_id": 2,
+        "start_poly_id": 12013,
+        "end_poly_id": 12052,
         "center": [
           129.215905,
           -31.5,
@@ -743827,6 +744085,9 @@
       },
       {
         "road_id": 87,
+        "lane_id": 1,
+        "start_poly_id": 12053,
+        "end_poly_id": 12092,
         "center": [
           126.125929,
           31.5,
@@ -743837,7 +744098,10 @@
         "end_angle": 270.0
       },
       {
-        "road_id": 88,
+        "road_id": 87,
+        "lane_id": 2,
+        "start_poly_id": 12093,
+        "end_poly_id": 12132,
         "center": [
           129.215905,
           31.5,
@@ -743849,6 +744113,9 @@
       },
       {
         "road_id": 89,
+        "lane_id": 1,
+        "start_poly_id": 12133,
+        "end_poly_id": 12172,
         "center": [
           31.5,
           126.125929,
@@ -743859,7 +744126,10 @@
         "end_angle": 255.9772176472858
       },
       {
-        "road_id": 90,
+        "road_id": 89,
+        "lane_id": 2,
+        "start_poly_id": 12173,
+        "end_poly_id": 12212,
         "center": [
           31.5,
           129.215905,
@@ -743871,6 +744141,9 @@
       },
       {
         "road_id": 91,
+        "lane_id": 1,
+        "start_poly_id": 12213,
+        "end_poly_id": 12252,
         "center": [
           -31.5,
           126.125929,
@@ -743881,7 +744154,10 @@
         "end_angle": 0.0
       },
       {
-        "road_id": 92,
+        "road_id": 91,
+        "lane_id": 2,
+        "start_poly_id": 12253,
+        "end_poly_id": 12292,
         "center": [
           -31.5,
           129.215905,
@@ -743893,6 +744169,9 @@
       },
       {
         "road_id": 93,
+        "lane_id": 1,
+        "start_poly_id": 12340,
+        "end_poly_id": 12293,
         "center": [
           -199.125929,
           28.5,
@@ -743904,6 +744183,9 @@
       },
       {
         "road_id": 94,
+        "lane_id": 1,
+        "start_poly_id": 12341,
+        "end_poly_id": 12388,
         "center": [
           -196.125929,
           31.5,
@@ -743915,6 +744197,9 @@
       },
       {
         "road_id": 95,
+        "lane_id": 1,
+        "start_poly_id": 12389,
+        "end_poly_id": 12436,
         "center": [
           -31.5,
           196.125929,
@@ -743926,6 +744211,9 @@
       },
       {
         "road_id": 96,
+        "lane_id": 1,
+        "start_poly_id": 12484,
+        "end_poly_id": 12437,
         "center": [
           -28.5,
           199.125929,
@@ -743937,6 +744225,9 @@
       },
       {
         "road_id": 97,
+        "lane_id": 1,
+        "start_poly_id": 12485,
+        "end_poly_id": 12532,
         "center": [
           -196.125929,
           196.125929,
@@ -743947,7 +744238,10 @@
         "end_angle": 180.0
       },
       {
-        "road_id": 98,
+        "road_id": 97,
+        "lane_id": 2,
+        "start_poly_id": 12584,
+        "end_poly_id": 12533,
         "center": [
           -196.125929,
           196.125929,
@@ -743959,6 +744253,9 @@
       },
       {
         "road_id": 99,
+        "lane_id": 1,
+        "start_poly_id": 12632,
+        "end_poly_id": 12585,
         "center": [
           -28.5,
           -199.125929,
@@ -743970,6 +744267,9 @@
       },
       {
         "road_id": 100,
+        "lane_id": 1,
+        "start_poly_id": 12633,
+        "end_poly_id": 12680,
         "center": [
           -31.5,
           -196.125929,
@@ -743981,6 +744281,9 @@
       },
       {
         "road_id": 101,
+        "lane_id": 1,
+        "start_poly_id": 12681,
+        "end_poly_id": 12728,
         "center": [
           -196.125929,
           -31.5,
@@ -743992,6 +744295,9 @@
       },
       {
         "road_id": 102,
+        "lane_id": 1,
+        "start_poly_id": 12776,
+        "end_poly_id": 12729,
         "center": [
           -199.125929,
           -28.5,
@@ -744003,6 +744309,9 @@
       },
       {
         "road_id": 103,
+        "lane_id": 1,
+        "start_poly_id": 12777,
+        "end_poly_id": 12824,
         "center": [
           -196.125929,
           -196.125929,
@@ -744013,7 +744322,10 @@
         "end_angle": 270.0
       },
       {
-        "road_id": 104,
+        "road_id": 103,
+        "lane_id": 2,
+        "start_poly_id": 12876,
+        "end_poly_id": 12825,
         "center": [
           -196.125929,
           -196.125929,
@@ -744025,6 +744337,9 @@
       },
       {
         "road_id": 105,
+        "lane_id": 1,
+        "start_poly_id": 12924,
+        "end_poly_id": 12877,
         "center": [
           199.125929,
           -28.5,
@@ -744036,6 +744351,9 @@
       },
       {
         "road_id": 106,
+        "lane_id": 1,
+        "start_poly_id": 12925,
+        "end_poly_id": 12972,
         "center": [
           196.125929,
           -31.5,
@@ -744047,6 +744365,9 @@
       },
       {
         "road_id": 107,
+        "lane_id": 1,
+        "start_poly_id": 12973,
+        "end_poly_id": 13020,
         "center": [
           31.5,
           -196.125929,
@@ -744058,6 +744379,9 @@
       },
       {
         "road_id": 108,
+        "lane_id": 1,
+        "start_poly_id": 13068,
+        "end_poly_id": 13021,
         "center": [
           28.5,
           -199.125929,
@@ -744069,6 +744393,9 @@
       },
       {
         "road_id": 109,
+        "lane_id": 1,
+        "start_poly_id": 13069,
+        "end_poly_id": 13116,
         "center": [
           196.125929,
           -196.125929,
@@ -744079,7 +744406,10 @@
         "end_angle": 0.0
       },
       {
-        "road_id": 110,
+        "road_id": 109,
+        "lane_id": 2,
+        "start_poly_id": 13168,
+        "end_poly_id": 13117,
         "center": [
           196.125929,
           -196.125929,
@@ -744091,6 +744421,9 @@
       },
       {
         "road_id": 111,
+        "lane_id": 1,
+        "start_poly_id": 13216,
+        "end_poly_id": 13169,
         "center": [
           28.5,
           199.125929,
@@ -744102,6 +744435,9 @@
       },
       {
         "road_id": 112,
+        "lane_id": 1,
+        "start_poly_id": 13217,
+        "end_poly_id": 13264,
         "center": [
           31.5,
           196.125929,
@@ -744113,6 +744449,9 @@
       },
       {
         "road_id": 113,
+        "lane_id": 1,
+        "start_poly_id": 13265,
+        "end_poly_id": 13312,
         "center": [
           196.125929,
           31.5,
@@ -744124,6 +744463,9 @@
       },
       {
         "road_id": 114,
+        "lane_id": 1,
+        "start_poly_id": 13360,
+        "end_poly_id": 13313,
         "center": [
           199.125929,
           28.5,
@@ -744135,6 +744477,9 @@
       },
       {
         "road_id": 115,
+        "lane_id": 1,
+        "start_poly_id": 13361,
+        "end_poly_id": 13408,
         "center": [
           196.125929,
           196.125929,
@@ -744145,7 +744490,10 @@
         "end_angle": 90.0
       },
       {
-        "road_id": 116,
+        "road_id": 115,
+        "lane_id": 2,
+        "start_poly_id": 13460,
+        "end_poly_id": 13409,
         "center": [
           196.125929,
           196.125929,
@@ -744157,6 +744505,9 @@
       },
       {
         "road_id": 117,
+        "lane_id": 1,
+        "start_poly_id": 13461,
+        "end_poly_id": 13508,
         "center": [
           -196.125929,
           366.125929,
@@ -744167,7 +744518,10 @@
         "end_angle": 180.0
       },
       {
-        "road_id": 118,
+        "road_id": 117,
+        "lane_id": 2,
+        "start_poly_id": 13560,
+        "end_poly_id": 13509,
         "center": [
           -196.125929,
           366.125929,
@@ -744179,6 +744533,9 @@
       },
       {
         "road_id": 119,
+        "lane_id": 1,
+        "start_poly_id": 13561,
+        "end_poly_id": 13608,
         "center": [
           196.125929,
           366.125929,
@@ -744189,7 +744546,10 @@
         "end_angle": 90.0
       },
       {
-        "road_id": 120,
+        "road_id": 119,
+        "lane_id": 2,
+        "start_poly_id": 13660,
+        "end_poly_id": 13609,
         "center": [
           196.125929,
           366.125929,
@@ -744201,6 +744561,9 @@
       },
       {
         "road_id": 121,
+        "lane_id": 1,
+        "start_poly_id": 13661,
+        "end_poly_id": 13708,
         "center": [
           -366.125929,
           -196.125929,
@@ -744211,7 +744574,10 @@
         "end_angle": 270.0
       },
       {
-        "road_id": 122,
+        "road_id": 121,
+        "lane_id": 2,
+        "start_poly_id": 13760,
+        "end_poly_id": 13709,
         "center": [
           -366.125929,
           -196.125929,
@@ -744223,6 +744589,9 @@
       },
       {
         "road_id": 123,
+        "lane_id": 1,
+        "start_poly_id": 13761,
+        "end_poly_id": 13808,
         "center": [
           -366.125929,
           196.125929,
@@ -744233,7 +744602,10 @@
         "end_angle": 180.0
       },
       {
-        "road_id": 124,
+        "road_id": 123,
+        "lane_id": 2,
+        "start_poly_id": 13860,
+        "end_poly_id": 13809,
         "center": [
           -366.125929,
           196.125929,
@@ -744245,6 +744617,9 @@
       },
       {
         "road_id": 125,
+        "lane_id": 1,
+        "start_poly_id": 13861,
+        "end_poly_id": 13908,
         "center": [
           196.125929,
           -366.125929,
@@ -744255,7 +744630,10 @@
         "end_angle": 0.0
       },
       {
-        "road_id": 126,
+        "road_id": 125,
+        "lane_id": 2,
+        "start_poly_id": 13960,
+        "end_poly_id": 13909,
         "center": [
           196.125929,
           -366.125929,
@@ -744267,6 +744645,9 @@
       },
       {
         "road_id": 127,
+        "lane_id": 1,
+        "start_poly_id": 13961,
+        "end_poly_id": 14008,
         "center": [
           -196.125929,
           -366.125929,
@@ -744277,7 +744658,10 @@
         "end_angle": 270.0
       },
       {
-        "road_id": 128,
+        "road_id": 127,
+        "lane_id": 2,
+        "start_poly_id": 14060,
+        "end_poly_id": 14009,
         "center": [
           -196.125929,
           -366.125929,
@@ -744289,6 +744673,9 @@
       },
       {
         "road_id": 129,
+        "lane_id": 1,
+        "start_poly_id": 14061,
+        "end_poly_id": 14108,
         "center": [
           366.125929,
           196.125929,
@@ -744299,7 +744686,10 @@
         "end_angle": 90.0
       },
       {
-        "road_id": 130,
+        "road_id": 129,
+        "lane_id": 2,
+        "start_poly_id": 14160,
+        "end_poly_id": 14109,
         "center": [
           366.125929,
           196.125929,
@@ -744311,6 +744701,9 @@
       },
       {
         "road_id": 131,
+        "lane_id": 1,
+        "start_poly_id": 14161,
+        "end_poly_id": 14208,
         "center": [
           366.125929,
           -196.125929,
@@ -744321,7 +744714,10 @@
         "end_angle": 2.54e-14
       },
       {
-        "road_id": 132,
+        "road_id": 131,
+        "lane_id": 2,
+        "start_poly_id": 14260,
+        "end_poly_id": 14209,
         "center": [
           366.125929,
           -196.125929,
@@ -744333,6 +744729,9 @@
       },
       {
         "road_id": 133,
+        "lane_id": 1,
+        "start_poly_id": 14261,
+        "end_poly_id": 14308,
         "center": [
           -366.125929,
           31.5,
@@ -744343,7 +744742,10 @@
         "end_angle": 270.0
       },
       {
-        "road_id": 134,
+        "road_id": 133,
+        "lane_id": 2,
+        "start_poly_id": 14360,
+        "end_poly_id": 14309,
         "center": [
           -366.125929,
           31.5,
@@ -744355,6 +744757,9 @@
       },
       {
         "road_id": 135,
+        "lane_id": 1,
+        "start_poly_id": 14361,
+        "end_poly_id": 14408,
         "center": [
           -31.5,
           -366.125929,
@@ -744365,7 +744770,10 @@
         "end_angle": 0.0
       },
       {
-        "road_id": 136,
+        "road_id": 135,
+        "lane_id": 2,
+        "start_poly_id": 14460,
+        "end_poly_id": 14409,
         "center": [
           -31.5,
           -366.125929,
@@ -744377,6 +744785,9 @@
       },
       {
         "road_id": 137,
+        "lane_id": 1,
+        "start_poly_id": 14461,
+        "end_poly_id": 14508,
         "center": [
           366.125929,
           -31.5,
@@ -744387,7 +744798,10 @@
         "end_angle": 90.0
       },
       {
-        "road_id": 138,
+        "road_id": 137,
+        "lane_id": 2,
+        "start_poly_id": 14560,
+        "end_poly_id": 14509,
         "center": [
           366.125929,
           -31.5,
@@ -744399,6 +744813,9 @@
       },
       {
         "road_id": 139,
+        "lane_id": 1,
+        "start_poly_id": 14561,
+        "end_poly_id": 14608,
         "center": [
           31.5,
           366.125929,
@@ -744409,7 +744826,10 @@
         "end_angle": 180.0
       },
       {
-        "road_id": 140,
+        "road_id": 139,
+        "lane_id": 2,
+        "start_poly_id": 14660,
+        "end_poly_id": 14609,
         "center": [
           31.5,
           366.125929,
@@ -744421,6 +744841,9 @@
       },
       {
         "road_id": 141,
+        "lane_id": 1,
+        "start_poly_id": 14710,
+        "end_poly_id": 14661,
         "center": [
           0.0,
           -0.0,
@@ -744431,7 +744854,10 @@
         "end_angle": 193.7002334883715
       },
       {
-        "road_id": 142,
+        "road_id": 141,
+        "lane_id": 2,
+        "start_poly_id": 14759,
+        "end_poly_id": 14711,
         "center": [
           0.0,
           0.0,
@@ -744443,6 +744869,9 @@
       },
       {
         "road_id": 143,
+        "lane_id": 1,
+        "start_poly_id": 14809,
+        "end_poly_id": 14760,
         "center": [
           -0.0,
           0.0,
@@ -744453,7 +744882,10 @@
         "end_angle": 283.7002334883715
       },
       {
-        "road_id": 144,
+        "road_id": 143,
+        "lane_id": 2,
+        "start_poly_id": 14858,
+        "end_poly_id": 14810,
         "center": [
           -0.0,
           0.0,
@@ -744465,6 +744897,9 @@
       },
       {
         "road_id": 145,
+        "lane_id": 1,
+        "start_poly_id": 14908,
+        "end_poly_id": 14859,
         "center": [
           0.0,
           -0.0,
@@ -744475,7 +744910,10 @@
         "end_angle": 13.70023348837154
       },
       {
-        "road_id": 146,
+        "road_id": 145,
+        "lane_id": 2,
+        "start_poly_id": 14957,
+        "end_poly_id": 14909,
         "center": [
           0.0,
           -0.0,
@@ -744487,6 +744925,9 @@
       },
       {
         "road_id": 147,
+        "lane_id": 1,
+        "start_poly_id": 15007,
+        "end_poly_id": 14958,
         "center": [
           0.0,
           0.0,
@@ -744497,7 +744938,10 @@
         "end_angle": 103.7002334883716
       },
       {
-        "road_id": 148,
+        "road_id": 147,
+        "lane_id": 2,
+        "start_poly_id": 15056,
+        "end_poly_id": 15008,
         "center": [
           0.0,
           0.0,
@@ -744509,6 +744953,9 @@
       },
       {
         "road_id": 149,
+        "lane_id": 1,
+        "start_poly_id": 15057,
+        "end_poly_id": 15371,
         "center": [
           196.125929,
           196.125929,
@@ -744519,7 +744966,10 @@
         "end_angle": 90.0
       },
       {
-        "road_id": 150,
+        "road_id": 149,
+        "lane_id": 2,
+        "start_poly_id": 15690,
+        "end_poly_id": 15372,
         "center": [
           196.125929,
           196.125929,
@@ -744531,6 +744981,9 @@
       },
       {
         "road_id": 151,
+        "lane_id": 1,
+        "start_poly_id": 15691,
+        "end_poly_id": 16005,
         "center": [
           -196.125929,
           196.125929,
@@ -744541,7 +744994,10 @@
         "end_angle": 180.0
       },
       {
-        "road_id": 152,
+        "road_id": 151,
+        "lane_id": 2,
+        "start_poly_id": 16324,
+        "end_poly_id": 16006,
         "center": [
           -196.125929,
           196.125929,
@@ -744553,6 +745009,9 @@
       },
       {
         "road_id": 153,
+        "lane_id": 1,
+        "start_poly_id": 16325,
+        "end_poly_id": 16639,
         "center": [
           -196.125929,
           -196.125929,
@@ -744563,7 +745022,10 @@
         "end_angle": 270.0
       },
       {
-        "road_id": 154,
+        "road_id": 153,
+        "lane_id": 2,
+        "start_poly_id": 16958,
+        "end_poly_id": 16640,
         "center": [
           -196.125929,
           -196.125929,
@@ -744575,6 +745037,9 @@
       },
       {
         "road_id": 155,
+        "lane_id": 1,
+        "start_poly_id": 16959,
+        "end_poly_id": 17273,
         "center": [
           196.125929,
           -196.125929,
@@ -744585,7 +745050,10 @@
         "end_angle": 0.0
       },
       {
-        "road_id": 156,
+        "road_id": 155,
+        "lane_id": 2,
+        "start_poly_id": 17592,
+        "end_poly_id": 17274,
         "center": [
           196.125929,
           -196.125929,
