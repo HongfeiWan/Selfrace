@@ -13,7 +13,7 @@ from utils.spatial_hash import SpatialHash
 from road import RoadNetwork
 from offroad import OffroadChecker
 from collision import CollisionChecker
-from goals import PathPlanner
+from goal import PathPlanner
 from reward import RewardCalculator
 from world_init import WorldInitializer
 from observation import ObservationGenerator
