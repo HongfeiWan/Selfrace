@@ -6,7 +6,6 @@ import torch
 import json
 import os
 from collections import defaultdict
-import time
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Polygon
@@ -569,25 +568,12 @@ class PathPlanner:
         # 4. 特殊情况：只有一条lane时，只有起点链和终点链
         
         # 分块处理，避免显存爆炸 (tile over N=B*M)
-        K = waypoints_length
-        final_flat = waypoints.flatten(0, 1)  # (B*M, K, 3)
-        # 经验 tile 大小：CUDA 下 2048，CPU 下 2048（可按需调整）
         tile = 2048
         P = max_path_len
         W = self.lane_waypoints.shape[1]
         n_lanes_total = self.n_lanes
-
-        # 性能计时
-        t_total_start = time.perf_counter()
-        t_chains_total = 0.0
-        t_mid_idx_total = 0.0
-        t_mid_gather_total = 0.0
-        t_mid_compact_total = 0.0
-        t_mid_sample_total = 0.0
-        t_concat_compact_total = 0.0
-        t_final_write_total = 0.0
-        n_tiles = (batch_size + tile - 1) // tile
-
+        final_flat = waypoints.flatten(0, 1)  # (B*M, K, 3)
+        K = waypoints_length
         for s_idx in range(0, batch_size, tile):
             e_idx = min(s_idx + tile, batch_size)
             n_sub = e_idx - s_idx
@@ -596,29 +582,18 @@ class PathPlanner:
             ep = end_poly_flat[s_idx:e_idx]
             pl = path_lengths_flat[s_idx:e_idx]
             # 起点链/终点链 (n_sub, K, 3)
-            t0 = time.perf_counter()
-            # 仅在第一个 tile 启用详细计时
-            enable_detailed_timing = (s_idx == 0)
             chain_waypoints_start = self._get_w_lane_chain_waypoints_from_poly_vectorized(
-                sp, direction='next', max_chain_len=K, enable_timing=enable_detailed_timing)
+                sp, direction='next', max_chain_len=K)
             chain_waypoints_end = self._get_w_lane_chain_waypoints_from_poly_vectorized(
-                ep, direction='prev', max_chain_len=K, enable_timing=enable_detailed_timing)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t_chains_total += time.perf_counter() - t0
-                
+                ep, direction='prev', max_chain_len=K)
+
             # 中间段：向量化压紧（仅对该 tile）
-            t0 = time.perf_counter()
             pos_idx = torch.arange(P, device=self.device).view(1, P).expand(n_sub, -1)
             middle_pos_mask = (pos_idx > 0) & (pos_idx < (pl.unsqueeze(1) - 1))
             lane_idx_all = pf
             valid_lane_mask = middle_pos_mask & (lane_idx_all >= 0) & (lane_idx_all < n_lanes_total)
             lane_idx_safe = torch.where(valid_lane_mask, lane_idx_all, torch.zeros_like(lane_idx_all))
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t_mid_idx_total += time.perf_counter() - t0
 
-            t0 = time.perf_counter()
             lane_wps_all = self.lane_waypoints[lane_idx_safe]                # (n_sub, P, W, 3)
             lane_wps_count = self.lane_waypoints_count[lane_idx_safe]        # (n_sub, P)
             k_idx = torch.arange(W, device=self.device).view(1, 1, W).expand(n_sub, P, -1)
@@ -632,12 +607,8 @@ class PathPlanner:
             feats_flat = feats.view(n_sub, P * W, 3)
             mask_flat = valid_all.view(n_sub, P * W)                          # (n_sub, L)
             total_mid_counts = mask_flat.sum(dim=1)                           # (n_sub,)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t_mid_gather_total += time.perf_counter() - t0
 
             # 使用按行 cumsum 计算写入位置并 scatter 到紧凑缓冲（避免排序）
-            t0 = time.perf_counter()
             Lmid = P * W
             compact_buf_all = torch.full((n_sub, Lmid, 3), self.INVALID_WAYPOINT_MARKER,
                                          dtype=torch.float32, device=self.device)
@@ -648,15 +619,10 @@ class PathPlanner:
             valid_lin = mask_flat
             if valid_lin.any():
                 compact_buf_all[batch_idx[valid_lin], pos_in_row[valid_lin], :] = feats_flat[valid_lin, :]
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t_mid_compact_total += time.perf_counter() - t0
 
             # 生成 middle_buf: (n_sub, K, 3)
-            t0 = time.perf_counter()
             middle_buf = torch.full((n_sub, K, 3), self.INVALID_WAYPOINT_MARKER,
                                     dtype=torch.float32, device=self.device)
-            # <=K: 直接取前缀
             small_mid = (total_mid_counts <= K)
             if small_mid.any():
                 rows = torch.nonzero(small_mid, as_tuple=False).squeeze(1)
@@ -678,12 +644,8 @@ class PathPlanner:
                 sample_idx = torch.clamp((t_lin * (totals.float().unsqueeze(1) - 1.0)).round().long(), 0)
                 gathered = compact_buf_all[rows].gather(1, sample_idx.unsqueeze(-1).expand(-1, -1, 3))
                 middle_buf[rows, :, :] = gathered
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t_mid_sample_total += time.perf_counter() - t0
 
             # 拼接三段并压紧到 K
-            t0 = time.perf_counter()
             concat_buf = torch.cat([chain_waypoints_start, middle_buf, chain_waypoints_end], dim=1)  # (n_sub, 3K, 3)
             threeK = 3 * K
             valid_mask_all = (concat_buf[:, :, 0] != self.INVALID_WAYPOINT_MARKER)  # (n_sub, 3K)
@@ -697,12 +659,8 @@ class PathPlanner:
             valid3 = valid_mask_all
             if valid3.any():
                 buffer3[batch_idx3[valid3], pos_total[valid3], :] = concat_buf[valid3, :]
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t_concat_compact_total += time.perf_counter() - t0
 
             # 生成该 tile 的最终结果并写入 final_flat
-            t0 = time.perf_counter()
             small_mask = (total_counts <= K)
             if small_mask.any():
                 rows = torch.nonzero(small_mask, as_tuple=False).squeeze(1)
@@ -723,51 +681,24 @@ class PathPlanner:
                 pos = torch.clamp((t_lin * (totals.float().unsqueeze(1) - 1.0)).round().long(), 0)
                 gathered = buffer3[rows].gather(1, pos.unsqueeze(-1).expand(-1, -1, 3))
                 final_flat[s_idx:e_idx][rows, :, :] = gathered
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t_final_write_total += time.perf_counter() - t0
-        
-        # 性能统计输出
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        t_total = time.perf_counter() - t_total_start
-        print(f"  collect_path_waypoints 性能分析 (tiles={n_tiles}, tile_size={tile}):")
-        print(f"    总耗时: {t_total*1000:.2f} ms")
-        print(f"    起点/终点链生成: {t_chains_total*1000:.2f} ms ({t_chains_total/t_total*100:.1f}%)")
-        print(f"    中间段索引计算: {t_mid_idx_total*1000:.2f} ms ({t_mid_idx_total/t_total*100:.1f}%)")
-        print(f"    中间段waypoints提取: {t_mid_gather_total*1000:.2f} ms ({t_mid_gather_total/t_total*100:.1f}%)")
-        print(f"    中间段压紧: {t_mid_compact_total*1000:.2f} ms ({t_mid_compact_total/t_total*100:.1f}%)")
-        print(f"    中间段采样: {t_mid_sample_total*1000:.2f} ms ({t_mid_sample_total/t_total*100:.1f}%)")
-        print(f"    三段拼接压紧: {t_concat_compact_total*1000:.2f} ms ({t_concat_compact_total/t_total*100:.1f}%)")
-        print(f"    最终写入: {t_final_write_total*1000:.2f} ms ({t_final_write_total/t_total*100:.1f}%)")
         
         # 单条lane特殊情形：已被三段拼接流程覆盖（start/end 链 + middle为空即可），无需额外处理
         return waypoints  # (B, M, waypoints_length, 3)
     
-    def _get_w_lane_chain_waypoints_from_poly_vectorized(self, poly_ids, direction='next', max_chain_len=10, enable_timing=False):
+    def _get_w_lane_chain_waypoints_from_poly_vectorized(self, poly_ids, direction='next', max_chain_len=10):
         """
         基于poly的预存完整链（CSR）直接取序列并转为waypoints。
         Args:
             poly_ids: (B,) poly_id tensor
             direction: 'next' 或 'prev'
             max_chain_len: 取前K个
-            enable_timing: 是否启用性能计时（用于调试）
         Returns:
             (B, max_chain_len, 3)
         """
-        if enable_timing:
-            t0 = time.perf_counter()
         B = poly_ids.shape[0]
         device = poly_ids.device
         out = torch.full((B, max_chain_len, 3), self.INVALID_WAYPOINT_MARKER, dtype=torch.float32, device=device)
-        if enable_timing:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            print(f"      [chain] alloc: {(t1-t0)*1000:.3f}ms")
         
-        if enable_timing:
-            t0 = time.perf_counter()
         if direction == 'next':
             off = self.poly_next_seq_offsets[poly_ids]
             leng = self.poly_next_seq_lengths[poly_ids]
@@ -776,14 +707,7 @@ class PathPlanner:
             off = self.poly_prev_seq_offsets[poly_ids]
             leng = self.poly_prev_seq_lengths[poly_ids]
             flat = self.poly_prev_seq_flat_idx
-        if enable_timing:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            print(f"      [chain] lookup offsets/lengths: {(t1-t0)*1000:.3f}ms")
         
-        if enable_timing:
-            t0 = time.perf_counter()
         K = max_chain_len
         pos = torch.arange(K, device=device, dtype=torch.long).view(1, K).expand(B, -1)
         take = torch.minimum(leng, torch.full_like(leng, K))
@@ -791,30 +715,9 @@ class PathPlanner:
         base = off.unsqueeze(1).expand(B, K)
         flat_idx = base + idx_in_seq
         flat_idx = torch.clamp(flat_idx, 0, max(0, flat.shape[0]-1))
-        if enable_timing:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            print(f"      [chain] compute indices: {(t1-t0)*1000:.3f}ms")
-        
-        if enable_timing:
-            t0 = time.perf_counter()
         feats = self.w_lane_features[flat[flat_idx]]  # 双重索引：先索引flat，再索引w_lane_features
-        if enable_timing:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            print(f"      [chain] double indexing (flat[flat_idx] -> w_lane_features): {(t1-t0)*1000:.3f}ms")
-        
-        if enable_timing:
-            t0 = time.perf_counter()
         mask = pos < take.unsqueeze(1)
         out[mask] = feats[mask]
-        if enable_timing:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            print(f"      [chain] mask & write: {(t1-t0)*1000:.3f}ms")
         return out
 
 if __name__ == '__main__':
@@ -836,11 +739,9 @@ if __name__ == '__main__':
     print(f"\n开始批量生成 {B} x {M} = {total_paths} 条路径...")
     all_poly_ids = [quad['poly_id'] for quad in all_quads if quad['poly_id'] in planner.poly_id_to_lane_idx]
     all_poly_ids_tensor = torch.tensor(all_poly_ids, dtype=torch.long)
-    
     # 随机生成起点和终点矩阵（使用GPU tensor）
     print("生成随机起点和终点 tensor...")
     # 创建包含所有可用 poly_ids 的 tensor
-
     n_available = len(all_poly_ids)
     # 使用 GPU 生成随机索引（如果 GPU 可用）
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -863,57 +764,30 @@ if __name__ == '__main__':
     print("路径生成完成！")
     # 不存储路径数据，直接从tensor中读取
     print(f"总共 {total_paths} 条路径（直接从tensor读取，不存储）")
-    
-    # ==================== 5. 基准测试 collect_path_waypoints ====================
-    print("\n开始基准测试 collect_path_waypoints (B=4800, M=150)...")
-    # 预热
-    _ = planner.collect_path_waypoints(all_paths[:1, :1, :], start_poly_tensor[:1, :1], end_poly_tensor[:1, :1])
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    runs = 3
-    times = []
-    for r in range(runs):
-        t0 = time.perf_counter()
-        _ = planner.collect_path_waypoints(all_paths, start_poly_tensor, end_poly_tensor)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        dt = (t1 - t0) * 1000.0
-        times.append(dt)
-        print(f"  第 {r+1}/{runs} 次：{dt:.2f} ms")
-    avg = sum(times) / len(times) if times else 0.0
-    p95 = sorted(times)[int(0.95 * (len(times) - 1))] if times else 0.0
-    print(f"collect_path_waypoints 平均耗时：{avg:.2f} ms | P95：{p95:.2f} ms")
+
+    # ==================== 4. 批量生成 collect_path_waypoints ====================
+    print("开始批量生成 collect_path_waypoints...")
+    all_waypoints = planner.collect_path_waypoints(all_paths, start_poly_tensor, end_poly_tensor)
+    print("waypoints 生成完成！")
 
     # ==================== 5. 可视化一条 collect_path_waypoints 结果 ====================
-    print("开始可视化 collect_path_waypoints 的结果（尝试寻找一条有有效waypoints的路径）...")
-    # 多次尝试，找到至少一条含有效waypoints的路径
-    b = 0
-    m = 0
-    valid_cnt = 0
-    max_try = 200
-    for _ in range(max_try):
-        bi = int(torch.randint(0, B, (1,), device=device).item())
-        mi = int(torch.randint(0, M, (1,), device=device).item())
-        paths_batch = all_paths[bi:bi+1, mi:mi+1, :]
-        start_poly_batch = start_poly_tensor[bi:bi+1, mi:mi+1]
-        end_poly_batch = end_poly_tensor[bi:bi+1, mi:mi+1]
-        waypoints_batch = planner.collect_path_waypoints(paths_batch, start_poly_batch, end_poly_batch)
-        wp = waypoints_batch[0, 0]
-        wp_np = wp.detach().cpu().numpy()
-        valid_cnt = int(np.sum(wp_np[:, 0] != planner.INVALID_WAYPOINT_MARKER))
-        if valid_cnt > 0:
-            b, m = bi, mi
-            break
-    # 若仍无有效点，则展示首条并提示
-    if valid_cnt == 0:
-        b, m = 0, 0
-        paths_batch = all_paths[b:b+1, m:m+1, :]
-        start_poly_batch = start_poly_tensor[b:b+1, m:m+1]
-        end_poly_batch = end_poly_tensor[b:b+1, m:m+1]
-        waypoints_batch = planner.collect_path_waypoints(paths_batch, start_poly_batch, end_poly_batch)
-        wp = waypoints_batch[0, 0]
-        wp_np = wp.detach().cpu().numpy()
+    print("开始可视化 collect_path_waypoints 的结果...")
+    valid_mask_wp = all_waypoints[..., 0] != planner.INVALID_WAYPOINT_MARKER
+    valid_counts = valid_mask_wp.sum(dim=2)
+    flat_counts = valid_counts.view(-1)
+    nonzero_indices = torch.nonzero(flat_counts > 0, as_tuple=False)
+    if nonzero_indices.numel() > 0:
+        first_index = int(nonzero_indices[0].item())
+    else:
+        first_index = 0
+    b = first_index // M
+    m = first_index % M
+    wp = all_waypoints[b, m]
+    wp_np = wp.detach().cpu().numpy()
+    valid_cnt = int(np.sum(wp_np[:, 0] != planner.INVALID_WAYPOINT_MARKER))
+    start_poly_batch = start_poly_tensor[b:b+1, m:m+1]
+    end_poly_batch = end_poly_tensor[b:b+1, m:m+1]
+
     # 创建图形窗口
     fig, ax = plt.subplots(figsize=(12, 8))
     try:
