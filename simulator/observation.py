@@ -5,6 +5,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from road import RoadNetwork
 from utils.spatial_hash import SpatialHash
+from utils.geometry_utils import *
     
 class ObservationGenerator:
     """
@@ -18,79 +19,32 @@ class ObservationGenerator:
         初始化观测生成器。
         """
         self.road_network = road_network
-        self.config = config
+        # 这里的 config 是完整的 default_config.json 根配置
+        # 提取 simulator.observation 段作为本模块的观测配置
+        sim_cfg = config.get('simulator', {}) if isinstance(config, dict) else {}
+        obs_cfg = sim_cfg.get('observation', {}) if isinstance(sim_cfg.get('observation', {}), dict) else {}
+        self.config = obs_cfg
         self.device = device
-
-        self.num_neighbors = config.get('num_neighbors') # 邻居数量
-        self.num_w_lanes = config.get('num_w_lanes') # 车道数量
-        self.num_w_boundaries = config.get('num_w_boundaries') # 边界数量
-        self.horizon = config.get('horizon', 100.0) # 视野范围
-        # 定义观测空间维度
-        self.local_state_dim = config.get('local_state_dim', 7)            # 修改为7个特征: x, y, yaw, speed, length, width, active       
-        self.neighbor_feature_dim = config.get('neighbor_feature_dim', 7)  # 修改为7个特征：dx, dy, vx, vy, length, width, active 
-        self.waypoint_feature_dim = config.get('waypoint_feature_dim', 2)  # 修改为2个特征：x,y
-        self.boundary_feature_dim = config.get('boundary_feature_dim', 2)  # 修改为2个特征：x,y
+        # 标量/数量配置（提供合理的缺省）
+        self.num_neighbors = int(obs_cfg.get('num_neighbors'))           # 邻居数量
+        self.num_w_lanes = int(obs_cfg.get('num_w_lanes'))               # 车道数量
+        self.num_w_boundaries = int(obs_cfg.get('num_w_boundaries'))     # 边界数量
+        self.horizon = float(obs_cfg.get('horizon'))                  # 视野范围
+        # 观测维度配置（与 default_config.json 对齐）
+        # local_state: x, y, yaw, speed, length, width, active
+        self.local_state_dim = int(obs_cfg.get('local_state_dim'))
+        self.neighbor_feature_dim = int(obs_cfg.get('neighbor_feature_dim'))
+        self.w_lane_feature_dim = int(obs_cfg.get('w_lane_feature_dim'))
+        self.boundary_feature_dim = int(obs_cfg.get('boundary_feature_dim'))
+        # 额外：导航与链长度（供上游模块使用时读取）
+        self.navigation_feature_dim = int(obs_cfg.get('navigation_feature_dim'))
+        self.num_start_end_chains = int(obs_cfg.get('num_start&end_chains'))
+        self.num_navigation_chains = int(obs_cfg.get('num_navigation_chains'))
         # 使用来自 SelfraceSimulator 的共享哈希，仅作网格坐标与单元ID计算，不在此处重建静态索引
         self.spatial_hash = spatial_hash
-        
-        # 预计算每个quad_id对应的最近w_lanes和w_boundaries的ID
-        self._precompute_quad_waypoint_associations()
-
-    def _precompute_quad_waypoint_associations(self):
-        """
-        预计算每个quad_id对应的最近w_lanes和w_boundaries的ID。
-        这样在generate时可以直接通过quad_id查找，避免重复计算。
-        """
-        num_quads = self.road_network.num_quads
-        
-        # 获取所有quad的中心点作为查询点
-        quad_centers = self.road_network.quad_centerlines.mean(dim=1)  # (num_quads, 2)
-        
-        # 预计算w_lanes关联
-        if self.road_network.global_w_lane_waypoints.numel() > 0:
-            self.quad_to_w_lanes_ids = self._compute_nearest_waypoint_ids(
-                quad_centers, 
-                self.road_network.global_w_lane_waypoints, 
-                self.num_w_lanes
-            )  # (num_quads, num_w_lanes)
-        else:
-            self.quad_to_w_lanes_ids = torch.zeros(num_quads, self.num_w_lanes, dtype=torch.long, device=self.device)
-        
-        # 预计算w_boundaries关联
-        if self.road_network.global_w_boundary_points.numel() > 0:
-            self.quad_to_w_boundaries_ids = self._compute_nearest_waypoint_ids(
-                quad_centers, 
-                self.road_network.global_w_boundary_points, 
-                self.num_w_boundaries
-            )  # (num_quads, num_w_boundaries)
-        else:
-            self.quad_to_w_boundaries_ids = torch.zeros(num_quads, self.num_w_boundaries, dtype=torch.long, device=self.device)
-
-    def _compute_nearest_waypoint_ids(self, query_points: torch.Tensor, waypoints: torch.Tensor, num_nearest: int) -> torch.Tensor:
-        """
-        计算每个查询点到waypoints的最近num_nearest个点的ID。
-        Args:
-            query_points: 查询点坐标 (N, 2)
-            waypoints: waypoints坐标 (M, 2)
-            num_nearest: 需要找到的最近点数量
-        Returns:
-            最近点的ID (N, num_nearest)
-        """
-        if waypoints.numel() == 0 or num_nearest == 0:
-            return torch.zeros(query_points.shape[0], num_nearest, dtype=torch.long, device=self.device)
-        
-        # 计算所有查询点到所有waypoints的距离
-        distances = torch.cdist(query_points, waypoints, p=2)  # (N, M)
-        
-        # 找到最近的num_nearest个点
-        _, nearest_indices = torch.topk(distances, k=min(num_nearest, waypoints.shape[0]), dim=1, largest=False)
-        
-        # 如果waypoints数量不足，用0填充
-        if waypoints.shape[0] < num_nearest:
-            padding = torch.zeros(query_points.shape[0], num_nearest - waypoints.shape[0], dtype=torch.long, device=self.device)
-            nearest_indices = torch.cat([nearest_indices, padding], dim=1)
-        
-        return nearest_indices
+        # 预计算映射改由 RoadNetwork 在加载时完成，直接引用即可
+        self.quad_to_w_lanes_ids = self.road_network.quad_to_w_lanes_ids
+        self.quad_to_w_boundaries_ids = self.road_network.quad_to_w_boundaries_ids
 
     def _get_precomputed_waypoints(self, agents_state: torch.Tensor) -> tuple:
         """
@@ -101,13 +55,11 @@ class ObservationGenerator:
             tuple: (w_lanes_world, w_boundaries_world)
         """
         batch_size, max_agents, _ = agents_state.shape
-        
         # 获取每个agent所在的quad_id
         agent_positions = agents_state[..., :2]  # (B, M, 2)
         agent_positions_flat = agent_positions.view(-1, 2)  # (B*M, 2)
-        
         # 找到每个agent最近的quad索引
-        distances, quad_indices = self.road_network.find_nearest_lanes(agent_positions_flat, k=1, spatial_hash=self.spatial_hash)
+        distances, quad_indices = find_nearest_lanes(self.device, self.road_network.quad_centerlines, agent_positions_flat, k=1, spatial_hash=self.spatial_hash)
         quad_indices = quad_indices.squeeze(-1)  # (B*M,)
         
         # 使用预计算的关联获取waypoint IDs
@@ -161,7 +113,7 @@ class ObservationGenerator:
         # 计算各部分维度
         local_state_size = self.local_state_dim  # 局部状态维度
         neighbors_size = self.num_neighbors * self.neighbor_feature_dim  # 邻居特征维度
-        w_lanes_size = self.num_w_lanes * self.waypoint_feature_dim  # 车道航点维度
+        w_lanes_size = self.num_w_lanes * self.w_lane_feature_dim  # 车道航点维度
         w_boundaries_size = self.num_w_boundaries * self.boundary_feature_dim  # 边界点维度
         # 总维度
         total_dim = local_state_size + neighbors_size + w_lanes_size + w_boundaries_size
@@ -189,10 +141,8 @@ class ObservationGenerator:
         # 1. 获取世界坐标系下的特征
         # (B, M, K, 7)
         neighbor_states_world = self._get_nearest_neighbors(agents_state)
-        
         # 使用预计算的数据获取w_lanes和w_boundaries
         w_lanes_world, w_boundaries_world = self._get_precomputed_waypoints(agents_state)
-
         # 2. 将所有信息转换到每个 Agent 的局部坐标系
         local_state, neighbors_local, w_lanes_local, w_boundaries_local = self._world_to_ego_centric(
             agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
@@ -488,7 +438,7 @@ if __name__ == '__main__':
             'horizon': 100.0,
             'local_state_dim': 7,  # 修改为7个特征：x, y, yaw, speed, length, width, active
             'neighbor_feature_dim': 7,  # 修改为7个特征：dx, dy, vx, vy, length, width, active
-            'waypoint_feature_dim': 2,
+            'w_lane_feature_dim': 2,
             'boundary_feature_dim': 2
         }
 
@@ -577,21 +527,21 @@ if __name__ == '__main__':
         num_neighbors = config['num_neighbors']
         num_w_lanes = config['num_w_lanes']
         num_w_boundaries = config['num_w_boundaries']
-        waypoint_feature_dim = config['waypoint_feature_dim']
+        w_lane_feature_dim = config['w_lane_feature_dim']
         boundary_feature_dim = config['boundary_feature_dim']
         
         # 计算各部分在观测向量中的位置
         local_state_size = local_state_dim
         neighbors_size = num_neighbors * neighbor_feature_dim
-        w_lanes_size = num_w_lanes * waypoint_feature_dim
-        w_boundaries_size = num_w_boundaries * waypoint_feature_dim
+        w_lanes_size = num_w_lanes * w_lane_feature_dim
+        w_boundaries_size = num_w_boundaries * w_lane_feature_dim
         
         # 提取第一辆车的w_lanes_local和w_boundaries_local
         vehicle1_obs = observation[0, 0].cpu().numpy()
         w_lanes_start = local_state_size + neighbors_size
         w_boundaries_start = w_lanes_start + w_lanes_size
-        w_lanes_local = vehicle1_obs[w_lanes_start:w_boundaries_start].reshape(num_w_lanes, waypoint_feature_dim)
-        w_boundaries_local = vehicle1_obs[w_boundaries_start:].reshape(num_w_boundaries, waypoint_feature_dim)
+        w_lanes_local = vehicle1_obs[w_lanes_start:w_boundaries_start].reshape(num_w_lanes, w_lane_feature_dim)
+        w_boundaries_local = vehicle1_obs[w_boundaries_start:].reshape(num_w_boundaries, w_lane_feature_dim)
         
         # 获取第一辆车的世界坐标和朝向（从agents_state中获取，确保一致性）
         vehicle_world_pos = np.array([float(agents_state[0, 0, 0]), float(agents_state[0, 0, 1])])

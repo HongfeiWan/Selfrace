@@ -2,6 +2,10 @@ import torch
 import math
 import json
 from typing import Dict, List
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.geometry_utils import find_nearest_lanes
 
 class RoadNetwork:
     """
@@ -33,6 +37,10 @@ class RoadNetwork:
         # 全局航点（w_lane与OOB）
         self.global_w_lane: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
         self.global_w_boundary: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+        # 便捷/同义字段与尺寸
+        self.num_quads: int = 0
+        self.global_w_lane_waypoints: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+        self.global_w_boundary_points: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
 
         # ===== 预先初始化 _store_metadata 中会写入的成员 =====
         # 原始数据缓存
@@ -58,7 +66,9 @@ class RoadNetwork:
         # poly 映射
         self.poly_id_to_lane_idx = {}
         self.poly_id_lookup: torch.Tensor = torch.empty((0,), dtype=torch.long, device=self.device)
-
+        # 观测所需的预计算映射（quad -> 最近航点ID）
+        self.quad_to_w_lanes_ids: torch.Tensor = torch.empty((0, 0), dtype=torch.long, device=self.device)
+        self.quad_to_w_boundaries_ids: torch.Tensor = torch.empty((0, 0), dtype=torch.long, device=self.device)
         # 加载和处理地图数据
         map_data = self._load_map_data(map_path)
         self._store_metadata(map_data)
@@ -88,6 +98,8 @@ class RoadNetwork:
         front_center = (BL + BR) / 2.0
         back_center = (TL + TR) / 2.0
         self.quad_centerlines = torch.stack([back_center, front_center], dim=1)
+        # 便捷属性
+        self.num_quads = int(self.quad_centerlines.shape[0])
         # 元数据
         self.quad_ids = torch.tensor([q['poly_id'] for q in quads_data], dtype=torch.int64, device=self.device)
         self.lane_ids = torch.tensor([q['lane_id'] for q in quads_data], dtype=torch.int32, device=self.device)
@@ -128,6 +140,9 @@ class RoadNetwork:
             )  # (n_w_lanes, 3)
         w_boundary_points = map_data.get('oob_points', [])
         self.global_w_boundary = torch.tensor([[p['x'], p['y']] for p in w_boundary_points], dtype=torch.float32, device=self.device) if w_boundary_points else torch.empty((0, 2), device=self.device)
+        # 为 Observation 兼容提供同义字段
+        self.global_w_lane_waypoints = self.global_w_lane
+        self.global_w_boundary_points = self.global_w_boundary
 
         # ===== 预计算供 PathPlanner 复用的数据结构 =====
         # 1) (road_id, lane_id) 分组与每组起终点 w_lane_id
@@ -221,6 +236,30 @@ class RoadNetwork:
         for pid, lidx in poly_id_to_lane_idx.items():
             lookup[pid] = lidx
         self.poly_id_lookup = lookup
+
+        # 7) 预计算 quad -> 最近 w_lanes / w_boundaries 的索引（供 Observation 直接使用）
+        try:
+            quad_centers = self.quad_centerlines.mean(dim=1)  # (num_quads, 2)
+            # 最近 w_lanes（最多80个，避免大内存）
+            if self.global_w_lane_waypoints.numel() > 0 and self.num_quads > 0:
+                k_lanes = min(80, self.global_w_lane_waypoints.shape[0])
+                d_l = torch.cdist(quad_centers, self.global_w_lane_waypoints, p=2)
+                _, nn_idx_l = torch.topk(d_l, k=k_lanes, dim=1, largest=False)
+                self.quad_to_w_lanes_ids = nn_idx_l.to(dtype=torch.long)
+            else:
+                self.quad_to_w_lanes_ids = torch.zeros(self.num_quads, 0, dtype=torch.long, device=self.device)
+            # 最近 w_boundaries（最多80个）
+            if self.global_w_boundary_points.numel() > 0 and self.num_quads > 0:
+                k_bd = min(80, self.global_w_boundary_points.shape[0])
+                d_b = torch.cdist(quad_centers, self.global_w_boundary_points, p=2)
+                _, nn_idx_b = torch.topk(d_b, k=k_bd, dim=1, largest=False)
+                self.quad_to_w_boundaries_ids = nn_idx_b.to(dtype=torch.long)
+            else:
+                self.quad_to_w_boundaries_ids = torch.zeros(self.num_quads, 0, dtype=torch.long, device=self.device)
+        except Exception:
+            # 出错时给出空结构，避免阻塞流程
+            self.quad_to_w_lanes_ids = torch.zeros(self.num_quads, 0, dtype=torch.long, device=self.device)
+            self.quad_to_w_boundaries_ids = torch.zeros(self.num_quads, 0, dtype=torch.long, device=self.device)
     
 if __name__ == "__main__":
     import os
@@ -387,6 +426,76 @@ if __name__ == "__main__":
     fig._rn_layer_check = check
     fig._rn_artists = artists
     fig._rn_rendered = rendered
+
+    # --- 点击交互：查找最近quad并可视化其关联航点/边界 ---
+    ui = {
+        'click': None,
+        'lane': None,
+        'bound': None,
+        'poly': None,
+    }
+
+    def on_click(event):
+        if event.inaxes is not ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        px, py = float(event.xdata), float(event.ydata)
+        if ui['click'] is None:
+            ui['click'] = ax.scatter([px], [py], c='black', s=20, marker='x', zorder=10, label='click')
+        else:
+            ui['click'].set_offsets([[px, py]])
+
+        # 最近邻查询（无需哈希）
+        pts = torch.tensor([[px, py]], dtype=torch.float32, device=rn.device)
+        _, idx = find_nearest_lanes(rn.device, rn.quad_centerlines, pts, k=1, spatial_hash=None)
+        qidx = int(idx[0, 0].item())
+        if qidx < 0 or qidx >= rn.quads_vertices.shape[0]:
+            return
+
+        # 高亮该 quad
+        verts = rn.quads_vertices[qidx].detach().cpu().numpy()
+        if ui['poly'] is not None:
+            ui['poly'].remove()
+        from matplotlib.patches import Polygon as MplPoly
+        ui['poly'] = MplPoly(verts, closed=True, facecolor='none', edgecolor='crimson', linewidth=1.5, linestyle='--')
+        ax.add_patch(ui['poly'])
+
+        # 取该quad的关联航点/边界索引
+        lane_ids = rn.quad_to_w_lanes_ids
+        bound_ids = rn.quad_to_w_boundaries_ids
+        lanes_idx = None
+        bounds_idx = None
+        if hasattr(rn, 'quad_to_w_lanes_ids') and lane_ids.numel() > 0 and qidx < lane_ids.shape[0]:
+            lanes_idx = lane_ids[qidx].detach().cpu().numpy()
+        if hasattr(rn, 'quad_to_w_boundaries_ids') and bound_ids.numel() > 0 and qidx < bound_ids.shape[0]:
+            bounds_idx = bound_ids[qidx].detach().cpu().numpy()
+
+        # 可视化 w_lanes 点
+        if lanes_idx is not None and lanes_idx.size > 0 and rn.global_w_lane_waypoints.numel() > 0:
+            wl = rn.global_w_lane_waypoints[torch.as_tensor(lanes_idx, device=rn.device)]
+            lxy = wl.detach().cpu().numpy()
+            if ui['lane'] is None:
+                ui['lane'] = ax.scatter(lxy[:,0], lxy[:,1], c='red', s=14, alpha=0.9, label='nearest w_lanes')
+            else:
+                ui['lane'].set_offsets(lxy)
+        elif ui['lane'] is not None:
+            ui['lane'].remove(); ui['lane'] = None
+
+        # 可视化 w_boundaries 点
+        if bounds_idx is not None and bounds_idx.size > 0 and rn.global_w_boundary_points.numel() > 0:
+            wb = rn.global_w_boundary_points[torch.as_tensor(bounds_idx, device=rn.device)]
+            bxy = wb.detach().cpu().numpy()
+            if ui['bound'] is None:
+                ui['bound'] = ax.scatter(bxy[:,0], bxy[:,1], c='purple', s=10, alpha=0.8, label='nearest boundaries')
+            else:
+                ui['bound'].set_offsets(bxy)
+        elif ui['bound'] is not None:
+            ui['bound'].remove(); ui['bound'] = None
+
+        ax.figure.canvas.draw_idle()
+
+    fig.canvas.mpl_connect('button_press_event', on_click)
 
     ax.autoscale()
     fig.canvas.draw_idle()

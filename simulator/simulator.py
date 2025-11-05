@@ -1,14 +1,10 @@
-from multiprocessing.spawn import prepare
-from sympy import N
 import torch
-import yaml
 import os
 import sys
-from typing import Dict, Tuple, Optional
-from types import SimpleNamespace
 import time
+from typing import Dict, Tuple, Optional
 
-
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.spatial_hash import SpatialHash
 from road import RoadNetwork
 from offroad import OffroadChecker
@@ -33,51 +29,53 @@ class TeraflowSimulator:
         self.config = config
         self.device = device
         simulator_config = config.get('simulator')
-        self.num_envs = simulator_config['num_envs']
+        # 批次数：默认沿用配置中的 B（环境批大小），若存在 num_envs 则优先使用
+        self.num_envs = simulator_config.get('B')
+        self.max_agents = simulator_config.get('M')
         self.dt = simulator_config['sim_dt']
-        self.map_path = simulator_config['map_path']
+        # 组合根配置中的地图目录与默认地图名
+        maps_dir = config.get('map_path', './maps')
+        default_map = config.get('default_map', 'town2.json')
+        self.map_path = os.path.join(os.path.dirname(__file__), '..', maps_dir, default_map)
 
         # 1. 加载地图网络
         # road.py 中的 RoadNetwork 类负责解析地图文件并提供查询接口
         self.road_network = RoadNetwork(self.map_path, self.device)
 
         # 2. 初始化共享的空间哈希
-        # 使用地图边界来定义哈希网格的范围
         all_verts = self.road_network.quads_vertices.view(-1, 2)
         min_bounds, _ = torch.min(all_verts, dim=0)
         max_bounds, _ = torch.max(all_verts, dim=0)
         # 使用一个固定的 cell_size, 也可以从 config 读取
         hash_config = simulator_config['hash']
-        cell_size = hash_config['hash_cell_size']
+        cell_size = hash_config.get('cell_size')
+
         self.spatial_hash = SpatialHash(cell_size, min_bounds, max_bounds, self.device)
 
-        # 3. 初始化车辆动力学模型
-        # dynamics.py 中的 KinematicBicycleModel 负责根据动作更新车辆状态
-        self.dynamics_model = KinematicBicycleModel(config, self.device)
-        # TODO: 把动力学里面随机的参数加入conditioning传入网络
-
-        # 4. 初始化离路检测器 (传入共享的哈希对象)
+        # 3. 初始化离路检测器 (传入共享的哈希对象)
         self.offroad_checker = OffroadChecker(self.road_network, self.spatial_hash)
 
-        # 5. 初始化碰撞检测器 (传入共享的哈希对象)
+        # 4. 初始化碰撞检测器 (传入共享的哈希对象)
         # collision.py 负责检测智能体之间的碰撞
         self.collision_checker = CollisionChecker(config, self.spatial_hash)
 
-        # 6. 初始化世界状态管理器
+        # 5. 初始化世界状态管理器（为动力学提供车辆初始化参数）
         # world_init.py 负责在 reset 时初始化场景
         self.world_initializer = WorldInitializer(self.road_network, self.offroad_checker, self.collision_checker, config)
 
+        # 6. 初始化车辆动力学模型（依赖 world_initializer 的车辆初始化参数）
+        # dynamics.py 中的 KinematicBicycleModel 负责根据动作更新车辆状态
+        self.dynamics_model = KinematicBicycleModel(config, self.device,self.world_initializer.vehicle_params)
+
         # 7. 初始化观测生成器
         # observation.py 负责为每个自车生成局部观测
-        obs_config = simulator_config['observation']
-        self.observation_generator = ObservationGenerator(self.road_network, obs_config, self.device, self.spatial_hash)
+        self.observation_generator = ObservationGenerator(self.road_network, config, self.device, self.spatial_hash)
 
         # 8. 初始化奖励计算器
         self.reward_calculator = RewardCalculator(self.config, self.device)
 
-        # 9. 初始化路径规划器
-        # PathPlanner现在会自动加载所需的数据
-        self.path_planner = PathPlanner(map_path=self.map_path, device=self.device)
+        # 9. 初始化路径规划器（直接复用 RoadNetwork 数据）
+        self.path_planner = PathPlanner(device=str(self.device).split(':')[0], road_network=self.road_network)
 
         # 10. 初始化模拟世界的状态张量
         # 这些张量将在 reset() 中被具体填充
@@ -571,446 +569,11 @@ class TeraflowSimulator:
             # 重新更新局部坐标（因为agents_path_plans可能已经改变）
             self._update_path_plans_local()
 
-if __name__ == '__main__':
-    # 这是一个简单的使用示例，用于测试模拟器的基本功能
-    # 从配置文件读取配置
-    from matplotlib import pyplot as plt
-    from matplotlib.widgets import Button
-    import numpy as np
-    from matplotlib.patches import Polygon, Circle
-    from matplotlib.collections import PatchCollection
-    
-    # 基于文件位置解析项目根目录，避免依赖当前工作目录
-    _this_dir = os.path.dirname(os.path.abspath(__file__))
-    _proj_root = os.path.dirname(_this_dir)
-    config_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-
-    device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-    simulator = TeraflowSimulator(config=config, device=device)
-
-    initial_obs = simulator.reset()
-    print(f"Initial observation batch shape: {initial_obs.shape}")
-
-    # 可视化道路网络和智能体位置（与goals.py绘制风格保持一致）
-    print("\n=== 可视化道路网络和智能体位置 ===")
-    # 获取道路网络的四边形顶点 这里是测试road.py
-    quads_vertices = simulator.road_network.quads_vertices  # (num_quads, 4, 2)
-    quads_vertices_np = quads_vertices.cpu().numpy()
-    # 获取智能体状态 这里已经测试过world_initializer.py
-    agents_state_np = simulator.agents_state.cpu().numpy()  # (B, M, 7)
-
-    # 创建图形
-    fig, ax = plt.subplots(figsize=(10, 10))
-    # 方法1: 使用PatchCollection进行批量绘制（最快）
-    patches = []
-    # 批量创建Polygon对象
-    for i in range(len(quads_vertices_np)):
-        vertices = quads_vertices_np[i]  # (4, 2)
-        polygon = Polygon(vertices, closed=True)
-        patches.append(polygon)
-    p = PatchCollection(patches, alpha=0.2, facecolor='lightblue', edgecolor='black', linewidth=0.1)
-    # 一次性添加所有quads到图形
-    ax.add_collection(p)
-
-    # 构建可更新的智能体绘制（仅显示第一个环境）
-    def build_agent_artists():
-        ax_agents = []
-        agents_state_np_local = simulator.agents_state.cpu().numpy()
-        active_mask_local = agents_state_np_local[0, :, 6] > 0.5
-        active_indices_local = np.where(active_mask_local)[0]
-        if len(active_indices_local) == 0:
-            return ax_agents, active_indices_local
-        colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
-        import math
-        for i, agent_idx in enumerate(active_indices_local):
-            x, y, yaw, speed, length, width, active = agents_state_np_local[0, agent_idx]
-            cos_yaw = math.cos(yaw)
-            sin_yaw = math.sin(yaw)
-            # 智能体矩形的四个角点 (相对于中心)
-            half_length = length / 2.0
-            half_width = width / 2.0
-            corners = np.array([
-                [-half_length, -half_width],
-                [half_length, -half_width],
-                [half_length, half_width],
-                [-half_length, half_width]
-            ])
-            # 旋转矩阵
-            rotation_matrix = np.array([
-                [cos_yaw, -sin_yaw],
-                [sin_yaw, cos_yaw]
-            ])
-            agent_corners = corners @ rotation_matrix.T + np.array([x, y])
-            poly = Polygon(agent_corners, closed=True)
-            color = colors[i % len(colors)]
-            ax.add_patch(poly)
-            poly.set_facecolor(color)
-            poly.set_alpha(0.8)
-            poly.set_edgecolor('black')
-            poly.set_linewidth(2)
-            # 仅为第一个激活agent显示标签与速度文本
-            if i == 0:
-                label = f'Agent {agent_idx}'
-                txt = ax.text(x, y, label, ha='center', va='center', fontsize=10,
-                              bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8),
-                              weight='bold')
-            else:
-                txt = None
-            speed_vec = 3.0
-            arr = ax.arrow(x, y, speed_vec * cos_yaw, speed_vec * sin_yaw,
-                           head_width=0.5, head_length=0.5, fc=color, ec=color,
-                           alpha=0.8, zorder=5, linewidth=2)
-            # 仅第一个激活agent显示速度文本
-            if i == 0:
-                info = ax.text(x, y + half_width + 1, f'v={speed:.1f}m/s', ha='center', va='bottom',
-                               fontsize=8, color=color, weight='bold')
-            else:
-                info = None
-            ax_agents.append((agent_idx, poly, txt, arr, info, color))
-        return ax_agents, active_indices_local
-
-    agent_artists, active_indices = build_agent_artists()
-
-    # 构建策略网络与初始特征（延迟导入避免循环依赖）
-    from ddppo import decompose_observation, build_network_features
-    from network import create_network
-    import json as _json
-
-    config_ns = _json.loads(_json.dumps(config), object_hook=lambda d: SimpleNamespace(**d))
-    model = create_network(config=config_ns, network_type="independent").to(device)
-    model.eval()
-    with torch.no_grad():
-        agents_state_dec, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(initial_obs, config_ns)
-        features_tensor = build_network_features(
-            agents_state_dec,
-            neighbors_local,
-            w_lanes_local,
-            w_boundaries_local,
-            simulator.agents_path_plans,
-            simulator.stop_lines,
-            simulator.reward_calculator.sampled_params,
-            config_ns,
-        )
-
-    # 在主图上绘制局部要素（第一个环境第一个激活agent）
-    overlay_artists = []
-    def clear_overlays():
-        global overlay_artists
-        for art in overlay_artists:
-            try:
-                art.remove()
-            except Exception:
-                pass
-        overlay_artists = []
-
-    def draw_local_overlays(agents_state_dec_t, neighbors_local_t, w_lanes_local_t, w_boundaries_local_t):
-        global overlay_artists, first_agent_idx
-        try:
-            clear_overlays()
-            import numpy as np
-            import math
-            # 自车位姿
-            ego = simulator.agents_state[0, first_agent_idx]
-            ex = float(ego[0].item()); ey = float(ego[1].item()); eyaw = float(ego[2].item())
-            cos_y = math.cos(eyaw); sin_y = math.sin(eyaw)
-            R = np.array([[cos_y, -sin_y],[sin_y, cos_y]], dtype=float)
-
-            # lanes
-            lanes = w_lanes_local_t[0, first_agent_idx] if w_lanes_local_t is not None else None
-            if lanes is not None:
-                lanes_np = lanes.detach().to('cpu').numpy()
-                if lanes_np.ndim >= 2 and lanes_np.shape[-1] >= 2:
-                    valid = (lanes_np[...,0] != -1) & (lanes_np[...,1] != -1)
-                    pts = lanes_np[valid][..., :2]
-                    if pts.size > 0:
-                        world = pts @ R.T + np.array([ex, ey])
-                        h = ax.scatter(world[:,0], world[:,1], s=5, c='lime', alpha=0.8, label='w_lanes_local')
-                        overlay_artists.append(h)
-
-            # boundaries
-            bounds = w_boundaries_local_t[0, first_agent_idx] if w_boundaries_local_t is not None else None
-            if bounds is not None:
-                bounds_np = bounds.detach().to('cpu').numpy()
-                if bounds_np.ndim >= 2 and bounds_np.shape[-1] >= 2:
-                    valid = (bounds_np[...,0] != -1) & (bounds_np[...,1] != -1)
-                    pts = bounds_np[valid][..., :2]
-                    if pts.size > 0:
-                        world = pts @ R.T + np.array([ex, ey])
-                        h = ax.scatter(world[:,0], world[:,1], s=4, c='k', alpha=0.5, label='w_boundaries_local')
-                        overlay_artists.append(h)
-
-            # neighbors_local: (B, M, K, 7) -> [dx, dy, dvx, dvy, length, width, active]
-            neigh = neighbors_local_t[0, first_agent_idx] if neighbors_local_t is not None else None
-            if neigh is not None:
-                neigh_np = neigh.detach().to('cpu').numpy()
-                if neigh_np.ndim >= 2 and neigh_np.shape[-1] >= 6:
-                    # 有效点：active>0.5 或者 长宽>0
-                    active_mask = neigh_np[..., 6] > 0.5 if neigh_np.shape[-1] >= 7 else np.ones(neigh_np.shape[0], dtype=bool)
-                    valid = active_mask
-                    dxdy = neigh_np[valid][..., :2]
-                    if dxdy.size > 0:
-                        world_pts = dxdy @ R.T + np.array([ex, ey])
-                        # 只为被观察到的邻居绘制标签（一次性标注）
-                        h = ax.scatter(world_pts[:,0], world_pts[:,1], s=20, facecolors='none', edgecolors='red', linewidths=2, label='neighbors_local')
-                        overlay_artists.append(h)
-                        # 标注被观察到的邻居（仅一次图例）
-                        for j, (wx, wy) in enumerate(world_pts):
-                            txtn = ax.text(wx, wy, 'N', fontsize=8, color='red', weight='bold')
-                            overlay_artists.append(txtn)
-                        try:
-                            # 仅处理前N个，避免过多图元
-                            max_draw = min(world_pts.shape[0], 20)
-                            # 取对应的行索引
-                            valid_indices = np.nonzero(valid)[0][:max_draw]
-                            # 计算自车绝对速度（世界坐标）
-                            ego_speed = float(simulator.agents_state[0, first_agent_idx, 3].item())
-                            vx_ego = ego_speed * cos_y
-                            vy_ego = ego_speed * sin_y
-                            for ii in valid_indices:
-                                row = neigh_np[ii]
-                                nx, ny = float(row[0]), float(row[1])
-                                dvx_local, dvy_local = float(row[2]), float(row[3])
-                                nlen = float(row[4])
-                                nwid = float(row[5])
-                                # 局部中心 -> 世界中心
-                                cx, cy = (R @ np.array([nx, ny])).tolist(); cx += ex; cy += ey
-                                # 相对速度(局部) -> 世界相对速度
-                                rvx_world, rvy_world = (R @ np.array([dvx_local, dvy_local])).tolist()
-                                # 近似邻居绝对速度 = 自车绝对速度 + 相对世界速度
-                                nvx_world = vx_ego + rvx_world
-                                nvy_world = vy_ego + rvy_world
-                                speed_mag = math.hypot(nvx_world, nvy_world)
-                                if speed_mag > 1e-2:
-                                    nyaw_world = math.atan2(nvy_world, nvx_world)
-                                else:
-                                    nyaw_world = eyaw
-                                c = math.cos(nyaw_world); s = math.sin(nyaw_world)
-                                Rn = np.array([[c, -s], [s, c]], dtype=float)
-                                hl = max(0.1, nlen * 0.5); hw = max(0.1, nwid * 0.5)
-                                rect_local = np.array([
-                                    [-hl, -hw],
-                                    [ hl, -hw],
-                                    [ hl,  hw],
-                                    [-hl,  hw]
-                                ], dtype=float)
-                                rect_world = rect_local @ Rn.T + np.array([cx, cy])
-                                # 邻居整体涂黑 + 金色描边
-                                poly = Polygon(rect_world, closed=True, facecolor='black', edgecolor='gold', linewidth=2.0, alpha=0.9)
-                                ax.add_patch(poly)
-                                overlay_artists.append(poly)
-                                # 绘制邻居世界速度方向（金色箭头，长度按速度幅值裁剪）
-                                if speed_mag > 1e-3:
-                                    ux = nvx_world / speed_mag
-                                    uy = nvy_world / speed_mag
-                                    arrow_len = max(3.0, min(8.0, speed_mag))
-                                    arr_v = ax.arrow(cx, cy, ux * arrow_len, uy * arrow_len,
-                                                     head_width=0.8, head_length=0.8, fc='gold', ec='gold',
-                                                     alpha=0.95, zorder=7, linewidth=2)
-                                    overlay_artists.append(arr_v)
-                        except Exception:
-                            pass
-
-            fig.canvas.draw_idle()
-        except Exception as e:
-            print(f"draw_local_overlays error: {e}")
-
-    # 初始绘制一次
-    try:
-        draw_local_overlays(agents_state_dec, neighbors_local, w_lanes_local, w_boundaries_local)
-    except Exception:
-        pass
-    
-    # 绘制第一个激活agent的局部路径规划
-    if simulator.agents_path_plans_local is not None and len(active_indices) > 0:
-        first_agent_idx = int(active_indices[0])
-        # 获取第一个激活agent的局部路径规划
-        path_local = simulator.agents_path_plans_local[0, first_agent_idx].cpu().numpy()  # (L, 2)
-        
-        # 过滤有效点（非零坐标）
-        valid_mask = (path_local[:, 0] != 0) | (path_local[:, 1] != 0)
-        if valid_mask.any():
-            valid_path = path_local[valid_mask]
-            
-            # 将局部坐标转换回世界坐标进行绘制
-            ego = simulator.agents_state[0, first_agent_idx]
-            ego_x, ego_y, ego_yaw = float(ego[0].item()), float(ego[1].item()), float(ego[2].item())
-            cos_yaw = np.cos(ego_yaw)
-            sin_yaw = np.sin(ego_yaw)
-            rotation_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
-            ego_pos = np.array([ego_x, ego_y])
-            
-            # 逆变换：从局部坐标转换回世界坐标
-            world_path = (valid_path @ rotation_matrix.T) + ego_pos
-            
-            # 绘制局部路径规划（绿色实线）
-            ax.plot(world_path[:, 0], world_path[:, 1], 'g-', linewidth=3, alpha=0.8, label='Local Path Plan')
-            ax.scatter(world_path[0, 0], world_path[0, 1], c='green', marker='o', s=100, label='Path Start')
-            if len(world_path) > 1:
-                ax.scatter(world_path[-1, 0], world_path[-1, 1], c='green', marker='x', s=100, label='Path Goal')
-    
-    # 统一图形样式
-    ax.set_aspect('equal', adjustable='box')
-    ax.grid(True, alpha=0.3)
-    ax.set_title('road graph and agent positions, first agent local path plan')
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    # 绘制观测半径虚线圆（以第一个激活agent为圆心）
-    horizon_circle = None
-    try:
-        horizon = float(config['simulator']['observation']['horizon'])
-        if len(active_indices) > 0:
-            first_idx = int(active_indices[0])
-            cx = float(simulator.agents_state[0, first_idx, 0].item())
-            cy = float(simulator.agents_state[0, first_idx, 1].item())
-            horizon_circle = Circle((cx, cy), radius=horizon, fill=False, edgecolor='gray', linestyle='--', linewidth=1.5, alpha=0.7)
-            ax.add_patch(horizon_circle)
-    except Exception:
-        pass
-    
-    # 添加 Next Step 按钮
-    btn_ax = fig.add_axes([0.82, 0.02, 0.15, 0.05])
-    btn_next = Button(btn_ax, 'Next Step')
-
-    # 第二个figure：动作概率分布（仅第一个环境的第一个agent）
-    num_actions = simulator.dynamics_model.discrete_action_space.num_actions
-    first_agent_idx = 0
-    if len(active_indices) > 0:
-        first_agent_idx = int(active_indices[0])
-    fig_act, ax_act = plt.subplots(figsize=(6, 3))
-    fig_act.canvas.manager.set_window_title('Action Probabilities (Agent 0)')
-    bars = ax_act.bar(np.arange(num_actions), np.zeros(num_actions), color='tab:blue')
-    ax_act.set_xlabel('Action Index')
-    ax_act.set_ylabel('Probability')
-    ax_act.set_title('First Agent Action Probabilities')
-    ax_act.set_xlim(-0.5, num_actions - 0.5)
-    ax_act.set_ylim(0.0, 1.0)
-    fig_act.tight_layout()
-
-    def refresh_agents():
-        global agent_artists, active_indices, horizon_circle
-        agents_state_np_local = simulator.agents_state.cpu().numpy()
-        new_active_mask = agents_state_np_local[0, :, 6] > 0.5
-        new_active_indices = np.where(new_active_mask)[0]
-        if not np.array_equal(new_active_indices, active_indices):
-            for _, poly, txt, arr, info, _ in agent_artists:
-                try:
-                    poly.remove(); txt.remove(); info.remove(); arr.remove()
-                except Exception:
-                    pass
-            agent_artists, active_indices = build_agent_artists()
-            fig.canvas.draw_idle()
-            return
-        import math
-        for (agent_idx, poly, txt, arr, info, color) in agent_artists:
-            x, y, yaw, speed, length, width, active = agents_state_np_local[0, agent_idx]
-            cos_yaw = math.cos(yaw)
-            sin_yaw = math.sin(yaw)
-            half_length = length / 2.0
-            half_width = width / 2.0
-            corners = np.array([
-                [-half_length, -half_width],
-                [half_length, -half_width],
-                [half_length, half_width],
-                [-half_length, half_width]
-            ])
-            rotation_matrix = np.array([
-                [cos_yaw, -sin_yaw],
-                [sin_yaw, cos_yaw]
-            ])
-            agent_corners = corners @ rotation_matrix.T + np.array([x, y])
-            poly.set_xy(agent_corners)
-            if txt is not None:
-                txt.set_position((x, y))
-            try:
-                arr.remove()
-            except Exception:
-                pass
-            speed_vec = 3.0
-            new_arr = ax.arrow(x, y, speed_vec * cos_yaw, speed_vec * sin_yaw,
-                               head_width=0.5, head_length=0.5, fc=color, ec=color,
-                               alpha=0.8, zorder=5, linewidth=2)
-            idx = [i for i, t in enumerate(agent_artists) if t[0] == agent_idx][0]
-            agent_artists[idx] = (agent_idx, poly, txt, new_arr, info, color)
-            if info is not None:
-                info.set_position((x, y + half_width + 1))
-                info.set_text(f'v={speed:.1f}m/s')
-        
-        # 更新虚线圆位置（跟随第一个激活agent）
-        try:
-            if horizon_circle is not None and len(active_indices) > 0:
-                first_idx = int(active_indices[0])
-                new_cx = float(simulator.agents_state[0, first_idx, 0].item())
-                new_cy = float(simulator.agents_state[0, first_idx, 1].item())
-                horizon_circle.center = (new_cx, new_cy)
-        except Exception:
-            pass
-            
-        fig.canvas.draw_idle()
-
-    def on_next_clicked(event):
-        # 使用网络输出的分布采样动作并推进一步
-        global features_tensor, first_agent_idx
-        with torch.no_grad():
-            logits = model.forward(features_tensor, mode="policy")
-            dist = torch.distributions.Categorical(logits=logits)
-            # 先显示当前步的动作概率分布
-            try:
-                probs = dist.probs.detach().to('cpu').numpy()  # (B, M, A)
-                probs_first = probs[0, first_agent_idx]
-                for i, b in enumerate(bars):
-                    b.set_height(float(probs_first[i]))
-                ax_act.set_ylim(0.0, 1.0)
-                fig_act.canvas.draw_idle()
-            except Exception:
-                pass
-            actions = dist.sample()
-        observation, reward, done = simulator.step(actions)
-        # 显示当前观测agent的reward（B=0, M=first_agent_idx）
-        try:
-            cur_r = float(reward[0, first_agent_idx].item())
-            print(f"当前观测agent(B=0, M={first_agent_idx}) reward: {cur_r:.4f}",'done:',done[0, first_agent_idx].item())
-        except Exception:
-            pass
-        # 基于新观测重建特征，供下一步使用
-        try:
-            with torch.no_grad():
-                agents_state_dec, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config_ns)
-                
-                features_tensor = build_network_features(
-                    agents_state_dec,
-                    neighbors_local,
-                    w_lanes_local,
-                    w_boundaries_local,
-                    simulator.agents_path_plans_local,
-                    simulator.stop_lines if hasattr(simulator, 'stop_lines') else None,
-                    simulator.reward_calculator.sampled_params,
-                    config_ns, 
-                )
-                # 绘制局部要素，并打印本次 agents_state_dec
-                try:
-                    draw_local_overlays(agents_state_dec, neighbors_local, w_lanes_local, w_boundaries_local)
-                    print('features_tensor:',features_tensor[0, first_agent_idx])
-                    #print('neighbors_local:',neighbors_local[0, first_agent_idx])
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        refresh_agents()
-
-    btn_next.on_clicked(on_next_clicked)
-
-    # 绑定空格键为“下一步”
-    def on_key_press(event):
-        try:
-            if event.key in (' ', 'space'):
-                on_next_clicked(event)
-        except Exception:
-            pass
-
-    fig.canvas.mpl_connect('key_press_event', on_key_press)
-    fig_act.canvas.mpl_connect('key_press_event', on_key_press)
-
-    plt.tight_layout()
-    plt.show()
+if __name__ == "__main__":
+    import json
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    cfg_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'default_config.json')
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    sim = TeraflowSimulator(config=cfg, device=torch.device(device))
+    print("Simulator initialized with dt=", sim.dt, "num_envs=", sim.num_envs, "map=", sim.map_path)

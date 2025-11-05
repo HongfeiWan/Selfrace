@@ -40,7 +40,7 @@
 
       "local_state_dim": 7,
       "neighbor_feature_dim": 7,
-      "waypoint_feature_dim": 2,
+      "w_lane_feature_dim": 2,
       "boundary_feature_dim": 2,
       "navigation_feature_dim": 2,
 
