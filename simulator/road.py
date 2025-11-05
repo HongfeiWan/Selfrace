@@ -33,6 +33,32 @@ class RoadNetwork:
         # 全局航点（w_lane与OOB）
         self.global_w_lane: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
         self.global_w_boundary: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+
+        # ===== 预先初始化 _store_metadata 中会写入的成员 =====
+        # 原始数据缓存
+        self.quads_raw = []
+        self.w_lanes_raw = []
+        # 分组与查找表
+        self.lane_groups = {}
+        self.quads_by_id = {}
+        self.lane_start_end = {}
+        # 车道索引相关
+        self.lane_keys: List = []
+        self.n_lanes: int = 0
+        self.lane_to_idx = {}
+        self.w_lane_id_to_idx = {}
+        # 起终点坐标
+        self.start_positions: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+        self.end_positions: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+        # w_lane 特征
+        self.w_lane_features: torch.Tensor = torch.empty((0, 3), dtype=torch.float32, device=self.device)
+        # 图结构
+        self.adjacency_matrix: torch.Tensor = torch.empty((0, 0), dtype=torch.float32, device=self.device)
+        self.edge_weights: torch.Tensor = torch.empty((0, 0), dtype=torch.float32, device=self.device)
+        # poly 映射
+        self.poly_id_to_lane_idx = {}
+        self.poly_id_lookup: torch.Tensor = torch.empty((0,), dtype=torch.long, device=self.device)
+
         # 加载和处理地图数据
         map_data = self._load_map_data(map_path)
         self._store_metadata(map_data)
@@ -48,8 +74,11 @@ class RoadNetwork:
             raise
 
     def _store_metadata(self, map_data: Dict):
-        """构建几何、存储元数据与全局航点（合并版）"""
+        """构建几何、存储元数据与全局航点（合并版），并预计算规划所需索引"""
         quads_data = map_data['quads']
+        # 保留原始数据以便上层复用
+        self.quads_raw = quads_data
+        self.w_lanes_raw = map_data.get('w_lanes', [])
         # 顶点与中心线
         TL = torch.tensor([[q['vertices'][0][0], q['vertices'][0][1]] for q in quads_data], dtype=torch.float32, device=self.device)
         TR = torch.tensor([[q['vertices'][1][0], q['vertices'][1][1]] for q in quads_data], dtype=torch.float32, device=self.device)
@@ -82,13 +111,116 @@ class RoadNetwork:
         self.left_boundaries = torch.where(mask, edgeA, edgeB)
         self.right_boundaries = torch.where(mask, edgeB, edgeA)
         # 全局航点
-        w_lane_points = map_data.get('w_lanes', [])
+        w_lane_points = self.w_lanes_raw
         self.global_w_lane = (
             torch.tensor([[p['center'][0], p['center'][1]] for p in w_lane_points], dtype=torch.float32, device=self.device)
             if w_lane_points else torch.empty((0, 2), device=self.device)
         )
+        # w_lane 特征 (x, y, direction_angle)
+        if self.w_lanes_raw:
+            self.w_lane_features = torch.tensor(
+                [
+                    [float(p['center'][0]), float(p['center'][1]), float(p.get('direction_angle'))]
+                    for p in self.w_lanes_raw
+                ],
+                dtype=torch.float32,
+                device=self.device,
+            )  # (n_w_lanes, 3)
         w_boundary_points = map_data.get('oob_points', [])
         self.global_w_boundary = torch.tensor([[p['x'], p['y']] for p in w_boundary_points], dtype=torch.float32, device=self.device) if w_boundary_points else torch.empty((0, 2), device=self.device)
+
+        # ===== 预计算供 PathPlanner 复用的数据结构 =====
+        # 1) (road_id, lane_id) 分组与每组起终点 w_lane_id
+        from collections import defaultdict
+        lane_groups = defaultdict(list)
+        for wl in self.w_lanes_raw:
+            lane_groups[(wl['road_id'], wl['lane_id'])].append(wl)
+        self.lane_groups = lane_groups
+
+        # quad 查找表
+        quads_by_id = {q['poly_id']: q for q in quads_data}
+        self.quads_by_id = quads_by_id
+
+        # 每条车道的 start/end w_lane_id
+        lane_start_end_dict = {}
+        for (road_id, lane_id), w_lanes_in_lane in lane_groups.items():
+            w_lanes_with_s = []
+            for wl in w_lanes_in_lane:
+                quad = quads_by_id.get(wl['poly_id'], {})
+                s = quad.get('s', 0.0)
+                w_lanes_with_s.append((wl, s))
+            w_lanes_with_s.sort(key=lambda x: x[1])
+            if len(w_lanes_with_s) == 0:
+                continue
+            start_w_lane = w_lanes_with_s[0][0]
+            end_w_lane = w_lanes_with_s[-1][0]
+            lane_start_end_dict[(road_id, lane_id)] = {
+                'start': start_w_lane['w_lane_id'],
+                'end': end_w_lane['w_lane_id'],
+            }
+        self.lane_start_end = lane_start_end_dict
+
+        # 2) 车道键与索引
+        self.lane_keys = sorted(lane_start_end_dict.keys())
+        self.n_lanes = len(self.lane_keys)
+        self.lane_to_idx = {key: idx for idx, key in enumerate(self.lane_keys)}
+
+        # 3) w_lane_id 到索引的映射（与 global_w_lane 行对应）
+        self.w_lane_id_to_idx = {wl['w_lane_id']: i for i, wl in enumerate(self.w_lanes_raw)}
+
+        # 4) 每条 lane 的 start/end 坐标（张量）
+        if self.n_lanes > 0 and self.global_w_lane.numel() > 0:
+            start_indices = [self.w_lane_id_to_idx[lane_start_end_dict[k]['start']] for k in self.lane_keys]
+            end_indices = [self.w_lane_id_to_idx[lane_start_end_dict[k]['end']] for k in self.lane_keys]
+            self.start_positions = self.global_w_lane[torch.tensor(start_indices, dtype=torch.long, device=self.device)]
+            self.end_positions = self.global_w_lane[torch.tensor(end_indices, dtype=torch.long, device=self.device)]
+        else:
+            self.start_positions = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+            self.end_positions = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+
+        # 5) 邻接矩阵和边权重（基于 end->start 距离 < 阈值）
+        if self.n_lanes > 0:
+            # 构建联通图：计算每个 lane 的 end 到其他 lane 的 start 的距离
+            # 形成单向导通图：lane_i的end -> lane_j的start（如果距离够近）
+            # self.end_positions: (n_lanes, 2)
+            # self.start_positions: (n_lanes, 2)
+            # 计算距离矩阵：dist[i,j] = ||end[i] - start[j]||
+            # 基于 RoadNetwork 的预计算，距离矩阵无需重复计算
+
+            # 建立邻接矩阵和边权重矩阵
+            # adjacency_matrix[i][j] = 1 表示 lane_i 的 end 可以导向 lane_j 的 start
+            # 邻接与边权重使用 RoadNetwork 版本
+
+            # 图结构已构建完成
+            # adjacency_matrix[i][j] = 1 表示 lane_i 的 end 可以导向 lane_j 的 start
+            # 由于每个lane内部 start->end 是天然导通的，因此：
+            # 从 lane_i 的 end 可以到达 lane_j 的 start，
+            # 那么就可以继续到达 lane_j 的 end
+            end_positions_expanded = self.end_positions.unsqueeze(1)
+            start_positions_expanded = self.start_positions.unsqueeze(0)
+            distances = torch.norm(end_positions_expanded - start_positions_expanded, dim=2)
+            CONNECTION_THRESHOLD = 5.0
+            self.adjacency_matrix = (distances < CONNECTION_THRESHOLD).float()
+            INF = 1e10
+            self.edge_weights = torch.where(self.adjacency_matrix > 0, distances, torch.full_like(distances, INF))
+        else:
+            self.adjacency_matrix = torch.empty((0, 0), dtype=torch.float32, device=self.device)
+            self.edge_weights = torch.empty((0, 0), dtype=torch.float32, device=self.device)
+
+        # 6) poly_id -> lane_idx 映射与查找表
+        poly_id_to_lane_idx = {}
+        max_poly_id = 0
+        for q in quads_data:
+            poly_id = q['poly_id']
+            max_poly_id = max(max_poly_id, poly_id)
+            key = (q['road_id'], q['lane_id'])
+            if key in self.lane_to_idx:
+                poly_id_to_lane_idx[poly_id] = self.lane_to_idx[key]
+        self.poly_id_to_lane_idx = poly_id_to_lane_idx
+        lookup = torch.full((max_poly_id + 1,), -1, dtype=torch.long, device=self.device)
+        for pid, lidx in poly_id_to_lane_idx.items():
+            lookup[pid] = lidx
+        self.poly_id_lookup = lookup
     
 if __name__ == "__main__":
     import os

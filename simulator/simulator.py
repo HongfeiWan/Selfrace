@@ -29,13 +29,6 @@ class TeraflowSimulator:
     def __init__(self, config:Dict, device: torch.device):
         """
         初始化模拟器。
-        Args:
-            config (Dict): 包含所有模拟器配置的字典。
-                - num_envs (int): 并行环境的数量 (batch_size)。
-                - map_path (str): 预处理后的地图文件路径 (.json)。
-                - device (str): 计算设备 ('cpu' 或 'cuda')。
-                - sim_dt (float): 模拟时间步长 (秒)。
-                - ... 其他配置，如车辆参数等
         """
         self.config = config
         self.device = device
