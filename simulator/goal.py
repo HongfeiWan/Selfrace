@@ -9,7 +9,6 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 import numpy as np
-import time
 
 # TODO：解决一下collect_path_w_lane_id函数内分块的问题。
 # 理论上不需要分块，创建三个空的tensor,长度为B,M,max_path_len
@@ -77,7 +76,6 @@ class PathPlanner:
         # poly 映射来自 RoadNetwork
         self.poly_id_to_lane_idx = rn.poly_id_to_lane_idx
         self.poly_id_lookup = rn.poly_id_lookup
-
 
         self.poly_id_to_next_w_lane = None
         self.poly_id_to_prev_w_lane = None
@@ -609,10 +607,12 @@ class PathPlanner:
             middle_segment_sampled[rows] = sampled_data
         
         # 直接拼接三段：start(max_chain_len) + middle(max_middle_len) + end(max_chain_len) = w_lane_ids_length
+        # 注意：end_segment 需要反转顺序，因为它是 [终点, 前1, ..., 前9]，需要变成 [前9, ..., 前1, 终点]
+        end_segment_flipped = torch.flip(end_segment, dims=[1])  # 沿着序列维度反转
         w_lane_ids_flat = torch.cat([
-            start_segment,  # (B*M, max_chain_len, 3)
-            middle_segment_sampled,  # (B*M, max_middle_len, 3)
-            end_segment  # (B*M, max_chain_len, 3)
+            start_segment,  # (B*M, max_chain_len, 3) - [起点, 后1, ..., 后9]
+            middle_segment_sampled,  # (B*M, max_middle_len, 3) - [中间点...]
+            end_segment_flipped  # (B*M, max_chain_len, 3) - [前9, ..., 前1, 终点]
         ], dim=1)  # (B*M, w_lane_ids_length, 3)
         # reshape回 (B, M, w_lane_ids_length, 3)
         w_lane_ids = w_lane_ids_flat.reshape(B, M, w_lane_ids_length, 3)
@@ -645,7 +645,11 @@ class PathPlanner:
         K = max_chain_len
         pos = torch.arange(K, device=device, dtype=torch.long).view(1, K).expand(B, -1)
         take = torch.minimum(leng, torch.full_like(leng, K))
+        
+        # 无论 next 还是 prev，都从序列开头取前 K 个点
+        # 因为在构建时，prev 已经 reversed，所以两者的顺序都是从近到远
         idx_in_seq = torch.minimum(pos, torch.clamp(leng.unsqueeze(1) - 1, min=0))
+        
         base = off.unsqueeze(1).expand(B, K)
         flat_idx = base + idx_in_seq
         flat_idx = torch.clamp(flat_idx, 0, max(0, flat.shape[0]-1))
@@ -675,6 +679,7 @@ if __name__ == '__main__':
             valid_mask = (planner.poly_id_lookup[all_poly_ids_tensor] >= 0)
             valid_poly_ids_tensor = all_poly_ids_tensor[valid_mask]
     n_available = int(valid_poly_ids_tensor.shape[0])
+
     if n_available == 0:
         raise RuntimeError('No valid poly ids available for demo')
     random_indices = torch.randint(0, n_available, (B, M), device=device)
@@ -712,6 +717,12 @@ if __name__ == '__main__':
     pygame.init()
     screen = pygame.display.set_mode((1080, 800), DOUBLEBUF | OPENGL)
     pygame.display.set_caption('collect_path_w_lane_ids (SPACE: next path, ESC: quit)')
+    
+    # 初始化字体
+    try:
+        font = pygame.font.Font(None, 36)
+    except:
+        font = pygame.font.SysFont('arial', 36)
 
     glClearColor(1.0, 1.0, 1.0, 1.0)
     glMatrixMode(GL_PROJECTION)
@@ -756,6 +767,37 @@ if __name__ == '__main__':
             glVertex2f(x, y)
             glVertex2f(x + dx, y + dy)
             glEnd()
+    
+    def draw_text(text, x, y, r=0.0, g=0.0, b=0.0):
+        """在OpenGL窗口中渲染文本"""
+        from OpenGL.GL import glEnable, GL_TEXTURE_2D, glBindTexture, glTexParameteri, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_NEAREST, glTexImage2D, GL_RGBA, GL_UNSIGNED_BYTE, glDisable, glPushMatrix, glPopMatrix, glTranslatef, glScalef, GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE
+        from OpenGL.GL import GL_RGB
+        
+        # 渲染文本到surface
+        text_surface = font.render(text, True, (int(r*255), int(g*255), int(b*255)), (255, 255, 255))
+        text_data = pygame.image.tostring(text_surface, "RGBA", True)
+        width, height = text_surface.get_size()
+        
+        # 创建纹理并显示
+        glEnable(GL_TEXTURE_2D)
+        texture_id = glBindTexture(GL_TEXTURE_2D, 0)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, text_data)
+        
+        # 绘制纹理矩形
+        glPushMatrix()
+        glTranslatef(x, y, 0)
+        glScalef(width, height, 1.0)
+        glBegin(GL_QUADS)
+        glVertex2f(0, 0)
+        glVertex2f(1, 0)
+        glVertex2f(1, 1)
+        glVertex2f(0, 1)
+        glEnd()
+        glPopMatrix()
+        
+        glDisable(GL_TEXTURE_2D)
 
     running = True
     clock = pygame.time.Clock()
@@ -775,26 +817,30 @@ if __name__ == '__main__':
         wp = all_w_lane_ids[b, m].detach().cpu().numpy()
         start_poly_id = int(start_poly_tensor[b, m].item())
         end_poly_id = int(end_poly_tensor[b, m].item())
-        # 优先使用路径的第一个/最后一个有效 w_lane 点
+        
+        # 更新窗口标题显示B和M编号
+        pygame.display.set_caption(f'collect_path_w_lane_ids - B={b}, M={m} (SPACE: next path, ESC: quit)')
+        
+        # 起点：优先使用路径的第一个有效 w_lane 点，否则使用 start_poly_id 的 center
         valid = wp[:, 0] != planner.INVALID_w_lane_id_MARKER
         if valid.any():
             first_idx = int(np.argmax(valid))
-            last_idx = int(np.where(valid)[0][-1])
             sx, sy = float(wp[first_idx, 0]), float(wp[first_idx, 1])
-            ex, ey = float(wp[last_idx, 0]), float(wp[last_idx, 1])
         else:
-            # 兜底：使用起终点 quad 的质心
-            sv = quads_by_id[start_poly_id]['vertices']
-            ev = quads_by_id[end_poly_id]['vertices']
-            sv_arr = np.asarray(sv, dtype=float).reshape(-1, 2)
-            ev_arr = np.asarray(ev, dtype=float).reshape(-1, 2)
-            sx, sy = float(sv_arr[:, 0].mean()), float(sv_arr[:, 1].mean())
-            ex, ey = float(ev_arr[:, 0].mean()), float(ev_arr[:, 1].mean())
+            # 兜底：使用起点 quad 的 center
+            start_quad = quads_by_id.get(start_poly_id, {})
+            center = start_quad.get('center', (0.0, 0.0))
+            sx, sy = float(center[0]), float(center[1])
+        
+        # 终点：始终使用 end_poly_id 对应的 quad 的质心（显示 end_poly_tensor 的位置）
+        end_quad = quads_by_id.get(end_poly_id, {})
+        center = end_quad.get('center', (0.0, 0.0))
+        ex, ey = float(center[0]), float(center[1])
 
         glClear(GL_COLOR_BUFFER_BIT)
         glLoadIdentity()
         draw_quads()
-        draw_point_xy(sx, sy, 0.2, 0.8, 0.2, size=10.0)
+        draw_point_xy(sx, sy, 0.2, 0.8, 0.2, size=5.0)
         draw_point_xy(ex, ey, 0.9, 0.2, 0.2, size=10.0)
         draw_path(wp)
         pygame.display.flip()

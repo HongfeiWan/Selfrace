@@ -48,7 +48,11 @@ class RewardCalculator:
         """
         self.device = device
         self.config = config
-        sim_cfg = config.get('simulator')
+        sim_cfg = config.get('simulator') if isinstance(config, dict) else {}
+
+
+        self.reward_config = sim_cfg.get('reward', {})
+
 
         # 初始化参数采样器
         self.parameter_sampler = RewardParameterSampler(sim_cfg, device)
@@ -58,11 +62,12 @@ class RewardCalculator:
         self.M = sim_cfg.get('M')
 
         # 从配置中加载固定参数
-        self.v_goal = self.reward_config.get('v_goal', 3.0)
-        self.goal_reward = self.reward_config.get('goal_reward', 1.0)
-        self.collision_speed_mult = self.reward_config.get('collision_speed_mult', 0.1)
-        self.velocity_alpha = self.reward_config.get('velocity_alpha', 2.5e-3)
-        self.timestep_alpha = self.reward_config.get('timestep_alpha', 2.5e-5)
+        rc = self.reward_config
+        self.v_goal = rc.get('v_goal')
+        self.goal_reward = rc.get('goal_reward')
+        self.collision_speed_mult = rc.get('collision_speed_mult')
+        self.velocity_alpha = rc.get('velocity_alpha')
+        self.timestep_alpha = rc.get('timestep_alpha')
         
         # 初始化所有随机参数
         self.sampled_params = self.parameter_sampler.sample_all_parameters(self.B, self.M)

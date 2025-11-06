@@ -1211,7 +1211,7 @@ def group_roads_by_overlap(polygons_data, threshold=0.8, device=DEVICE):
         groups.append(sorted(comp))
     return groups
 
-def reassign_road_lane_ids(polygons_data, groups):
+def reassign_road_lane_ids(polygons_data, groups, w_lanes=None):
     # 组内第k条路 -> lane_id = k+1；组的road_id取该组最小旧rid
     rid_to_groupmin = {}
     rid_to_lane = {}
@@ -1229,6 +1229,24 @@ def reassign_road_lane_ids(polygons_data, groups):
             q['lane_id'] = rid_to_lane[old]
         else:
             q['lane_id'] = 1
+    
+    # 同步更新 w_lanes 的 road_id 和 lane_id，确保与 quads 一致
+    if w_lanes is not None:
+        # 构建 poly_id -> quad 的映射
+        poly_to_quad = {q['poly_id']: q for q in polygons_data}
+        updated_count = 0
+        for w in w_lanes:
+            poly_id = w.get('poly_id')
+            if poly_id in poly_to_quad:
+                # 从对应的 quad 读取最新的 road_id 和 lane_id
+                quad = poly_to_quad[poly_id]
+                old_rid, old_lid = w['road_id'], w['lane_id']
+                w['road_id'] = quad['road_id']
+                w['lane_id'] = quad['lane_id']
+                if old_rid != quad['road_id'] or old_lid != quad['lane_id']:
+                    updated_count += 1
+        print(f"  已同步更新 {updated_count} 个 w_lane 的 (road_id, lane_id) 以匹配对应的 quad")
+    
     # 返回 polygons 以及两个映射，供几何基元层回填
     return polygons_data, rid_to_groupmin, rid_to_lane
 
@@ -2192,7 +2210,7 @@ print("\n=== 基于GPU相交检测进行道路分组与ID/LANE重排 ===")
 INTERSECTION_THRESHOLD = config['preprocessor'].get('intersection_threshold')
 groups = group_roads_by_overlap(polygons_data, threshold=INTERSECTION_THRESHOLD, device=DEVICE)
 print(f"分到 {len(groups)} 组: {groups}")
-polygons_data, rid_to_groupmin, rid_to_lane = reassign_road_lane_ids(polygons_data, groups)
+polygons_data, rid_to_groupmin, rid_to_lane = reassign_road_lane_ids(polygons_data, groups, w_lanes=w_lanes)
 apply_mapping_to_geometry(lines_data, circles_data, arcs_data, rid_to_groupmin, rid_to_lane)
 attach_geometry_end_poly_ids(lines_data, circles_data, arcs_data, polygons_data)
 

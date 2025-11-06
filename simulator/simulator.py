@@ -65,7 +65,7 @@ class TeraflowSimulator:
 
         # 6. 初始化车辆动力学模型（依赖 world_initializer 的车辆初始化参数）
         # dynamics.py 中的 KinematicBicycleModel 负责根据动作更新车辆状态
-        self.dynamics_model = KinematicBicycleModel(config, self.device,self.world_initializer.vehicle_params)
+        self.dynamics_model = KinematicBicycleModel(config, self.device)
 
         # 7. 初始化观测生成器
         # observation.py 负责为每个自车生成局部观测
@@ -75,11 +75,12 @@ class TeraflowSimulator:
         self.reward_calculator = RewardCalculator(self.config, self.device)
 
         # 9. 初始化路径规划器（直接复用 RoadNetwork 数据）
-        self.path_planner = PathPlanner(device=str(self.device).split(':')[0], road_network=self.road_network)
+        self.path_planner = PathPlanner(self.device, self.road_network)
 
         # 10. 初始化模拟世界的状态张量
         # 这些张量将在 reset() 中被具体填充
         self.agents_state: Optional[torch.Tensor] = None
+        self.agents_start_quad_ids: Optional[torch.Tensor] = None  # 存储所有智能体的起始quad_id
         self.agents_goal_quad_ids: Optional[torch.Tensor] = None  # 存储所有智能体的目标quad_id
         self.agents_path_plans: Optional[torch.Tensor] = None     # 存储所有智能体的路径规划（世界坐标）
         self.agents_path_plans_local: Optional[torch.Tensor] = None  # 存储所有智能体的路径规划（局部坐标）
@@ -87,39 +88,30 @@ class TeraflowSimulator:
     def reset(self) -> torch.Tensor:
         """
         重置所有环境，并返回所有智能体的初始观测。
-        Returns:
-            torch.Tensor: 一批初始观测, 形状为 (B, M, obs_dim)。
         """
-        print("Resetting simulator environments...")
-        # 重置动力学模型的状态变量，避免不同episode之间的tensor大小不匹配
-        self.dynamics_model.reset_control_state()
-        print("Reset dynamics model state - cleared for fresh initialization")
-
-        # 使用 WorldInitializer 来生成一批新的世界状态，包括起始quad_id
-        self.agents_state, _, self.agents_start_quad_ids = self.world_initializer.initialize_world(self.num_envs)
-        
+        # 必须先reset world。产生不同大小的车
+        self.agents_state, self.agents_start_quad_ids, self.agents_goal_quad_ids = self.world_initializer.initialize_world(self.num_envs, self.max_agents)
+        # 重置动力学模型：传入新一批车辆参数并重置内部控制状态与风格参数
+        self.dynamics_model.reset(self.world_initializer.vehicle_params)
         # 重置reward风格参数
         self.reward_calculator.reset_episode()
-
         # 将状态数据移动到正确的设备
         self.agents_state = self.agents_state.to(self.device)
-        
         # 重置done状态
         self.last_done = None
-
         # 生成初始观测
         print("Generating initial observation...") 
-        initial_observation = self.observation_generator.generate(self.agents_state)
+        initial_observation,d,theta_f = self.observation_generator.generate(self.agents_state)
         print(initial_observation.shape)
         print("Initial observation generated")
 
         # 初始化路径规划器 - 为所有智能体分配目标和生成路径规划
-        self._initialize_path_planning()
-        print("Path planning initialized")
+        paths = self.path_planner.path_plan(self.agents_start_quad_ids, self.agents_goal_quad_ids)
+        self.agents_path_plans = self.path_planner.collect_path_w_lane_ids(paths, self.agents_start_quad_ids, self.agents_goal_quad_ids)
+
         print(f"Reset complete. World state shape: {self.agents_state.shape}")
-        self.stop_lines = torch.zeros((self.num_envs, self.world_initializer.max_agents,20), dtype=torch.int32, device=self.device)
-        
-        return initial_observation
+        self.stop_lines = torch.zeros((self.num_envs, self.max_agents,20), dtype=torch.int32, device=self.device)
+        return initial_observation,d,theta_f
     
     def step(self, actions: torch.Tensor, debug_collision: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
         """
@@ -341,197 +333,7 @@ class TeraflowSimulator:
         self.extend_state = extended_state # 用于传入网络
         return reward, goal_reached
     
-    def _initialize_path_planning(self):
-        """
-        为所有智能体初始化路径规划：
-        1. 为每个激活的智能体随机分配一个目标quad_id
-        2. 使用plan_path批量生成从起始位置到目标的路径规划
-        """
-        prepare_time = time.time()
-        if self.agents_state is None:
-            return
-        # 基本尺寸与激活掩码（GPU）
-        B, M, _ = self.agents_state.shape
-        active_mask = self.agents_state[..., 6] > 0.5
-        # 起点与目标（纯GPU、极简随机目标，仅在激活位赋值）
-        if not hasattr(self, 'agents_start_quad_ids') or self.agents_start_quad_ids is None:
-            print("Warning: No start quad IDs available for path planning")
-            return
-        start_i32 = self.agents_start_quad_ids.to(dtype=torch.int32, device=self.device)
-        goal_i32 = torch.full_like(start_i32, -1, dtype=torch.int32, device=self.device)
-        # 仅对"激活且起点有效"的样本，从最近K个quads中随机选一个作为终点
-        valid_mask = (active_mask) & (start_i32 >= 0)
-        if valid_mask.any():
-            rand_vals = torch.randint(0, self.road_network.num_quads, (int(valid_mask.sum().item()),), device=self.device, dtype=torch.int32)
-            goal_i32 = goal_i32.masked_scatter(valid_mask, rand_vals)
-        # 一次性调用 planner（形状为 (B,M,1)）
-        start_3d = start_i32.unsqueeze(-1)
-        goal_3d = goal_i32.unsqueeze(-1)
-        prepare_time_done = time.time()
-        print(f"prepare_time_done: {prepare_time_done-prepare_time:.4f}s")
-        
-        # 只对有效的起点和终点进行路径规划
-        valid_planning_mask = (start_i32 >= 0) & (goal_i32 >= 0) & active_mask
-        if valid_planning_mask.any():
-            # 创建临时的起点和终点，将无效的设置为-1
-            start_3d_valid = torch.where(valid_planning_mask.unsqueeze(-1), start_3d, torch.tensor([[-1]], device=self.device))
-            goal_3d_valid = torch.where(valid_planning_mask.unsqueeze(-1), goal_3d, torch.tensor([[-1]], device=self.device))
-            path_plans = self.path_planner.plan_path(start_3d_valid, goal_3d_valid)  # 形状 (B,M,L,2)
-        else:
-            # 如果没有有效的路径规划，创建空的路径
-            path_plans = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
-        # 存储结果
-        self.agents_goal_quad_ids = goal_i32
-        self.agents_path_plans = path_plans
-        
-        # 由于收敛性问题，需要将agents_path_plans的路径逐渐放长
-        # 使用动态的path_observation_length，可以通过外部设置
-        if not hasattr(self, 'path_observation_length'):
-            self.path_observation_length = 2  # 初始值
-        path_observation_length = self.path_observation_length
-        # 创建全-1的中间tensor，保持原始长度128
-        B, M, _, _ = self.agents_path_plans.shape
-        filtered_paths = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
-        # 只将前path_observation_length个位置赋予有效值
-        filtered_paths[:, :, :path_observation_length, :] = self.agents_path_plans[:, :, :path_observation_length, :]
-        self.agents_path_plans = filtered_paths
-        
-        # 设置goal_positions为路径的第二个点（批量操作）
-        B, M, L, _ = self.agents_path_plans.shape
-        # 批量找到所有有效点
-        valid_mask = (self.agents_path_plans[..., 0] != -1) & (self.agents_path_plans[..., 1] != -1)  # (B, M, L)
-        # 对每个路径，找到前两个有效点的位置
-        ar = torch.arange(L, device=self.device).unsqueeze(0).unsqueeze(0).expand(B, M, -1)
-        # 将无效位置排到后面
-        big = L + 1000
-        order_score = torch.where(valid_mask, ar, ar + big)
-        order = torch.argsort(order_score, dim=2, stable=True)
-        
-        # 获取第二个有效点作为目标位置
-        second_valid_indices = order[:, :, 1]  # (B, M)
-        # 检查是否有第二个有效点
-        has_second = valid_mask.gather(2, second_valid_indices.unsqueeze(-1)).squeeze(-1)  # (B, M)
-        
-        # 如果没有第二个有效点，使用第一个有效点
-        first_valid_indices = order[:, :, 0]  # (B, M)
-        has_first = valid_mask.gather(2, first_valid_indices.unsqueeze(-1)).squeeze(-1)  # (B, M)
-        
-        # 选择目标索引：优先第二个，其次第一个，最后使用当前位置
-        target_indices = torch.where(
-            has_second, 
-            second_valid_indices,
-            torch.where(has_first, first_valid_indices, torch.zeros_like(first_valid_indices))
-        )
-        
-        # 批量获取目标位置
-        batch_indices = torch.arange(B, device=self.device).unsqueeze(1).expand(-1, M)
-        agent_indices = torch.arange(M, device=self.device).unsqueeze(0).expand(B, -1)
-        
-        # 获取目标位置
-        self.goal_positions = self.agents_path_plans[batch_indices, agent_indices, target_indices]
-        
-        # 对于没有有效点的智能体，使用当前位置
-        no_valid_points = ~(has_second | has_first)
-        if no_valid_points.any():
-            # 正确索引：no_valid_points是(B,M)的布尔mask
-            current_positions = self.agents_state[..., :2]  # (B, M, 2)
-            self.goal_positions[no_valid_points] = current_positions[no_valid_points]
-
-        # 初始化path_plans的局部坐标版本
-        self._update_path_plans_local()
-    
-    def set_path_observation_length(self, length: int):
-        """
-        动态设置路径观察长度
-        
-        Args:
-            length (int): 新的路径观察长度，范围[2, 128]
-        """
-        length = max(2, min(128, length))  # 限制在合理范围内
-        self.path_observation_length = length
-        print(f"路径观察长度已更新为: {self.path_observation_length}")
-        
-        # 如果当前有路径规划，需要重新应用新的长度
-        if hasattr(self, 'agents_path_plans') and self.agents_path_plans is not None:
-            self._apply_path_observation_length()
-    
-    def _apply_path_observation_length(self):
-        """
-        应用当前的path_observation_length到现有的路径规划
-        """
-        if not hasattr(self, 'agents_path_plans') or self.agents_path_plans is None:
-            return
-            
-        B, M, _, _ = self.agents_path_plans.shape
-        filtered_paths = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
-        # 只将前path_observation_length个位置赋予有效值
-        filtered_paths[:, :, :self.path_observation_length, :] = self.agents_path_plans[:, :, :self.path_observation_length, :]
-        self.agents_path_plans = filtered_paths
-        
-        # 重新更新局部坐标
-        self._update_path_plans_local()
-
-    def _update_path_plans_local(self):
-        """
-        将path_plans从世界坐标转换到每个智能体的局部坐标系。
-        使用observation.py中_world_to_ego_centric的原理进行坐标转换。
-        同时将-1,-1坐标转换为0，方便后续网络输入。
-        """
-        if self.agents_path_plans is None or self.agents_state is None:
-            return
-        
-        B, M, L, _ = self.agents_path_plans.shape
-        ego_states = self.agents_state  # (B, M, 7)
-        
-        # 获取ego车辆的位置和朝向
-        ego_pos = ego_states[..., :2]  # (B, M, 2)
-        ego_yaw = ego_states[..., 2]   # (B, M)
-        
-        # 计算旋转矩阵
-        cos_yaw, sin_yaw = torch.cos(ego_yaw), torch.sin(ego_yaw)
-        
-        # 使用标准2D旋转矩阵（车左边为正）
-        rot_matrix = torch.stack([
-            torch.stack([cos_yaw, -sin_yaw], dim=-1), 
-            torch.stack([sin_yaw, cos_yaw], dim=-1)
-        ], dim=-2)  # (B, M, 2, 2)
-        
-        # 创建path_plans_local张量
-        path_plans_local = torch.zeros_like(self.agents_path_plans)
-        
-        # 向量化bmm操作：将 (B, M) 批次展平为 (B*M)，执行bmm，然后重塑
-        def batch_rotate_path_plans(path_plans_world, ego_pos, rot_matrix):
-            # path_plans_world: (B, M, L, 2), ego_pos: (B, M, 2), rot_matrix: (B, M, 2, 2)
-            B, M, L, D = path_plans_world.shape
-            
-            # 创建有效坐标掩码（排除-1,-1坐标）
-            valid_mask = (path_plans_world[..., 0] != -1) & (path_plans_world[..., 1] != -1)  # (B, M, L)
-            
-            # 计算相对位置
-            rel_pos = path_plans_world - ego_pos.unsqueeze(2)  # (B, M, L, 2)
-            
-            # 展平为 (B*M, L, 2) 和 (B*M, 2, 2)
-            rel_pos_flat = rel_pos.view(B*M, L, D)
-            rot_matrix_flat = rot_matrix.view(B*M, D, D)
-            
-            # 执行批量矩阵乘法
-            rotated_flat = torch.bmm(rel_pos_flat, rot_matrix_flat)  # (B*M, L, 2)
-            
-            # 重塑回原始形状
-            rotated = rotated_flat.view(B, M, L, D)
-            
-            # 将无效坐标（-1,-1）设置为0
-            rotated[~valid_mask] = 0.0
-            
-            return rotated
-        
-        # 执行坐标转换
-        path_plans_local = batch_rotate_path_plans(self.agents_path_plans, ego_pos, rot_matrix)
-        
-        # 存储转换后的局部坐标
-        self.agents_path_plans_local = path_plans_local
-        
-    def _check_and_remove_reached_waypoints(self):
+ 
         """
         检查并移除已到达的路径点。
         当车辆与路径规划中的某个点的距离小于1米时，将该点从路径规划中移除（设置为-1, -1）。
@@ -570,10 +372,180 @@ class TeraflowSimulator:
             self._update_path_plans_local()
 
 if __name__ == "__main__":
+    # ==================== 1. 初始化 TeraflowSimulator ====================
     import json
+    import numpy as np
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     cfg_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'default_config.json')
     with open(cfg_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
     sim = TeraflowSimulator(config=cfg, device=torch.device(device))
-    print("Simulator initialized with dt=", sim.dt, "num_envs=", sim.num_envs, "map=", sim.map_path)
+    initial_observation, d, theta_f = sim.reset()
+    
+    # ==================== 2. 获取路径规划数据（直接使用reset()中已生成的路径） ====================
+    # reset()方法中已经调用了路径规划，直接使用其结果
+    planner = sim.path_planner
+    rn = sim.road_network  # 用于后续分析
+    agents_state = sim.agents_state  # (B, M, 7) - 读取所有智能体的状态
+    start_poly_tensor = sim.agents_start_quad_ids  # (B, M)
+    end_poly_tensor = sim.agents_goal_quad_ids  # (B, M)
+    agents_path_plans = sim.agents_path_plans  # (B, M, w_lane_ids_length, 3) - reset()中已生成
+    
+    # ==================== 检查无效 poly_id ====================
+    print("=" * 80)
+    print("检查无效 poly_id:")
+    start_quad_ids = sim.agents_start_quad_ids  # (B, M)
+    goal_quad_ids = sim.agents_goal_quad_ids    # (B, M)
+    invalid_marker = sim.world_initializer.INVALID_MARKER
+    
+    # 检查 start_quad_ids 中的无效值
+    invalid_start_mask = (start_quad_ids == invalid_marker)
+    invalid_start_count = invalid_start_mask.sum().item()
+    total_count = start_quad_ids.numel()
+    print(f"Start quad_ids 中无效数量: {invalid_start_count} / {total_count}")
+    
+    # 检查 goal_quad_ids 中的无效值
+    invalid_goal_mask = (goal_quad_ids == invalid_marker)
+    invalid_goal_count = invalid_goal_mask.sum().item()
+    print(f"Goal quad_ids 中无效数量: {invalid_goal_count} / {total_count}")
+    
+    # 检查 poly_id_lookup 中的无效值（即使不是 INVALID_MARKER，也可能在 lookup 中无效）
+    if start_quad_ids.numel() > 0:
+        # 获取所有有效的 start_quad_ids（排除 INVALID_MARKER）
+        valid_start_mask = (start_quad_ids != invalid_marker)
+        valid_start_ids = start_quad_ids[valid_start_mask]
+        if valid_start_ids.numel() > 0:
+            # 检查这些 poly_id 在 poly_id_lookup 中是否有效
+            max_poly_id = valid_start_ids.max().item()
+            if max_poly_id < planner.poly_id_lookup.shape[0]:
+                lookup_results = planner.poly_id_lookup[valid_start_ids]
+                invalid_in_lookup = (lookup_results < 0).sum().item()
+                print(f"Start quad_ids 中在 poly_id_lookup 中无效的数量: {invalid_in_lookup} / {valid_start_ids.numel()}")
+                if invalid_in_lookup > 0:
+                    invalid_ids = valid_start_ids[lookup_results < 0]
+                    print(f"  无效的 poly_id 示例（前5个）: {invalid_ids[:5].cpu().numpy()}")
+            else:
+                print(f"警告: 最大 poly_id ({max_poly_id}) 超出 poly_id_lookup 范围 ({planner.poly_id_lookup.shape[0]})")
+    
+    # 检查 poly_id_lookup 的统计信息
+    print(f"poly_id_lookup 大小: {planner.poly_id_lookup.shape[0]}")
+    valid_in_lookup = (planner.poly_id_lookup >= 0).sum().item()
+    print(f"poly_id_lookup 中有效的 poly_id 数量: {valid_in_lookup} / {planner.poly_id_lookup.shape[0]}")
+    print("=" * 80)
+    
+    # ==================== 打印第一条路径 ====================
+    print("=" * 80)
+    print("第一条路径 agents_path_plans[0, 0] 的内容:")
+    print(f"路径形状: {agents_path_plans[0, 0].shape}")
+    print(f"路径数据 (前10个点):")
+    first_path = agents_path_plans[0, 0].cpu().numpy()  # 转换为numpy便于打印
+    for i in range(min(10, len(first_path))):
+        print(f"  点 {i}: x={first_path[i, 0]:.2f}, y={first_path[i, 1]:.2f}, angle={first_path[i, 2]:.4f}")
+    print(f"无效标记值: {planner.INVALID_w_lane_id_MARKER}")
+    print('state',agents_state[0,0].cpu().numpy())
+    
+    # 统计有效路径点数量
+    invalid_marker_tensor = torch.tensor(planner.INVALID_w_lane_id_MARKER, device=agents_path_plans.device, dtype=agents_path_plans.dtype)
+    valid_mask = agents_path_plans[0, 0, :, 0] != invalid_marker_tensor
+    valid_count = valid_mask.sum().item()
+    print(f"有效路径点数量: {valid_count} / {len(first_path)}")
+    print("=" * 80)
+    
+    # ==================== 3. 绘制active车辆的路径规划 ====================
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon
+    import numpy as np
+    
+    # 获取active掩码：agents_state的第七位（索引6）表示是否active
+    active_mask = agents_state[..., 6] > 0.5  # (B, M) - 布尔掩码
+    
+    # 获取无效标记值（转换为tensor以确保类型匹配）
+    invalid_marker_value = planner.INVALID_w_lane_id_MARKER
+    
+    # 创建图形
+    fig, ax = plt.subplots(figsize=(12, 10))
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_title('Active Vehicles Path Plans (Batch 0)')
+    
+    # ==================== 绘制road network中的四边形 ====================
+    if rn.quads_vertices.numel() > 0:
+        quads_np = rn.quads_vertices.detach().cpu().numpy()  # (N, 4, 2)
+        for verts in quads_np:
+            # 将顶点转换为matplotlib Polygon需要的格式
+            vertices_2d = [(v[0], v[1]) for v in verts]
+            poly = Polygon(vertices_2d, closed=True, 
+                         facecolor='yellow', edgecolor='black', 
+                         alpha=0.2, linewidth=0.2, zorder=0)
+            ax.add_patch(poly)
+        print(f"绘制了 {len(quads_np)} 个四边形")
+    
+    # 定义不同车辆的颜色
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    
+    # 只绘制第一个批次（B=0）的车辆
+    B, M = agents_state.shape[:2]
+    b = 0  # 只绘制第一个批次
+    path_count = 0
+    
+    # 仅选择 B=0 中第一个 active 的 agent 进行绘制
+    active_agents = torch.nonzero(active_mask[b], as_tuple=False).squeeze(-1)
+    if active_agents.numel() == 0:
+        print("Batch 0 中没有active车辆")
+    else:
+        m = int(active_agents[0].item())
+        # 获取该车辆的路径规划 (w_lane_ids_length, 3)
+        path = agents_path_plans[b, m]  # (w_lane_ids_length, 3)
+
+        # 过滤掉无效的路径点（第一个维度不等于invalid_marker）
+        # 使用tensor比较以确保类型匹配
+        invalid_marker_tensor = torch.tensor(invalid_marker_value, device=path.device, dtype=path.dtype)
+        valid_mask = path[:, 0] != invalid_marker_tensor
+        valid_path = path[valid_mask].cpu().numpy()  # 转换为numpy数组
+        
+        if len(valid_path) > 0:
+            # 提取x, y坐标
+            x_coords = valid_path[:, 0]
+            y_coords = valid_path[:, 1]
+            
+            # 选择颜色
+            color = colors[path_count % len(colors)]
+            
+            # 绘制路径点连线（zorder=2，确保在四边形之上）
+            ax.plot(x_coords, y_coords, 'o-', color=color, markersize=4, 
+                   linewidth=2, alpha=0.7, label=f'B{b}_M{m}', zorder=2)
+            
+            # 绘制起点（绿色，zorder=3，确保在最上层）
+            ax.plot(x_coords[0], y_coords[0], 's', color='green', 
+                   markersize=8, markeredgecolor='black', markeredgewidth=1, zorder=3)
+            
+            # 绘制终点（红色，zorder=3）
+            ax.plot(x_coords[-1], y_coords[-1], '^', color='red', 
+                   markersize=8, markeredgecolor='black', markeredgewidth=1, zorder=3)
+            
+            # 绘制所有有效点的方向箭头（zorder=2）
+            angles = valid_path[:, 2]  # 角度信息
+            arrow_length = 0.5
+            for i in range(len(valid_path)):
+                x, y, angle = x_coords[i], y_coords[i], angles[i]
+                dx = arrow_length * np.cos(angle)
+                dy = arrow_length * np.sin(angle)
+                ax.arrow(x, y, dx, dy, head_width=0.3, head_length=0.2, 
+                       fc=color, ec=color, alpha=0.6, length_includes_head=True, zorder=2)
+            path_count = 1
+    
+    # 添加图例（如果路径数量不多）
+    if path_count <= 20:
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    
+    print(f"绘制了 {path_count} 个active车辆的路径规划")
+    
+    # 显示图形
+    plt.tight_layout()
+    plt.show()
+
+
+
+    
