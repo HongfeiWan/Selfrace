@@ -141,6 +141,8 @@ class WorldInitializer:
             same_mask = goal_quad_indices == spawn_quad_indices
             if same_mask.any():
                 goal_quad_indices[same_mask] = (goal_quad_indices[same_mask] + 1) % max(1, num_quads)
+            # 注意：这里暂时赋值索引，后续会被转换为poly_id或设置为INVALID_MARKER
+            # 在步骤5和7中会正确转换为poly_id
             agents_goal_quad_ids[:, :M] = goal_quad_indices.view(B, M)
             
             # 3. 并行检查所有agent的有效性
@@ -163,9 +165,11 @@ class WorldInitializer:
             
             # 5. 如果所有放置都有效，则完成初始化
             if not invalid_placement_mask.any():
-                # 记录有效的quad_id - 使用实际生成智能体位置时使用的quad_id
-                agents_start_quad_ids[:, :M] = spawn_quad_indices.view(B, M)
-                # 目标quad已在上方生成，直接保留
+                # 记录有效的quad_id - 将索引转换为实际的poly_id
+                # spawn_quad_indices 是数组索引（0-based），需要转换为 poly_id
+                agents_start_quad_ids[:, :M] = self.road_network.quad_ids[spawn_quad_indices].view(B, M)
+                # 目标quad也需要转换
+                agents_goal_quad_ids[:, :M] = self.road_network.quad_ids[goal_quad_indices].view(B, M)
                 if retry > 0:
                     logging.debug(f"All agents placed successfully after {retry+1} retries.")
                 break
@@ -177,10 +181,11 @@ class WorldInitializer:
             valid_placement_mask = ~invalid_placement_mask
             if valid_placement_mask.any():
                 # 使用实际生成智能体位置时使用的quad_id
-                # 修复形状不匹配：将spawn_quad_indices重塑为2D，然后更新
-                spawn_quad_indices_2d = spawn_quad_indices.view(B, M)
-                agents_start_quad_ids[:, :M][valid_placement_mask] = spawn_quad_indices_2d[valid_placement_mask]
-                # 目标quad已写入 agents_goal_quad_ids，无需特别区分
+                # 将索引转换为实际的poly_id
+                spawn_poly_ids = self.road_network.quad_ids[spawn_quad_indices].view(B, M)
+                goal_poly_ids = self.road_network.quad_ids[goal_quad_indices].view(B, M)
+                agents_start_quad_ids[:, :M][valid_placement_mask] = spawn_poly_ids[valid_placement_mask]
+                agents_goal_quad_ids[:, :M][valid_placement_mask] = goal_poly_ids[valid_placement_mask]
         logging.info("World initialization complete.")
         return agents_state, agents_start_quad_ids, agents_goal_quad_ids
 

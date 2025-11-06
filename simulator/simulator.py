@@ -127,10 +127,8 @@ class TeraflowSimulator:
         """
         if self.agents_state is None:
             raise RuntimeError("Must call reset() before calling step().")
-        
         actions = actions.to(self.device)     #action挪到当前显卡上
         states_t0 = self.agents_state.clone() #这一时刻的状态
-
         # 1. 基于收到的所有动作，更新：采用全批次恒定大小（B*M），并用mask混合回写
         active_mask = self.agents_state[..., 6] > 0.5
         if hasattr(self, 'last_done') and self.last_done is not None:
@@ -391,160 +389,457 @@ if __name__ == "__main__":
     end_poly_tensor = sim.agents_goal_quad_ids  # (B, M)
     agents_path_plans = sim.agents_path_plans  # (B, M, w_lane_ids_length, 3) - reset()中已生成
     
-    # ==================== 检查无效 poly_id ====================
-    print("=" * 80)
-    print("检查无效 poly_id:")
-    start_quad_ids = sim.agents_start_quad_ids  # (B, M)
-    goal_quad_ids = sim.agents_goal_quad_ids    # (B, M)
-    invalid_marker = sim.world_initializer.INVALID_MARKER
-    
-    # 检查 start_quad_ids 中的无效值
-    invalid_start_mask = (start_quad_ids == invalid_marker)
-    invalid_start_count = invalid_start_mask.sum().item()
-    total_count = start_quad_ids.numel()
-    print(f"Start quad_ids 中无效数量: {invalid_start_count} / {total_count}")
-    
-    # 检查 goal_quad_ids 中的无效值
-    invalid_goal_mask = (goal_quad_ids == invalid_marker)
-    invalid_goal_count = invalid_goal_mask.sum().item()
-    print(f"Goal quad_ids 中无效数量: {invalid_goal_count} / {total_count}")
-    
-    # 检查 poly_id_lookup 中的无效值（即使不是 INVALID_MARKER，也可能在 lookup 中无效）
-    if start_quad_ids.numel() > 0:
-        # 获取所有有效的 start_quad_ids（排除 INVALID_MARKER）
-        valid_start_mask = (start_quad_ids != invalid_marker)
-        valid_start_ids = start_quad_ids[valid_start_mask]
-        if valid_start_ids.numel() > 0:
-            # 检查这些 poly_id 在 poly_id_lookup 中是否有效
-            max_poly_id = valid_start_ids.max().item()
-            if max_poly_id < planner.poly_id_lookup.shape[0]:
-                lookup_results = planner.poly_id_lookup[valid_start_ids]
-                invalid_in_lookup = (lookup_results < 0).sum().item()
-                print(f"Start quad_ids 中在 poly_id_lookup 中无效的数量: {invalid_in_lookup} / {valid_start_ids.numel()}")
-                if invalid_in_lookup > 0:
-                    invalid_ids = valid_start_ids[lookup_results < 0]
-                    print(f"  无效的 poly_id 示例（前5个）: {invalid_ids[:5].cpu().numpy()}")
-            else:
-                print(f"警告: 最大 poly_id ({max_poly_id}) 超出 poly_id_lookup 范围 ({planner.poly_id_lookup.shape[0]})")
-    
-    # 检查 poly_id_lookup 的统计信息
-    print(f"poly_id_lookup 大小: {planner.poly_id_lookup.shape[0]}")
-    valid_in_lookup = (planner.poly_id_lookup >= 0).sum().item()
-    print(f"poly_id_lookup 中有效的 poly_id 数量: {valid_in_lookup} / {planner.poly_id_lookup.shape[0]}")
-    print("=" * 80)
-    
-    # ==================== 打印第一条路径 ====================
-    print("=" * 80)
-    print("第一条路径 agents_path_plans[0, 0] 的内容:")
-    print(f"路径形状: {agents_path_plans[0, 0].shape}")
-    print(f"路径数据 (前10个点):")
-    first_path = agents_path_plans[0, 0].cpu().numpy()  # 转换为numpy便于打印
-    for i in range(min(10, len(first_path))):
-        print(f"  点 {i}: x={first_path[i, 0]:.2f}, y={first_path[i, 1]:.2f}, angle={first_path[i, 2]:.4f}")
-    print(f"无效标记值: {planner.INVALID_w_lane_id_MARKER}")
-    print('state',agents_state[0,0].cpu().numpy())
-    
-    # 统计有效路径点数量
-    invalid_marker_tensor = torch.tensor(planner.INVALID_w_lane_id_MARKER, device=agents_path_plans.device, dtype=agents_path_plans.dtype)
-    valid_mask = agents_path_plans[0, 0, :, 0] != invalid_marker_tensor
-    valid_count = valid_mask.sum().item()
-    print(f"有效路径点数量: {valid_count} / {len(first_path)}")
-    print("=" * 80)
-    
-    # ==================== 3. 绘制active车辆的路径规划 ====================
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Polygon
+    # ==================== 3. 使用 OpenGL + Pygame 可视化 active 车辆的路径规划 ====================
     import numpy as np
+    try:
+        import pygame
+        from pygame.locals import DOUBLEBUF, OPENGL
+        from OpenGL.GL import (glClearColor, glClear, GL_COLOR_BUFFER_BIT, glMatrixMode, 
+                              GL_PROJECTION, GL_MODELVIEW, glLoadIdentity, glOrtho, 
+                              glBegin, glEnd, glVertex2f, glColor3f, glColor4f, GL_QUADS, GL_LINES, 
+                              GL_POINTS, GL_POLYGON, GL_LINE_LOOP, glPointSize, glLineWidth, glEnable, glBlendFunc,
+                              GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    except Exception as e:
+        print(f'请安装 pygame 和 PyOpenGL: pip install pygame PyOpenGL')
+        print(f'错误信息: {e}')
+        exit(1)
     
     # 获取active掩码：agents_state的第七位（索引6）表示是否active
     active_mask = agents_state[..., 6] > 0.5  # (B, M) - 布尔掩码
     
-    # 获取无效标记值（转换为tensor以确保类型匹配）
+    # 获取无效标记值
     invalid_marker_value = planner.INVALID_w_lane_id_MARKER
     
-    # 创建图形
-    fig, ax = plt.subplots(figsize=(12, 10))
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_title('Active Vehicles Path Plans (Batch 0)')
-    
-    # ==================== 绘制road network中的四边形 ====================
-    if rn.quads_vertices.numel() > 0:
-        quads_np = rn.quads_vertices.detach().cpu().numpy()  # (N, 4, 2)
-        for verts in quads_np:
-            # 将顶点转换为matplotlib Polygon需要的格式
-            vertices_2d = [(v[0], v[1]) for v in verts]
-            poly = Polygon(vertices_2d, closed=True, 
-                         facecolor='yellow', edgecolor='black', 
-                         alpha=0.2, linewidth=0.2, zorder=0)
-            ax.add_patch(poly)
-        print(f"绘制了 {len(quads_np)} 个四边形")
-    
-    # 定义不同车辆的颜色
-    colors = plt.cm.tab10(np.linspace(0, 1, 10))
-    
-    # 只绘制第一个批次（B=0）的车辆
+    # 准备数据
+    quads_vertices_np = rn.quads_vertices.detach().cpu().numpy()  # (N, 4, 2)
+    quads_by_id = rn.quads_by_id
     B, M = agents_state.shape[:2]
     b = 0  # 只绘制第一个批次
-    path_count = 0
     
-    # 仅选择 B=0 中第一个 active 的 agent 进行绘制
+    # 获取所有 active 的 agents
     active_agents = torch.nonzero(active_mask[b], as_tuple=False).squeeze(-1)
     if active_agents.numel() == 0:
         print("Batch 0 中没有active车辆")
+        exit(0)
+    
+    active_agents_list = active_agents.tolist()
+    print(f"Batch 0 中有 {len(active_agents_list)} 个active车辆")
+    
+    # 计算坐标范围
+    if quads_vertices_np.shape[0] > 0:
+        xs = quads_vertices_np[:, :, 0].reshape(-1)
+        ys = quads_vertices_np[:, :, 1].reshape(-1)
+        margin = 20.0
+        x_min, x_max = float(xs.min() - margin), float(xs.max() + margin)
+        y_min, y_max = float(ys.min() - margin), float(ys.max() + margin)
     else:
-        m = int(active_agents[0].item())
-        # 获取该车辆的路径规划 (w_lane_ids_length, 3)
+        x_min, x_max, y_min, y_max = -100.0, 100.0, -100.0, 100.0
+    
+    # 初始化 Pygame 和 OpenGL
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 960), DOUBLEBUF | OPENGL)
+    pygame.display.set_caption('Active Vehicles Path Plans (SPACE: next, ESC: quit)')
+    
+    glClearColor(1.0, 1.0, 1.0, 1.0)
+    
+    # 启用透明度支持
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    glOrtho(x_min, x_max, y_min, y_max, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    
+    # 当前显示的车辆索引
+    cur_idx = 0
+    
+    # 缩放参数
+    zoom_level = 1.0  # 1.0 = 原始视图
+    zoom_min = 0.1    # 最小缩放（最大化视野）
+    zoom_max = 10.0   # 最大缩放（最小化视野）
+    
+    # 获取 horizon 参数
+    horizon = sim.observation_generator.horizon
+    
+    def draw_quads():
+        """绘制所有 quads 作为背景"""
+        glColor3f(0.95, 0.95, 0.7)  # 浅黄色
+        for verts in quads_vertices_np:
+            glBegin(GL_QUADS)
+            glVertex2f(float(verts[0, 0]), float(verts[0, 1]))
+            glVertex2f(float(verts[1, 0]), float(verts[1, 1]))
+            glVertex2f(float(verts[2, 0]), float(verts[2, 1]))
+            glVertex2f(float(verts[3, 0]), float(verts[3, 1]))
+            glEnd()
+        
+        # 绘制 quad 边框
+        glColor3f(0.6, 0.6, 0.6)
+        glLineWidth(0.5)
+        for verts in quads_vertices_np:
+            glBegin(GL_LINES)
+            for i in range(4):
+                glVertex2f(float(verts[i, 0]), float(verts[i, 1]))
+                glVertex2f(float(verts[(i+1)%4, 0]), float(verts[(i+1)%4, 1]))
+            glEnd()
+    
+    def draw_vehicle_box(x, y, heading, length, width, r, g, b, line_width=2.0):
+        """绘制车辆的矩形框"""
+        import math
+        # 计算车辆四个角的坐标
+        cos_h = math.cos(heading)
+        sin_h = math.sin(heading)
+        
+        # 车辆中心在 (x, y)，长度方向沿着 heading
+        half_length = length / 2.0
+        half_width = width / 2.0
+        
+        # 四个角（相对于中心）
+        corners = [
+            (-half_length, -half_width),  # 后左
+            (half_length, -half_width),   # 前左
+            (half_length, half_width),    # 前右
+            (-half_length, half_width)    # 后右
+        ]
+        
+        # 旋转并平移
+        world_corners = []
+        for cx, cy in corners:
+            wx = x + cx * cos_h - cy * sin_h
+            wy = y + cx * sin_h + cy * cos_h
+            world_corners.append((wx, wy))
+        
+        # 绘制矩形框
+        glColor3f(r, g, b)
+        glLineWidth(line_width)
+        glBegin(GL_LINES)
+        for i in range(4):
+            glVertex2f(world_corners[i][0], world_corners[i][1])
+            glVertex2f(world_corners[(i+1)%4][0], world_corners[(i+1)%4][1])
+        glEnd()
+        
+        # 绘制前方指示线（车头方向）
+        front_x = x + half_length * cos_h
+        front_y = y + half_length * sin_h
+        glBegin(GL_LINES)
+        glVertex2f(x, y)
+        glVertex2f(front_x, front_y)
+        glEnd()
+    
+    def draw_horizon_box(ego_x, ego_y, horizon_size):
+        """绘制观测范围的圆形"""
+        import math
+        radius = horizon_size / 2.0
+        num_segments = 64  # 圆形分段数，越大越平滑
+        
+        # 绘制半透明的填充圆
+        glColor4f(0.0, 0.8, 0.8, 0.08)  # 青色，8% 不透明度
+        glBegin(GL_POLYGON)
+        for i in range(num_segments):
+            angle = 2.0 * math.pi * i / num_segments
+            x = ego_x + radius * math.cos(angle)
+            y = ego_y + radius * math.sin(angle)
+            glVertex2f(x, y)
+        glEnd()
+        
+        # 绘制边框圆线
+        glColor4f(0.0, 0.8, 0.8, 0.8)  # 青色，80% 不透明度
+        glLineWidth(2.5)
+        glBegin(GL_LINE_LOOP)
+        for i in range(num_segments):
+            angle = 2.0 * math.pi * i / num_segments
+            x = ego_x + radius * math.cos(angle)
+            y = ego_y + radius * math.sin(angle)
+            glVertex2f(x, y)
+        glEnd()
+    
+    def draw_all_agents(agents_state, current_m):
+        """绘制所有 active agents（除了当前选中的）"""
+        for m_idx in range(M):
+            if agents_state[b, m_idx, 6] < 0.5:  # 不是 active
+                continue
+            if m_idx == current_m:  # 跳过当前选中的车辆
+                continue
+            
+            # 获取车辆状态：[x, y, heading, vx, vy, length, width]
+            state = agents_state[b, m_idx].cpu().numpy()
+            x, y, heading = state[0], state[1], state[2]
+            length, width = state[4], state[5]
+            
+            # 绘制灰色车辆框
+            draw_vehicle_box(x, y, heading, length, width, 0.4, 0.4, 0.4, line_width=1.5)
+    
+    def draw_observation_data(neighbors_local, w_lanes_local, w_boundaries_local, ego_x, ego_y, ego_heading, ego_speed):
+        """绘制 observation 中的数据（透明显示）"""
+        import math
+        import numpy as np
+        
+        if neighbors_local is None:
+            return
+        
+        # 旋转矩阵
+        cos_yaw = math.cos(ego_heading)
+        sin_yaw = math.sin(ego_heading)
+        rot = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+        
+        # 1. 绘制观测到的其他车辆（红色框）
+        try:
+            neighbors_np = neighbors_local.cpu().numpy() if torch.is_tensor(neighbors_local) else neighbors_local
+            # neighbors_local: (K, 7) - [dx, dy, dvx, dvy, length, width, active]
+            
+            for k in range(neighbors_np.shape[0]):
+                neighbor = neighbors_np[k]
+                dx, dy = neighbor[0], neighbor[1]
+                
+                # 检查是否是有效的 neighbor
+                if abs(dx) < 1e-5 and abs(dy) < 1e-5:
+                    continue
+                if neighbor[6] < 0.5:  # active flag
+                    continue
+                
+                # 局部坐标转换为世界坐标
+                dx_dy = np.array([dx, dy])
+                world_pos = dx_dy @ rot.T + np.array([ego_x, ego_y])
+                world_x, world_y = world_pos[0], world_pos[1]
+                
+                # 从相对速度恢复世界速度和朝向
+                dvx, dvy = neighbor[2], neighbor[3]
+                v_local = np.array([dvx, dvy])
+                v_ego_world = np.array([ego_speed * cos_yaw, ego_speed * sin_yaw])
+                v_neighbor_world = v_local @ rot.T + v_ego_world
+                
+                vx_k, vy_k = v_neighbor_world[0], v_neighbor_world[1]
+                if (vx_k * vx_k + vy_k * vy_k) < 1e-6:
+                    world_heading = ego_heading
+                else:
+                    world_heading = math.atan2(vy_k, vx_k)
+                
+                length = neighbor[4]
+                width = neighbor[5]
+                
+                if length <= 0.0 or width <= 0.0:
+                    continue
+                
+                # 绘制红色车辆框
+                draw_vehicle_box(world_x, world_y, world_heading, length, width, 
+                               1.0, 0.0, 0.0, line_width=2.5)
+        except Exception as e:
+            print(f"绘制 neighbors 失败: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 2. 绘制 observation 中的 w_lane（蓝色散点）
+        try:
+            if w_lanes_local is not None:
+                wlane_np = w_lanes_local.cpu().numpy() if torch.is_tensor(w_lanes_local) else w_lanes_local
+                # w_lanes_local: (num_w_lanes, 2) - [dx, dy] in local frame
+                
+                # 绘制 w_lane 散点
+                glColor4f(0.2, 0.4, 0.9, 0.8)  # 蓝色，80% 不透明度
+                glPointSize(4.0)
+                glBegin(GL_POINTS)
+                for i in range(wlane_np.shape[0]):
+                    dx, dy = wlane_np[i, 0], wlane_np[i, 1]
+                    if abs(dx) < 1e-5 and abs(dy) < 1e-5:
+                        continue
+                    
+                    # 局部坐标转世界坐标
+                    dx_dy = np.array([dx, dy])
+                    world_pos = dx_dy @ rot.T + np.array([ego_x, ego_y])
+                    glVertex2f(world_pos[0], world_pos[1])
+                glEnd()
+        except Exception as e:
+            print(f"绘制 w_lanes 失败: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 3. 绘制 boundary（红色散点）
+        try:
+            if w_boundaries_local is not None:
+                boundary_np = w_boundaries_local.cpu().numpy() if torch.is_tensor(w_boundaries_local) else w_boundaries_local
+                # w_boundaries_local: (num_w_boundaries, 2) - [dx, dy] in local frame
+                
+                # 绘制 boundary 散点
+                glColor4f(0.9, 0.2, 0.2, 0.8)  # 红色，80% 不透明度
+                glPointSize(4.0)
+                glBegin(GL_POINTS)
+                for i in range(boundary_np.shape[0]):
+                    dx, dy = boundary_np[i, 0], boundary_np[i, 1]
+                    if abs(dx) < 1e-5 and abs(dy) < 1e-5:
+                        continue
+                    
+                    dx_dy = np.array([dx, dy])
+                    world_pos = dx_dy @ rot.T + np.array([ego_x, ego_y])
+                    glVertex2f(world_pos[0], world_pos[1])
+                glEnd()
+        except Exception as e:
+            print(f"绘制 boundaries 失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def draw_point_xy(x, y, r, g, b, size=8.0):
+        """绘制一个点"""
+        glColor3f(r, g, b)
+        glPointSize(float(size))
+        glBegin(GL_POINTS)
+        glVertex2f(float(x), float(y))
+        glEnd()
+    
+    def draw_path_with_arrows(valid_path):
+        """绘制路径点、连线和方向箭头"""
+        if len(valid_path) == 0:
+            return
+        
+        # 1. 绘制路径连线（蓝色）
+        glColor3f(0.2, 0.4, 0.8)
+        glLineWidth(2.0)
+        glBegin(GL_LINES)
+        for i in range(len(valid_path) - 1):
+            glVertex2f(float(valid_path[i, 0]), float(valid_path[i, 1]))
+            glVertex2f(float(valid_path[i+1, 0]), float(valid_path[i+1, 1]))
+        glEnd()
+        
+        # 2. 绘制所有路径点（蓝色小点）
+        glColor3f(0.2, 0.4, 0.8)
+        glPointSize(4.0)
+        glBegin(GL_POINTS)
+        for p in valid_path:
+            glVertex2f(float(p[0]), float(p[1]))
+        glEnd()
+        
+        # 3. 绘制方向箭头（紫色）
+        glColor3f(0.5, 0.1, 0.7)
+        glLineWidth(1.5)
+        arrow_length = 5.0
+        for p in valid_path:
+            x, y, angle = float(p[0]), float(p[1]), float(p[2])
+            dx = arrow_length * np.cos(angle)
+            dy = arrow_length * np.sin(angle)
+            glBegin(GL_LINES)
+            glVertex2f(x, y)
+            glVertex2f(x + dx, y + dy)
+            glEnd()
+        
+        # 4. 绘制起点（绿色方块）
+        draw_point_xy(valid_path[0, 0], valid_path[0, 1], 0.2, 0.8, 0.2, size=10.0)
+        
+        # 5. 绘制终点（红色三角 - 用大点代替）
+        draw_point_xy(valid_path[-1, 0], valid_path[-1, 1], 0.9, 0.2, 0.2, size=12.0)
+    
+    # 主循环
+    running = True
+    clock = pygame.time.Clock()
+    
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_SPACE:
+                    cur_idx = (cur_idx + 1) % len(active_agents_list)
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                # 处理滚轮缩放
+                if event.button == 4:  # 滚轮向上 - 放大
+                    zoom_level = min(zoom_level * 1.2, zoom_max)
+                elif event.button == 5:  # 滚轮向下 - 缩小
+                    zoom_level = max(zoom_level / 1.2, zoom_min)
+        
+        # 获取当前车辆的数据
+        m = active_agents_list[cur_idx]
         path = agents_path_plans[b, m]  # (w_lane_ids_length, 3)
-
-        # 过滤掉无效的路径点（第一个维度不等于invalid_marker）
-        # 使用tensor比较以确保类型匹配
+        
+        # 过滤无效路径点
         invalid_marker_tensor = torch.tensor(invalid_marker_value, device=path.device, dtype=path.dtype)
         valid_mask = path[:, 0] != invalid_marker_tensor
-        valid_path = path[valid_mask].cpu().numpy()  # 转换为numpy数组
+        valid_path = path[valid_mask].cpu().numpy()
         
+        # 获取起点和终点的 poly_id
+        start_poly_id = int(start_poly_tensor[b, m].item())
+        end_poly_id = int(end_poly_tensor[b, m].item())
+        
+        # 获取当前车辆的状态
+        ego_state = agents_state[b, m].cpu().numpy()
+        ego_x, ego_y, ego_heading = ego_state[0], ego_state[1], ego_state[2]
+        ego_length, ego_width = ego_state[4], ego_state[5]
+        
+        # 获取当前车辆的 observation（使用内部方法获取未展平的数据）
+        try:
+            # 使用 ObservationGenerator 的内部方法获取结构化数据
+            neighbor_states_world = sim.observation_generator._get_nearest_neighbors(agents_state)
+            w_lanes_world, w_boundaries_world = sim.observation_generator._get_precomputed_waypoints(agents_state)
+            local_state_tmp, neighbors_local_tmp, w_lanes_local_tmp, w_boundaries_local_tmp = \
+                sim.observation_generator._world_to_ego_centric(
+                    agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
+                )
+            
+            # 提取当前车辆的数据
+            neighbors_local = neighbors_local_tmp[b, m]  # (K, 7)
+            w_lanes_local = w_lanes_local_tmp[b, m]      # (num_w_lanes, 2)
+            w_boundaries_local = w_boundaries_local_tmp[b, m]  # (num_w_boundaries, 2)
+            
+            has_observation = True
+        except Exception as e:
+            print(f"获取 observation 失败: {e}")
+            has_observation = False
+            neighbors_local = None
+            w_lanes_local = None
+            w_boundaries_local = None
+        
+        # 更新窗口标题
+        pygame.display.set_caption(
+            f'Active Vehicles Path Plans - B={b}, M={m} ({cur_idx+1}/{len(active_agents_list)}) '
+            f'(SPACE: next, ESC: quit, Scroll: zoom) - Path: {len(valid_path)} pts, Zoom: {zoom_level:.2f}x'
+        )
+        
+        # 更新投影矩阵以应用缩放
+        # 以当前车辆为中心进行缩放
+        view_width = (x_max - x_min) / zoom_level
+        view_height = (y_max - y_min) / zoom_level
+        
+        view_x_min = ego_x - view_width / 2
+        view_x_max = ego_x + view_width / 2
+        view_y_min = ego_y - view_height / 2
+        view_y_max = ego_y + view_height / 2
+        
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(view_x_min, view_x_max, view_y_min, view_y_max, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        
+        # 清空并绘制
+        glClear(GL_COLOR_BUFFER_BIT)
+        glLoadIdentity()
+        
+        # 绘制背景（quads）
+        draw_quads()
+        
+        # 绘制 horizon 观测范围框
+        draw_horizon_box(ego_x, ego_y, horizon)
+        
+        # 绘制所有其他 agents（灰色）
+        draw_all_agents(agents_state, m)
+        
+        # 绘制 observation 数据（透明显示）
+        if has_observation:
+            ego_speed = ego_state[3]
+            draw_observation_data(neighbors_local, w_lanes_local, w_boundaries_local, 
+                                ego_x, ego_y, ego_heading, ego_speed)
+        
+        # 绘制当前车辆（蓝绿色）
+        draw_vehicle_box(ego_x, ego_y, ego_heading, ego_length, ego_width, 
+                        0.0, 0.8, 0.8, line_width=3.0)
+        
+        # 绘制路径
         if len(valid_path) > 0:
-            # 提取x, y坐标
-            x_coords = valid_path[:, 0]
-            y_coords = valid_path[:, 1]
-            
-            # 选择颜色
-            color = colors[path_count % len(colors)]
-            
-            # 绘制路径点连线（zorder=2，确保在四边形之上）
-            ax.plot(x_coords, y_coords, 'o-', color=color, markersize=4, 
-                   linewidth=2, alpha=0.7, label=f'B{b}_M{m}', zorder=2)
-            
-            # 绘制起点（绿色，zorder=3，确保在最上层）
-            ax.plot(x_coords[0], y_coords[0], 's', color='green', 
-                   markersize=8, markeredgecolor='black', markeredgewidth=1, zorder=3)
-            
-            # 绘制终点（红色，zorder=3）
-            ax.plot(x_coords[-1], y_coords[-1], '^', color='red', 
-                   markersize=8, markeredgecolor='black', markeredgewidth=1, zorder=3)
-            
-            # 绘制所有有效点的方向箭头（zorder=2）
-            angles = valid_path[:, 2]  # 角度信息
-            arrow_length = 0.5
-            for i in range(len(valid_path)):
-                x, y, angle = x_coords[i], y_coords[i], angles[i]
-                dx = arrow_length * np.cos(angle)
-                dy = arrow_length * np.sin(angle)
-                ax.arrow(x, y, dx, dy, head_width=0.3, head_length=0.2, 
-                       fc=color, ec=color, alpha=0.6, length_includes_head=True, zorder=2)
-            path_count = 1
+            draw_path_with_arrows(valid_path)
+        
+        pygame.display.flip()
+        clock.tick(60)
     
-    # 添加图例（如果路径数量不多）
-    if path_count <= 20:
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-    
-    print(f"绘制了 {path_count} 个active车辆的路径规划")
-    
-    # 显示图形
-    plt.tight_layout()
-    plt.show()
+    pygame.quit()
+    print(f"可视化结束，共查看了 {len(active_agents_list)} 个active车辆")
 
 
 
