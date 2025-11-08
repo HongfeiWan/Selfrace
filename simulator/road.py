@@ -39,8 +39,6 @@ class RoadNetwork:
         self.global_w_boundary: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
         # 便捷/同义字段与尺寸
         self.num_quads: int = 0
-        self.global_w_lane_waypoints: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
-        self.global_w_boundary_points: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
 
         # ===== 预先初始化 _store_metadata 中会写入的成员 =====
         # 原始数据缓存
@@ -140,9 +138,7 @@ class RoadNetwork:
             )  # (n_w_lanes, 3)
         w_boundary_points = map_data.get('oob_points', [])
         self.global_w_boundary = torch.tensor([[p['x'], p['y']] for p in w_boundary_points], dtype=torch.float32, device=self.device) if w_boundary_points else torch.empty((0, 2), device=self.device)
-        # 为 Observation 兼容提供同义字段
-        self.global_w_lane_waypoints = self.global_w_lane
-        self.global_w_boundary_points = self.global_w_boundary
+
 
         # ===== 预计算供 PathPlanner 复用的数据结构 =====
         # 1) (road_id, lane_id) 分组与每组起终点 w_lane_id
@@ -241,17 +237,17 @@ class RoadNetwork:
         try:
             quad_centers = self.quad_centerlines.mean(dim=1)  # (num_quads, 2)
             # 最近 w_lanes（最多80个，避免大内存）
-            if self.global_w_lane_waypoints.numel() > 0 and self.num_quads > 0:
-                k_lanes = min(80, self.global_w_lane_waypoints.shape[0])
-                d_l = torch.cdist(quad_centers, self.global_w_lane_waypoints, p=2)
+            if self.global_w_lane.numel() > 0 and self.num_quads > 0:
+                k_lanes = min(80, self.global_w_lane.shape[0])
+                d_l = torch.cdist(quad_centers, self.global_w_lane, p=2)
                 _, nn_idx_l = torch.topk(d_l, k=k_lanes, dim=1, largest=False)
                 self.quad_to_w_lanes_ids = nn_idx_l.to(dtype=torch.long)
             else:
                 self.quad_to_w_lanes_ids = torch.zeros(self.num_quads, 0, dtype=torch.long, device=self.device)
             # 最近 w_boundaries（最多80个）
-            if self.global_w_boundary_points.numel() > 0 and self.num_quads > 0:
-                k_bd = min(80, self.global_w_boundary_points.shape[0])
-                d_b = torch.cdist(quad_centers, self.global_w_boundary_points, p=2)
+            if self.global_w_boundary.numel() > 0 and self.num_quads > 0:
+                k_bd = min(80, self.global_w_boundary.shape[0])
+                d_b = torch.cdist(quad_centers, self.global_w_boundary, p=2)
                 _, nn_idx_b = torch.topk(d_b, k=k_bd, dim=1, largest=False)
                 self.quad_to_w_boundaries_ids = nn_idx_b.to(dtype=torch.long)
             else:
@@ -472,8 +468,8 @@ if __name__ == "__main__":
             bounds_idx = bound_ids[qidx].detach().cpu().numpy()
 
         # 可视化 w_lanes 点
-        if lanes_idx is not None and lanes_idx.size > 0 and rn.global_w_lane_waypoints.numel() > 0:
-            wl = rn.global_w_lane_waypoints[torch.as_tensor(lanes_idx, device=rn.device)]
+        if lanes_idx is not None and lanes_idx.size > 0 and rn.global_w_lane.numel() > 0:
+            wl = rn.global_w_lane[torch.as_tensor(lanes_idx, device=rn.device)]
             lxy = wl.detach().cpu().numpy()
             if ui['lane'] is None:
                 ui['lane'] = ax.scatter(lxy[:,0], lxy[:,1], c='red', s=14, alpha=0.9, label='nearest w_lanes')
@@ -483,8 +479,8 @@ if __name__ == "__main__":
             ui['lane'].remove(); ui['lane'] = None
 
         # 可视化 w_boundaries 点
-        if bounds_idx is not None and bounds_idx.size > 0 and rn.global_w_boundary_points.numel() > 0:
-            wb = rn.global_w_boundary_points[torch.as_tensor(bounds_idx, device=rn.device)]
+        if bounds_idx is not None and bounds_idx.size > 0 and rn.global_w_boundary.numel() > 0:
+            wb = rn.global_w_boundary[torch.as_tensor(bounds_idx, device=rn.device)]
             bxy = wb.detach().cpu().numpy()
             if ui['bound'] is None:
                 ui['bound'] = ax.scatter(bxy[:,0], bxy[:,1], c='purple', s=10, alpha=0.8, label='nearest boundaries')

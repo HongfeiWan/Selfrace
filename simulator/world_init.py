@@ -63,7 +63,6 @@ class WorldInitializer:
         self.initial_agents_start_quad_ids = start_quad_ids
         self.initial_agents_goal_quad_ids = goal_quad_ids
 
-
     def _generate_states_on_quads(self, quad_indices: torch.Tensor, lengths: torch.Tensor, widths: torch.Tensor) -> torch.Tensor:
         """
         在指定的道路四边形上生成车辆状态。

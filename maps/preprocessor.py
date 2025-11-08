@@ -1479,21 +1479,21 @@ def sample_w_lanes(polygons_data, sample_distance_m=W_LANE_SAMPLE_DISTANCE):
         # next_w_lane_id: 从当前quad往后到终点的所有w_lane_id列表
         for quad_idx, quad in enumerate(quads):
             if len(sorted_idx_list) == 0:
-                # 没有waypoint，设置为空列表
+                # 没有w_lane，设置为空列表
                 quad['prev_w_lane_id'] = []
                 quad['next_w_lane_id'] = []
             elif quad_idx in idx_to_w_lane_id:
-                # 这个quad是waypoint
+                # 这个quad是w_lane
                 pos = sorted_idx_list.index(quad_idx)
-                # prev_w_lane_id: 从起点到当前waypoint（包含当前）的所有waypoint ID
+                # prev_w_lane_id: 从起点到当前w_lane（包含当前）的所有w_lane ID
                 prev_list = [idx_to_w_lane_id[sorted_idx_list[i]] for i in range(pos + 1)]
-                # next_w_lane_id: 从当前waypoint（包含当前）到终点的所有waypoint ID
+                # next_w_lane_id: 从当前w_lane（包含当前）到终点的所有w_lane ID
                 next_list = [idx_to_w_lane_id[sorted_idx_list[i]] for i in range(pos, len(sorted_idx_list))]
                 quad['prev_w_lane_id'] = prev_list
                 quad['next_w_lane_id'] = next_list
             else:
-                # 这个quad不是waypoint，在两个waypoint之间
-                # 找到前面最近的waypoint（小于等于quad_idx的最大索引）
+                # 这个quad不是w_lane，在两个w_lane之间
+                # 找到前面最近的w_lane（小于等于quad_idx的最大索引）
                 prev_w_idx = None
                 for i in range(len(sorted_idx_list) - 1, -1, -1):
                     w_idx = sorted_idx_list[i]
@@ -1501,7 +1501,7 @@ def sample_w_lanes(polygons_data, sample_distance_m=W_LANE_SAMPLE_DISTANCE):
                         prev_w_idx = i
                         break
                 
-                # 找到后面最近的waypoint（大于quad_idx的最小索引）
+                # 找到后面最近的w_lane（大于quad_idx的最小索引）
                 next_w_idx = None
                 for i in range(len(sorted_idx_list)):
                     w_idx = sorted_idx_list[i]
@@ -1509,19 +1509,19 @@ def sample_w_lanes(polygons_data, sample_distance_m=W_LANE_SAMPLE_DISTANCE):
                         next_w_idx = i
                         break
                 
-                # prev_w_lane_id: 从起点到前面最近waypoint（包含该waypoint）的所有waypoint ID
+                # prev_w_lane_id: 从起点到前面最近w_lane（包含该w_lane）的所有w_lane ID
                 if prev_w_idx is not None:
                     prev_list = [idx_to_w_lane_id[sorted_idx_list[i]] for i in range(prev_w_idx + 1)]
                 else:
-                    # 前面没有waypoint，使用第一个waypoint
+                    # 前面没有w_lane，使用第一个w_lane
                     prev_list = [idx_to_w_lane_id[sorted_idx_list[0]]]
                 quad['prev_w_lane_id'] = prev_list
                 
-                # next_w_lane_id: 从后面最近waypoint（包含该waypoint）到终点的所有waypoint ID
+                # next_w_lane_id: 从后面最近w_lane（包含该w_lane）到终点的所有w_lane ID
                 if next_w_idx is not None:
                     next_list = [idx_to_w_lane_id[sorted_idx_list[i]] for i in range(next_w_idx, len(sorted_idx_list))]
                 else:
-                    # 后面没有waypoint，使用最后一个waypoint
+                    # 后面没有w_lane，使用最后一个w_lane
                     next_list = [idx_to_w_lane_id[sorted_idx_list[-1]]]
                 quad['next_w_lane_id'] = next_list
     

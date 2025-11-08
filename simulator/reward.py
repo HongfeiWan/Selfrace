@@ -65,9 +65,9 @@ class RewardCalculator:
         rc = self.reward_config
         self.v_goal = rc.get('v_goal')
         self.goal_reward = rc.get('goal_reward')
-        self.collision_speed_mult = rc.get('collision_speed_mult')
-        self.velocity_alpha = rc.get('velocity_alpha')
-        self.timestep_alpha = rc.get('timestep_alpha')
+        self.collision_speed_mult = rc.get('collision_speed_mult', 0.1)
+        self.velocity_alpha = rc.get('velocity_alpha', 2.5e-3)
+        self.timestep_alpha = rc.get('timestep_alpha', 2.5e-5)
         
         # 初始化所有随机参数
         self.sampled_params = self.parameter_sampler.sample_all_parameters(self.B, self.M)

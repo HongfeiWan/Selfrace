@@ -61,7 +61,7 @@ class ObservationGenerator:
         total_dim = local_state_size + neighbors_size + w_lanes_size + w_boundaries_size
         return total_dim
 
-    def _get_precomputed_waypoints(self, agents_state: torch.Tensor) -> tuple:
+    def _get_precomputed_w_lanes(self, agents_state: torch.Tensor) -> tuple:
         """
         使用预计算的数据获取w_lanes和w_boundaries。
         Args:
@@ -76,12 +76,12 @@ class ObservationGenerator:
         # 找到每个agent最近的quad索引
         distances, quad_indices = find_nearest_lanes(self.device, self.road_network.quad_centerlines, agent_positions_flat, k=1, spatial_hash=self.spatial_hash)
         quad_indices = quad_indices.squeeze(-1)  # (B*M,)
-        # 使用预计算的关联获取 waypoint 索引并直接索引坐标
+        # 使用预计算的关联获取 w_lane 索引并直接索引坐标
         w_lanes_ids = self.quad_to_w_lanes_ids[quad_indices]      # (B*M, K_lanes)
         w_bounds_ids = self.quad_to_w_boundaries_ids[quad_indices]# (B*M, K_bounds)
 
-        wl_world = self.road_network.global_w_lane_waypoints[w_lanes_ids]   # (B*M, wl_K, 2)
-        wb_world = self.road_network.global_w_boundary_points[w_bounds_ids] # (B*M, wb_K, 2)
+        wl_world = self.road_network.global_w_lane[w_lanes_ids]   # (B*M, wl_K, 2)
+        wb_world = self.road_network.global_w_boundary[w_bounds_ids] # (B*M, wb_K, 2)
 
         # 若 K 与配置的目标数量不同，进行右侧零填充/裁剪
         def _pad_or_trim(t: torch.Tensor, target_k: int) -> torch.Tensor:
@@ -117,9 +117,10 @@ class ObservationGenerator:
         self_mask = torch.eye(max_agents, device=self.device, dtype=torch.bool).expand(batch_size, -1, -1)
         # 2. 不活跃的 agent 不能作为邻居
         inactive_mask = (agents_state[..., 6] < 0.5).unsqueeze(1).expand(-1, max_agents, -1)
-        # 3. 距离超过视野范围的邻居不考虑
+        # 3. 距离超过视野范围的邻居不考虑（使用 horizon/2 作为半径）
+        horizon_radius = self.horizon 
         dist_sq[self_mask | inactive_mask] = float('inf')
-        dist_sq[dist_sq > self.horizon**2] = float('inf') 
+        dist_sq[dist_sq > horizon_radius**2] = float('inf') 
         # 4. 找到最近的 K 个
         _, topk_indices = torch.topk(dist_sq, k=self.num_neighbors, dim=-1, largest=False) # (B, M, K)
         # 5. 使用高级索引高效地收集邻居状态
@@ -167,6 +168,21 @@ class ObservationGenerator:
         # 将世界坐标系下的车道线和边界线转换到局部坐标系
         w_lanes_local = batch_rotate(w_lanes_world, ego_pos, rot_matrix)
         w_boundaries_local = batch_rotate(w_boundaries_world, ego_pos, rot_matrix)
+        
+        # 根据 horizon 对 w_lanes 和 w_boundaries 进行掩码处理
+        # 计算每个点到 ego 的距离（已经是局部坐标，直接计算模长）
+        w_lanes_dist = torch.norm(w_lanes_local, dim=-1)  # (B, M, num_w_lanes)
+        w_boundaries_dist = torch.norm(w_boundaries_local, dim=-1)  # (B, M, num_w_boundaries)
+        
+        # 创建掩码：距离超过 horizon/2 的点设为无效（置零）
+        horizon_radius = self.horizon 
+        w_lanes_valid_mask = w_lanes_dist <= horizon_radius  # (B, M, num_w_lanes)
+        w_boundaries_valid_mask = w_boundaries_dist <= horizon_radius  # (B, M, num_w_boundaries)
+        
+        # 将超出范围的点设置为 0
+        w_lanes_local = w_lanes_local * w_lanes_valid_mask.unsqueeze(-1).float()
+        w_boundaries_local = w_boundaries_local * w_boundaries_valid_mask.unsqueeze(-1).float()
+        
         # --- 转换邻居 ---
         if K_neighbors > 0:
             rel_pos_neighbors = neighbor_states[..., :2] - ego_pos.unsqueeze(2) # (B, M, K, 2)
@@ -229,7 +245,7 @@ class ObservationGenerator:
         # (B, M, K, 7)
         neighbor_states_world = self._get_nearest_neighbors(agents_state)
         # 使用预计算的数据获取w_lanes和w_boundaries
-        w_lanes_world, w_boundaries_world = self._get_precomputed_waypoints(agents_state)
+        w_lanes_world, w_boundaries_world = self._get_precomputed_w_lanes(agents_state)
         # 2. 将所有信息转换到每个 Agent 的局部坐标系
         local_state, neighbors_local, w_lanes_local, w_boundaries_local = self._world_to_ego_centric(
             agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
@@ -319,7 +335,7 @@ if __name__ == '__main__':
         m_idx = 0
 
     # 7) 使用预计算的世界坐标航点获取该车的观测内容（世界坐标）
-    w_lanes_world, w_boundaries_world = obs_gen._get_precomputed_waypoints(agents_state)
+    w_lanes_world, w_boundaries_world = obs_gen._get_precomputed_w_lanes(agents_state)
     wl = w_lanes_world[0, m_idx].detach().cpu().numpy()  # (K,2)
     wb = w_boundaries_world[0, m_idx].detach().cpu().numpy()  # (K,2)
 
@@ -332,7 +348,7 @@ if __name__ == '__main__':
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
-    ax.set_title('Observation preview: quads + first active agent waypoints')
+    ax.set_title('Observation preview: quads + first active agent w_lanes')
     ax.set_xlabel('x')
     ax.set_ylabel('y')
 
