@@ -5,6 +5,7 @@ Pygame/OpenGL 可视化工具模块
 import torch
 import numpy as np
 import math
+from typing import Optional, Callable, Tuple
 
 try:
     import pygame
@@ -13,7 +14,12 @@ try:
                           GL_PROJECTION, GL_MODELVIEW, glLoadIdentity, glOrtho, 
                           glBegin, glEnd, glVertex2f, glColor3f, glColor4f, GL_QUADS, GL_LINES, 
                           GL_POINTS, GL_POLYGON, GL_LINE_LOOP, glPointSize, glLineWidth, glEnable, glBlendFunc,
-                          GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                          GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, glPushMatrix, glPopMatrix,
+                          glTexParameteri, glTexImage2D, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                          GL_TEXTURE_MAG_FILTER, GL_LINEAR, glBindTexture, glTexCoord2f, glDeleteTextures,
+                          glGenTextures,
+                          glDisable)
+    from OpenGL.GL import GL_RGBA, GL_UNSIGNED_BYTE
     PYGAME_AVAILABLE = True
 except ImportError:
     PYGAME_AVAILABLE = False
@@ -21,31 +27,53 @@ except ImportError:
 
 
 class PathPlanningVisualizer:
-    """路径规划可视化器"""
+    """路径规划可视化器（通用版本）"""
     
-    def __init__(self, simulator, batch_idx=0):
+    def __init__(
+        self, 
+        agents_state: torch.Tensor,
+        agents_path_plans: torch.Tensor,
+        quads_vertices: torch.Tensor,
+        batch_idx: int = 0,
+        invalid_marker_value: float = -999999.0,
+        horizon: float = 80.0,
+        observation_callback: Optional[Callable] = None,
+        step_callback: Optional[Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        info_callback: Optional[Callable[[torch.Tensor, int, int], Optional[object]]] = None,
+        agents_start_quad_ids: Optional[torch.Tensor] = None,
+        agents_goal_quad_ids: Optional[torch.Tensor] = None):
         """
         初始化可视化器
+        
         Args:
-            simulator: TeraflowSimulator实例
+            agents_state: 车辆状态张量 [B, M, 7] - (x, y, heading, speed, length, width, active)
+            agents_path_plans: 路径规划张量 [B, M, N, 3] - (x, y, angle)
+            quads_vertices: 道路网格顶点 [num_quads, 4, 2] - 每个quad的4个顶点坐标
             batch_idx: 要可视化的批次索引（默认0）
+            invalid_marker_value: 无效路径点的标记值（默认-999999.0）
+            horizon: 观测范围半径（默认80.0）
+            observation_callback: 可选的观测数据获取回调函数
+                                 签名: (agents_state, batch_idx, agent_idx) -> (neighbors_local, w_lanes_local, w_boundaries_local)
+            agents_start_quad_ids: 可选的起始quad ID
+            agents_goal_quad_ids: 可选的目标quad ID
         """
         if not PYGAME_AVAILABLE:
             raise ImportError("pygame and PyOpenGL are required for visualization")
         
-        self.sim = simulator
+        # 保存数据
+        self.agents_state = agents_state
+        self.agents_path_plans = agents_path_plans
         self.batch_idx = batch_idx
-        
-        # 获取数据
-        self.agents_state = simulator.agents_state
-        self.agents_path_plans = simulator.agents_path_plans
-        self.start_poly_tensor = simulator.agents_start_quad_ids
-        self.end_poly_tensor = simulator.agents_goal_quad_ids
-        self.invalid_marker_value = simulator.path_planner.INVALID_w_lane_id_MARKER
-        self.horizon = simulator.observation_generator.horizon
+        self.invalid_marker_value = invalid_marker_value
+        self.horizon = horizon
+        self.observation_callback = observation_callback
+        self.step_callback = step_callback
+        self.info_callback = info_callback
+        self.agents_start_quad_ids = agents_start_quad_ids
+        self.agents_goal_quad_ids = agents_goal_quad_ids
         
         # 准备地图数据
-        self.quads_vertices_np = simulator.road_network.quads_vertices.detach().cpu().numpy()
+        self.quads_vertices_np = quads_vertices.detach().cpu().numpy()
         
         # 获取active agents
         active_mask = self.agents_state[..., 6] > 0.5
@@ -71,7 +99,8 @@ class PathPlanningVisualizer:
         # 初始化Pygame和OpenGL
         pygame.init()
         self.screen = pygame.display.set_mode((1280, 960), DOUBLEBUF | OPENGL)
-        pygame.display.set_caption('Active Vehicles Path Plans (SPACE: next, ESC: quit)')
+        pygame.display.set_caption('Active Vehicles Path Plans (SPACE: next, W: step, ESC: quit)')
+        self.screen_width, self.screen_height = self.screen.get_size()
         
         glClearColor(1.0, 1.0, 1.0, 1.0)
         glEnable(GL_BLEND)
@@ -88,6 +117,16 @@ class PathPlanningVisualizer:
         self.zoom_min = 0.1
         self.zoom_max = 10.0
         self.clock = pygame.time.Clock()
+        
+        pygame.font.init()
+        try:
+            self.info_font = pygame.font.SysFont('simhei', 18)
+            self.info_title_font = pygame.font.SysFont('simhei', 20)
+        except Exception:
+            self.info_font = pygame.font.Font(None, 18)
+            self.info_title_font = pygame.font.Font(None, 20)
+        self.info_panel_width = 320
+        self.info_panel_margin = 10
     
     def draw_quads(self):
         """绘制所有 quads 作为背景"""
@@ -152,17 +191,7 @@ class PathPlanningVisualizer:
         radius = horizon_size
         num_segments = 64
         
-        # 绘制半透明填充圆
-        glColor4f(0.0, 0.8, 0.8, 0.08)
-        glBegin(GL_POLYGON)
-        for i in range(num_segments):
-            angle = 2.0 * math.pi * i / num_segments
-            x = ego_x + radius * math.cos(angle)
-            y = ego_y + radius * math.sin(angle)
-            glVertex2f(x, y)
-        glEnd()
-        
-        # 绘制边框圆线
+        # 仅绘制边框圆线（避免区域被不透明填充）
         glColor4f(0.0, 0.8, 0.8, 0.8)
         glLineWidth(2.5)
         glBegin(GL_LINE_LOOP)
@@ -196,7 +225,9 @@ class PathPlanningVisualizer:
         
         cos_yaw = math.cos(ego_heading)
         sin_yaw = math.sin(ego_heading)
-        rot = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+        rot = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])  # world -> ego
+        rot_T = rot.T  # ego -> world
+        v_ego_world = np.array([ego_speed * cos_yaw, ego_speed * sin_yaw])
         
         # 1. 绘制观测到的其他车辆（红色框）
         try:
@@ -213,19 +244,18 @@ class PathPlanningVisualizer:
                     continue
                 
                 # 局部坐标转世界坐标
-                dx_dy = np.array([dx, dy])
-                world_pos = dx_dy @ rot.T + np.array([ego_x, ego_y])
-                world_x, world_y = world_pos[0], world_pos[1]
+                local_pos = np.array([dx, dy])
+                world_pos = local_pos @ rot_T + np.array([ego_x, ego_y])
+                world_x, world_y = world_pos
                 
                 # 从相对速度恢复世界速度和朝向
                 dvx, dvy = neighbor[2], neighbor[3]
                 v_local = np.array([dvx, dvy])
-                v_ego_world = np.array([ego_speed * cos_yaw, ego_speed * sin_yaw])
-                v_neighbor_world = v_local @ rot.T + v_ego_world
+                v_neighbor_world = v_local @ rot_T + v_ego_world
                 
-                vx_k, vy_k = v_neighbor_world[0], v_neighbor_world[1]
+                vx_k, vy_k = v_neighbor_world
                 if (vx_k * vx_k + vy_k * vy_k) < 1e-6:
-                    world_heading = ego_heading
+                    world_heading = math.atan2(world_y - ego_y, world_x - ego_x)
                 else:
                     world_heading = math.atan2(vy_k, vx_k)
                 
@@ -336,21 +366,131 @@ class PathPlanningVisualizer:
         # 5. 绘制终点
         self.draw_point_xy(valid_path[-1, 0], valid_path[-1, 1], 0.9, 0.2, 0.2, size=12.0)
     
+    def _format_info_lines(self, info_obj: Optional[object]) -> Optional[list]:
+        if info_obj is None:
+            return None
+        lines = []
+        if isinstance(info_obj, dict):
+            for key, value in info_obj.items():
+                lines.append(f"{key}: {value}")
+        elif isinstance(info_obj, (list, tuple)):
+            for item in info_obj:
+                if isinstance(item, tuple) and len(item) == 2:
+                    lines.append(f"{item[0]}: {item[1]}")
+                else:
+                    lines.append(str(item))
+        else:
+            lines.append(str(info_obj))
+        return lines if lines else None
+
+    def draw_info_panel(self, lines: list):
+        if not lines:
+            return
+        line_height = self.info_font.get_linesize()
+        max_text_width = self.info_title_font.size("车辆状态")[0]
+        rendered_lines = []
+        for text in lines:
+            try:
+                surface = self.info_font.render(text, True, (220, 220, 220))
+            except Exception:
+                surface = self.info_font.render(text.encode('utf-8', 'ignore').decode('utf-8', 'ignore'), True, (220, 220, 220))
+            rendered_lines.append(surface)
+            max_text_width = max(max_text_width, surface.get_width())
+        panel_width = max(self.info_panel_width, max_text_width + 20)
+        panel_height = line_height * (len(rendered_lines) + 1) + 30
+        surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+        surface.fill((30, 30, 30, 220))
+        y = 10
+        try:
+            title_surface = self.info_title_font.render("车辆状态", True, (255, 255, 255))
+            surface.blit(title_surface, (10, y))
+            y += line_height + 4
+        except Exception:
+            pass
+        for text_surface in rendered_lines:
+            surface.blit(text_surface, (10, y))
+            y += line_height
+        texture_data = pygame.image.tostring(surface, "RGBA", True)
+        width, height = surface.get_size()
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, self.screen_width, self.screen_height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_TEXTURE_2D)
+        texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, texture)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, texture_data)
+        x = self.info_panel_margin
+        y = self.info_panel_margin
+        glColor4f(1.0, 1.0, 1.0, 1.0)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 1)
+        glVertex2f(x, y)
+        glTexCoord2f(1, 1)
+        glVertex2f(x + width, y)
+        glTexCoord2f(1, 0)
+        glVertex2f(x + width, y + height)
+        glTexCoord2f(0, 0)
+        glVertex2f(x, y + height)
+        glEnd()
+        glDeleteTextures([texture])
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_BLEND)
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+
     def run(self):
-        """运行可视化主循环"""
+        """运行可视化主循环
+        
+        Returns:
+            str: 退出原因，'quit' 表示退出可视化，'step' 表示请求外部执行一步仿真
+        """
         running = True
         b = self.batch_idx
+        exit_reason = 'quit'
         
         while running:
             # 处理事件
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                    exit_reason = 'quit'
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
+                        exit_reason = 'quit'
                     elif event.key == pygame.K_SPACE:
                         self.cur_idx = (self.cur_idx + 1) % len(self.active_agents_list)
+                    elif event.key == pygame.K_w:
+                        if self.step_callback is not None:
+                            try:
+                                step_result = self.step_callback()
+                                if step_result is not None:
+                                    new_agents_state, new_agents_path_plans = step_result
+                                    if new_agents_state is not None:
+                                        self.agents_state = new_agents_state
+                                    if new_agents_path_plans is not None:
+                                        self.agents_path_plans = new_agents_path_plans
+                                    active_mask = self.agents_state[..., 6] > 0.5
+                                    active_agents = torch.nonzero(active_mask[self.batch_idx], as_tuple=False).squeeze(-1)
+                                    if active_agents.numel() > 0:
+                                        self.active_agents_list = active_agents.tolist()
+                                        self.cur_idx %= len(self.active_agents_list)
+                                    else:
+                                        print("警告：Step 后没有 active 车辆。")
+                            except Exception as e:
+                                print(f"执行 step_callback 失败: {e}")
+                                import traceback
+                                traceback.print_exc()
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 4:  # 滚轮向上
                         self.zoom_level = min(self.zoom_level * 1.2, self.zoom_max)
@@ -372,30 +512,32 @@ class PathPlanningVisualizer:
             ego_x, ego_y, ego_heading = ego_state[0], ego_state[1], ego_state[2]
             ego_length, ego_width = ego_state[4], ego_state[5]
             
-            # 获取观测数据
-            try:
-                neighbor_states_world = self.sim.observation_generator._get_nearest_neighbors(self.agents_state)
-                w_lanes_world, w_boundaries_world = self.sim.observation_generator._get_precomputed_w_lanes(self.agents_state)
-                local_state_tmp, neighbors_local_tmp, w_lanes_local_tmp, w_boundaries_local_tmp = \
-                    self.sim.observation_generator._world_to_ego_centric(
-                        self.agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
+            # 获取观测数据（如果提供了回调函数）
+            has_observation = False
+            neighbors_local = None
+            w_lanes_local = None
+            w_boundaries_local = None
+            
+            if self.observation_callback is not None:
+                try:
+                    neighbors_local, w_lanes_local, w_boundaries_local = \
+                        self.observation_callback(self.agents_state, b, m)
+                    has_observation = True
+                except Exception as e:
+                    print(f"获取 observation 失败: {e}")
+            info_lines = None
+            if self.info_callback is not None:
+                try:
+                    info_lines = self._format_info_lines(
+                        self.info_callback(self.agents_state, b, m)
                     )
-                
-                neighbors_local = neighbors_local_tmp[b, m]
-                w_lanes_local = w_lanes_local_tmp[b, m]
-                w_boundaries_local = w_boundaries_local_tmp[b, m]
-                has_observation = True
-            except Exception as e:
-                print(f"获取 observation 失败: {e}")
-                has_observation = False
-                neighbors_local = None
-                w_lanes_local = None
-                w_boundaries_local = None
+                except Exception as e:
+                    print(f"获取 info 失败: {e}")
             
             # 更新窗口标题
             pygame.display.set_caption(
                 f'Active Vehicles Path Plans - B={b}, M={m} ({self.cur_idx+1}/{len(self.active_agents_list)}) '
-                f'(SPACE: next, ESC: quit, Scroll: zoom) - Path: {len(valid_path)} pts, Zoom: {self.zoom_level:.2f}x'
+                 f'(SPACE: next, W: step, ESC: quit, Scroll: zoom) - Path: {len(valid_path)} pts, Zoom: {self.zoom_level:.2f}x'
             )
             
             # 更新投影矩阵（缩放）
@@ -439,25 +581,59 @@ class PathPlanningVisualizer:
             if len(valid_path) > 0:
                 self.draw_path_with_arrows(valid_path)
             
+            if info_lines:
+                self.draw_info_panel(info_lines)
+            
             pygame.display.flip()
             self.clock.tick(60)
         
         pygame.quit()
         print(f"可视化结束，共查看了 {len(self.active_agents_list)} 个active车辆")
+        return exit_reason
 
 
-def visualize_path_planning(simulator, batch_idx=0):
+def visualize_path_planning(
+    agents_state: torch.Tensor,
+    agents_path_plans: torch.Tensor,
+    quads_vertices: torch.Tensor,
+    batch_idx: int = 0,
+    invalid_marker_value: float = -999999.0,
+    horizon: float = 80.0,
+    observation_callback: Optional[Callable] = None,
+    step_callback: Optional[Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+    info_callback: Optional[Callable[[torch.Tensor, int, int], Optional[object]]] = None,
+    agents_start_quad_ids: Optional[torch.Tensor] = None,
+    agents_goal_quad_ids: Optional[torch.Tensor] = None):
     """
-    便捷函数：可视化路径规划
+    便捷函数：可视化路径规划（通用版本）
     
     Args:
-        simulator: TeraflowSimulator实例
+        agents_state: 车辆状态张量 [B, M, 7] - (x, y, heading, speed, length, width, active)
+        agents_path_plans: 路径规划张量 [B, M, N, 3] - (x, y, angle)
+        quads_vertices: 道路网格顶点 [num_quads, 4, 2] - 每个quad的4个顶点坐标
         batch_idx: 要可视化的批次索引（默认0）
+        invalid_marker_value: 无效路径点的标记值（默认-999999.0）
+        horizon: 观测范围半径（默认80.0）
+        observation_callback: 可选的观测数据获取回调函数
+        info_callback: 可选的信息展示回调函数
+        agents_start_quad_ids: 可选的起始quad ID
+        agents_goal_quad_ids: 可选的目标quad ID
     """
     if not PYGAME_AVAILABLE:
         print("错误：请安装 pygame 和 PyOpenGL: pip install pygame PyOpenGL")
-        return
+        return 'quit'
     
-    visualizer = PathPlanningVisualizer(simulator, batch_idx)
-    visualizer.run()
-
+    visualizer = PathPlanningVisualizer(
+        agents_state=agents_state,
+        agents_path_plans=agents_path_plans,
+        quads_vertices=quads_vertices,
+        batch_idx=batch_idx,
+        invalid_marker_value=invalid_marker_value,
+        horizon=horizon,
+        observation_callback=observation_callback,
+        step_callback=step_callback,
+        info_callback=info_callback,
+        agents_start_quad_ids=agents_start_quad_ids,
+        agents_goal_quad_ids=agents_goal_quad_ids
+    )
+    return visualizer.run()

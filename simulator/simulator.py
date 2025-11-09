@@ -2,6 +2,7 @@ import torch
 import os
 import sys
 import time
+import math
 from typing import Dict, Tuple, Optional
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -33,6 +34,7 @@ class TeraflowSimulator:
         self.num_envs = simulator_config.get('B')
         self.max_agents = simulator_config.get('M')
         self.dt = simulator_config['sim_dt']
+
         # 组合根配置中的地图目录与默认地图名
         maps_dir = config.get('map_path', './maps')
         default_map = config.get('default_map', 'town2.json')
@@ -97,19 +99,25 @@ class TeraflowSimulator:
         self.reward_calculator.reset_episode()
         # 将状态数据移动到正确的设备
         self.agents_state = self.agents_state.to(self.device)
-        # 重置done状态
-        self.last_done = None
+        # 重置累积done状态
+        self.cumulative_done_mask = None
+        
         # 生成初始观测
         print("Generating initial observation...") 
         initial_observation,d,theta_f = self.observation_generator.generate(self.agents_state)
-        print(initial_observation.shape)
         print("Initial observation generated")
 
         # 初始化路径规划器 - 为所有智能体分配目标和生成路径规划
         paths = self.path_planner.path_plan(self.agents_start_quad_ids, self.agents_goal_quad_ids)
         self.agents_path_plans = self.path_planner.collect_path_w_lane_ids(paths, self.agents_start_quad_ids, self.agents_goal_quad_ids)
-
         print(f"Reset complete. World state shape: {self.agents_state.shape}")
+
+        # 使用 preprocessor 预计算好的 quad centers（准确值）
+        # agents_goal_quad_ids 存储的是 poly_id，需要转换为数组索引
+        goal_center_indices = self.road_network.poly_id_to_center_idx[self.agents_goal_quad_ids]
+        self.goal_positions = self.road_network.quad_centers[goal_center_indices]  # (B, M, 2)
+        self.frenet_d = d
+        self.frenet_theta_f = theta_f
 
         # 仍然没有traffic内容
         self.stop_lines = torch.zeros((self.num_envs, self.max_agents,20), dtype=torch.int32, device=self.device)
@@ -120,7 +128,7 @@ class TeraflowSimulator:
         """
         让所有环境向前步进一个时间步。所有智能体都根据actions更新。
         Args:
-            actions (torch.Tensor): 形状为 (B, M, action) 的动作张量。
+            actions (torch.Tensor): 形状为 (B, M, 1) 的动作索引张量。
             debug_collision (bool): 是否为碰撞检测器开启调试模式。
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
@@ -133,31 +141,28 @@ class TeraflowSimulator:
         actions = actions.to(self.device)     #action挪到当前显卡上
 
         states_t0 = self.agents_state.clone() #这一时刻的状态
+
         # 1. 基于收到的所有动作，更新：采用全批次恒定大小（B*M），并用mask混合回写
         active_mask = self.agents_state[..., 6] > 0.5
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            not_done_mask = ~self.last_done
+        if hasattr(self, 'cumulative_done_mask') and self.cumulative_done_mask is not None:
+            alive_mask = ~self.cumulative_done_mask
         else:
-            not_done_mask = torch.ones_like(active_mask, dtype=torch.bool)
-        effective_mask = active_mask & not_done_mask  # 仅这些需要物理更新
+            alive_mask = torch.ones_like(active_mask, dtype=torch.bool)
+        effective_mask = active_mask & alive_mask  # 仅这些需要物理更新，出生了且没有死
         
         # 构造全批次输入 (B*M, 4) 和 (B*M,) 的动作索引
         Bsz, Msz, _S = self.agents_state.shape
         states_flat = self.agents_state[..., :4].contiguous().view(Bsz * Msz, 4)
-        # 规整actions为 (B, M)
-        if actions.ndim == 3 and actions.shape[-1] == 1:
-            actions_idx = actions.squeeze(-1).long()
-        elif actions.ndim == 2:
-            actions_idx = actions.long()
-        else:
-            actions_idx = actions.view(Bsz, Msz).long()
-
+        
+        # 规整actions为 (B, M)，输入格式固定为 (B, M, 1)
+        actions_idx = actions.squeeze(-1).long()  # (B, M)
         actions_flat = actions_idx.contiguous().view(Bsz * Msz)
         # 调用动力学（全批次大小恒定），再把无效位置用旧状态覆盖
         new_states_flat = self.dynamics_model.step(states_flat, actions_flat, self.dt)  # (B*M, 4)
         new_states = new_states_flat.view(Bsz, Msz, 4)
-        keep_old = ~effective_mask
-        self.agents_state[..., :4] = torch.where(keep_old.unsqueeze(-1), self.agents_state[..., :4], new_states)
+
+        # 只更新有效车辆的状态，无效车辆（未激活或已done）保持旧状态
+        self.agents_state[..., :4] = torch.where(effective_mask.unsqueeze(-1), new_states, self.agents_state[..., :4])
 
         # 2. 离路检测
         is_on_road = torch.ones_like(active_mask) # 默认在路上
@@ -170,40 +175,41 @@ class TeraflowSimulator:
         offroad_mask = ~is_on_road # (B, M)
 
         # 3. 动态碰撞检测（排除done的车辆）
-        # 临时将done车辆的状态设置为无效，避免它们参与碰撞检测
-        original_states_t0 = states_t0.clone()
-        original_states_t1 = self.agents_state.clone()
-        
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            # 将done车辆的状态设置为无效（active=0）
-            states_t0_for_collision = states_t0.clone()
-            states_t1_for_collision = self.agents_state.clone()
-            states_t0_for_collision[..., 6] = torch.where(self.last_done, 0.0, states_t0_for_collision[..., 6])
-            states_t1_for_collision[..., 6] = torch.where(self.last_done, 0.0, states_t1_for_collision[..., 6])
+        # 原地修改active标志，避免clone整个状态张量，减少内存开销
+        if hasattr(self, 'cumulative_done_mask') and self.cumulative_done_mask is not None:
+            # 暂存原始active标志（只clone第6列，内存占用减少7倍）
+            original_active_t0 = states_t0[..., 6].clone()
+            original_active_t1 = self.agents_state[..., 6].clone()
+            
+            # 原地修改active标志，将done车辆设为无效
+            states_t0[..., 6] = torch.where(self.cumulative_done_mask, 0.0, states_t0[..., 6])
+            self.agents_state[..., 6] = torch.where(self.cumulative_done_mask, 0.0, self.agents_state[..., 6])
+            
+            collision_check_result = self.collision_checker.check(
+                states_t0, self.agents_state, debug=debug_collision, debug_env_idx=0
+            )
+            
+            # 恢复原始active标志
+            states_t0[..., 6] = original_active_t0
+            self.agents_state[..., 6] = original_active_t1
         else:
-            states_t0_for_collision = states_t0
-            states_t1_for_collision = self.agents_state
-        
-        collision_check_result = self.collision_checker.check(
-            states_t0_for_collision, states_t1_for_collision, debug=debug_collision, debug_env_idx=0
-        )
+            collision_check_result = self.collision_checker.check(
+                states_t0, self.agents_state, debug=debug_collision, debug_env_idx=0
+            )
         all_collisions = collision_check_result
 
-        # 4. 计算Frenet坐标信息
-        vehicle_positions = self.agents_state[..., :2]  # (B, M, 2) - x, y
-        vehicle_headings = self.agents_state[..., 2]    # (B, M) - heading
-        d, theta_f = self.road_network.calculate_frenet_coordinates(vehicle_positions, vehicle_headings, self.spatial_hash)
-
-        # 6. 生成新的观测（排除done的车辆）
-        # 临时将done车辆的状态设置为无效，避免它们参与观测生成
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            # 将done车辆的状态设置为无效（active=0）
-            agents_state_for_obs = self.agents_state.clone()
-            agents_state_for_obs[..., 6] = torch.where(self.last_done, 0.0, agents_state_for_obs[..., 6])
+        # 4. 生成新的观测（排除done的车辆），同时获取Frenet坐标信息
+        # 原地修改active标志，避免clone整个状态张量
+        if hasattr(self, 'cumulative_done_mask') and self.cumulative_done_mask is not None:
+            # 暂存原始active标志
+            original_active = self.agents_state[..., 6].clone()
+            # 原地修改active标志，将done车辆设为无效
+            self.agents_state[..., 6] = torch.where(self.cumulative_done_mask, 0.0, self.agents_state[..., 6])
+            observation, d, theta_f = self.observation_generator.generate(self.agents_state)
+            # 恢复原始active标志
+            self.agents_state[..., 6] = original_active
         else:
-            agents_state_for_obs = self.agents_state
-        
-        observation = self.observation_generator.generate(agents_state_for_obs)
+            observation, d, theta_f = self.observation_generator.generate(self.agents_state)
 
         # 7. 计算奖励（传入Frenet坐标和动作）
         reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
@@ -212,11 +218,10 @@ class TeraflowSimulator:
         done = all_collisions|offroad_mask|goal_reached
         
         # 保存done状态供下次step使用（累积done状态，一旦done就保持done）
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            self.last_done = self.last_done | done
+        if hasattr(self, 'cumulative_done_mask') and self.cumulative_done_mask is not None:
+            self.cumulative_done_mask = self.cumulative_done_mask | done
         else:
-            self.last_done = done.clone()
-
+            self.cumulative_done_mask = done.clone()
         return observation, reward, done
     
     def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -227,7 +232,7 @@ class TeraflowSimulator:
             offroad_mask (torch.Tensor): 离路状态 (B, M)
             d (torch.Tensor): Frenet横向距离 (B, M)
             theta_f (torch.Tensor): Frenet角度误差 (B, M)
-            actions (torch.Tensor): 动作索引 (B, M)，用于直接获取jerk值
+            actions (torch.Tensor): 动作索引 (B, M, 1)，用于直接获取jerk值
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (奖励值 (B, M), 目标到达标志 (B, M))
         """
@@ -245,11 +250,11 @@ class TeraflowSimulator:
         if hasattr(self.dynamics_model, 'current_along') and hasattr(self.dynamics_model, 'current_alat'):
             # 激活掩码（与step阶段保持一致：仅激活且未done的为有效位置）
             active_mask = self.agents_state[..., 6] > 0.5  # (B, M)
-            if hasattr(self, 'last_done') and self.last_done is not None:
-                not_done_mask = ~self.last_done
+            if hasattr(self, 'cumulative_done_mask') and self.cumulative_done_mask is not None:
+                alive_mask = ~self.cumulative_done_mask
             else:
-                not_done_mask = torch.ones_like(active_mask, dtype=torch.bool)
-            effective_mask = active_mask & not_done_mask
+                alive_mask = torch.ones_like(active_mask, dtype=torch.bool)
+            effective_mask = active_mask & alive_mask
             
             # 1) 构造全局 along/alat 加速度 (B,M)，仅有效位置为有效值
             #    将连续的有效向量按掩码散射回批量形状
@@ -268,14 +273,8 @@ class TeraflowSimulator:
 
             # 2) 从动作空间一次性映射出所有智能体的 jerk (B,M,2)，未激活位置后续用掩码置零
             if actions is not None:
-                # 规整为 (B, M) 的索引
-                if actions.ndim == 3 and actions.shape[-1] == 1:
-                    actions_idx = actions.squeeze(-1).long()
-                elif actions.ndim == 2:
-                    actions_idx = actions.long()
-                else:
-                    # 兜底：兼容 (N,1) after masking 的情况
-                    actions_idx = actions.view(B, M).long()
+                # 规整为 (B, M) 的索引，输入格式固定为 (B, M, 1)
+                actions_idx = actions.squeeze(-1).long()  # (B, M)
                 jerk_all = self.dynamics_model.discrete_action_space.get_action(actions_idx.view(-1))  # (B*M,2)
                 jerk_all = jerk_all.view(B, M, 2)
                 full_along_jerk = jerk_all[..., 0]  # (B, M)
@@ -299,9 +298,6 @@ class TeraflowSimulator:
         extended_state[..., 9] = d        # d - Frenet横向距离
         # 准备目标奖励计算的参数
 
-        # 计算目标和初始化goal_reached，速度很快
-        # print(self.agents_goal_quad_ids)
-
         # goal_positions = self.path_planner.get_quad_centers(self.agents_goal_quad_ids)
         goal_positions = self.goal_positions
 
@@ -319,16 +315,17 @@ class TeraflowSimulator:
         
         # 过滤掉非active或已done车辆的奖励（与动力学一致的有效掩码）
         active_mask = self.agents_state[..., 6] > 0.5  # (B, M)
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            not_done_mask = ~self.last_done
+        if hasattr(self, 'cumulative_done_mask') and self.cumulative_done_mask is not None:
+            alive_mask = ~self.cumulative_done_mask
         else:
-            not_done_mask = torch.ones_like(active_mask, dtype=torch.bool)
-        effective_mask = active_mask & not_done_mask
+            alive_mask = torch.ones_like(active_mask, dtype=torch.bool)
+        effective_mask = active_mask & alive_mask
         reward = reward * effective_mask.float()  # 非有效车辆的奖励设为0，等价于"done后奖励不再更新"
 
         self.extend_state = extended_state # 用于传入网络
         return reward, goal_reached
     
+
 if __name__ == "__main__":
     # ==================== 1. 初始化 TeraflowSimulator ====================
     import json
@@ -339,6 +336,115 @@ if __name__ == "__main__":
         cfg = json.load(f)
     sim = TeraflowSimulator(config=cfg, device=torch.device(device))
     initial_observation, d, theta_f = sim.reset()
+    sim._last_action = torch.zeros((sim.num_envs, sim.max_agents), dtype=torch.long, device=sim.device)
+    
     # ==================== 2. 使用 Pygame/OpenGL 可视化 active 车辆的路径规划 ====================
     from utils.pygame_utils import visualize_path_planning
-    visualize_path_planning(sim, batch_idx=0)
+    # 定义observation回调函数来获取观测数据
+    def observation_callback(agents_state, b, m):
+        neighbor_states_world = sim.observation_generator._get_nearest_neighbors(agents_state)
+        w_lanes_world, w_boundaries_world = sim.observation_generator._get_precomputed_w_lanes(agents_state)
+        local_state_tmp, neighbors_local_tmp, w_lanes_local_tmp, w_boundaries_local_tmp = \
+            sim.observation_generator._world_to_ego_centric(
+                agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
+            )
+        return neighbors_local_tmp[b, m], w_lanes_local_tmp[b, m], w_boundaries_local_tmp[b, m]
+        
+    # 定义step回调：按 W 键时执行一步仿真并返回最新状态
+    def step_callback():
+        with torch.no_grad():
+            B, M = sim.agents_state.shape[:2]
+            actions = torch.full((B, M, 1), 7, dtype=torch.long, device=sim.device)
+            observation, reward, done = sim.step(actions)
+            sim._last_action = actions.squeeze(-1).clone()
+        sim.frenet_d = d
+        sim.frenet_theta_f = theta_f
+        print("已执行一步仿真。")
+        return sim.agents_state, sim.agents_path_plans
+
+    def info_callback(agents_state, b, m):
+        state = agents_state[b, m].detach().cpu().numpy()
+        x, y, yaw, speed, length, width, active = state
+        lines = [
+            ("Agent", f"B={b}, M={m}"),
+            ("Active", "Yes" if active > 0.5 else "No"),
+            ("Position", f"{x:.2f}, {y:.2f}"),
+            ("Yaw", f"{math.degrees(yaw):.2f}°"),
+            ("Speed", f"{speed:.2f} m/s"),
+            ("Size", f"L={length:.2f}, W={width:.2f}")
+        ]
+        if hasattr(sim, "goal_positions") and sim.goal_positions is not None:
+            try:
+                goal = sim.goal_positions[b, m].detach().cpu().numpy()
+                lines.append(("Goal", f"{goal[0]:.2f}, {goal[1]:.2f}"))
+            except Exception:
+                pass
+        if hasattr(sim, "frenet_d") and sim.frenet_d is not None:
+            try:
+                d_val = sim.frenet_d[b, m].detach().cpu().item()
+                lines.append(("d", f"{d_val:.2f} m"))
+            except Exception:
+                pass
+        if hasattr(sim, "frenet_theta_f") and sim.frenet_theta_f is not None:
+            try:
+                theta_val = sim.frenet_theta_f[b, m].detach().cpu().item()
+                lines.append(("theta_f", f"{math.degrees(theta_val):.2f}°"))
+            except Exception:
+                pass
+        dyn = getattr(sim, "dynamics_model", None)
+        if dyn is not None:
+            def pick_value(tensor):
+                if tensor is None:
+                    return None
+                try:
+                    value = tensor.view(sim.num_envs, sim.max_agents)[b, m]
+                except Exception:
+                    idx = b * sim.max_agents + m
+                    if idx < tensor.numel():
+                        value = tensor[idx]
+                    else:
+                        return None
+                return value.detach().cpu().item()
+            long_acc = pick_value(getattr(dyn, "current_along", None))
+            if long_acc is not None:
+                lines.append(("Long Acc", f"{long_acc:.2f} m/s^2"))
+            lat_acc = pick_value(getattr(dyn, "current_alat", None))
+            if lat_acc is not None:
+                lines.append(("Lat Acc", f"{lat_acc:.2f} m/s^2"))
+            steering = pick_value(getattr(dyn, "current_steering_angle", None))
+            if steering is not None:
+                lines.append(("Steering", f"{math.degrees(steering):.2f}°"))
+        last_action = getattr(sim, "_last_action", None)
+        if last_action is not None and b < last_action.shape[0] and m < last_action.shape[1]:
+            action_idx = int(last_action[b, m].detach().cpu().item())
+            lines.append(("Action Index", action_idx))
+            try:
+                jerk = sim.dynamics_model.discrete_action_space.get_action(
+                    torch.tensor([action_idx], device=sim.device)
+                )[0].detach().cpu().numpy()
+                lines.append(("Jerk (long, lat)", f"{jerk[0]:.2f}, {jerk[1]:.2f}"))
+            except Exception:
+                pass
+        if hasattr(sim, "cumulative_done_mask") and sim.cumulative_done_mask is not None:
+            try:
+                done_val = bool(sim.cumulative_done_mask[b, m].item())
+                lines.append(("Done", "Yes" if done_val else "No"))
+            except Exception:
+                pass
+        return lines
+
+    print("按 SPACE 切换车辆，按 W 运行一步仿真，按 ESC 退出。")
+    visualize_path_planning(
+        agents_state=sim.agents_state,
+        agents_path_plans=sim.agents_path_plans,
+        quads_vertices=sim.road_network.quads_vertices,
+        batch_idx=0,
+        invalid_marker_value=sim.path_planner.INVALID_w_lane_id_MARKER,
+        horizon=sim.observation_generator.horizon,
+        observation_callback=observation_callback,
+        step_callback=step_callback,
+        info_callback=info_callback,
+        agents_start_quad_ids=sim.agents_start_quad_ids,
+        agents_goal_quad_ids=sim.agents_goal_quad_ids
+    )
+    print("退出可视化。")

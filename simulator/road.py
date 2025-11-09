@@ -24,6 +24,7 @@ class RoadNetwork:
         # 预初始化在后续流程中会被写入/依赖的成员，便于理解可用数据结构
         # 基本拓扑/几何（放在指定device上）
         self.quads_vertices: torch.Tensor = torch.empty((0, 4, 2), dtype=torch.float32, device=self.device)
+        self.quad_centers: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
         self.quad_centerlines: torch.Tensor = torch.empty((0, 2, 2), dtype=torch.float32, device=self.device)
         self.left_boundaries: torch.Tensor = torch.empty((0, 2, 2), dtype=torch.float32, device=self.device)
         self.right_boundaries: torch.Tensor = torch.empty((0, 2, 2), dtype=torch.float32, device=self.device)
@@ -32,6 +33,7 @@ class RoadNetwork:
         self.quad_ids: torch.Tensor = torch.empty((0,), dtype=torch.int64, device=self.device)
         self.lane_ids: torch.Tensor = torch.empty((0,), dtype=torch.int32, device=self.device)
         self.road_ids: torch.Tensor = torch.empty((0,), dtype=torch.int32, device=self.device)
+        self.poly_id_to_center_idx: torch.Tensor = torch.empty((0,), dtype=torch.long, device=self.device)
         self.w_lane_ids: List[List[int]] = []
         self.w_boundary_ids: List[List[int]] = []
         # 全局航点（w_lane与OOB）
@@ -87,6 +89,13 @@ class RoadNetwork:
         # 保留原始数据以便上层复用
         self.quads_raw = quads_data
         self.w_lanes_raw = map_data.get('w_lanes', [])
+        
+        # 直接从 JSON 加载 quad centers（preprocessor 已经计算好的准确值）
+        self.quad_centers = torch.tensor(
+            [[q['center'][0], q['center'][1]] for q in quads_data], 
+            dtype=torch.float32, device=self.device
+        )
+        
         # 顶点与中心线
         TL = torch.tensor([[q['vertices'][0][0], q['vertices'][0][1]] for q in quads_data], dtype=torch.float32, device=self.device)
         TR = torch.tensor([[q['vertices'][1][0], q['vertices'][1][1]] for q in quads_data], dtype=torch.float32, device=self.device)
@@ -102,6 +111,12 @@ class RoadNetwork:
         self.quad_ids = torch.tensor([q['poly_id'] for q in quads_data], dtype=torch.int64, device=self.device)
         self.lane_ids = torch.tensor([q['lane_id'] for q in quads_data], dtype=torch.int32, device=self.device)
         self.road_ids = torch.tensor([q['road_id'] for q in quads_data], dtype=torch.int32, device=self.device)
+        
+        # 创建 poly_id 到数组索引的查找表（用于快速索引 quad_centers）
+        max_poly_id = int(self.quad_ids.max().item()) if self.quad_ids.numel() > 0 else 0
+        self.poly_id_to_center_idx = torch.full((max_poly_id + 1,), -1, dtype=torch.long, device=self.device)
+        for idx, poly_id in enumerate(self.quad_ids.tolist()):
+            self.poly_id_to_center_idx[poly_id] = idx
         self.w_lane_ids = [q.get('w_lane_ids', []) for q in quads_data]
         self.w_boundary_ids = [q.get('w_boundary_ids', []) for q in quads_data]
         # 方向

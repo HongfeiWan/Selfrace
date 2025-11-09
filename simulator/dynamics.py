@@ -52,7 +52,7 @@ class KinematicBicycleModel:
     特别是在转弯场景中。所有操作都已完全向量化，以实现最高性能。
     支持离散动作空间。
     """
-    def __init__(self, config: Dict, device: torch.device, vehicle_params: Dict[str, torch.Tensor] = None):
+    def __init__(self, config: Dict, device: torch.device):
         """
         初始化动力学模型。
         Args:
@@ -408,7 +408,8 @@ if __name__ == '__main__':
     
     # 初始化动力学模型
     print("初始化动力学模型...")
-    dynamics_model = KinematicBicycleModel(config, device, vehicle_params)
+    dynamics_model = KinematicBicycleModel(config, device)
+    dynamics_model.reset(vehicle_params)
     
     # 初始化车辆状态：在第一个道路段的中心线上
     initial_state = torch.zeros(1, 4, device=device)
