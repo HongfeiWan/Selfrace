@@ -95,56 +95,23 @@ class RewardCalculator:
         self.sampled_params = self.parameter_sampler.sample_all_parameters(self.B, self.M)
     
     def calculate_goal_reward(self, 
-                             agent_positions: torch.Tensor,
-                             goal_positions: torch.Tensor,
+                             goal_reached: torch.Tensor,
                              speeds: torch.Tensor,
                              waypoint_reached: torch.Tensor) -> torch.Tensor:
         """
         计算目标奖励 Rgoal。
-        Rgoal = 1 if (||x-g|| < δgoal ∧ (waypoint_reached ∨ |v| < vgoal)) else 0
+        Rgoal = 1 if (goal_reached ∧ (|v| < vgoal)) 或 waypoint_reached
         Args:
-            agent_positions (torch.Tensor): 智能体位置 (B, M, 2) - (x, y)
-            goal_positions (torch.Tensor): 目标位置 (B, M, 2) - (x, y)
+            goal_reached (torch.Tensor): 目标达成掩码 (B, M) - 布尔值
             speeds (torch.Tensor): 智能体速度 (B, M)
             waypoint_reached (torch.Tensor): 是否到达路点 (B, M) - 布尔值
         Returns:
             torch.Tensor: 目标奖励 (B, M)
         """
-        B, M, _ = agent_positions.shape
-        
-        # 检查并修复goal_positions的形状
-        
-        if goal_positions.dim() == 2 and goal_positions.shape[1] == 2:
-            # 如果goal_positions是 (B*M, 2)，恢复为 (B, M, 2)
-            goal_positions = goal_positions.view(B, M, 2)
-
-
-        # 计算距离 ||x-g||
-        distances = torch.norm(agent_positions - goal_positions, dim=-1)  # (B, M)
-        # 逐元素 δgoal 阈值 (B, M)
-        delta_goal_tensor = self.sampled_params[..., self._param_name_to_idx['delta_goal']]
-        try:
-            delta_goal_tensor = delta_goal_tensor.expand_as(distances)
-        except Exception:
-            pass
-
-        # 距离条件: ||x-g|| < δgoal(B,M)
-
-        distance_condition = distances < delta_goal_tensor
-        # 速度条件: |v| < vgoal
         speed_condition = torch.abs(speeds) < self.v_goal
-        
-        # 路点条件: waypoint_reached
-        waypoint_condition = waypoint_reached
-        
-        # 综合条件: (||x-g|| < δgoal) ∧ (waypoint_reached ∨ |v| < vgoal)
-        goal_condition = distance_condition & (waypoint_condition | speed_condition)
-        
-        # 计算奖励
-        goal_rewards = torch.where(goal_condition, 
-                                  torch.full_like(goal_condition, self.goal_reward, dtype=torch.float32),
-                                  torch.zeros_like(goal_condition, dtype=torch.float32))
-
+        goal_reward_mask = goal_reached & speed_condition
+        reward_mask = goal_reward_mask | waypoint_reached
+        goal_rewards = reward_mask.float() * self.goal_reward
         return goal_rewards
 
     def calculate_collision_penalty(self, 
@@ -413,7 +380,7 @@ class RewardCalculator:
                   all_collisions: torch.Tensor, 
                   offroad_mask: torch.Tensor,
                   dt: float = 0.3,
-                  goal_positions: torch.Tensor = None,
+                  goal_reached: torch.Tensor = None,
                   waypoint_reached: torch.Tensor = None,
                   stop_line_violation: torch.Tensor = None) -> torch.Tensor:
         """
@@ -437,16 +404,15 @@ class RewardCalculator:
                 - [9]: d - Frenet 横向距离
             all_collisions (torch.Tensor): 碰撞掩码 (B, M)，布尔值张量
             offroad_mask (torch.Tensor): 离路掩码 (B, M)，布尔值张量
-            goal_positions (torch.Tensor): 目标位置 (B, M, 2)
+            goal_reached (torch.Tensor): 目标到达掩码 (B, M) - 布尔值张量
             waypoint_reached (torch.Tensor): 路点到达掩码 (B, M)，布尔值张量
             stop_line_violation (torch.Tensor): 停止线违规掩码 (B, M)，布尔值张量
             
-        Returns:s
+        Returns:
             torch.Tensor: 每个智能体的总奖励 (B, M)
         """
 
         # 提取信息
-        agent_positions = agents_state[..., :2]  # 提取位置信息 (x, y)
         speeds = agents_state[..., 3]  # 速度
         along = agents_state[..., 4]  # 纵向加速度
         alat = agents_state[..., 5]   # 横向加速度
@@ -456,54 +422,63 @@ class RewardCalculator:
         d = agents_state[..., 9]  # Frenet坐标系中的横向距离
 
         B, M, _ = agents_state.shape
+
+        zero_template = torch.zeros((B, M), device=self.device)
+
         # 归零奖励
-        reward = torch.zeros((B, M), device=self.device)
+        reward = zero_template.clone()
 
-        # 计算目标奖励
-        goal_reached = torch.zeros((B, M), dtype=torch.bool, device=self.device)
-        goal_rewards = self.calculate_goal_reward(agent_positions, goal_positions, speeds, waypoint_reached)
-        reward += goal_rewards
-        # 判断是否到达目标：如果获得了目标奖励，说明到达了目标
-        goal_reached = (goal_rewards > 0)
-
+        # 计算目标奖励（使用外部传入的目标到达掩码）
+        waypoint_mask = waypoint_reached
+        if goal_reached is not None:
+            self.last_goal_reward = self.calculate_goal_reward(goal_reached, speeds, waypoint_mask)
+        else:
+            self.last_goal_reward = zero_template.clone()
+        reward += self.last_goal_reward
 
         # 计算碰撞惩罚
-        collision_penalty = self.calculate_collision_penalty(agents_state, all_collisions)
-        reward += collision_penalty
+        self.last_collision_penalty = self.calculate_collision_penalty(agents_state, all_collisions)
+        reward += self.last_collision_penalty
 
         # 计算离路惩罚
-        offroad_penalty = self.calculate_offroad_penalty(offroad_mask)
-        reward += offroad_penalty
+        self.last_offroad_penalty = self.calculate_offroad_penalty(offroad_mask)
+        reward += self.last_offroad_penalty
         
         # 计算舒适度惩罚 (如果提供了加速度和加加速度信息)
-        comfort_penalty = self.calculate_comfort_penalty(along, alat, along_jerk, alat_jerk)
-        reward += comfort_penalty
+        self.last_comfort_penalty = self.calculate_comfort_penalty(along, alat, along_jerk, alat_jerk)
+        reward += self.last_comfort_penalty
         
         # 计算车道对齐奖励 (如果提供了车道角度信息)
-        lane_alignment_reward = self.calculate_lane_alignment_reward(theta_f, speeds, dt)
-        reward += lane_alignment_reward
+        self.last_lane_alignment_reward = self.calculate_lane_alignment_reward(theta_f, speeds, dt)
+        reward += self.last_lane_alignment_reward
         
         # 计算车道中心对齐奖励 (如果提供了横向位置信息)
-        lane_center_reward = self.calculate_lane_center_reward(theta_f, d, dt)
-        reward += lane_center_reward
+        self.last_lane_center_reward = self.calculate_lane_center_reward(theta_f, d, dt)
+        reward += self.last_lane_center_reward
         
         # 计算新的速度奖励 (如果提供了车道角度信息)
-        new_velocity_reward = self.calculate_velocity_reward(theta_f, speeds, dt)
-        reward += new_velocity_reward
+        self.last_velocity_reward = self.calculate_velocity_reward(theta_f, speeds, dt)
+        reward += self.last_velocity_reward
         
         # 计算倒车惩罚
-        reverse_penalty = self.calculate_reverse_penalty(speeds, dt)
-        reward += reverse_penalty
+        self.last_reverse_penalty = self.calculate_reverse_penalty(speeds, dt)
+        reward += self.last_reverse_penalty
         
         # 计算停止线违规惩罚 (如果提供了停止线违规信息)
         stop_line_penalty = self.calculate_stop_line_penalty(stop_line_violation)
-        reward += stop_line_penalty
+        if torch.is_tensor(stop_line_penalty):
+            if stop_line_penalty.dim() == 0:
+                stop_line_penalty = zero_template.clone()
+        else:
+            stop_line_penalty = zero_template.clone()
+        self.last_stop_line_penalty = stop_line_penalty
+        reward += self.last_stop_line_penalty
         
         # 计算时间步惩罚 (如果提供了加速度信息)
-        timestep_penalty = self.calculate_timestep_penalty(speeds, along, alat, dt)
-        reward += timestep_penalty
+        self.last_timestep_penalty = self.calculate_timestep_penalty(speeds, along, alat, dt)
+        reward += self.last_timestep_penalty
         
-        return reward, goal_reached 
+        return reward
 
 if __name__ == "__main__":
     def test_goal_reward():

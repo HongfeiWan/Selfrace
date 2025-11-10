@@ -15,6 +15,7 @@ from reward import RewardCalculator
 from world_init import WorldInitializer
 from observation import ObservationGenerator
 from dynamics import KinematicBicycleModel
+from utils.geometry_utils import find_nearest_lanes
 
 # 在 __init__ 方法中:
 class TeraflowSimulator:
@@ -34,6 +35,7 @@ class TeraflowSimulator:
         self.num_envs = simulator_config.get('B')
         self.max_agents = simulator_config.get('M')
         self.dt = simulator_config['sim_dt']
+        self.path_length = 10 #这个用于控制初始可以看到的路径长度，可以后续随着avg_reward增加而增加
 
         # 组合根配置中的地图目录与默认地图名
         maps_dir = config.get('map_path', './maps')
@@ -86,6 +88,8 @@ class TeraflowSimulator:
         self.agents_goal_quad_ids: Optional[torch.Tensor] = None  # 存储所有智能体的目标quad_id
         self.agents_path_plans: Optional[torch.Tensor] = None     # 存储所有智能体的路径规划（世界坐标）
         self.agents_path_plans_local: Optional[torch.Tensor] = None  # 存储所有智能体的路径规划（局部坐标）
+        self.goal_radius_tensor: Optional[torch.Tensor] = None
+        self.goal_positions: Optional[torch.Tensor] = None
 
     def reset(self) -> torch.Tensor:
         """
@@ -112,16 +116,56 @@ class TeraflowSimulator:
         self.agents_path_plans = self.path_planner.collect_path_w_lane_ids(paths, self.agents_start_quad_ids, self.agents_goal_quad_ids)
         print(f"Reset complete. World state shape: {self.agents_state.shape}")
 
+        # 将路径截断为前max_keep个有效 w_lane waypoint，并更新目标 quad_id
+        max_keep = self.path_length
+        invalid_marker = self.path_planner.INVALID_w_lane_id_MARKER
+        if max_keep > 0:
+            truncated_paths = self.agents_path_plans.clone()
+            if self.agents_path_plans.shape[2] > max_keep:
+                truncated_paths[:, :, max_keep:, :] = invalid_marker
+            self.agents_path_plans = truncated_paths
+
+            valid_mask = self.agents_path_plans[..., 0] != invalid_marker  # (B, M, L)
+            valid_counts = valid_mask.sum(dim=-1)  # (B, M)
+            has_valid = valid_counts > 0
+            if has_valid.any():
+                last_indices = valid_counts.clamp(min=1) - 1  # (B, M)
+                max_index = self.agents_path_plans.shape[2] - 1
+                last_indices = torch.clamp(last_indices, max=max_index)
+                gather_idx = last_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
+                last_points = torch.gather(
+                    self.agents_path_plans[..., :2],  # (B, M, L, 2)
+                    dim=2,
+                    index=gather_idx
+                ).squeeze(2)  # (B, M, 2)
+                mask_flat = has_valid.view(-1)
+                selected_points = last_points.view(-1, 2)[mask_flat]
+                distances, nearest_indices = find_nearest_lanes(
+                    self.device,
+                    self.road_network.quad_centerlines,
+                    selected_points,
+                    k=1,
+                    spatial_hash=self.offroad_checker.spatial_hash
+                )
+                nearest_indices = nearest_indices.squeeze(1)
+                valid_goal_mask = nearest_indices >= 0
+                if valid_goal_mask.any():
+                    goal_poly_ids = self.road_network.quad_ids[nearest_indices[valid_goal_mask]]
+                    goal_flat = self.agents_goal_quad_ids.view(-1)
+                    flat_indices = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)[valid_goal_mask]
+                    goal_flat[flat_indices] = goal_poly_ids
+                    self.agents_goal_quad_ids = goal_flat.view_as(self.agents_goal_quad_ids)
+
         # 使用 preprocessor 预计算好的 quad centers（准确值）
         # agents_goal_quad_ids 存储的是 poly_id，需要转换为数组索引
         goal_center_indices = self.road_network.poly_id_to_center_idx[self.agents_goal_quad_ids]
         self.goal_positions = self.road_network.quad_centers[goal_center_indices]  # (B, M, 2)
+        idx_delta_goal = self.reward_calculator._param_name_to_idx['delta_goal']
+        self.goal_radius_tensor = self.reward_calculator.sampled_params[..., idx_delta_goal]
         self.frenet_d = d
         self.frenet_theta_f = theta_f
-
         # 仍然没有traffic内容
         self.stop_lines = torch.zeros((self.num_envs, self.max_agents,20), dtype=torch.int32, device=self.device)
-
         return initial_observation,d,theta_f
     
     def step(self, actions: torch.Tensor, debug_collision: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
@@ -210,13 +254,46 @@ class TeraflowSimulator:
             self.agents_state[..., 6] = original_active
         else:
             observation, d, theta_f = self.observation_generator.generate(self.agents_state)
+        self.frenet_d = d
+        self.frenet_theta_f = theta_f
+
+        # TODO:这里产生goal_reached和waypoints_reached的mask
+        B, M = self.agents_state.shape[:2]
+        goal_positions = self.goal_positions
+        agent_positions = self.agents_state[..., :2]
+        distances = torch.norm(agent_positions - goal_positions, dim=-1)
+        delta_goal_tensor = self.reward_calculator.sampled_params[..., self.reward_calculator._param_name_to_idx['delta_goal']]
+        if delta_goal_tensor.shape != distances.shape:
+            delta_goal_tensor = delta_goal_tensor.expand_as(distances)
+        goal_reached = distances < delta_goal_tensor
+        waypoint_reached = torch.zeros((B, M), dtype=torch.bool, device=self.device)
+        self.goal_radius_tensor = delta_goal_tensor
+
+        # 根据距离阈值移除已经过的路径点(贪吃蛇的部分)
+        if self.agents_path_plans is not None and self.agents_path_plans.numel() > 0:
+            invalid_marker = self.path_planner.INVALID_w_lane_id_MARKER
+            waypoints_xy = self.agents_path_plans[..., :2]
+            valid_waypoints = waypoints_xy[..., 0] != invalid_marker
+            if valid_waypoints.any():
+                diffs = waypoints_xy - agent_positions.unsqueeze(-2)
+                dists_wp = torch.norm(diffs, dim=-1)  # (B, M, L)
+                goal_radii = self.goal_radius_tensor.unsqueeze(-1).expand_as(dists_wp)
+                reached_mask = valid_waypoints & (dists_wp <= goal_radii)
+                reached_any = reached_mask.any(dim=-1)
+                if reached_any.any():
+                    first_reached = torch.argmax(reached_mask.float(), dim=-1)
+                    indices = torch.arange(self.agents_path_plans.shape[2], device=self.device).view(1, 1, -1)
+                    prefix_mask = (indices <= first_reached.unsqueeze(-1)) & reached_any.unsqueeze(-1)
+                    inv_tensor = torch.full_like(self.agents_path_plans[..., 0], invalid_marker)
+                    self.agents_path_plans[..., 0] = torch.where(prefix_mask, inv_tensor, self.agents_path_plans[..., 0])
+                    self.agents_path_plans[..., 1] = torch.where(prefix_mask, inv_tensor, self.agents_path_plans[..., 1])
+                    self.agents_path_plans[..., 2] = torch.where(prefix_mask, inv_tensor, self.agents_path_plans[..., 2])
 
         # 7. 计算奖励（传入Frenet坐标和动作）
-        reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
+        reward = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, goal_reached, waypoint_reached, actions)
 
         # 8. 检查是否结束（包含目标到达判断）
         done = all_collisions|offroad_mask|goal_reached
-        
         # 保存done状态供下次step使用（累积done状态，一旦done就保持done）
         if hasattr(self, 'cumulative_done_mask') and self.cumulative_done_mask is not None:
             self.cumulative_done_mask = self.cumulative_done_mask | done
@@ -224,7 +301,16 @@ class TeraflowSimulator:
             self.cumulative_done_mask = done.clone()
         return observation, reward, done
     
-    def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _calculate_reward(
+        self,
+        all_collisions: torch.Tensor,
+        offroad_mask: torch.Tensor,
+        d: torch.Tensor,
+        theta_f: torch.Tensor,
+        goal_reached: torch.Tensor,
+        waypoint_reached: torch.Tensor,
+        actions: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         为所有智能体计算奖励。
         Args:
@@ -232,9 +318,11 @@ class TeraflowSimulator:
             offroad_mask (torch.Tensor): 离路状态 (B, M)
             d (torch.Tensor): Frenet横向距离 (B, M)
             theta_f (torch.Tensor): Frenet角度误差 (B, M)
+            goal_reached (torch.Tensor): 目标达成掩码 (B, M)
+            waypoint_reached (torch.Tensor): 路点达成掩码 (B, M)
             actions (torch.Tensor): 动作索引 (B, M, 1)，用于直接获取jerk值
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (奖励值 (B, M), 目标到达标志 (B, M))
+            torch.Tensor: 奖励值 (B, M)
         """
 
         # 构建扩展的状态张量，包含加速度信息
@@ -298,18 +386,13 @@ class TeraflowSimulator:
         extended_state[..., 9] = d        # d - Frenet横向距离
         # 准备目标奖励计算的参数
 
-        # goal_positions = self.path_planner.get_quad_centers(self.agents_goal_quad_ids)
-        goal_positions = self.goal_positions
-
-        waypoint_reached = torch.ones((B, M), dtype=torch.bool, device=self.device)
-
         # 调用奖励计算器，这个速度很快
-        reward, goal_reached = self.reward_calculator.calculate(
+        reward = self.reward_calculator.calculate(
             extended_state,
             all_collisions,
             offroad_mask,
             dt=self.dt,
-            goal_positions=goal_positions,
+            goal_reached=goal_reached,
             waypoint_reached=waypoint_reached,
         )
         
@@ -323,7 +406,7 @@ class TeraflowSimulator:
         reward = reward * effective_mask.float()  # 非有效车辆的奖励设为0，等价于"done后奖励不再更新"
 
         self.extend_state = extended_state # 用于传入网络
-        return reward, goal_reached
+        return reward
     
 
 if __name__ == "__main__":
@@ -340,6 +423,7 @@ if __name__ == "__main__":
     
     # ==================== 2. 使用 Pygame/OpenGL 可视化 active 车辆的路径规划 ====================
     from utils.pygame_utils import visualize_path_planning
+    
     # 定义observation回调函数来获取观测数据
     def observation_callback(agents_state, b, m):
         neighbor_states_world = sim.observation_generator._get_nearest_neighbors(agents_state)
@@ -357,12 +441,16 @@ if __name__ == "__main__":
             actions = torch.full((B, M, 1), 7, dtype=torch.long, device=sim.device)
             observation, reward, done = sim.step(actions)
             sim._last_action = actions.squeeze(-1).clone()
-        sim.frenet_d = d
-        sim.frenet_theta_f = theta_f
         print("已执行一步仿真。")
-        return sim.agents_state, sim.agents_path_plans
+        return (
+            sim.agents_state,
+            sim.agents_path_plans,
+            sim.goal_positions,
+            sim.goal_radius_tensor,
+            sim.cumulative_done_mask,
+        )
 
-    def info_callback(agents_state, b, m):
+    def info_callback(agents_state, goal_positions, goal_radii, done_mask, b, m):
         state = agents_state[b, m].detach().cpu().numpy()
         x, y, yaw, speed, length, width, active = state
         lines = [
@@ -373,10 +461,34 @@ if __name__ == "__main__":
             ("Speed", f"{speed:.2f} m/s"),
             ("Size", f"L={length:.2f}, W={width:.2f}")
         ]
-        if hasattr(sim, "goal_positions") and sim.goal_positions is not None:
+        # 绘制可视化中的终点红点（路径最后一个有效点）
+        goal_point = None
+        try:
+            path = sim.agents_path_plans[b, m]
+            invalid_marker_tensor = torch.tensor(
+                sim.path_planner.INVALID_w_lane_id_MARKER,
+                dtype=path.dtype,
+                device=path.device,
+            )
+            valid_mask = path[:, 0] != invalid_marker_tensor
+            if valid_mask.any():
+                last_valid_idx = torch.nonzero(valid_mask, as_tuple=False)[-1].item()
+                last_point = path[last_valid_idx, :2].detach().cpu().numpy()
+                goal_point = (float(last_point[0]), float(last_point[1]))
+        except Exception:
+            goal_point = None
+
+        if goal_point is not None:
+            lines.append(("Goal", f"{goal_point[0]:.2f}, {goal_point[1]:.2f}"))
+        else:
+            lines.append(("Goal", "N/A"))
+
+        if goal_radii is not None:
             try:
-                goal = sim.goal_positions[b, m].detach().cpu().numpy()
-                lines.append(("Goal", f"{goal[0]:.2f}, {goal[1]:.2f}"))
+                radius_val = goal_radii[b, m]
+                if torch.is_tensor(radius_val):
+                    radius_val = radius_val.detach().cpu().item()
+                lines.append(("Goal Radius", f"{float(radius_val):.2f} m"))
             except Exception:
                 pass
         if hasattr(sim, "frenet_d") and sim.frenet_d is not None:
@@ -425,9 +537,9 @@ if __name__ == "__main__":
                 lines.append(("Jerk (long, lat)", f"{jerk[0]:.2f}, {jerk[1]:.2f}"))
             except Exception:
                 pass
-        if hasattr(sim, "cumulative_done_mask") and sim.cumulative_done_mask is not None:
+        if done_mask is not None:
             try:
-                done_val = bool(sim.cumulative_done_mask[b, m].item())
+                done_val = bool(done_mask[b, m].item())
                 lines.append(("Done", "Yes" if done_val else "No"))
             except Exception:
                 pass
@@ -437,7 +549,7 @@ if __name__ == "__main__":
     visualize_path_planning(
         agents_state=sim.agents_state,
         agents_path_plans=sim.agents_path_plans,
-        quads_vertices=sim.road_network.quads_vertices,
+        quads_vertices=sim.road_network.left_boundaries,
         batch_idx=0,
         invalid_marker_value=sim.path_planner.INVALID_w_lane_id_MARKER,
         horizon=sim.observation_generator.horizon,
@@ -445,6 +557,9 @@ if __name__ == "__main__":
         step_callback=step_callback,
         info_callback=info_callback,
         agents_start_quad_ids=sim.agents_start_quad_ids,
-        agents_goal_quad_ids=sim.agents_goal_quad_ids
+        agents_goal_quad_ids=sim.agents_goal_quad_ids,
+        goal_positions=sim.goal_positions,
+        goal_radii=sim.goal_radius_tensor,
+        done_mask=sim.cumulative_done_mask,
     )
     print("退出可视化。")

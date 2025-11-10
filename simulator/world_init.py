@@ -49,11 +49,9 @@ class WorldInitializer:
         # 状态维度默认7: [x, y, yaw, v, length, width, active]
         self.local_state_dim = int(obs_cfg.get('local_state_dim'))
         self.neighbor_feature_dim = int(obs_cfg.get('neighbor_feature_dim'))
-        
         # 读取批大小（B, M），供初始化世界使用
         self.B = int(simulator_config.get('B'))
         self.M = int(simulator_config.get('M'))
-
         # 车辆参数（episode 采样），在 initialize_world 中填充
         self.vehicle_params = {}
 

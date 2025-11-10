@@ -38,10 +38,13 @@ class PathPlanningVisualizer:
         invalid_marker_value: float = -999999.0,
         horizon: float = 80.0,
         observation_callback: Optional[Callable] = None,
-        step_callback: Optional[Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
-        info_callback: Optional[Callable[[torch.Tensor, int, int], Optional[object]]] = None,
+        step_callback: Optional[Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
+        info_callback: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int, int], Optional[object]]] = None,
         agents_start_quad_ids: Optional[torch.Tensor] = None,
-        agents_goal_quad_ids: Optional[torch.Tensor] = None):
+        agents_goal_quad_ids: Optional[torch.Tensor] = None,
+        goal_positions: Optional[torch.Tensor] = None,
+        goal_radii: Optional[torch.Tensor] = None,
+        done_mask: Optional[torch.Tensor] = None):
         """
         初始化可视化器
         
@@ -56,6 +59,9 @@ class PathPlanningVisualizer:
                                  签名: (agents_state, batch_idx, agent_idx) -> (neighbors_local, w_lanes_local, w_boundaries_local)
             agents_start_quad_ids: 可选的起始quad ID
             agents_goal_quad_ids: 可选的目标quad ID
+            goal_positions: 可选的目标位置 (B, M, 2)
+            goal_radii: 可选的目标半径 (B, M)
+            done_mask: 可选的完成掩码 (B, M)
         """
         if not PYGAME_AVAILABLE:
             raise ImportError("pygame and PyOpenGL are required for visualization")
@@ -71,9 +77,12 @@ class PathPlanningVisualizer:
         self.info_callback = info_callback
         self.agents_start_quad_ids = agents_start_quad_ids
         self.agents_goal_quad_ids = agents_goal_quad_ids
+        self.goal_positions = goal_positions
+        self.goal_radii = goal_radii
+        self.done_mask = done_mask
         
-        # 准备地图数据
-        self.quads_vertices_np = quads_vertices.detach().cpu().numpy()
+        # 准备道路几何数据
+        self.road_geometry_np = quads_vertices.detach().cpu().numpy()
         
         # 获取active agents
         active_mask = self.agents_state[..., 6] > 0.5
@@ -87,9 +96,10 @@ class PathPlanningVisualizer:
         print(f"Batch {batch_idx} 中有 {len(self.active_agents_list)} 个active车辆")
         
         # 计算坐标范围
-        if self.quads_vertices_np.shape[0] > 0:
-            xs = self.quads_vertices_np[:, :, 0].reshape(-1)
-            ys = self.quads_vertices_np[:, :, 1].reshape(-1)
+        if self.road_geometry_np.size > 0:
+            coords = self.road_geometry_np.reshape(-1, self.road_geometry_np.shape[-1])
+            xs = coords[:, 0]
+            ys = coords[:, 1]
             margin = 20.0
             self.x_min, self.x_max = float(xs.min() - margin), float(xs.max() + margin)
             self.y_min, self.y_max = float(ys.min() - margin), float(ys.max() + margin)
@@ -129,25 +139,33 @@ class PathPlanningVisualizer:
         self.info_panel_margin = 10
     
     def draw_quads(self):
-        """绘制所有 quads 作为背景"""
-        glColor3f(0.95, 0.95, 0.7)  # 浅黄色
-        for verts in self.quads_vertices_np:
-            glBegin(GL_QUADS)
-            glVertex2f(float(verts[0, 0]), float(verts[0, 1]))
-            glVertex2f(float(verts[1, 0]), float(verts[1, 1]))
-            glVertex2f(float(verts[2, 0]), float(verts[2, 1]))
-            glVertex2f(float(verts[3, 0]), float(verts[3, 1]))
-            glEnd()
-        
-        # 绘制 quad 边框
-        glColor3f(0.6, 0.6, 0.6)
-        glLineWidth(0.5)
-        for verts in self.quads_vertices_np:
-            glBegin(GL_LINES)
-            for i in range(4):
-                glVertex2f(float(verts[i, 0]), float(verts[i, 1]))
-                glVertex2f(float(verts[(i+1)%4, 0]), float(verts[(i+1)%4, 1]))
-            glEnd()
+        """绘制道路几何（支持四边形或线段）"""
+        if self.road_geometry_np.size == 0:
+            return
+        geom = self.road_geometry_np
+        if geom.ndim >= 3 and geom.shape[1] == 4:
+            glColor3f(0.95, 0.95, 0.7)
+            for verts in geom:
+                glBegin(GL_QUADS)
+                for i in range(4):
+                    glVertex2f(float(verts[i, 0]), float(verts[i, 1]))
+                glEnd()
+            glColor3f(0.6, 0.6, 0.6)
+            glLineWidth(0.5)
+            for verts in geom:
+                glBegin(GL_LINES)
+                for i in range(4):
+                    glVertex2f(float(verts[i, 0]), float(verts[i, 1]))
+                    glVertex2f(float(verts[(i + 1) % 4, 0]), float(verts[(i + 1) % 4, 1]))
+                glEnd()
+        elif geom.ndim >= 3 and geom.shape[1] == 2:
+            glColor3f(0.6, 0.6, 0.6)
+            glLineWidth(1.5)
+            for segment in geom:
+                glBegin(GL_LINES)
+                glVertex2f(float(segment[0, 0]), float(segment[0, 1]))
+                glVertex2f(float(segment[1, 0]), float(segment[1, 1]))
+                glEnd()
     
     def draw_vehicle_box(self, x, y, heading, length, width, r, g, b, line_width=2.0):
         """绘制车辆的矩形框"""
@@ -186,8 +204,8 @@ class PathPlanningVisualizer:
         glVertex2f(front_x, front_y)
         glEnd()
     
-    def draw_horizon_box(self, ego_x, ego_y, horizon_size):
-        """绘制观测范围的圆形"""
+    def draw_horizon_box(self, ego_x, ego_y, horizon_size, goal_radius=None):
+        """绘制观测范围与目标半径"""
         radius = horizon_size
         num_segments = 64
         
@@ -201,6 +219,17 @@ class PathPlanningVisualizer:
             y = ego_y + radius * math.sin(angle)
             glVertex2f(x, y)
         glEnd()
+        
+        if goal_radius is not None and goal_radius > 0:
+            glColor4f(0.9, 0.4, 0.1, 0.9)
+            glLineWidth(2.0)
+            glBegin(GL_LINE_LOOP)
+            for i in range(num_segments):
+                angle = 2.0 * math.pi * i / num_segments
+                x = ego_x + goal_radius * math.cos(angle)
+                y = ego_y + goal_radius * math.sin(angle)
+                glVertex2f(x, y)
+            glEnd()
     
     def draw_all_agents(self, current_m):
         """绘制所有 active agents（除了当前选中的）"""
@@ -215,7 +244,33 @@ class PathPlanningVisualizer:
             x, y, heading = state[0], state[1], state[2]
             length, width = state[4], state[5]
             
-            self.draw_vehicle_box(x, y, heading, length, width, 0.4, 0.4, 0.4, line_width=1.5)
+            is_done = False
+            if self.done_mask is not None:
+                try:
+                    is_done = bool(self.done_mask[b, m_idx].item())
+                except Exception:
+                    is_done = False
+
+            if is_done:
+                glColor4f(0.0, 0.6, 0.0, 0.1)
+                glBegin(GL_QUADS)
+                cos_h = math.cos(heading)
+                sin_h = math.sin(heading)
+                half_length = length / 2.0
+                half_width = width / 2.0
+                corners = [
+                    (-half_length, -half_width),
+                    (half_length, -half_width),
+                    (half_length, half_width),
+                    (-half_length, half_width),
+                ]
+                for cx, cy in corners:
+                    wx = x + cx * cos_h - cy * sin_h
+                    wy = y + cx * sin_h + cy * cos_h
+                    glVertex2f(wx, wy)
+                glEnd()
+            else:
+                self.draw_vehicle_box(x, y, heading, length, width, 0.4, 0.4, 0.4, line_width=1.5)
     
     def draw_observation_data(self, neighbors_local, w_lanes_local, w_boundaries_local, 
                             ego_x, ego_y, ego_heading, ego_speed):
@@ -475,11 +530,28 @@ class PathPlanningVisualizer:
                             try:
                                 step_result = self.step_callback()
                                 if step_result is not None:
-                                    new_agents_state, new_agents_path_plans = step_result
+                                    if isinstance(step_result, tuple):
+                                        new_agents_state = step_result[0] if len(step_result) > 0 else None
+                                        new_agents_path_plans = step_result[1] if len(step_result) > 1 else None
+                                        new_goal_positions = step_result[2] if len(step_result) > 2 else None
+                                        new_goal_radii = step_result[3] if len(step_result) > 3 else None
+                                        new_done_mask = step_result[4] if len(step_result) > 4 else None
+                                    else:
+                                        new_agents_state = step_result
+                                        new_agents_path_plans = None
+                                        new_goal_positions = None
+                                        new_goal_radii = None
+                                        new_done_mask = None
                                     if new_agents_state is not None:
                                         self.agents_state = new_agents_state
                                     if new_agents_path_plans is not None:
                                         self.agents_path_plans = new_agents_path_plans
+                                    if new_goal_positions is not None:
+                                        self.goal_positions = new_goal_positions
+                                    if new_goal_radii is not None:
+                                        self.goal_radii = new_goal_radii
+                                    if new_done_mask is not None:
+                                        self.done_mask = new_done_mask
                                     active_mask = self.agents_state[..., 6] > 0.5
                                     active_agents = torch.nonzero(active_mask[self.batch_idx], as_tuple=False).squeeze(-1)
                                     if active_agents.numel() > 0:
@@ -506,6 +578,15 @@ class PathPlanningVisualizer:
                                                 device=path.device, dtype=path.dtype)
             valid_mask = path[:, 0] != invalid_marker_tensor
             valid_path = path[valid_mask].cpu().numpy()
+            goal_radius_value = None
+            if self.goal_radii is not None:
+                try:
+                    goal_radius_value = float(self.goal_radii[self.batch_idx, m].detach().cpu().item())
+                except Exception:
+                    try:
+                        goal_radius_value = float(self.goal_radii[self.batch_idx, m])
+                    except Exception:
+                        goal_radius_value = None
             
             # 获取当前车辆状态
             ego_state = self.agents_state[b, m].cpu().numpy()
@@ -529,7 +610,14 @@ class PathPlanningVisualizer:
             if self.info_callback is not None:
                 try:
                     info_lines = self._format_info_lines(
-                        self.info_callback(self.agents_state, b, m)
+                        self.info_callback(
+                            self.agents_state,
+                            self.goal_positions,
+                            self.goal_radii,
+                            self.done_mask,
+                            b,
+                            m,
+                        )
                     )
                 except Exception as e:
                     print(f"获取 info 失败: {e}")
@@ -561,8 +649,8 @@ class PathPlanningVisualizer:
             # 绘制背景
             self.draw_quads()
             
-            # 绘制 horizon 观测范围
-            self.draw_horizon_box(ego_x, ego_y, self.horizon)
+            # 绘制 horizon 观测范围及目标半径
+            self.draw_horizon_box(ego_x, ego_y, self.horizon, goal_radius_value)
             
             # 绘制所有其他 agents
             self.draw_all_agents(m)
@@ -600,10 +688,13 @@ def visualize_path_planning(
     invalid_marker_value: float = -999999.0,
     horizon: float = 80.0,
     observation_callback: Optional[Callable] = None,
-    step_callback: Optional[Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
-    info_callback: Optional[Callable[[torch.Tensor, int, int], Optional[object]]] = None,
+    step_callback: Optional[Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
+    info_callback: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int, int], Optional[object]]] = None,
     agents_start_quad_ids: Optional[torch.Tensor] = None,
-    agents_goal_quad_ids: Optional[torch.Tensor] = None):
+    agents_goal_quad_ids: Optional[torch.Tensor] = None,
+    goal_positions: Optional[torch.Tensor] = None,
+    goal_radii: Optional[torch.Tensor] = None,
+    done_mask: Optional[torch.Tensor] = None):
     """
     便捷函数：可视化路径规划（通用版本）
     
@@ -634,6 +725,9 @@ def visualize_path_planning(
         step_callback=step_callback,
         info_callback=info_callback,
         agents_start_quad_ids=agents_start_quad_ids,
-        agents_goal_quad_ids=agents_goal_quad_ids
+        agents_goal_quad_ids=agents_goal_quad_ids,
+        goal_positions=goal_positions,
+        goal_radii=goal_radii,
+        done_mask=done_mask
     )
     return visualizer.run()

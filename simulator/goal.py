@@ -39,12 +39,22 @@ class PathPlanner:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
         
+        device_obj = torch.device(device)
+
         # ==================== 初始化所有 self 变量 ====================
         # 基础配置（从配置读取）
         _invalid_src = config['simulator']['observation'].get('INVALID_MARKER')
         self.INVALID_MARKER = _invalid_src
         self.INVALID_PATH_MARKER = int(_invalid_src)
         self.INVALID_w_lane_id_MARKER = float(_invalid_src)
+        
+        # Waypoint 对应的 w_lane_id（x, y, yaw），默认置为无效标记
+        self.current_waypoint_w_lane_id = torch.full(
+            (3,),
+            self.INVALID_w_lane_id_MARKER,
+            dtype=torch.float32,
+            device=device_obj
+        )
 
         # 路径长度相关（确保为int，且非None）
         nav_chains = config['simulator']['observation'].get('num_navigation_chains')
@@ -54,7 +64,7 @@ class PathPlanner:
         start_end_chains = config['simulator']['observation'].get('num_start&end_chains')
         self.max_chain_len = int(start_end_chains)
         
-        self.device = torch.device(device)
+        self.device = device_obj
         # 可选的 RoadNetwork（仅保存引用，后续可复用其张量/元数据）
         self.road_network = road_network
         if self.road_network is None:
@@ -559,37 +569,26 @@ class PathPlanner:
         
         # 向量化统计需要采样的路径
         need_sample_mask = (middle_counts > max_middle_len)
-        
         # 创建采样后的middle_segment
         middle_segment_sampled = middle_segment[:, :max_middle_len, :].clone()  # (B*M, max_middle_len, 3)
-        
-        # 对需要采样的路径进行完全向量化间隔采样
+        # 对需要采样的路径进行完全向量化均匀采样
         if need_sample_mask.any():
             rows = torch.nonzero(need_sample_mask, as_tuple=False).squeeze(1)  # (N_need,)
             counts_need_sample = middle_counts[rows]  # (N_need,) 需要采样的路径的中间段长度
             
-            # 直接整除计算倍数，然后+1作为采样间隔
-            # 例如：counts=150, max_middle_len=100 -> multiples=1 -> intervals=2
-            #      counts=250, max_middle_len=100 -> multiples=2 -> intervals=3
-            multiples = counts_need_sample // max_middle_len  # (N_need,) 整除得到倍数
-            intervals = multiples + 1  # (N_need,) 间隔 = 倍数 + 1
-            
-            # 完全向量化生成采样索引矩阵
-            # 对于每个路径，生成其对应的采样索引：0, interval, 2*interval, 3*interval, ...
             N_need = rows.shape[0]
-            
-            # 创建位置索引：每个路径的max_middle_len个位置
-            pos_indices = torch.arange(max_middle_len, device=self.device, dtype=torch.long).unsqueeze(0)  # (1, max_middle_len)
-            pos_indices = pos_indices.expand(N_need, -1)  # (N_need, max_middle_len)
-            
-            # 计算每个位置对应的原始索引：pos * interval
-            # intervals: (N_need,), 需要扩展为 (N_need, max_middle_len)
-            intervals_expanded = intervals.unsqueeze(1).expand(-1, max_middle_len)  # (N_need, max_middle_len)
-            sample_indices = pos_indices * intervals_expanded  # (N_need, max_middle_len)
-            
-            # 限制索引范围：不能超过w_lane_ids_length
-            sample_indices = torch.clamp(sample_indices, max=w_lane_ids_length - 1)
-            
+            if max_middle_len > 1:
+                base_positions = torch.arange(max_middle_len, device=self.device, dtype=torch.float32).unsqueeze(0).expand(N_need, -1)  # (N_need, max_middle_len)
+                step = (counts_need_sample.float() - 1).unsqueeze(1) / (max_middle_len - 1)
+                sample_positions = base_positions * step
+            else:
+                sample_positions = torch.zeros((N_need, 1), device=self.device, dtype=torch.float32)
+            sample_indices = torch.floor(sample_positions).long()
+            upper_bound = (counts_need_sample - 1).unsqueeze(1)
+            sample_indices = torch.minimum(sample_indices, upper_bound)
+            sample_indices = torch.clamp(sample_indices, min=0, max=w_lane_ids_length - 1)
+            sample_indices[:, -1] = torch.minimum(upper_bound.squeeze(1), torch.tensor(w_lane_ids_length - 1, device=self.device))
+
             # 使用gather进行向量化采样
             # middle_segment[rows]: (N_need, w_lane_ids_length, 3)
             # sample_indices: (N_need, max_middle_len)
@@ -609,6 +608,7 @@ class PathPlanner:
         # 直接拼接三段：start(max_chain_len) + middle(max_middle_len) + end(max_chain_len) = w_lane_ids_length
         # 注意：end_segment 需要反转顺序，因为它是 [终点, 前1, ..., 前9]，需要变成 [前9, ..., 前1, 终点]
         end_segment_flipped = torch.flip(end_segment, dims=[1])  # 沿着序列维度反转
+
         w_lane_ids_flat = torch.cat([
             start_segment,  # (B*M, max_chain_len, 3) - [起点, 后1, ..., 后9]
             middle_segment_sampled,  # (B*M, max_middle_len, 3) - [中间点...]
