@@ -96,6 +96,7 @@ class ObservationGenerator:
             return torch.cat([t, pad], dim=1)
         wl_world = _pad_or_trim(wl_world, self.num_w_lanes)
         wb_world = _pad_or_trim(wb_world, self.num_w_boundaries)
+        
         # 恢复原始形状
         w_lanes_world = wl_world.view(batch_size, max_agents, self.num_w_lanes, 2)
         w_boundaries_world = wb_world.view(batch_size, max_agents, self.num_w_boundaries, 2)

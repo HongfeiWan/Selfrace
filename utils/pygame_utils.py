@@ -38,7 +38,7 @@ class PathPlanningVisualizer:
         invalid_marker_value: float = -999999.0,
         horizon: float = 80.0,
         observation_callback: Optional[Callable] = None,
-        step_callback: Optional[Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
+        step_callback: Optional[Callable[[int, int], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
         info_callback: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int, int], Optional[object]]] = None,
         agents_start_quad_ids: Optional[torch.Tensor] = None,
         agents_goal_quad_ids: Optional[torch.Tensor] = None,
@@ -528,7 +528,8 @@ class PathPlanningVisualizer:
                     elif event.key == pygame.K_w:
                         if self.step_callback is not None:
                             try:
-                                step_result = self.step_callback()
+                                m = self.active_agents_list[self.cur_idx]
+                                step_result = self.step_callback(self.batch_idx, m)
                                 if step_result is not None:
                                     if isinstance(step_result, tuple):
                                         new_agents_state = step_result[0] if len(step_result) > 0 else None
@@ -688,7 +689,7 @@ def visualize_path_planning(
     invalid_marker_value: float = -999999.0,
     horizon: float = 80.0,
     observation_callback: Optional[Callable] = None,
-    step_callback: Optional[Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
+    step_callback: Optional[Callable[[int, int], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
     info_callback: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int, int], Optional[object]]] = None,
     agents_start_quad_ids: Optional[torch.Tensor] = None,
     agents_goal_quad_ids: Optional[torch.Tensor] = None,

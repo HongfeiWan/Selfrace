@@ -499,7 +499,8 @@ class PathPlanner:
             # 只获取count，不展开数据
             lane_idx_safe = torch.where(valid_lane_mask, pf, torch.zeros_like(pf))
             lane_wps_count = self.lane_w_lane_ids_count[lane_idx_safe]  # (n_sub, P)
-            
+            lane_wps_count = torch.where(valid_lane_mask, lane_wps_count, torch.zeros_like(lane_wps_count))
+
             # 计算每行的写入偏移（每行内，每个lane的起始位置）- 向量化
             row_cumsum = torch.cumsum(lane_wps_count, dim=1)  # (n_sub, P) 每行累积count
             row_offsets = torch.cat([torch.zeros(n_sub, 1, dtype=torch.long, device=self.device), 
@@ -694,6 +695,20 @@ if __name__ == '__main__':
 
     all_paths = planner.path_plan(start_poly_tensor, end_poly_tensor)
     all_w_lane_ids = planner.collect_path_w_lane_ids(all_paths, start_poly_tensor, end_poly_tensor)
+
+    print("all_w_lane_ids shape:", tuple(all_w_lane_ids.shape))
+    sample_b, sample_m = 0, 0
+    if all_w_lane_ids.numel() > 0:
+        sample_path = all_w_lane_ids[sample_b, sample_m].detach().cpu().tolist()
+        print(f"Sample path for B={sample_b}, M={sample_m}:")
+        for idx, waypoint in enumerate(sample_path):
+            if waypoint[0] == planner.INVALID_w_lane_id_MARKER:
+                print(f"  [{idx:02d}] INVALID")
+            else:
+                x, y, angle = waypoint
+                print(f"  [{idx:02d}] x={x:.4f}, y={y:.4f}, angle={angle:.4f}")
+    else:
+        print("all_w_lane_ids is empty.")
 
     # ==================== 3. 基于 Pygame + OpenGL 可视化 ====================
     try:

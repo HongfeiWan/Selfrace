@@ -34,7 +34,6 @@
 
     "observation": {
       "INVALID_MARKER": -1e10,
-      
       "num_neighbors": 20,
       "horizon": 200.0,
 
@@ -99,11 +98,17 @@
     "traffic": {
     },
 
-    "policy": {
+    "network": {
+      "WBoundaryNet_embed_dim": 64,
+      "WBoundaryNet_encoded_dim": 64,
+      "GoalsNet_embed_dim": 64,
+      "GoalsNet_encoded_dim": 64
     }
 
   },
   
+
+
   "training": {
   },
 

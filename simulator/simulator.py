@@ -90,6 +90,7 @@ class TeraflowSimulator:
         self.agents_path_plans_local: Optional[torch.Tensor] = None  # 存储所有智能体的路径规划（局部坐标）
         self.goal_radius_tensor: Optional[torch.Tensor] = None
         self.goal_positions: Optional[torch.Tensor] = None
+        self.w_lanes_local_with_goal_distances: Optional[torch.Tensor] = None
 
     def reset(self) -> torch.Tensor:
         """
@@ -155,6 +156,13 @@ class TeraflowSimulator:
                     flat_indices = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)[valid_goal_mask]
                     goal_flat[flat_indices] = goal_poly_ids
                     self.agents_goal_quad_ids = goal_flat.view_as(self.agents_goal_quad_ids)
+
+        # 预计算每个路径点到终点的累积距离
+        self.precompute_path_plan_goal_distances()
+        # self._update_observed_w_lane_goal_distances(
+        #     self.agents_path_plans,
+        #     self.agents_path_plan_goal_distances,
+        #     initial_observation,)
 
         # 使用 preprocessor 预计算好的 quad centers（准确值）
         # agents_goal_quad_ids 存储的是 poly_id，需要转换为数组索引
@@ -288,6 +296,15 @@ class TeraflowSimulator:
                     self.agents_path_plans[..., 0] = torch.where(prefix_mask, inv_tensor, self.agents_path_plans[..., 0])
                     self.agents_path_plans[..., 1] = torch.where(prefix_mask, inv_tensor, self.agents_path_plans[..., 1])
                     self.agents_path_plans[..., 2] = torch.where(prefix_mask, inv_tensor, self.agents_path_plans[..., 2])
+                    # 更新一下agents_path_plan_goal_distances，因为有的点消失了，它的距离要重新计算。（赋予无效值的点，距离就是无穷大    ）
+                    if self.agents_path_plan_goal_distances is not None:
+                        self.agents_path_plan_goal_distances = torch.where(
+                            prefix_mask,
+                            inv_tensor,
+                            self.agents_path_plan_goal_distances)
+                    #TODO: 更新一下w_lane
+
+        # TODO: 这里判断目前观测中的w_lanes_local是否在agents_path_plans内？产生self.w_lanes_local_with_goal_distances(dx,dy,delta_goal)用于输入网络
 
         # 7. 计算奖励（传入Frenet坐标和动作）
         reward = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, goal_reached, waypoint_reached, actions)
@@ -309,8 +326,7 @@ class TeraflowSimulator:
         theta_f: torch.Tensor,
         goal_reached: torch.Tensor,
         waypoint_reached: torch.Tensor,
-        actions: torch.Tensor = None,
-    ) -> torch.Tensor:
+        actions: torch.Tensor = None,) -> torch.Tensor:
         """
         为所有智能体计算奖励。
         Args:
@@ -404,10 +420,125 @@ class TeraflowSimulator:
             alive_mask = torch.ones_like(active_mask, dtype=torch.bool)
         effective_mask = active_mask & alive_mask
         reward = reward * effective_mask.float()  # 非有效车辆的奖励设为0，等价于"done后奖励不再更新"
-
         self.extend_state = extended_state # 用于传入网络
         return reward
     
+    def precompute_path_plan_goal_distances(self) -> None:
+        """Compute cumulative distance from each path waypoint to the final goal."""
+        if self.agents_path_plans is None or self.agents_path_plans.numel() == 0:
+            self.agents_path_plan_goal_distances = None
+            return
+        invalid_marker = self.path_planner.INVALID_w_lane_id_MARKER
+        waypoints_xy = self.agents_path_plans[..., :2]
+        valid_waypoints = waypoints_xy[..., 0] != invalid_marker
+
+        distances = torch.full(
+            valid_waypoints.shape,
+            invalid_marker,
+            device=self.device,
+            dtype=waypoints_xy.dtype,
+        )
+
+        if not valid_waypoints.any():
+            self.agents_path_plan_goal_distances = distances
+            return
+
+        coords = torch.where(
+            valid_waypoints.unsqueeze(-1),
+            waypoints_xy,
+            torch.zeros_like(waypoints_xy),
+        )
+        segment_vecs = coords[..., 1:, :] - coords[..., :-1, :]
+        segment_lengths = torch.norm(segment_vecs, dim=-1)
+        segment_valid = valid_waypoints[..., :-1] & valid_waypoints[..., 1:]
+        segment_lengths = torch.where(segment_valid, segment_lengths, torch.zeros_like(segment_lengths))
+
+        zeros_tail = torch.zeros(
+            (*segment_lengths.shape[:-1], 1),
+            device=self.device,
+            dtype=segment_lengths.dtype,
+        )
+        segment_with_tail = torch.cat([segment_lengths, zeros_tail], dim=-1)
+        cumulative = torch.flip(
+            torch.cumsum(torch.flip(segment_with_tail, dims=[-1]), dim=-1),
+            dims=[-1],
+        )
+
+        distances = torch.where(valid_waypoints, cumulative, distances)
+        self.agents_path_plan_goal_distances = distances
+
+    def _update_observed_w_lane_goal_distances(
+        self,
+        agents_path_plans: Optional[torch.Tensor],
+        path_plan_goal_distances: Optional[torch.Tensor],
+        observation: Optional[torch.Tensor],) -> None:
+        """Align observed w-lane points with path-plan goal distances and cache augmented tensors."""
+        if (
+            observation is None
+            or agents_path_plans is None
+            or path_plan_goal_distances is None
+            or agents_path_plans.numel() == 0
+            or path_plan_goal_distances.numel() == 0
+        ):
+            print("error")
+            return
+
+        B, M = observation.shape[0], observation.shape[1]
+        obs_gen = self.observation_generator
+        local_dim = obs_gen.local_state_dim
+        neighbor_dim = obs_gen.num_neighbors * obs_gen.neighbor_feature_dim
+        w_lane_feat_dim = obs_gen.w_lane_feature_dim
+        num_w_lanes = obs_gen.num_w_lanes
+        start = local_dim + neighbor_dim
+        end = start + num_w_lanes * w_lane_feat_dim
+        if end > observation.shape[-1]:
+            self.w_lanes_local_with_goal_distances = None
+            return
+        w_lanes_flat = observation[..., start:end]
+        w_lanes_local = w_lanes_flat.view(B, M, num_w_lanes, w_lane_feat_dim)
+        lanes_valid_mask = (w_lanes_local[..., 0].abs() + w_lanes_local[..., 1].abs()) > 1e-6
+
+        ego_pos = self.agents_state[..., :2]
+        ego_yaw = self.agents_state[..., 2]
+        cos_yaw = torch.cos(ego_yaw)
+        sin_yaw = torch.sin(ego_yaw)
+        rot_matrix = torch.stack(
+            [
+                torch.stack([cos_yaw, -sin_yaw], dim=-1),
+                torch.stack([sin_yaw, cos_yaw], dim=-1),
+            ],
+            dim=-2,
+        )
+        lanes_local_xy = w_lanes_local[..., :2]
+        lanes_world = (
+            torch.bmm(
+                lanes_local_xy.view(B * M, num_w_lanes, 2),
+                rot_matrix.view(B * M, 2, 2),
+            ).view(B, M, num_w_lanes, 2)
+            + ego_pos.unsqueeze(-2)
+        )
+        invalid_marker = self.path_planner.INVALID_w_lane_id_MARKER
+        lanes_distance = torch.full(
+            (B, M, num_w_lanes),
+            invalid_marker,
+            device=self.device,
+            dtype=path_plan_goal_distances.dtype,
+        )
+        plan_world = agents_path_plans[..., :2]
+        valid_plan_mask = plan_world[..., 0] != invalid_marker
+        diff = plan_world.unsqueeze(3) - lanes_world.unsqueeze(2)  # (B, M, L, K, 2)
+        dist_sq = diff.pow(2).sum(-1).permute(0, 1, 3, 2)  # (B, M, K, L)
+        inf = torch.tensor(float("inf"), device=self.device, dtype=dist_sq.dtype)
+        dist_sq = torch.where(valid_plan_mask.unsqueeze(2), dist_sq, inf)
+        min_dist, closest_idx = dist_sq.min(dim=3)
+        matched_plan_valid = torch.gather(valid_plan_mask, 2, closest_idx)
+        tolerance_sq = 0.04
+        match_mask = (min_dist <= tolerance_sq) & matched_plan_valid & lanes_valid_mask
+        gathered_distances = torch.gather(path_plan_goal_distances, 2, closest_idx)
+        lanes_distance = torch.where(match_mask, gathered_distances, lanes_distance)
+        self.w_lanes_local_with_goal_distances = torch.cat(
+            [w_lanes_local, lanes_distance.unsqueeze(-1)], dim=-1
+        )
 
 if __name__ == "__main__":
     # ==================== 1. 初始化 TeraflowSimulator ====================
@@ -420,7 +551,7 @@ if __name__ == "__main__":
     sim = TeraflowSimulator(config=cfg, device=torch.device(device))
     initial_observation, d, theta_f = sim.reset()
     sim._last_action = torch.zeros((sim.num_envs, sim.max_agents), dtype=torch.long, device=sim.device)
-    
+
     # ==================== 2. 使用 Pygame/OpenGL 可视化 active 车辆的路径规划 ====================
     from utils.pygame_utils import visualize_path_planning
     
@@ -433,9 +564,9 @@ if __name__ == "__main__":
                 agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
             )
         return neighbors_local_tmp[b, m], w_lanes_local_tmp[b, m], w_boundaries_local_tmp[b, m]
-        
+
     # 定义step回调：按 W 键时执行一步仿真并返回最新状态
-    def step_callback():
+    def step_callback(b_idx: int, m_idx: int):
         with torch.no_grad():
             B, M = sim.agents_state.shape[:2]
             actions = torch.full((B, M, 1), 7, dtype=torch.long, device=sim.device)
@@ -483,14 +614,50 @@ if __name__ == "__main__":
         else:
             lines.append(("Goal", "N/A"))
 
+        radius_val = None
         if goal_radii is not None:
             try:
                 radius_val = goal_radii[b, m]
                 if torch.is_tensor(radius_val):
                     radius_val = radius_val.detach().cpu().item()
-                lines.append(("Goal Radius", f"{float(radius_val):.2f} m"))
             except Exception:
-                pass
+                radius_val = None
+        if radius_val is not None:
+            lines.append(("Goal Radius", f"{float(radius_val):.2f} m"))
+        else:
+            lines.append(("Goal Radius", "N/A"))
+
+        reward_calc = getattr(sim, "reward_calculator", None)
+        if reward_calc is not None:
+            def fetch_reward(component_name: str):
+                value = getattr(reward_calc, component_name, None)
+                if value is None:
+                    return None
+                try:
+                    return float(value[b, m].detach().cpu().item())
+                except Exception:
+                    try:
+                        return float(value[b, m])
+                    except Exception:
+                        return None
+
+            reward_components = [
+                ("Goal Reward", "last_goal_reward"),
+                ("Collision Penalty", "last_collision_penalty"),
+                ("Offroad Penalty", "last_offroad_penalty"),
+                ("Comfort Penalty", "last_comfort_penalty"),
+                ("Lane Align Reward", "last_lane_alignment_reward"),
+                ("Lane Center Reward", "last_lane_center_reward"),
+                ("Velocity Reward", "last_velocity_reward"),
+                ("Reverse Penalty", "last_reverse_penalty"),
+                ("Stop-Line Penalty", "last_stop_line_penalty"),
+                ("Timestep Penalty", "last_timestep_penalty"),
+            ]
+            for label, attr in reward_components:
+                comp_value = fetch_reward(attr)
+                if comp_value is not None:
+                    lines.append((label, f"{comp_value:+.6f}"))
+
         if hasattr(sim, "frenet_d") and sim.frenet_d is not None:
             try:
                 d_val = sim.frenet_d[b, m].detach().cpu().item()

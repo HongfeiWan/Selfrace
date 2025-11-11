@@ -605,10 +605,10 @@ if __name__ == "__main__":
         # test_driving_style_sampler()
         
         # 测试 RewardParameterSampler
-        test_reward_parameter_sampler()
+        # test_reward_parameter_sampler()
 
         # 测试 VehicleParameterSampler
-        #  test_vehicle_parameter_sampler()
+        test_vehicle_parameter_sampler()
 
         print("\n所有测试完成！")
     main()
