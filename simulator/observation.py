@@ -1,5 +1,5 @@
 import torch
-from typing import Dict
+from typing import Dict, Optional
 import os
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -45,6 +45,8 @@ class ObservationGenerator:
         # 预计算映射改由 RoadNetwork 在加载时完成，直接引用即可
         self.quad_to_w_lanes_ids = self.road_network.quad_to_w_lanes_ids
         self.quad_to_w_boundaries_ids = self.road_network.quad_to_w_boundaries_ids
+        self.last_w_lanes_local: Optional[torch.Tensor] = None
+        self.last_w_lanes_ids: Optional[torch.Tensor] = None
 
     def get_observation_dim(self) -> int:
         """
@@ -76,10 +78,12 @@ class ObservationGenerator:
         # 找到每个agent最近的quad索引
         distances, quad_indices = find_nearest_lanes(self.device, self.road_network.quad_centerlines, agent_positions_flat, k=1, spatial_hash=self.spatial_hash)
         quad_indices = quad_indices.squeeze(-1)  # (B*M,)
+        # 获取每个agent所在quad的曲率
+        self.curvature = self.road_network.quad_curvatures[quad_indices].view(batch_size, max_agents)  # (B, M) 
         # 使用预计算的关联获取 w_lane 索引并直接索引坐标
         w_lanes_ids = self.quad_to_w_lanes_ids[quad_indices]      # (B*M, K_lanes)
         w_bounds_ids = self.quad_to_w_boundaries_ids[quad_indices]# (B*M, K_bounds)
-
+        self.w_lanes_ids = w_lanes_ids
         wl_world = self.road_network.global_w_lane[w_lanes_ids]   # (B*M, wl_K, 2)
         wb_world = self.road_network.global_w_boundary[w_bounds_ids] # (B*M, wb_K, 2)
 
@@ -242,6 +246,7 @@ class ObservationGenerator:
             额外返回：d (B, M), theta_f (B, M)
             说明：local_state 仍为几何/占位等内部拼接所用，不再塞入 d/theta_f。
         """
+        B, M, _ = agents_state.shape
         # 1. 获取世界坐标系下的特征
         # (B, M, K, 7)
         neighbor_states_world = self._get_nearest_neighbors(agents_state)
@@ -264,10 +269,16 @@ class ObservationGenerator:
                 spatial_hash=self.spatial_hash
             )  # 均为 (B, M)
         except Exception:
-            B, M, _ = agents_state.shape
             d = torch.zeros(B, M, device=self.device)
             theta_f = torch.zeros(B, M, device=self.device)
         
+        # 缓存当前观测的 w_lane 局部坐标与对应 ID
+        self.last_w_lanes_local = w_lanes_local
+        if hasattr(self, "w_lanes_ids") and self.w_lanes_ids is not None:
+            self.last_w_lanes_ids = self.w_lanes_ids.view(B, M, self.num_w_lanes)
+        else:
+            self.last_w_lanes_ids = None
+
         # 3. 展平并拼接成最终的观测向量
         # 返回：自身绝对状态，邻居相对状态，车道线相对状态，边界线相对状态
         observation = torch.cat([

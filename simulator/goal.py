@@ -46,13 +46,14 @@ class PathPlanner:
         _invalid_src = config['simulator']['observation'].get('INVALID_MARKER')
         self.INVALID_MARKER = _invalid_src
         self.INVALID_PATH_MARKER = int(_invalid_src)
-        self.INVALID_w_lane_id_MARKER = float(_invalid_src)
+        self.INVALID_w_lane_id_MARKER = int(_invalid_src)
+        self.INVALID_w_lane_index_MARKER = -1
         
-        # Waypoint 对应的 w_lane_id（x, y, yaw），默认置为无效标记
+        # Waypoint 对应的 w_lane_id，默认置为无效标记
         self.current_waypoint_w_lane_id = torch.full(
-            (3,),
+            (1,),
             self.INVALID_w_lane_id_MARKER,
-            dtype=torch.float32,
+            dtype=torch.long,
             device=device_obj
         )
 
@@ -138,13 +139,31 @@ class PathPlanner:
             w_lane_features[i, 2] = w_lane.get('direction_angle', 0.0)
         self.w_lane_features = torch.from_numpy(w_lane_features).to(
             device=self.device, dtype=torch.float32)  # (n_w_lanes, 3)
+        if n_w_lanes > 0:
+            ordered_w_lane_ids = [int(w_lane['w_lane_id']) for w_lane in w_lanes]
+            self.w_lane_idx_to_id = torch.tensor(ordered_w_lane_ids, dtype=torch.long, device=self.device)
+            max_w_lane_id = max(ordered_w_lane_ids)
+            id_lookup = torch.full(
+                (max_w_lane_id + 1,),
+                self.INVALID_w_lane_index_MARKER,
+                dtype=torch.long,
+                device=self.device,
+            )
+            id_lookup[self.w_lane_idx_to_id] = torch.arange(len(ordered_w_lane_ids), device=self.device)
+            self.w_lane_id_to_idx_tensor = id_lookup
+        else:
+            self.w_lane_idx_to_id = torch.empty((0,), dtype=torch.long, device=self.device)
+            self.w_lane_id_to_idx_tensor = torch.empty((0,), dtype=torch.long, device=self.device)
         
         # 2. 为每个lane构建排序后的w_lane_ids列表（固定长度）
         max_w_lanes_per_lane = max(len(lane_groups[key]) for key in lane_groups.keys()) if lane_groups else 0
         max_w_lanes_per_lane = max(max_w_lanes_per_lane, 50)  # 安全余量
         
-        lane_w_lane_ids_cpu = np.full((self.n_lanes, max_w_lanes_per_lane, 3), 
-                                     self.INVALID_w_lane_id_MARKER, dtype=np.float32)
+        lane_w_lane_ids_cpu = np.full(
+            (self.n_lanes, max_w_lanes_per_lane),
+            self.INVALID_w_lane_id_MARKER,
+            dtype=np.int64
+        )
         lane_w_lane_ids_count = np.zeros(self.n_lanes, dtype=np.int32)
         
         for lane_idx in range(self.n_lanes):
@@ -164,14 +183,11 @@ class PathPlanner:
             for i, (w_lane, _) in enumerate(w_lanes_with_s):
                 if i >= max_w_lanes_per_lane:
                     break
-                center = w_lane['center']
-                lane_w_lane_ids_cpu[lane_idx, i, 0] = center[0]
-                lane_w_lane_ids_cpu[lane_idx, i, 1] = center[1]
-                lane_w_lane_ids_cpu[lane_idx, i, 2] = w_lane.get('direction_angle', 0.0)
+                lane_w_lane_ids_cpu[lane_idx, i] = int(w_lane['w_lane_id'])
             lane_w_lane_ids_count[lane_idx] = min(len(w_lanes_with_s), max_w_lanes_per_lane)
         
         self.lane_w_lane_ids = torch.from_numpy(lane_w_lane_ids_cpu).to(
-            device=self.device, dtype=torch.float32)  # (n_lanes, max_w_lanes_per_lane, 3)
+            device=self.device, dtype=torch.long)  # (n_lanes, max_w_lanes_per_lane)
         self.lane_w_lane_ids_count = torch.from_numpy(lane_w_lane_ids_count).to(
             device=self.device, dtype=torch.long)  # (n_lanes,)
         
@@ -432,208 +448,185 @@ class PathPlanner:
     
     def collect_path_w_lane_ids(self, paths, start_poly_ids, end_poly_ids):
         """
-        批量收集路径的w_lane_ids（GPU加速，完全向量化，无for循环，无分块，直接写入）
+        批量收集路径的 w_lane_id（整型标识），结果固定长度并用无效标记填充。
         Args:
             paths: (B, M, max_path_len) 路径tensor，包含lane索引，无效值为INVALID_PATH_MARKER
             start_poly_ids: (B, M) 起点poly_id
             end_poly_ids: (B, M) 终点poly_id
         Returns:
-            w_lane_ids: (B, M, w_lane_ids_length, 3) w_lane_ids tensor，格式为(x, y, angle)
-                      无效位置用INVALID_w_lane_id_MARKER填充
+            w_lane_ids: (B, M, w_lane_ids_length) w_lane_id tensor，整型，使用 INVALID_w_lane_id_MARKER 填充无效位置
         """
         B, M, max_path_len = paths.shape
         w_lane_ids_length = self.w_lane_ids_length
-        
-        # 确保输入在正确设备上
-        paths = paths.to(self.device)
-        start_poly_ids = start_poly_ids.to(self.device)
-        end_poly_ids = end_poly_ids.to(self.device)
-        
-        # 计算每个路径的有效长度（第一个无效标记的位置）
-        invalid_mask = (paths == self.INVALID_PATH_MARKER)  # (B, M, max_path_len)
-        path_lengths = torch.argmax(invalid_mask.long(), dim=2)  # (B, M) 第一个无效位置
-        # 如果全有效，path_lengths会是0，需要特殊处理
-        all_valid_mask = ~invalid_mask.any(dim=2)  # (B, M)
-        max_path_len_t = torch.full((B, M), max_path_len, dtype=torch.long, device=self.device)
-        path_lengths = torch.where(all_valid_mask, max_path_len_t, path_lengths)
+        device = self.device
 
-        # 展平为批量处理 (B*M, ...)
+        paths = paths.to(device)
+        start_poly_ids = start_poly_ids.to(device)
+        end_poly_ids = end_poly_ids.to(device)
+
+        invalid_mask = (paths == self.INVALID_PATH_MARKER)
+        path_lengths = torch.argmax(invalid_mask.long(), dim=2)
+        all_valid_mask = ~invalid_mask.any(dim=2)
+        path_lengths = torch.where(
+            all_valid_mask,
+            torch.full((B, M), max_path_len, dtype=torch.long, device=device),
+            path_lengths,
+        )
+
         batch_size = B * M
-        paths_flat = paths.flatten(0, 1)  # (B*M, max_path_len)
-        start_poly_flat = start_poly_ids.flatten()  # (B*M,)
-        end_poly_flat = end_poly_ids.flatten()  # (B*M,)
-        path_lengths_flat = path_lengths.flatten()  # (B*M,)
+        paths_flat = paths.flatten(0, 1)
+        start_poly_flat = start_poly_ids.flatten()
+        end_poly_flat = end_poly_ids.flatten()
+        path_lengths_flat = path_lengths.flatten()
 
-        # ==================== 创建三个空tensor，直接写入（统一使用w_lane_ids_length） ====================
-        # 1. 起点段：从start_poly获取，使用_get_w_lane_chain_w_lane_ids_from_poly_vectorized
         start_segment = self._get_w_lane_chain_w_lane_ids_from_poly_vectorized(
-            start_poly_flat, direction='next', max_chain_len=self.max_chain_len)  # (B*M, max_chain_len, 3)
-        
-        # 2. 终点段：从end_poly获取
+            start_poly_flat, direction='next', max_chain_len=self.max_chain_len
+        )
         end_segment = self._get_w_lane_chain_w_lane_ids_from_poly_vectorized(
-            end_poly_flat, direction='prev', max_chain_len=self.max_chain_len)  # (B*M, max_chain_len, 3)
-        
-        # 3. 中间段：从paths的中间lane_idx获取，直接写入到middle_segment（分batchsize处理）
-        middle_segment = torch.full((batch_size, w_lane_ids_length, 3), 
-                                   self.INVALID_w_lane_id_MARKER,
-                                   dtype=torch.float32, device=self.device)
-        
-        # 分块处理，避免显存爆炸
-        tile = 2048  # 可以根据显存调整
+            end_poly_flat, direction='prev', max_chain_len=self.max_chain_len
+        )
+
+        middle_segment = torch.full(
+            (batch_size, w_lane_ids_length),
+            self.INVALID_w_lane_id_MARKER,
+            dtype=torch.long,
+            device=device,
+        )
+
+        tile = 2048
         P = max_path_len
         n_lanes_total = self.n_lanes
 
         for s_idx in range(0, batch_size, tile):
             e_idx = min(s_idx + tile, batch_size)
             n_sub = e_idx - s_idx
-            
-            # 当前tile的数据
-            pf = paths_flat[s_idx:e_idx]  # (n_sub, P)
-            pl = path_lengths_flat[s_idx:e_idx]  # (n_sub,)
-            
-            # 提取中间段的lane_idx (pos > 0 and pos < path_len-1)
-            pos_idx = torch.arange(P, device=self.device).view(1, P).expand(n_sub, -1)  # (n_sub, P)
-            middle_pos_mask = (pos_idx > 0) & (pos_idx < (pl.unsqueeze(1) - 1))  # (n_sub, P)
-            valid_lane_mask = middle_pos_mask & (pf >= 0) & (pf < n_lanes_total)  # (n_sub, P)
-            
-            # 只获取count，不展开数据
+
+            pf = paths_flat[s_idx:e_idx]
+            pl = path_lengths_flat[s_idx:e_idx]
+
+            pos_idx = torch.arange(P, device=device).view(1, P).expand(n_sub, -1)
+            middle_pos_mask = (pos_idx > 0) & (pos_idx < (pl.unsqueeze(1) - 1))
+            valid_lane_mask = middle_pos_mask & (pf >= 0) & (pf < n_lanes_total)
+
             lane_idx_safe = torch.where(valid_lane_mask, pf, torch.zeros_like(pf))
-            lane_wps_count = self.lane_w_lane_ids_count[lane_idx_safe]  # (n_sub, P)
+            lane_wps_count = self.lane_w_lane_ids_count[lane_idx_safe]
             lane_wps_count = torch.where(valid_lane_mask, lane_wps_count, torch.zeros_like(lane_wps_count))
 
-            # 计算每行的写入偏移（每行内，每个lane的起始位置）- 向量化
-            row_cumsum = torch.cumsum(lane_wps_count, dim=1)  # (n_sub, P) 每行累积count
-            row_offsets = torch.cat([torch.zeros(n_sub, 1, dtype=torch.long, device=self.device), 
-                                    row_cumsum[:, :-1]], dim=1)  # (n_sub, P) 每行的lane起始偏移
-            
-            # 只对有效位置处理，不展开到W维度
-            # 找到所有有效的 (batch_idx, p) 组合（在当前tile内）
-            valid_positions = torch.nonzero(valid_lane_mask, as_tuple=False)  # (N_valid, 2) [local_idx, p]
-            
-            if valid_positions.shape[0] > 0:
-                local_indices = valid_positions[:, 0]  # (N_valid,) tile内的索引
-                p_indices = valid_positions[:, 1]  # (N_valid,)
-                
-                # 转换为全局索引
-                global_indices = local_indices + s_idx  # (N_valid,)
-                
-                # 获取对应的lane_idx, count, offset
-                lane_idx_valid = lane_idx_safe[local_indices, p_indices]  # (N_valid,)
-                count_valid = lane_wps_count[local_indices, p_indices]  # (N_valid,)
-                offset_valid = row_offsets[local_indices, p_indices]  # (N_valid,)
-                
-                # 计算每个位置需要写入的数量（限制在w_lane_ids_length内）
-                write_count = torch.minimum(count_valid, w_lane_ids_length - offset_valid)  # (N_valid,)
-                write_count = torch.maximum(write_count, torch.zeros_like(write_count))  # 确保非负
-                
-                # 向量化写入：对所有有效位置批量处理
-                # 使用repeat_interleave展开索引，避免嵌套循环
-                repeat_counts = write_count.long()  # (N_valid,)
-                total_points = repeat_counts.sum().item()  # 总点数
-                
-                if total_points > 0:
-                    # 创建展开的batch索引和lane索引
-                    batch_idx_expanded = torch.repeat_interleave(global_indices, repeat_counts)  # (total_points,)
-                    lane_idx_expanded = torch.repeat_interleave(lane_idx_valid, repeat_counts)  # (total_points,)
-                    offset_expanded = torch.repeat_interleave(offset_valid, repeat_counts)  # (total_points,)
-                    
-                    # 创建每个位置内的点索引（0, 1, 2, ..., count-1）
-                    # 使用cumsum创建分组索引，然后减去偏移
-                    cumsum_counts = torch.cat([torch.zeros(1, dtype=torch.long, device=self.device), 
-                                              repeat_counts.cumsum(dim=0)[:-1]])  # (N_valid,)
-                    point_idx_base = torch.arange(total_points, device=self.device)  # (total_points,)
-                    point_idx_local = point_idx_base - torch.repeat_interleave(cumsum_counts, repeat_counts)  # (total_points,)
-                    
-                    # 计算全局写入位置
-                    write_pos_expanded = offset_expanded + point_idx_local  # (total_points,)
-                    
-                    # 限制在w_lane_ids_length内
-                    valid_write_mask = write_pos_expanded < w_lane_ids_length
-                    if valid_write_mask.any():
-                        batch_idx_final = batch_idx_expanded[valid_write_mask]
-                        write_pos_final = write_pos_expanded[valid_write_mask]
-                        lane_idx_final = lane_idx_expanded[valid_write_mask]
-                        point_idx_final = point_idx_local[valid_write_mask]
-                        
-                        # 批量获取数据并写入（完全向量化）
-                        w_lane_data = self.lane_w_lane_ids[lane_idx_final, point_idx_final, :]  # (N_write, 3)
-                        middle_segment[batch_idx_final, write_pos_final, :] = w_lane_data
-            
-        # ==================== 对中间段进行采样判断和拼接 ====================
-        # start_segment和end_segment永不采样，完整保留（各10个点）
-        # 只对middle_segment判断是否超过 w_lane_ids_length - 10 - 10 = w_lane_ids_length - 20
-        max_middle_len = w_lane_ids_length - 2*self.max_chain_len  # 中间段最大长度
-        
-        # 计算middle_segment的有效长度
-        middle_valid_mask = (middle_segment[:, :, 0] != self.INVALID_w_lane_id_MARKER)  # (B*M, w_lane_ids_length)
-        middle_counts = middle_valid_mask.sum(dim=1)  # (B*M,) 每个路径中间段的有效点数
-        
-        # 向量化统计需要采样的路径
-        need_sample_mask = (middle_counts > max_middle_len)
-        # 创建采样后的middle_segment
-        middle_segment_sampled = middle_segment[:, :max_middle_len, :].clone()  # (B*M, max_middle_len, 3)
-        # 对需要采样的路径进行完全向量化均匀采样
-        if need_sample_mask.any():
-            rows = torch.nonzero(need_sample_mask, as_tuple=False).squeeze(1)  # (N_need,)
-            counts_need_sample = middle_counts[rows]  # (N_need,) 需要采样的路径的中间段长度
-            
-            N_need = rows.shape[0]
-            if max_middle_len > 1:
-                base_positions = torch.arange(max_middle_len, device=self.device, dtype=torch.float32).unsqueeze(0).expand(N_need, -1)  # (N_need, max_middle_len)
-                step = (counts_need_sample.float() - 1).unsqueeze(1) / (max_middle_len - 1)
-                sample_positions = base_positions * step
-            else:
-                sample_positions = torch.zeros((N_need, 1), device=self.device, dtype=torch.float32)
-            sample_indices = torch.floor(sample_positions).long()
-            upper_bound = (counts_need_sample - 1).unsqueeze(1)
-            sample_indices = torch.minimum(sample_indices, upper_bound)
-            sample_indices = torch.clamp(sample_indices, min=0, max=w_lane_ids_length - 1)
-            sample_indices[:, -1] = torch.minimum(upper_bound.squeeze(1), torch.tensor(w_lane_ids_length - 1, device=self.device))
-
-            # 使用gather进行向量化采样
-            # middle_segment[rows]: (N_need, w_lane_ids_length, 3)
-            # sample_indices: (N_need, max_middle_len)
-            # 需要将sample_indices扩展到3维以匹配gather的要求
-            sample_indices_expanded = sample_indices.unsqueeze(2).expand(-1, -1, 3)  # (N_need, max_middle_len, 3)
-            
-            # 使用gather进行采样
-            sampled_data = torch.gather(
-                middle_segment[rows],  # (N_need, w_lane_ids_length, 3)
+            row_cumsum = torch.cumsum(lane_wps_count, dim=1)
+            row_offsets = torch.cat(
+                [torch.zeros(n_sub, 1, dtype=torch.long, device=device), row_cumsum[:, :-1]],
                 dim=1,
-                index=sample_indices_expanded  # (N_need, max_middle_len, 3)
-            )  # (N_need, max_middle_len, 3)
-            
-            # 写入到采样后的middle_segment
-            middle_segment_sampled[rows] = sampled_data
-        
-        # 直接拼接三段：start(max_chain_len) + middle(max_middle_len) + end(max_chain_len) = w_lane_ids_length
-        # 注意：end_segment 需要反转顺序，因为它是 [终点, 前1, ..., 前9]，需要变成 [前9, ..., 前1, 终点]
-        end_segment_flipped = torch.flip(end_segment, dims=[1])  # 沿着序列维度反转
+            )
 
-        w_lane_ids_flat = torch.cat([
-            start_segment,  # (B*M, max_chain_len, 3) - [起点, 后1, ..., 后9]
-            middle_segment_sampled,  # (B*M, max_middle_len, 3) - [中间点...]
-            end_segment_flipped  # (B*M, max_chain_len, 3) - [前9, ..., 前1, 终点]
-        ], dim=1)  # (B*M, w_lane_ids_length, 3)
-        # reshape回 (B, M, w_lane_ids_length, 3)
-        w_lane_ids = w_lane_ids_flat.reshape(B, M, w_lane_ids_length, 3)
-        
+            valid_positions = torch.nonzero(valid_lane_mask, as_tuple=False)
+            if valid_positions.shape[0] == 0:
+                continue
+
+            local_indices = valid_positions[:, 0]
+            p_indices = valid_positions[:, 1]
+            global_indices = local_indices + s_idx
+
+            lane_idx_valid = lane_idx_safe[local_indices, p_indices]
+            count_valid = lane_wps_count[local_indices, p_indices]
+            offset_valid = row_offsets[local_indices, p_indices]
+
+            write_count = torch.minimum(count_valid, w_lane_ids_length - offset_valid)
+            write_count = torch.maximum(write_count, torch.zeros_like(write_count))
+
+            repeat_counts = write_count.long()
+            total_points = int(repeat_counts.sum().item())
+
+            if total_points == 0:
+                continue
+
+            batch_idx_expanded = torch.repeat_interleave(global_indices, repeat_counts)
+            lane_idx_expanded = torch.repeat_interleave(lane_idx_valid, repeat_counts)
+            offset_expanded = torch.repeat_interleave(offset_valid, repeat_counts)
+
+            cumsum_counts = torch.cat(
+                [torch.zeros(1, dtype=torch.long, device=device), repeat_counts.cumsum(dim=0)[:-1]]
+            )
+            point_idx_base = torch.arange(total_points, device=device, dtype=torch.long)
+            point_idx_local = point_idx_base - torch.repeat_interleave(cumsum_counts, repeat_counts)
+
+            write_pos_expanded = offset_expanded + point_idx_local
+            valid_write_mask = write_pos_expanded < w_lane_ids_length
+            if not valid_write_mask.any():
+                continue
+
+            batch_idx_final = batch_idx_expanded[valid_write_mask]
+            write_pos_final = write_pos_expanded[valid_write_mask]
+            lane_idx_final = lane_idx_expanded[valid_write_mask]
+            point_idx_final = point_idx_local[valid_write_mask]
+
+            w_lane_data = self.lane_w_lane_ids[lane_idx_final, point_idx_final]
+            middle_segment[batch_idx_final, write_pos_final] = w_lane_data
+
+        max_middle_len = max(w_lane_ids_length - 2 * self.max_chain_len, 0)
+        if max_middle_len > 0:
+            middle_valid_mask = middle_segment != self.INVALID_w_lane_id_MARKER
+            middle_counts = middle_valid_mask.sum(dim=1)
+            need_sample_mask = middle_counts > max_middle_len
+            middle_segment_sampled = middle_segment[:, :max_middle_len].clone()
+
+            if need_sample_mask.any():
+                rows = torch.nonzero(need_sample_mask, as_tuple=False).squeeze(1)
+                counts_need_sample = middle_counts[rows]
+                N_need = rows.shape[0]
+                if max_middle_len > 1:
+                    base_positions = torch.arange(
+                        max_middle_len, device=device, dtype=torch.float32
+                    ).unsqueeze(0).expand(N_need, -1)
+                    step = (counts_need_sample.float() - 1).unsqueeze(1) / (max_middle_len - 1)
+                    sample_positions = base_positions * step
+                else:
+                    sample_positions = torch.zeros((N_need, 1), device=device, dtype=torch.float32)
+                sample_indices = torch.floor(sample_positions).long()
+                upper_bound = (counts_need_sample - 1).unsqueeze(1)
+                sample_indices = torch.minimum(sample_indices, torch.clamp(upper_bound, min=0))
+                sample_indices = torch.clamp(sample_indices, min=0, max=w_lane_ids_length - 1)
+
+                gathered = torch.gather(
+                    middle_segment[rows],
+                    1,
+                    sample_indices,
+                )
+                middle_segment_sampled[rows] = gathered
+        else:
+            middle_segment_sampled = middle_segment[:, :0]
+
+        end_segment_flipped = torch.flip(end_segment, dims=[1])
+
+        w_lane_ids_flat = torch.cat(
+            [start_segment, middle_segment_sampled, end_segment_flipped],
+            dim=1,
+        )
+        w_lane_ids = w_lane_ids_flat.reshape(B, M, w_lane_ids_length)
+
         return w_lane_ids
     
     def _get_w_lane_chain_w_lane_ids_from_poly_vectorized(self, poly_ids, direction='next', max_chain_len=10):
         """
-        基于poly的预存完整链（CSR）直接取序列并转为w_lane_ids。
+        基于poly的预存完整链（CSR）直接取序列并转为 w_lane_id。
         Args:
             poly_ids: (B,) poly_id tensor
             direction: 'next' 或 'prev'
             max_chain_len: 取前K个
         Returns:
-            (B, max_chain_len, 3)
+            (B, max_chain_len) ，元素为 w_lane_id（整型）
         """
         B = poly_ids.shape[0]
         device = poly_ids.device
-        out = torch.full((B, max_chain_len, 3), self.INVALID_w_lane_id_MARKER, dtype=torch.float32, device=device)
-        
+        out = torch.full(
+            (B, max_chain_len),
+            self.INVALID_w_lane_id_MARKER,
+            dtype=torch.long,
+            device=device,
+        )
+
+        if self.w_lane_idx_to_id.numel() == 0:
+            return out
+
         if direction == 'next':
             off = self.poly_next_seq_offsets[poly_ids]
             leng = self.poly_next_seq_lengths[poly_ids]
@@ -642,22 +635,72 @@ class PathPlanner:
             off = self.poly_prev_seq_offsets[poly_ids]
             leng = self.poly_prev_seq_lengths[poly_ids]
             flat = self.poly_prev_seq_flat_idx
-        
+
         K = max_chain_len
         pos = torch.arange(K, device=device, dtype=torch.long).view(1, K).expand(B, -1)
         take = torch.minimum(leng, torch.full_like(leng, K))
-        
-        # 无论 next 还是 prev，都从序列开头取前 K 个点
-        # 因为在构建时，prev 已经 reversed，所以两者的顺序都是从近到远
+
         idx_in_seq = torch.minimum(pos, torch.clamp(leng.unsqueeze(1) - 1, min=0))
-        
         base = off.unsqueeze(1).expand(B, K)
         flat_idx = base + idx_in_seq
-        flat_idx = torch.clamp(flat_idx, 0, max(0, flat.shape[0]-1))
-        feats = self.w_lane_features[flat[flat_idx]]  # 双重索引：先索引flat，再索引w_lane_features
+        flat_idx = torch.clamp(flat_idx, 0, max(0, flat.shape[0] - 1))
+
+        lane_indices = flat[flat_idx]
+        lane_indices = torch.clamp(lane_indices, min=0, max=max(0, self.w_lane_idx_to_id.shape[0] - 1))
+        w_lane_ids = self.w_lane_idx_to_id[lane_indices]
+
         mask = pos < take.unsqueeze(1)
-        out[mask] = feats[mask]
+        out[mask] = w_lane_ids[mask]
         return out
+
+# =====功能性函数===============
+    def map_w_lane_ids_to_indices(self, w_lane_ids: torch.Tensor) -> torch.Tensor:
+        """将 w_lane_id 张量映射为内部索引，未命中返回 INVALID_w_lane_index_MARKER。"""
+        if self.w_lane_id_to_idx_tensor.numel() == 0 or w_lane_ids.numel() == 0:
+            return torch.full(
+                w_lane_ids.shape,
+                self.INVALID_w_lane_index_MARKER,
+                dtype=torch.long,
+                device=w_lane_ids.device,
+            )
+
+        max_id = self.w_lane_id_to_idx_tensor.shape[0] - 1
+        ids_long = w_lane_ids.to(torch.long)
+        clamped = torch.clamp(ids_long, min=0, max=max_id)
+        idx = self.w_lane_id_to_idx_tensor[clamped]
+        invalid_mask = (ids_long < 0) | (ids_long > max_id) | (idx == self.INVALID_w_lane_index_MARKER)
+        idx = torch.where(
+            invalid_mask,
+            torch.full_like(idx, self.INVALID_w_lane_index_MARKER),
+            idx,
+        )
+        return idx
+
+    def get_w_lane_features_by_id(self, w_lane_ids: torch.Tensor) -> torch.Tensor:
+        """根据 w_lane_id 返回对应特征 (x, y, angle)，无效位置填 `INVALID_MARKER`。"""
+        if w_lane_ids.numel() == 0:
+            return torch.full(
+                w_lane_ids.shape + (3,),
+                float(self.INVALID_MARKER),
+                dtype=self.w_lane_features.dtype,
+                device=w_lane_ids.device,
+            )
+        idx = self.map_w_lane_ids_to_indices(w_lane_ids.to(self.device))
+        out = torch.full(
+            w_lane_ids.shape + (3,),
+            float(self.INVALID_MARKER),
+            dtype=self.w_lane_features.dtype,
+            device=self.device,
+        )
+        valid_mask = idx >= 0
+        if valid_mask.any():
+            out[valid_mask] = self.w_lane_features[idx[valid_mask]]
+        return out.to(w_lane_ids.device)
+
+    def get_w_lane_centers_by_id(self, w_lane_ids: torch.Tensor) -> torch.Tensor:
+        """根据 w_lane_id 返回中心坐标 (x, y)。"""
+        features = self.get_w_lane_features_by_id(w_lane_ids)
+        return features[..., :2]
 
 if __name__ == '__main__':
     # ==================== 1. 初始化 RoadNetwork 和 Planner ====================
@@ -699,14 +742,15 @@ if __name__ == '__main__':
     print("all_w_lane_ids shape:", tuple(all_w_lane_ids.shape))
     sample_b, sample_m = 0, 0
     if all_w_lane_ids.numel() > 0:
-        sample_path = all_w_lane_ids[sample_b, sample_m].detach().cpu().tolist()
+        sample_ids = all_w_lane_ids[sample_b, sample_m]
+        sample_features = planner.get_w_lane_features_by_id(sample_ids).detach().cpu().numpy()
         print(f"Sample path for B={sample_b}, M={sample_m}:")
-        for idx, waypoint in enumerate(sample_path):
-            if waypoint[0] == planner.INVALID_w_lane_id_MARKER:
+        for idx, (lane_id, feat) in enumerate(zip(sample_ids.tolist(), sample_features.tolist())):
+            if lane_id == planner.INVALID_w_lane_id_MARKER:
                 print(f"  [{idx:02d}] INVALID")
             else:
-                x, y, angle = waypoint
-                print(f"  [{idx:02d}] x={x:.4f}, y={y:.4f}, angle={angle:.4f}")
+                x, y, angle = feat
+                print(f"  [{idx:02d}] id={lane_id}, x={x:.4f}, y={y:.4f}, angle={angle:.4f}")
     else:
         print("all_w_lane_ids is empty.")
 
@@ -746,7 +790,7 @@ if __name__ == '__main__':
     glMatrixMode(GL_MODELVIEW)
 
     # 可用路径索引列表
-    flat_counts = (all_w_lane_ids[..., 0] != planner.INVALID_w_lane_id_MARKER).sum(dim=2).view(-1)
+    flat_counts = (all_w_lane_ids != planner.INVALID_w_lane_id_MARKER).sum(dim=2).view(-1)
     indices = torch.nonzero(flat_counts > 0, as_tuple=False).flatten().tolist()
     if not indices:
         indices = [0]
@@ -773,7 +817,7 @@ if __name__ == '__main__':
         glColor3f(0.5, 0.1, 0.7)
         L = 10.0
         for p in wp_np_local:
-            if p[0] == planner.INVALID_w_lane_id_MARKER:
+            if p[0] == planner.INVALID_MARKER:
                 continue
             x, y, ang = float(p[0]), float(p[1]), float(p[2])
             dx = L * np.cos(ang)
@@ -829,7 +873,8 @@ if __name__ == '__main__':
         flat_i = indices[cur_idx]
         b = flat_i // M
         m = flat_i % M
-        wp = all_w_lane_ids[b, m].detach().cpu().numpy()
+        wp_ids = all_w_lane_ids[b, m]
+        wp = planner.get_w_lane_features_by_id(wp_ids).detach().cpu().numpy()
         start_poly_id = int(start_poly_tensor[b, m].item())
         end_poly_id = int(end_poly_tensor[b, m].item())
         
@@ -837,7 +882,7 @@ if __name__ == '__main__':
         pygame.display.set_caption(f'collect_path_w_lane_ids - B={b}, M={m} (SPACE: next path, ESC: quit)')
         
         # 起点：优先使用路径的第一个有效 w_lane 点，否则使用 start_poly_id 的 center
-        valid = wp[:, 0] != planner.INVALID_w_lane_id_MARKER
+        valid = wp[:, 0] != planner.INVALID_MARKER
         if valid.any():
             first_idx = int(np.argmax(valid))
             sx, sy = float(wp[first_idx, 0]), float(wp[first_idx, 1])

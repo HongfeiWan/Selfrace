@@ -29,6 +29,7 @@ class RoadNetwork:
         self.left_boundaries: torch.Tensor = torch.empty((0, 2, 2), dtype=torch.float32, device=self.device)
         self.right_boundaries: torch.Tensor = torch.empty((0, 2, 2), dtype=torch.float32, device=self.device)
         self.quad_directions: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+        self.quad_curvatures: torch.Tensor = torch.empty((0,), dtype=torch.float32, device=self.device)
         # 元数据/索引
         self.quad_ids: torch.Tensor = torch.empty((0,), dtype=torch.int64, device=self.device)
         self.lane_ids: torch.Tensor = torch.empty((0,), dtype=torch.int32, device=self.device)
@@ -122,6 +123,8 @@ class RoadNetwork:
         # 方向
         angles = torch.tensor([float(q['direction_angle']) for q in quads_data], dtype=torch.float32, device=self.device)
         self.quad_directions = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
+        # 曲率
+        self.quad_curvatures = torch.tensor([float(q.get('curvature', 0.0)) for q in quads_data], dtype=torch.float32, device=self.device)
         # 左右边界（基于方向）
         edgeA = torch.stack([TL, BL], dim=1)
         edgeB = torch.stack([TR, BR], dim=1)

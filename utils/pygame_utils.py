@@ -38,13 +38,15 @@ class PathPlanningVisualizer:
         invalid_marker_value: float = -999999.0,
         horizon: float = 80.0,
         observation_callback: Optional[Callable] = None,
-        step_callback: Optional[Callable[[int, int], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
+        step_callback: Optional[Callable[[int, int], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
         info_callback: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int, int], Optional[object]]] = None,
         agents_start_quad_ids: Optional[torch.Tensor] = None,
         agents_goal_quad_ids: Optional[torch.Tensor] = None,
         goal_positions: Optional[torch.Tensor] = None,
         goal_radii: Optional[torch.Tensor] = None,
-        done_mask: Optional[torch.Tensor] = None):
+        done_mask: Optional[torch.Tensor] = None,
+        sampled_waypoint_features: Optional[torch.Tensor] = None,
+        sampled_waypoint_ids: Optional[torch.Tensor] = None):
         """
         初始化可视化器
         
@@ -80,6 +82,8 @@ class PathPlanningVisualizer:
         self.goal_positions = goal_positions
         self.goal_radii = goal_radii
         self.done_mask = done_mask
+        self.sampled_waypoint_features = sampled_waypoint_features
+        self.sampled_waypoint_ids = sampled_waypoint_ids
         
         # 准备道路几何数据
         self.road_geometry_np = quads_vertices.detach().cpu().numpy()
@@ -137,6 +141,8 @@ class PathPlanningVisualizer:
             self.info_title_font = pygame.font.Font(None, 20)
         self.info_panel_width = 320
         self.info_panel_margin = 10
+        self.current_view_width = self.x_max - self.x_min if (self.x_max > self.x_min) else 1.0
+        self.current_view_height = self.y_max - self.y_min if (self.y_max > self.y_min) else 1.0
     
     def draw_quads(self):
         """绘制道路几何（支持四边形或线段）"""
@@ -336,6 +342,7 @@ class PathPlanningVisualizer:
                 glColor4f(0.2, 0.4, 0.9, 0.8)
                 glPointSize(4.0)
                 glBegin(GL_POINTS)
+                text_entries = []
                 for i in range(wlane_np.shape[0]):
                     dx, dy = wlane_np[i, 0], wlane_np[i, 1]
                     if abs(dx) < 1e-5 and abs(dy) < 1e-5:
@@ -344,7 +351,21 @@ class PathPlanningVisualizer:
                     dx_dy = np.array([dx, dy])
                     world_pos = dx_dy @ rot.T + np.array([ego_x, ego_y])
                     glVertex2f(world_pos[0], world_pos[1])
+                    delta_val = None
+                    if wlane_np.shape[1] >= 3:
+                        delta_val = wlane_np[i, 2]
+                    text_entries.append((world_pos[0], world_pos[1], float(dx), float(dy), None if delta_val is None else float(delta_val)))
                 glEnd()
+                if text_entries:
+                    offset_x = (self.current_view_width / max(1, self.screen_width)) * 12.0
+                    offset_y = (self.current_view_height / max(1, self.screen_height)) * 12.0
+                    for wx, wy, dx_val, dy_val, delta_val in text_entries:
+                        if delta_val is None or not math.isfinite(delta_val) or abs(delta_val - self.invalid_marker_value) < 1e-3:
+                            delta_str = "Δ:∞"
+                        else:
+                            delta_str = f"Δ:{delta_val:.1f}"
+                        label = f"dx:{dx_val:.1f} dy:{dy_val:.1f} {delta_str}"
+                        self.draw_text_world(label, wx + offset_x, wy + offset_y, color=(0.2, 0.4, 0.9), alpha=0.65)
         except Exception as e:
             print(f"绘制 w_lanes 失败: {e}")
             import traceback
@@ -379,6 +400,60 @@ class PathPlanningVisualizer:
         glBegin(GL_POINTS)
         glVertex2f(float(x), float(y))
         glEnd()
+    
+    def draw_text_world(self, text: str, x: float, y: float, color=(1.0, 1.0, 1.0), alpha: float = 0.6):
+        """在世界坐标系中绘制带透明度的文本。"""
+        if not text:
+            return
+        try:
+            text_surface = self.info_font.render(
+                text,
+                True,
+                (
+                    max(0, min(255, int(color[0] * 255))),
+                    max(0, min(255, int(color[1] * 255))),
+                    max(0, min(255, int(color[2] * 255))),
+                ),
+            )
+        except Exception:
+            return
+        width, height = text_surface.get_size()
+        if width == 0 or height == 0:
+            return
+
+        surface = pygame.Surface((width, height), pygame.SRCALPHA)
+        surface.blit(text_surface, (0, 0))
+        texture_data = pygame.image.tostring(surface, "RGBA", True)
+
+        scale = 0.6
+        world_width = (self.current_view_width / max(1, self.screen_width)) * width * scale
+        world_height = (self.current_view_height / max(1, self.screen_height)) * height * scale
+        if world_width <= 0 or world_height <= 0:
+            return
+
+        texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, texture)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, texture_data)
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_TEXTURE_2D)
+        glColor4f(color[0], color[1], color[2], alpha)
+        x0 = float(x)
+        y0 = float(y)
+        x1 = x0 + world_width
+        y1 = y0 + world_height
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 0.0); glVertex2f(x0, y0)
+        glTexCoord2f(1.0, 0.0); glVertex2f(x1, y0)
+        glTexCoord2f(1.0, 1.0); glVertex2f(x1, y1)
+        glTexCoord2f(0.0, 1.0); glVertex2f(x0, y1)
+        glEnd()
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_BLEND)
+        glDeleteTextures([texture])
     
     def draw_path_with_arrows(self, valid_path):
         """绘制路径点、连线和方向箭头"""
@@ -420,6 +495,49 @@ class PathPlanningVisualizer:
         
         # 5. 绘制终点
         self.draw_point_xy(valid_path[-1, 0], valid_path[-1, 1], 0.9, 0.2, 0.2, size=12.0)
+    
+    def draw_sampled_waypoints(self, sampled_features, sampled_ids=None):
+        """绘制随机采样的关键 waypoint。"""
+        if sampled_features is None:
+            return
+        try:
+            features_np = sampled_features.detach().cpu().numpy() if torch.is_tensor(sampled_features) else np.asarray(sampled_features)
+        except Exception:
+            return
+        if features_np.size == 0:
+            return
+        ids_np = None
+        if sampled_ids is not None:
+            try:
+                ids_np = sampled_ids.detach().cpu().numpy() if torch.is_tensor(sampled_ids) else np.asarray(sampled_ids)
+            except Exception:
+                ids_np = None
+        glColor4f(0.95, 0.75, 0.1, 0.9)
+        glPointSize(8.0)
+        glBegin(GL_POINTS)
+        text_entries = []
+        for idx, point in enumerate(features_np):
+            if point.shape[0] < 2:
+                continue
+            x_val, y_val = point[0], point[1]
+            if not np.isfinite(x_val) or not np.isfinite(y_val):
+                continue
+            if abs(x_val - self.invalid_marker_value) < 1e-3 or abs(y_val - self.invalid_marker_value) < 1e-3:
+                continue
+            glVertex2f(float(x_val), float(y_val))
+            waypoint_id = None
+            if ids_np is not None and idx < ids_np.shape[0]:
+                val = ids_np[idx]
+                if np.isfinite(val):
+                    waypoint_id = int(val)
+            text_entries.append((float(x_val), float(y_val), waypoint_id))
+        glEnd()
+        if text_entries:
+            offset_x = (self.current_view_width / max(1, self.screen_width)) * 14.0
+            offset_y = (self.current_view_height / max(1, self.screen_height)) * 14.0
+            for wx, wy, waypoint_id in text_entries:
+                label = f"id:{waypoint_id}" if waypoint_id is not None else "id:?"
+                self.draw_text_world(label, wx + offset_x, wy + offset_y, color=(0.95, 0.75, 0.1), alpha=0.8)
     
     def _format_info_lines(self, info_obj: Optional[object]) -> Optional[list]:
         if info_obj is None:
@@ -537,12 +655,16 @@ class PathPlanningVisualizer:
                                         new_goal_positions = step_result[2] if len(step_result) > 2 else None
                                         new_goal_radii = step_result[3] if len(step_result) > 3 else None
                                         new_done_mask = step_result[4] if len(step_result) > 4 else None
+                                        new_sampled_features = step_result[5] if len(step_result) > 5 else None
+                                        new_sampled_ids = step_result[6] if len(step_result) > 6 else None
                                     else:
                                         new_agents_state = step_result
                                         new_agents_path_plans = None
                                         new_goal_positions = None
                                         new_goal_radii = None
                                         new_done_mask = None
+                                        new_sampled_features = None
+                                        new_sampled_ids = None
                                     if new_agents_state is not None:
                                         self.agents_state = new_agents_state
                                     if new_agents_path_plans is not None:
@@ -553,6 +675,10 @@ class PathPlanningVisualizer:
                                         self.goal_radii = new_goal_radii
                                     if new_done_mask is not None:
                                         self.done_mask = new_done_mask
+                                    if new_sampled_features is not None:
+                                        self.sampled_waypoint_features = new_sampled_features
+                                    if new_sampled_ids is not None:
+                                        self.sampled_waypoint_ids = new_sampled_ids
                                     active_mask = self.agents_state[..., 6] > 0.5
                                     active_agents = torch.nonzero(active_mask[self.batch_idx], as_tuple=False).squeeze(-1)
                                     if active_agents.numel() > 0:
@@ -594,6 +720,19 @@ class PathPlanningVisualizer:
             ego_x, ego_y, ego_heading = ego_state[0], ego_state[1], ego_state[2]
             ego_length, ego_width = ego_state[4], ego_state[5]
             
+            sampled_features = None
+            sampled_ids = None
+            if self.sampled_waypoint_features is not None:
+                try:
+                    sampled_features = self.sampled_waypoint_features[b, m]
+                except Exception:
+                    sampled_features = self.sampled_waypoint_features
+            if self.sampled_waypoint_ids is not None:
+                try:
+                    sampled_ids = self.sampled_waypoint_ids[b, m]
+                except Exception:
+                    sampled_ids = self.sampled_waypoint_ids
+            
             # 获取观测数据（如果提供了回调函数）
             has_observation = False
             neighbors_local = None
@@ -632,6 +771,8 @@ class PathPlanningVisualizer:
             # 更新投影矩阵（缩放）
             view_width = (self.x_max - self.x_min) / self.zoom_level
             view_height = (self.y_max - self.y_min) / self.zoom_level
+            self.current_view_width = view_width
+            self.current_view_height = view_height
             
             view_x_min = ego_x - view_width / 2
             view_x_max = ego_x + view_width / 2
@@ -670,6 +811,9 @@ class PathPlanningVisualizer:
             if len(valid_path) > 0:
                 self.draw_path_with_arrows(valid_path)
             
+            if sampled_features is not None:
+                self.draw_sampled_waypoints(sampled_features, sampled_ids)
+            
             if info_lines:
                 self.draw_info_panel(info_lines)
             
@@ -689,13 +833,15 @@ def visualize_path_planning(
     invalid_marker_value: float = -999999.0,
     horizon: float = 80.0,
     observation_callback: Optional[Callable] = None,
-    step_callback: Optional[Callable[[int, int], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
+    step_callback: Optional[Callable[[int, int], Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]]]] = None,
     info_callback: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int, int], Optional[object]]] = None,
     agents_start_quad_ids: Optional[torch.Tensor] = None,
     agents_goal_quad_ids: Optional[torch.Tensor] = None,
     goal_positions: Optional[torch.Tensor] = None,
     goal_radii: Optional[torch.Tensor] = None,
-    done_mask: Optional[torch.Tensor] = None):
+    done_mask: Optional[torch.Tensor] = None,
+    sampled_waypoint_features: Optional[torch.Tensor] = None,
+    sampled_waypoint_ids: Optional[torch.Tensor] = None):
     """
     便捷函数：可视化路径规划（通用版本）
     
@@ -729,6 +875,8 @@ def visualize_path_planning(
         agents_goal_quad_ids=agents_goal_quad_ids,
         goal_positions=goal_positions,
         goal_radii=goal_radii,
-        done_mask=done_mask
+        done_mask=done_mask,
+        sampled_waypoint_features=sampled_waypoint_features,
+        sampled_waypoint_ids=sampled_waypoint_ids,
     )
     return visualizer.run()

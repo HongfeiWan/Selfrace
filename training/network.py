@@ -132,6 +132,311 @@ class GoalsNet(nn.Module):
         max_pool = point_features.max(dim=2).values  # (B, M, embed_dim)
         return self.pool_proj(max_pool)
 
+class WlaneNet(nn.Module):
+    """Encode observed w_lane points (dx, dy, Δs) into pooled embeddings."""
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        if config is None:
+            config = _load_default_config()
+        sim_cfg = config.get("simulator", {}) if isinstance(config, dict) else {}
+        net_cfg = sim_cfg.get("network", {}) if isinstance(sim_cfg.get("network", {}), dict) else {}
+        obs_cfg = sim_cfg.get("observation", {}) if isinstance(sim_cfg.get("observation", {}), dict) else {}
+
+        self.horizon = float(obs_cfg.get("horizon"))
+        base_dim = int(obs_cfg.get("w_lane_feature_dim", 2))
+        # 输入包含 dx, dy 以及额外的 Δs
+        self.point_dim = base_dim + 1
+        self.embed_dim = int(net_cfg.get("GoalsNet_embed_dim", 64))
+        self.encoded_dim = int(net_cfg.get("GoalsNet_encoded_dim", 64))
+        self.path_invalid_marker = float(obs_cfg.get("INVALID_MARKER", -1e10))
+
+        self.point_mlp = nn.Sequential(
+            nn.Linear(self.point_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.ReLU(),
+        )
+        self.pool_proj = nn.Sequential(
+            nn.Linear(self.embed_dim, self.encoded_dim),
+            nn.ReLU(),
+            nn.Linear(self.encoded_dim, self.encoded_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, w_lanes_local_with_goal_distances: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            w_lanes_local_with_goal_distances: (B, M, K, 3) with [dx, dy, Δs]
+        Returns:
+            Encoded features of shape (B, M, encoded_dim)
+        """
+        if w_lanes_local_with_goal_distances.dim() != 4 or w_lanes_local_with_goal_distances.shape[-1] != self.point_dim:
+            raise ValueError(
+                f"Expected input shape (B, M, K, {self.point_dim}), got {tuple(w_lanes_local_with_goal_distances.shape)}"
+            )
+        processed = _normalize_relative_distances(w_lanes_local_with_goal_distances, self.horizon)
+        B, M, K, _ = processed.shape
+        point_features = self.point_mlp(processed.view(B * M * K, self.point_dim)).view(B, M, K, self.embed_dim)
+        max_pool = point_features.max(dim=2).values
+        return self.pool_proj(max_pool)
+
+class OtherAgentsNet(nn.Module):
+    """Encode neighbor vehicles (dx, dy, dvx, dvy, w, l, active) into pooled embeddings."""
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        if config is None:
+            config = _load_default_config()
+        sim_cfg = config.get("simulator", {}) if isinstance(config, dict) else {}
+        net_cfg = sim_cfg.get("network", {}) if isinstance(sim_cfg.get("network", {}), dict) else {}
+        obs_cfg = sim_cfg.get("observation", {}) if isinstance(sim_cfg.get("observation", {}), dict) else {}
+        
+        self.horizon = float(obs_cfg.get("horizon"))
+        self.point_dim = int(obs_cfg.get("neighbor_feature_dim"))  # dx, dy, dvx, dvy, w, l, active
+        self.embed_dim = int(net_cfg.get("OtherAgentsNet_embed_dim"))
+        self.encoded_dim = int(net_cfg.get("OtherAgentsNet_encoded_dim"))
+        
+        # 归一化参数
+        self.dvx_dvy_min = -2.0
+        self.dvx_dvy_mid = 0.0
+        self.dvx_dvy_max = 20.0
+        self.w_min = 0.8
+        self.w_max = 3.0
+        self.l_min = 0.8
+        self.l_max = 7.0
+        
+        self.point_mlp = nn.Sequential(
+            nn.Linear(self.point_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.ReLU(),
+        )
+        
+        self.pool_proj = nn.Sequential(
+            nn.Linear(self.embed_dim, self.encoded_dim),
+            nn.ReLU(),
+            nn.Linear(self.encoded_dim, self.encoded_dim),
+            nn.ReLU(),
+        )
+    
+    def _normalize_neighbor_features(self, neighbors: torch.Tensor) -> torch.Tensor:
+        """
+        归一化邻居车辆特征。
+        Args:
+            neighbors: (B, M, K, 7) with [dx, dy, dvx, dvy, w, l, active]
+        Returns:
+            normalized: (B, M, K, 7) 归一化后的特征
+        """
+        B, M, K, D = neighbors.shape
+        if D != self.point_dim:
+            raise ValueError(f"Expected point_dim={self.point_dim}, but got {D}")
+        
+        normalized = torch.zeros_like(neighbors)
+        
+        # 1. dx, dy 使用 _normalize_relative_distances 归一化
+        normalized[..., :2] = _normalize_relative_distances(neighbors[..., :2], self.horizon)
+        
+        # 2. dvx, dvy 分段归一化
+        dvx = neighbors[..., 2]
+        dvy = neighbors[..., 3]
+        
+        # -2到0映射到-1到0
+        mask_neg = (dvx >= self.dvx_dvy_min) & (dvx < self.dvx_dvy_mid)
+        normalized[..., 2] = torch.where(
+            mask_neg,
+            (dvx - self.dvx_dvy_mid) / (self.dvx_dvy_mid - self.dvx_dvy_min),  # 映射到 [-1, 0]
+            torch.zeros_like(dvx)
+        )
+        # 0到20归一化到0到1
+        mask_pos = (dvx >= self.dvx_dvy_mid) & (dvx <= self.dvx_dvy_max)
+        normalized[..., 2] = torch.where(
+            mask_pos,
+            (dvx - self.dvx_dvy_mid) / (self.dvx_dvy_max - self.dvx_dvy_mid),  # 映射到 [0, 1]
+            normalized[..., 2]
+        )
+        # 范围外的值映射到-1到1（<-1设置-1，>1设置1）
+        normalized[..., 2] = torch.clamp(normalized[..., 2], min=-1.0, max=1.0)
+        
+        # 对 dvy 做同样的处理
+        mask_neg = (dvy >= self.dvx_dvy_min) & (dvy < self.dvx_dvy_mid)
+        normalized[..., 3] = torch.where(
+            mask_neg,
+            (dvy - self.dvx_dvy_mid) / (self.dvx_dvy_mid - self.dvx_dvy_min),
+            torch.zeros_like(dvy)
+        )
+        mask_pos = (dvy >= self.dvx_dvy_mid) & (dvy <= self.dvx_dvy_max)
+        normalized[..., 3] = torch.where(
+            mask_pos,
+            (dvy - self.dvx_dvy_mid) / (self.dvx_dvy_max - self.dvx_dvy_mid),
+            normalized[..., 3]
+        )
+        normalized[..., 3] = torch.clamp(normalized[..., 3], min=-1.0, max=1.0)
+        
+        # 3. w 使用范围（0.8, 3）到（0, 1）映射
+        w = neighbors[..., 4]
+        normalized[..., 4] = torch.clamp(
+            (w - self.w_min) / (self.w_max - self.w_min),
+            min=0.0,
+            max=1.0
+        )
+        
+        # 4. l 使用范围（0.8, 7）到（0, 1）映射
+        l = neighbors[..., 5]
+        normalized[..., 5] = torch.clamp(
+            (l - self.l_min) / (self.l_max - self.l_min),
+            min=0.0,
+            max=1.0
+        )
+        
+        # 5. active 输入是0或1，直接使用即可
+        normalized[..., 6] = neighbors[..., 6]
+        
+        return normalized
+    
+    def forward(self, neighbors_local: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            neighbors_local: (B, M, K, 7) with [dx, dy, dvx, dvy, w, l, active]
+        Returns:
+            Encoded features of shape (B, M, encoded_dim)
+        """
+        if neighbors_local.dim() != 4 or neighbors_local.shape[-1] != self.point_dim:
+            raise ValueError(
+                f"Expected input shape (B, M, K, {self.point_dim}), got {tuple(neighbors_local.shape)}"
+            )
+        
+        # 归一化所有特征
+        processed = self._normalize_neighbor_features(neighbors_local)
+        
+        B, M, K, _ = processed.shape
+        # 将所有邻居的特征通过 MLP 处理
+        point_features = self.point_mlp(processed.view(B * M * K, self.point_dim)).view(B, M, K, self.embed_dim)
+        # Max pooling 在 K 维度上
+        max_pool = point_features.max(dim=2).values  # (B, M, embed_dim)
+        
+        return self.pool_proj(max_pool)
+
+class ConditionNet(nn.Module):
+    """Fuse simulator-level conditioning signals into agent embeddings."""
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        if config is None:
+            config = _load_default_config()
+        sim_cfg = config.get("simulator", {}) if isinstance(config, dict) else {}
+        net_cfg = sim_cfg.get("network", {}) if isinstance(sim_cfg.get("network", {}), dict) else {}
+        dynamics_cfg = sim_cfg.get("dynamics", {}) if isinstance(sim_cfg.get("dynamics", {}), dict) else {}
+
+        self.embed_dim = int(net_cfg.get("ConditionNet_embed_dim", 64))
+        self.encoded_dim = int(net_cfg.get("ConditionNet_encoded_dim", 64))
+
+        # 归一化所需的范围
+        self.curvature_scale = 0.077
+        self.wheelbase_min = 0.48
+        self.wheelbase_max = 4.2
+        
+        # 驾驶风格参数归一化范围
+        self.c_throttle_min = 0.900
+        self.c_throttle_max = 1.125
+        self.c_steer_min = 0.900
+        self.c_steer_max = 1.125
+        self.c_acc_min = 0.833
+        self.c_acc_max = 1.25
+        self.c_vel_min = 0.833
+        self.c_vel_max = 1.25
+
+        # Condition features: [curvature, Cthrottle, Csteer, Cacc, Cvel] + reward_params(10) + wheelbase
+        self.reward_param_dim = int(net_cfg.get("ConditionNet_reward_param_dim", 10))
+        self.input_dim = 1 + 4 + self.reward_param_dim + 1  # curvature + 4 coeffs + reward params + wheelbase
+
+        self.mlp = nn.Sequential(
+            nn.Linear(self.input_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.embed_dim, self.encoded_dim),
+            nn.LayerNorm(self.encoded_dim),
+            nn.ReLU(),
+        )
+
+    def _reshape_feature(self, tensor: torch.Tensor, B: int, M: int) -> torch.Tensor:
+        if tensor.dim() == 1:
+            return tensor.view(B, M)
+        if tensor.dim() == 2 and tensor.shape[0] == B and tensor.shape[1] == M:
+            return tensor
+        if tensor.dim() == 2 and tensor.shape[0] == B * M:
+            return tensor.view(B, M)
+        raise ValueError(f"Unexpected tensor shape {tuple(tensor.shape)} for ConditionNet feature.")
+
+    def _normalize_curvature(self, curvature: torch.Tensor) -> torch.Tensor:
+        if self.curvature_scale <= 0:
+            return torch.clamp(curvature, min=-self.curvature_scale, max=self.curvature_scale)
+        return torch.clamp(curvature / (2*self.curvature_scale), min=-1.0, max=1.0)
+
+    def _normalize_wheelbase(self, wheelbase: torch.Tensor) -> torch.Tensor:
+        denom = max(self.wheelbase_max - self.wheelbase_min, 1e-6)
+        normalized = (wheelbase - self.wheelbase_min) / denom
+        return torch.clamp(normalized, min=0.0, max=1.0)
+
+    def forward(
+        self,
+        curvature: torch.Tensor,
+        c_throttle: torch.Tensor,
+        c_steer: torch.Tensor,
+        c_acc: torch.Tensor,
+        c_vel: torch.Tensor,
+        reward_params: torch.Tensor,
+        wheelbase: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            curvature: (B, M)
+            c_throttle/c_steer/c_acc/c_vel: (B*M,) 或 (B, M)
+            reward_params: (B, M, R)
+            wheelbase: (B*M,) 或 (B, M)
+        Returns:
+            Encoded conditioning features of shape (B, M, encoded_dim)
+        """
+        if curvature.dim() != 2:
+            raise ValueError("curvature must be of shape (B, M)")
+        B, M = curvature.shape
+
+        curv_norm = self._normalize_curvature(curvature)
+        cth = self._reshape_feature(c_throttle, B, M)
+        cst = self._reshape_feature(c_steer, B, M)
+        cac = self._reshape_feature(c_acc, B, M)
+        cvl = self._reshape_feature(c_vel, B, M)
+        wheelbase_reshaped = self._normalize_wheelbase(self._reshape_feature(wheelbase, B, M))
+
+        if reward_params.dim() != 3 or reward_params.shape[0] != B or reward_params.shape[1] != M:
+            raise ValueError("reward_params must be of shape (B, M, R)")
+        if reward_params.shape[2] != self.reward_param_dim:
+            raise ValueError(
+                f"Expected reward_params last dim {self.reward_param_dim}, got {reward_params.shape[2]}"
+            )
+            
+        features = torch.cat(
+            [
+                curv_norm.unsqueeze(-1),
+                cth.unsqueeze(-1),
+                cst.unsqueeze(-1),
+                cac.unsqueeze(-1),
+                cvl.unsqueeze(-1),
+                reward_params,
+                wheelbase_reshaped.unsqueeze(-1),
+            ],
+            dim=-1,
+        )  # (B, M, input_dim)
+        output = self.mlp(features.view(B * M, self.input_dim))
+        return output.view(B, M, self.encoded_dim)
+
+class VehicleStateNet(nn.Module):
+    #simulator的observation返回内容的local_state部分。
+    #包含dx=0,dy=0,yaw,speed,w,l,active
+    #需要在forward当中变成八个维度：0,0,cos(yaw),sin(yaw),speed(-2,20分两段归一化到-1到1),w(同OtherAgentsNet归一化),l(同OtherAgentsNet归一化),active（直接输入）
+
+    pass
 
 if __name__ == "__main__":
     # 测试一下，WBoundaryNet 是否能正常工作

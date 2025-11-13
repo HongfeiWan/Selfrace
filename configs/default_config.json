@@ -39,7 +39,7 @@
 
       "local_state_dim": 7,
       "neighbor_feature_dim": 7,
-      "w_lane_feature_dim": 2,
+      "w_lane_feature_dim": 3,
       "boundary_feature_dim": 2,
       "navigation_feature_dim": 2,
 
@@ -102,7 +102,11 @@
       "WBoundaryNet_embed_dim": 64,
       "WBoundaryNet_encoded_dim": 64,
       "GoalsNet_embed_dim": 64,
-      "GoalsNet_encoded_dim": 64
+      "GoalsNet_encoded_dim": 64,
+      "OtherAgentsNet_embed_dim": 64,
+      "OtherAgentsNet_encoded_dim": 64,
+      "ConditionNet_embed_dim":64,
+      "ConditionNet_encoded_dim":64
     }
 
   },
