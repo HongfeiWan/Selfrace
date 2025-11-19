@@ -59,6 +59,10 @@ class PathPlanningVisualizer:
             horizon: 观测范围半径（默认80.0）
             observation_callback: 可选的观测数据获取回调函数
                                  签名: (agents_state, batch_idx, agent_idx) -> (neighbors_local, w_lanes_local, w_boundaries_local)
+                                 w_lanes_local 形状: (K, 2) 或 (K, 3) 或 (K, 4)
+                                 2维: [dx, dy]
+                                 3维: [dx, dy, Δs] (旧格式)
+                                 4维: [dx, dy, angle_local, Δs] (新格式)
             agents_start_quad_ids: 可选的起始quad ID
             agents_goal_quad_ids: 可选的目标quad ID
             goal_positions: 可选的目标位置 (B, M, 2)
@@ -280,14 +284,25 @@ class PathPlanningVisualizer:
     
     def draw_observation_data(self, neighbors_local, w_lanes_local, w_boundaries_local, 
                             ego_x, ego_y, ego_heading, ego_speed):
-        """绘制 observation 中的数据（透明显示）"""
+        """绘制 observation 中的数据（透明显示）
+        
+        Args:
+            neighbors_local: 邻居车辆局部坐标 (K, 7)
+            w_lanes_local: w_lane 局部坐标，形状可以是 (K, 2), (K, 3) 或 (K, 4)
+                          - (K, 2): [dx, dy]
+                          - (K, 3): [dx, dy, Δs] (旧格式)
+                          - (K, 4): [dx, dy, angle_local, Δs] (新格式)
+            w_boundaries_local: 边界局部坐标 (K, 2)
+            ego_x, ego_y, ego_heading, ego_speed: 自车状态
+        """
         if neighbors_local is None:
             return
         
         cos_yaw = math.cos(ego_heading)
         sin_yaw = math.sin(ego_heading)
-        rot = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])  # world -> ego
-        rot_T = rot.T  # ego -> world
+        # 标准 2D 旋转矩阵：将局部坐标系向量转换到世界坐标系
+        rot = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])  # ego -> world
+        rot_T = rot.T  # world -> ego
         v_ego_world = np.array([ego_speed * cos_yaw, ego_speed * sin_yaw])
         
         # 1. 绘制观测到的其他车辆（红色框）
@@ -349,22 +364,95 @@ class PathPlanningVisualizer:
                         continue
                     
                     dx_dy = np.array([dx, dy])
-                    world_pos = dx_dy @ rot.T + np.array([ego_x, ego_y])
+                    # 将局部坐标转换到世界坐标：使用 rot (ego -> world)
+                    # 注意：根据 simulator.py 中的转换逻辑，rot_matrix 是 ego -> world
+                    world_pos = dx_dy @ rot + np.array([ego_x, ego_y])
                     glVertex2f(world_pos[0], world_pos[1])
+                    
+                    # 处理不同维度的数据：
+                    # 2维: [dx, dy]
+                    # 3维: [dx, dy, Δs] (旧格式) 或 [dx, dy, angle_local] (新格式的一部分)
+                    # 4维: [dx, dy, angle_local, Δs] (新格式)
                     delta_val = None
-                    if wlane_np.shape[1] >= 3:
+                    angle_local = None
+                    if wlane_np.shape[1] >= 4:
+                        # 新格式：4维 [dx, dy, angle_local, Δs]
+                        angle_local = wlane_np[i, 2]
+                        delta_val = wlane_np[i, 3]
+                    elif wlane_np.shape[1] >= 3:
+                        # 兼容旧格式：3维，可能是 [dx, dy, Δs] 或 [dx, dy, angle_local]
+                        # 假设是 Δs（向后兼容）
                         delta_val = wlane_np[i, 2]
-                    text_entries.append((world_pos[0], world_pos[1], float(dx), float(dy), None if delta_val is None else float(delta_val)))
+                    
+                    text_entries.append((
+                        world_pos[0], world_pos[1], 
+                        float(dx), float(dy), 
+                        None if angle_local is None else float(angle_local),
+                        None if delta_val is None else float(delta_val)
+                    ))
                 glEnd()
                 if text_entries:
                     offset_x = (self.current_view_width / max(1, self.screen_width)) * 12.0
                     offset_y = (self.current_view_height / max(1, self.screen_height)) * 12.0
-                    for wx, wy, dx_val, dy_val, delta_val in text_entries:
-                        if delta_val is None or not math.isfinite(delta_val) or abs(delta_val - self.invalid_marker_value) < 1e-3:
-                            delta_str = "Δ:∞"
-                        else:
-                            delta_str = f"Δ:{delta_val:.1f}"
-                        label = f"dx:{dx_val:.1f} dy:{dy_val:.1f} {delta_str}"
+                    for wx, wy, dx_val, dy_val, angle_val, delta_val in text_entries:
+                        # 构建标签：显示 dx, dy, angle (可选), Δs
+                        try:
+                            parts = []
+                            
+                            # 检查并格式化 dx（使用科学计数法处理大值）
+                            try:
+                                if math.isfinite(dx_val):
+                                    if abs(dx_val) > 1000:
+                                        parts.append(f"dx:{dx_val:.2e}")
+                                    else:
+                                        parts.append(f"dx:{dx_val:.1f}")
+                                else:
+                                    parts.append("dx:NaN")
+                            except Exception:
+                                parts.append(f"dx:{dx_val}")
+                            
+                            # 检查并格式化 dy（使用科学计数法处理大值）
+                            try:
+                                if math.isfinite(dy_val):
+                                    if abs(dy_val) > 1000:
+                                        parts.append(f"dy:{dy_val:.2e}")
+                                    else:
+                                        parts.append(f"dy:{dy_val:.1f}")
+                                else:
+                                    parts.append("dy:NaN")
+                            except Exception:
+                                parts.append(f"dy:{dy_val}")
+                            
+                            # 检查并格式化 angle
+                            try:
+                                if angle_val is not None and math.isfinite(angle_val):
+                                    angle_deg = math.degrees(angle_val)
+                                    parts.append(f"θ:{angle_deg:.1f}°")
+                            except Exception:
+                                pass
+                            
+                            # 检查并格式化 Δs
+                            try:
+                                if delta_val is None or not math.isfinite(delta_val) or abs(delta_val - self.invalid_marker_value) < 1e-3:
+                                    delta_str = "Δ:∞"
+                                else:
+                                    delta_str = f"Δ:{delta_val:.1f}"
+                                parts.append(delta_str)
+                            except Exception:
+                                delta_str = f"Δ:{delta_val}"
+                                parts.append(delta_str)
+                            
+                            label = " ".join(parts)
+                            # 确保标签不为空（至少显示 Δs）
+                            if not label.strip():
+                                label = delta_str if 'delta_str' in locals() else "Δ:?"
+                        except Exception as e:
+                            # 如果格式化失败，至少显示基本信息
+                            try:
+                                label = f"dx:{dx_val} dy:{dy_val} Δ:{delta_val}"
+                            except Exception:
+                                label = f"Δ:{delta_val}" if delta_val is not None else "Δ:?"
+                        
                         self.draw_text_world(label, wx + offset_x, wy + offset_y, color=(0.2, 0.4, 0.9), alpha=0.65)
         except Exception as e:
             print(f"绘制 w_lanes 失败: {e}")
@@ -489,6 +577,24 @@ class PathPlanningVisualizer:
             glVertex2f(x, y)
             glVertex2f(x + dx, y + dy)
             glEnd()
+
+        # 4. 显示路径 Δs 信息（若提供）
+        if valid_path.shape[1] >= 4:
+            offset_x = (self.current_view_width / max(1, self.screen_width)) * 12.0
+            offset_y = (self.current_view_height / max(1, self.screen_height)) * 12.0
+            for p in valid_path:
+                delta_val = float(p[3])
+                if not math.isfinite(delta_val) or abs(delta_val - self.invalid_marker_value) < 1e-3:
+                    delta_str = "Δ:∞"
+                else:
+                    delta_str = f"Δ:{delta_val:.1f}"
+                self.draw_text_world(
+                    delta_str,
+                    float(p[0]) + offset_x,
+                    float(p[1]) + offset_y,
+                    color=(0.5, 0.1, 0.7),
+                    alpha=0.65,
+                )
         
         # 4. 绘制起点
         self.draw_point_xy(valid_path[0, 0], valid_path[0, 1], 0.2, 0.8, 0.2, size=10.0)

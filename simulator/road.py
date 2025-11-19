@@ -196,6 +196,22 @@ class RoadNetwork:
 
         # 3) w_lane_id 到索引的映射（与 global_w_lane 行对应）
         self.w_lane_id_to_idx = {wl['w_lane_id']: i for i, wl in enumerate(self.w_lanes_raw)}
+        # w_lane_id 到 quad_id (poly_id) 的映射（用于快速查询）
+        self.w_lane_id_to_quad_id = {wl['w_lane_id']: wl['poly_id'] for wl in self.w_lanes_raw}
+        # 创建 GPU 张量用于批量查询（如果 w_lane_id 是连续的整数索引）
+        if self.w_lanes_raw:
+            max_w_lane_id = max(wl['w_lane_id'] for wl in self.w_lanes_raw)
+            # 创建映射张量：w_lane_id -> quad_id (poly_id)
+            self.w_lane_id_to_quad_id_tensor = torch.full(
+                (max_w_lane_id + 1,), 
+                -1,  # 无效值
+                dtype=torch.long, 
+                device=self.device
+            )
+            for wl in self.w_lanes_raw:
+                self.w_lane_id_to_quad_id_tensor[wl['w_lane_id']] = wl['poly_id']
+        else:
+            self.w_lane_id_to_quad_id_tensor = torch.empty((0,), dtype=torch.long, device=self.device)
 
         # 4) 每条 lane 的 start/end 坐标（张量）
         if self.n_lanes > 0 and self.global_w_lane.numel() > 0:

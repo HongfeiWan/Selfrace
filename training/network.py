@@ -328,27 +328,65 @@ class ConditionNet(nn.Module):
         sim_cfg = config.get("simulator", {}) if isinstance(config, dict) else {}
         net_cfg = sim_cfg.get("network", {}) if isinstance(sim_cfg.get("network", {}), dict) else {}
         dynamics_cfg = sim_cfg.get("dynamics", {}) if isinstance(sim_cfg.get("dynamics", {}), dict) else {}
+        reward_cfg = sim_cfg.get("reward", {}) if isinstance(sim_cfg.get("reward", {}), dict) else {}
 
         self.embed_dim = int(net_cfg.get("ConditionNet_embed_dim", 64))
         self.encoded_dim = int(net_cfg.get("ConditionNet_encoded_dim", 64))
 
-        # 归一化所需的范围
-        self.curvature_scale = 0.077
-        self.wheelbase_min = 0.48
-        self.wheelbase_max = 4.2
+        # 归一化所需的范围（从 dynamics 配置读取）
+        self.curvature_scale = float(dynamics_cfg.get("ConditionNet_curvature_scale", 0.077))
         
-        # 驾驶风格参数归一化范围
-        self.c_throttle_min = 0.900
-        self.c_throttle_max = 1.125
-        self.c_steer_min = 0.900
-        self.c_steer_max = 1.125
-        self.c_acc_min = 0.833
-        self.c_acc_max = 1.25
-        self.c_vel_min = 0.833
-        self.c_vel_max = 1.25
+        # wheelbase 范围从 dynamics 配置计算
+        vehicle_length_min = float(dynamics_cfg.get("vehicle_length_min", 0.8))
+        vehicle_length_max = float(dynamics_cfg.get("vehicle_length_max", 7.0))
+        wheelbase_ratio = float(dynamics_cfg.get("wheelbase_ratio", 0.6))
+        self.wheelbase_min = vehicle_length_min * wheelbase_ratio
+        self.wheelbase_max = vehicle_length_max * wheelbase_ratio
+        
+        # 驾驶风格参数归一化范围（从 dynamics 配置读取）
+        self.c_throttle_min = float(dynamics_cfg.get("ConditionNet_c_throttle_min", 0.900))
+        self.c_throttle_max = float(dynamics_cfg.get("ConditionNet_c_throttle_max", 1.125))
+        self.c_steer_min = float(dynamics_cfg.get("ConditionNet_c_steer_min", 0.900))
+        self.c_steer_max = float(dynamics_cfg.get("ConditionNet_c_steer_max", 1.125))
+        self.c_acc_min = float(dynamics_cfg.get("ConditionNet_c_acc_min", 0.833))
+        self.c_acc_max = float(dynamics_cfg.get("ConditionNet_c_acc_max", 1.25))
+        self.c_vel_min = float(dynamics_cfg.get("ConditionNet_c_vel_min", 0.833))
+        self.c_vel_max = float(dynamics_cfg.get("ConditionNet_c_vel_max", 1.25))
+
+        # Reward 参数归一化范围（从 reward 配置读取）
+        # 顺序对应 reward.py 中的 _param_name_to_idx: delta_goal, collision_alpha, boundary_alpha, 
+        # comfort_alpha, l_align_alpha, vel_align_alpha, l_center_alpha, center_bias_alpha, 
+        # reverse_alpha, stop_line_alpha
+        reward_param_mins = torch.tensor([
+            float(reward_cfg.get("delta_goal_min", 2.0)),
+            float(reward_cfg.get("collision_alpha_min", 0.0)),
+            float(reward_cfg.get("boundary_alpha_min", 0.0)),
+            float(reward_cfg.get("comfort_alpha_min", 0.0)),
+            float(reward_cfg.get("l_align_alpha_min", 2.5e-4)),
+            float(reward_cfg.get("vel_align_alpha_min", 0.0)),
+            float(reward_cfg.get("l_center_alpha_min", 2.5e-4)),
+            float(reward_cfg.get("center_bias_alpha_min", -0.5)),
+            float(reward_cfg.get("reverse_alpha_min", 2.5e-4)),
+            float(reward_cfg.get("stop_line_alpha_min", 0.0)),
+        ])
+        reward_param_maxs = torch.tensor([
+            float(reward_cfg.get("delta_goal_max", 12.0)),
+            float(reward_cfg.get("collision_alpha_max", 3.0)),
+            float(reward_cfg.get("boundary_alpha_max", 3.0)),
+            float(reward_cfg.get("comfort_alpha_max", 0.1)),
+            float(reward_cfg.get("l_align_alpha_max", 2.5e-2)),
+            float(reward_cfg.get("vel_align_alpha_max", 1.0)),
+            float(reward_cfg.get("l_center_alpha_max", 7.5e-3)),
+            float(reward_cfg.get("center_bias_alpha_max", 0.5)),
+            float(reward_cfg.get("reverse_alpha_max", 7.5e-3)),
+            float(reward_cfg.get("stop_line_alpha_max", 1.0)),
+        ])
+        # 注册为 buffer，确保能正确移动到设备上
+        self.register_buffer("reward_param_mins", reward_param_mins)
+        self.register_buffer("reward_param_maxs", reward_param_maxs)
 
         # Condition features: [curvature, Cthrottle, Csteer, Cacc, Cvel] + reward_params(10) + wheelbase
-        self.reward_param_dim = int(net_cfg.get("ConditionNet_reward_param_dim", 10))
+        self.reward_param_dim = 10 #10个reward参数
         self.input_dim = 1 + 4 + self.reward_param_dim + 1  # curvature + 4 coeffs + reward params + wheelbase
 
         self.mlp = nn.Sequential(
@@ -370,14 +408,71 @@ class ConditionNet(nn.Module):
         raise ValueError(f"Unexpected tensor shape {tuple(tensor.shape)} for ConditionNet feature.")
 
     def _normalize_curvature(self, curvature: torch.Tensor) -> torch.Tensor:
-        if self.curvature_scale <= 0:
-            return torch.clamp(curvature, min=-self.curvature_scale, max=self.curvature_scale)
-        return torch.clamp(curvature / (2*self.curvature_scale), min=-1.0, max=1.0)
+        return torch.clamp(curvature / self.curvature_scale, min=-1.0, max=1.0)
 
     def _normalize_wheelbase(self, wheelbase: torch.Tensor) -> torch.Tensor:
         denom = max(self.wheelbase_max - self.wheelbase_min, 1e-6)
         normalized = (wheelbase - self.wheelbase_min) / denom
         return torch.clamp(normalized, min=0.0, max=1.0)
+    
+    def _normalize_c_throttle(self, c_throttle: torch.Tensor) -> torch.Tensor:
+        denom = max(self.c_throttle_max - self.c_throttle_min, 1e-6)
+        normalized = (c_throttle - self.c_throttle_min) / denom
+        return torch.clamp(normalized, min=0.0, max=1.0)
+    
+    def _normalize_c_steer(self, c_steer: torch.Tensor) -> torch.Tensor:
+        denom = max(self.c_steer_max - self.c_steer_min, 1e-6)
+        normalized = (c_steer - self.c_steer_min) / denom
+        return torch.clamp(normalized, min=0.0, max=1.0)
+    
+    def _normalize_c_acc(self, c_acc: torch.Tensor) -> torch.Tensor:
+        denom = max(self.c_acc_max - self.c_acc_min, 1e-6)
+        normalized = (c_acc - self.c_acc_min) / denom
+        return torch.clamp(normalized, min=0.0, max=1.0)
+    
+    def _normalize_c_vel(self, c_vel: torch.Tensor) -> torch.Tensor:
+        denom = max(self.c_vel_max - self.c_vel_min, 1e-6)
+        normalized = (c_vel - self.c_vel_min) / denom
+        return torch.clamp(normalized, min=0.0, max=1.0)
+    
+    def _normalize_reward_params(self, reward_params: torch.Tensor) -> torch.Tensor:
+        """
+        对 reward_params 的每一维进行归一化。
+        Args:
+            reward_params: (B, M, 10)
+        Returns:
+            normalized: (B, M, 10) 归一化后的参数，大部分映射到 [0, 1]，center_bias_alpha 映射到 [-1, 1]
+        """
+        B, M, R = reward_params.shape
+        if R != self.reward_param_dim:
+            raise ValueError(f"Expected reward_params last dim {self.reward_param_dim}, got {R}")
+        
+        # 将 mins 和 maxs 扩展到 (B, M, R) 形状
+        mins = self.reward_param_mins.view(1, 1, -1).expand(B, M, -1).to(reward_params.device)
+        maxs = self.reward_param_maxs.view(1, 1, -1).expand(B, M, -1).to(reward_params.device)
+        
+        # 计算分母，避免除零
+        denoms = torch.clamp(maxs - mins, min=1e-6)
+        
+        # 归一化到 [0, 1] 或 [-1, 1]
+        normalized = (reward_params - mins) / denoms
+        
+        # center_bias_alpha (索引 7) 需要映射到 [-1, 1]，其他映射到 [0, 1]
+        # 对于 center_bias_alpha: 从 [-0.5, 0.5] 映射到 [-1, 1]
+        # 公式: normalized = (value - min) / (max - min) * 2 - 1
+        center_bias_idx = 7
+        center_bias_normalized = normalized[..., center_bias_idx:center_bias_idx+1] * 2.0 - 1.0
+        center_bias_normalized = torch.clamp(center_bias_normalized, min=-1.0, max=1.0)
+        
+        # 其他参数映射到 [0, 1]
+        other_normalized = torch.clamp(normalized[..., :center_bias_idx], min=0.0, max=1.0)
+        if center_bias_idx + 1 < R:
+            other_normalized_after = torch.clamp(normalized[..., center_bias_idx+1:], min=0.0, max=1.0)
+            normalized = torch.cat([other_normalized, center_bias_normalized, other_normalized_after], dim=-1)
+        else:
+            normalized = torch.cat([other_normalized, center_bias_normalized], dim=-1)
+        
+        return normalized
 
     def forward(
         self,
@@ -403,19 +498,13 @@ class ConditionNet(nn.Module):
         B, M = curvature.shape
 
         curv_norm = self._normalize_curvature(curvature)
-        cth = self._reshape_feature(c_throttle, B, M)
-        cst = self._reshape_feature(c_steer, B, M)
-        cac = self._reshape_feature(c_acc, B, M)
-        cvl = self._reshape_feature(c_vel, B, M)
+        cth = self._normalize_c_throttle(self._reshape_feature(c_throttle, B, M))
+        cst = self._normalize_c_steer(self._reshape_feature(c_steer, B, M))
+        cac = self._normalize_c_acc(self._reshape_feature(c_acc, B, M))
+        cvl = self._normalize_c_vel(self._reshape_feature(c_vel, B, M))
         wheelbase_reshaped = self._normalize_wheelbase(self._reshape_feature(wheelbase, B, M))
-
-        if reward_params.dim() != 3 or reward_params.shape[0] != B or reward_params.shape[1] != M:
-            raise ValueError("reward_params must be of shape (B, M, R)")
-        if reward_params.shape[2] != self.reward_param_dim:
-            raise ValueError(
-                f"Expected reward_params last dim {self.reward_param_dim}, got {reward_params.shape[2]}"
-            )
-            
+        # 归一化 reward_params
+        reward_params_norm = self._normalize_reward_params(reward_params)
         features = torch.cat(
             [
                 curv_norm.unsqueeze(-1),
@@ -423,7 +512,7 @@ class ConditionNet(nn.Module):
                 cst.unsqueeze(-1),
                 cac.unsqueeze(-1),
                 cvl.unsqueeze(-1),
-                reward_params,
+                reward_params_norm,
                 wheelbase_reshaped.unsqueeze(-1),
             ],
             dim=-1,
@@ -432,11 +521,271 @@ class ConditionNet(nn.Module):
         return output.view(B, M, self.encoded_dim)
 
 class VehicleStateNet(nn.Module):
-    #simulator的observation返回内容的local_state部分。
-    #包含dx=0,dy=0,yaw,speed,w,l,active
-    #需要在forward当中变成八个维度：0,0,cos(yaw),sin(yaw),speed(-2,20分两段归一化到-1到1),w(同OtherAgentsNet归一化),l(同OtherAgentsNet归一化),active（直接输入）
+    """Encode vehicle local state (dx=0, dy=0, yaw, speed, w, l, active) into embeddings."""
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        if config is None:
+            config = _load_default_config()
+        sim_cfg = config.get("simulator", {}) if isinstance(config, dict) else {}
+        net_cfg = sim_cfg.get("network", {}) if isinstance(sim_cfg.get("network", {}), dict) else {}
+        dynamics_cfg = sim_cfg.get("dynamics", {}) if isinstance(sim_cfg.get("dynamics", {}), dict) else {}
+        
+        self.embed_dim = int(net_cfg.get("VehicleStateNet_embed_dim"))
+        self.encoded_dim = int(net_cfg.get("VehicleStateNet_encoded_dim"))
+        
+        # 归一化参数（从 dynamics 配置读取）
+        self.speed_min = float(dynamics_cfg.get("min_velocity"))
+        self.speed_mid = 0.0
+        self.speed_max = float(dynamics_cfg.get("max_velocity"))
+        self.w_min = float(dynamics_cfg.get("vehicle_width_min"))
+        self.w_max = float(dynamics_cfg.get("vehicle_width_max"))
+        self.l_min = float(dynamics_cfg.get("vehicle_length_min"))
+        self.l_max = float(dynamics_cfg.get("vehicle_length_max"))
+        # 输入特征维度：8 (0, 0, cos(yaw), sin(yaw), speed_norm, w_norm, l_norm, active)
+        self.input_dim = 8
+        self.mlp = nn.Sequential(
+            nn.Linear(self.input_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.embed_dim, self.encoded_dim),
+            nn.LayerNorm(self.encoded_dim),
+            nn.ReLU(),
+        )
+    
+    def _normalize_speed(self, speed: torch.Tensor) -> torch.Tensor:
+        """
+        对 speed 进行分段归一化：-2到0映射到-1到0，0到20映射到0到1。
+        Args:
+            speed: (B, M) 速度值
+        Returns:
+            normalized: (B, M) 归一化后的速度，范围 [-1, 1]
+        """
+        normalized = torch.zeros_like(speed)
+        
+        # -2到0映射到-1到0
+        mask_neg = (speed >= self.speed_min) & (speed < self.speed_mid)
+        normalized = torch.where(
+            mask_neg,
+            (speed - self.speed_mid) / (self.speed_mid - self.speed_min),  # 映射到 [-1, 0]
+            normalized
+        )
+        
+        # 0到20映射到0到1
+        mask_pos = (speed >= self.speed_mid) & (speed <= self.speed_max)
+        normalized = torch.where(
+            mask_pos,
+            (speed - self.speed_mid) / (self.speed_max - self.speed_mid),  # 映射到 [0, 1]
+            normalized
+        )
+        
+        # 范围外的值映射到-1到1
+        normalized = torch.clamp(normalized, min=-1.0, max=1.0)
+        return normalized
+    
+    def _normalize_w(self, w: torch.Tensor) -> torch.Tensor:
+        """将宽度从 (0.8, 3) 映射到 (0, 1)"""
+        denom = max(self.w_max - self.w_min, 1e-6)
+        normalized = (w - self.w_min) / denom
+        return torch.clamp(normalized, min=0.0, max=1.0)
+    
+    def _normalize_l(self, l: torch.Tensor) -> torch.Tensor:
+        """将长度从 (0.8, 7) 映射到 (0, 1)"""
+        denom = max(self.l_max - self.l_min, 1e-6)
+        normalized = (l - self.l_min) / denom
+        return torch.clamp(normalized, min=0.0, max=1.0)
+    
+    def forward(self, local_state: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            local_state: (B, M, 7) with [dx=0, dy=0, yaw, speed, w, l, active]
+        Returns:
+            Encoded features of shape (B, M, encoded_dim)
+        """
+        if local_state.dim() != 3 or local_state.shape[-1] != 7:
+            raise ValueError(f"Expected input shape (B, M, 7), got {tuple(local_state.shape)}")
+        
+        B, M, _ = local_state.shape
+        
+        # 提取各个特征
+        # local_state: [dx=0, dy=0, yaw, speed, w, l, active]
+        yaw = local_state[..., 2]
+        speed = local_state[..., 3]
+        w = local_state[..., 4]
+        l = local_state[..., 5]
+        active = local_state[..., 6]
+        
+        # 构建8维特征：[0, 0, cos(yaw), sin(yaw), speed_norm, w_norm, l_norm, active]
+        zeros = torch.zeros(B, M, 2, device=local_state.device, dtype=local_state.dtype)
+        cos_yaw = torch.cos(yaw).unsqueeze(-1)
+        sin_yaw = torch.sin(yaw).unsqueeze(-1)
+        speed_norm = self._normalize_speed(speed).unsqueeze(-1)
+        w_norm = self._normalize_w(w).unsqueeze(-1)
+        l_norm = self._normalize_l(l).unsqueeze(-1)
+        active_reshaped = active.unsqueeze(-1)
+        
+        features = torch.cat(
+            [zeros, cos_yaw, sin_yaw, speed_norm, w_norm, l_norm, active_reshaped],
+            dim=-1
+        )  # (B, M, 8)
+        
+        # 通过 MLP 处理
+        output = self.mlp(features.view(B * M, self.input_dim))
+        return output.view(B, M, self.encoded_dim)
 
-    pass
+class MLP_policy(nn.Module):
+    """汇总所有网络的输出，通过三层MLP输出动作空间的概率分布。"""
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        if config is None:
+            config = _load_default_config()
+        sim_cfg = config.get("simulator", {}) if isinstance(config, dict) else {}
+        net_cfg = sim_cfg.get("network", {}) if isinstance(sim_cfg.get("network", {}), dict) else {}
+        dynamics_cfg = sim_cfg.get("dynamics", {}) if isinstance(sim_cfg.get("dynamics", {}), dict) else {}
+        
+        # 获取各个网络的 encoded_dim
+        w_boundary_dim = int(net_cfg.get("WBoundaryNet_encoded_dim", 64))
+        goals_dim = int(net_cfg.get("GoalsNet_encoded_dim", 64))
+        w_lane_dim = int(net_cfg.get("GoalsNet_encoded_dim", 64))  # WlaneNet 使用 GoalsNet_encoded_dim
+        other_agents_dim = int(net_cfg.get("OtherAgentsNet_encoded_dim", 64))
+        condition_dim = int(net_cfg.get("ConditionNet_encoded_dim", 64))
+        vehicle_state_dim = int(net_cfg.get("VehicleStateNet_encoded_dim", 64))
+        
+        # 计算总输入维度
+        self.input_dim = w_boundary_dim + goals_dim + w_lane_dim + other_agents_dim + condition_dim + vehicle_state_dim
+        # 输出维度（动作空间）
+        self.output_dim = int(dynamics_cfg.get("dynamics_jerk_dim", 12))
+        # 三层 MLP: 1024x1024x1024
+        self.mlp = nn.Sequential(
+            nn.Linear(self.input_dim, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Linear(1024, self.output_dim),
+        )
+    
+    def forward(
+        self,
+        w_boundary_features: torch.Tensor,
+        goals_features: torch.Tensor,
+        w_lane_features: torch.Tensor,
+        other_agents_features: torch.Tensor,
+        condition_features: torch.Tensor,
+        vehicle_state_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        汇总所有网络的输出并输出动作空间的概率分布。
+        
+        Args:
+            w_boundary_features: (B, M, WBoundaryNet_encoded_dim)
+            goals_features: (B, M, GoalsNet_encoded_dim)
+            w_lane_features: (B, M, GoalsNet_encoded_dim)
+            other_agents_features: (B, M, OtherAgentsNet_encoded_dim)
+            condition_features: (B, M, ConditionNet_encoded_dim)
+            vehicle_state_features: (B, M, VehicleStateNet_encoded_dim)
+        
+        Returns:
+            action_probs: (B, M, dynamics_jerk_dim) 动作空间的概率分布
+        """
+        # 拼接所有特征
+        combined = torch.cat(
+            [
+                w_boundary_features,
+                goals_features,
+                w_lane_features,
+                other_agents_features,
+                condition_features,
+                vehicle_state_features,
+            ],
+            dim=-1,
+        )  # (B, M, input_dim)
+        
+        # 通过 MLP
+        B, M, _ = combined.shape
+        logits = self.mlp(combined.view(B * M, self.input_dim))  # (B*M, output_dim)
+        # 输出概率分布（使用 softmax）
+        action_probs = torch.softmax(logits, dim=-1)  # (B*M, output_dim)
+        return action_probs.view(B, M, self.output_dim)
+
+class MLP_value(nn.Module):
+    """汇总所有网络的输出，通过三层MLP输出价值估计（单头输出）。"""
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        if config is None:
+            config = _load_default_config()
+        sim_cfg = config.get("simulator", {}) if isinstance(config, dict) else {}
+        net_cfg = sim_cfg.get("network", {}) if isinstance(sim_cfg.get("network", {}), dict) else {}
+        
+        # 获取各个网络的 encoded_dim
+        w_boundary_dim = int(net_cfg.get("WBoundaryNet_encoded_dim", 64))
+        goals_dim = int(net_cfg.get("GoalsNet_encoded_dim", 64))
+        w_lane_dim = int(net_cfg.get("GoalsNet_encoded_dim", 64))  # WlaneNet 使用 GoalsNet_encoded_dim
+        other_agents_dim = int(net_cfg.get("OtherAgentsNet_encoded_dim", 64))
+        condition_dim = int(net_cfg.get("ConditionNet_encoded_dim", 64))
+        vehicle_state_dim = int(net_cfg.get("VehicleStateNet_encoded_dim", 64))
+        
+        # 计算总输入维度
+        self.input_dim = w_boundary_dim + goals_dim + w_lane_dim + other_agents_dim + condition_dim + vehicle_state_dim
+        
+        # 三层 MLP: 1024x1024x1024，最后输出单个价值
+        self.mlp = nn.Sequential(
+            nn.Linear(self.input_dim, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1),  # 输出单个价值
+        )
+    
+    def forward(
+        self,
+        w_boundary_features: torch.Tensor,
+        goals_features: torch.Tensor,
+        w_lane_features: torch.Tensor,
+        other_agents_features: torch.Tensor,
+        condition_features: torch.Tensor,
+        vehicle_state_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        汇总所有网络的输出并输出价值估计。
+        
+        Args:
+            w_boundary_features: (B, M, WBoundaryNet_encoded_dim)
+            goals_features: (B, M, GoalsNet_encoded_dim)
+            w_lane_features: (B, M, GoalsNet_encoded_dim)
+            other_agents_features: (B, M, OtherAgentsNet_encoded_dim)
+            condition_features: (B, M, ConditionNet_encoded_dim)
+            vehicle_state_features: (B, M, VehicleStateNet_encoded_dim)
+        
+        Returns:
+            values: (B, M, 1) 价值估计
+        """
+        # 拼接所有特征
+        combined = torch.cat(
+            [
+                w_boundary_features,
+                goals_features,
+                w_lane_features,
+                other_agents_features,
+                condition_features,
+                vehicle_state_features,
+            ],
+            dim=-1,
+        )  # (B, M, input_dim)
+        
+        # 通过 MLP
+        B, M, _ = combined.shape
+        values = self.mlp(combined.view(B * M, self.input_dim))  # (B*M, 1)
+        return values.view(B, M, 1)
+
 
 if __name__ == "__main__":
     # 测试一下，WBoundaryNet 是否能正常工作
@@ -545,16 +894,18 @@ if __name__ == "__main__":
     # print(local_path[0, 0])
 
     # 测试 GoalsNet with sample data
-    goals_net = GoalsNet()
-    agents_state_example = torch.tensor(
-        [[[0.0, 0.0, 0.0, 5.0, 4.5, 2.0, 1.0], [1.0, 1.0, 0.5, 4.0, 4.5, 2.0, 1.0], [2.0, -1.0, 1.0, 3.0, 4.5, 2.0, 1.0]]],
-        dtype=torch.float32,
-    )
-    agents_path_plan_example = torch.full((1, 3, 128, 3), -1.0e10, dtype=torch.float32)
-    agents_path_plan_example[0, 2, :2] = torch.tensor(
-        [[-2.2690e02, -2.0805e02, 1.9404e00], [-2.2913e02, -1.9613e02, 1.5708e00]],
-        dtype=torch.float32,
-    )
-    goals_output = goals_net(agents_state_example, agents_path_plan_example)
-    print("GoalsNet output:")
-    print(goals_output)
+    # goals_net = GoalsNet()
+    # agents_state_example = torch.tensor(
+    #     [[[0.0, 0.0, 0.0, 5.0, 4.5, 2.0, 1.0], [1.0, 1.0, 0.5, 4.0, 4.5, 2.0, 1.0], [2.0, -1.0, 1.0, 3.0, 4.5, 2.0, 1.0]]],
+    #     dtype=torch.float32,
+    # )
+    # agents_path_plan_example = torch.full((1, 3, 128, 3), -1.0e10, dtype=torch.float32)
+    # agents_path_plan_example[0, 2, :2] = torch.tensor(
+    #     [[-2.2690e02, -2.0805e02, 1.9404e00], [-2.2913e02, -1.9613e02, 1.5708e00]],
+    #     dtype=torch.float32,
+    # )
+    # goals_output = goals_net(agents_state_example, agents_path_plan_example)
+    # print("GoalsNet output:")
+    # print(goals_output).
+    
+    pass

@@ -47,6 +47,9 @@ class ObservationGenerator:
         self.quad_to_w_boundaries_ids = self.road_network.quad_to_w_boundaries_ids
         self.last_w_lanes_local: Optional[torch.Tensor] = None
         self.last_w_lanes_ids: Optional[torch.Tensor] = None
+        self.last_local_state: Optional[torch.Tensor] = None
+        self.last_neighbors_local: Optional[torch.Tensor] = None
+        self.last_w_boundaries_local: Optional[torch.Tensor] = None
 
     def get_observation_dim(self) -> int:
         """
@@ -272,8 +275,11 @@ class ObservationGenerator:
             d = torch.zeros(B, M, device=self.device)
             theta_f = torch.zeros(B, M, device=self.device)
         
-        # 缓存当前观测的 w_lane 局部坐标与对应 ID
+        # 缓存当前观测的所有局部坐标变量，供网络使用
         self.last_w_lanes_local = w_lanes_local
+        self.last_local_state = local_state
+        self.last_neighbors_local = neighbors_local
+        self.last_w_boundaries_local = w_boundaries_local
         if hasattr(self, "w_lanes_ids") and self.w_lanes_ids is not None:
             self.last_w_lanes_ids = self.w_lanes_ids.view(B, M, self.num_w_lanes)
         else:

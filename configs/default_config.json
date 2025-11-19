@@ -10,6 +10,11 @@
     "num_npc_vehicles": 150,
 
     "dynamics": {
+      "min_longitudinal_jerk": -15.0,
+      "max_longitudinal_jerk": 4.0,
+      "min_lateral_jerk": -4.0,
+      "max_lateral_jerk": 4.0,
+      "dynamics_jerk_dim": 12,
 
       "max_velocity": 20.0,
       "min_velocity": -2.0,
@@ -28,7 +33,17 @@
       "max_lateral_accel":4.0,
       "min_lateral_accel":-4.0,
 
-      "curvature_epsilon":1e-5
+      "curvature_epsilon":1e-5,
+
+      "ConditionNet_curvature_scale": 0.077,
+      "ConditionNet_c_throttle_min": 0.900,
+      "ConditionNet_c_throttle_max": 1.125,
+      "ConditionNet_c_steer_min": 0.900,
+      "ConditionNet_c_steer_max": 1.125,
+      "ConditionNet_c_acc_min": 0.833,
+      "ConditionNet_c_acc_max": 1.25,
+      "ConditionNet_c_vel_min": 0.833,
+      "ConditionNet_c_vel_max": 1.25
 
     },
 
@@ -99,14 +114,16 @@
     },
 
     "network": {
-      "WBoundaryNet_embed_dim": 64,
-      "WBoundaryNet_encoded_dim": 64,
-      "GoalsNet_embed_dim": 64,
-      "GoalsNet_encoded_dim": 64,
-      "OtherAgentsNet_embed_dim": 64,
-      "OtherAgentsNet_encoded_dim": 64,
-      "ConditionNet_embed_dim":64,
-      "ConditionNet_encoded_dim":64
+      "WBoundaryNet_embed_dim": 128,
+      "WBoundaryNet_encoded_dim": 128,
+      "GoalsNet_embed_dim": 128,
+      "GoalsNet_encoded_dim": 128,
+      "OtherAgentsNet_embed_dim": 128,
+      "OtherAgentsNet_encoded_dim": 128,
+      "ConditionNet_embed_dim":128,
+      "ConditionNet_encoded_dim":128,
+      "VehicleStateNet_embed_dim": 128,
+      "VehicleStateNet_encoded_dim": 128
     }
 
   },
@@ -114,8 +131,14 @@
 
 
   "training": {
-  },
+    "learning_rate": 0.0005,
+    "num_iterations": 10000,
+    "rollout_steps": 128,
+    "max_episode_steps": 1200,
 
+    "gamma": 0.999,
+    "lambda": 0.95
+  },
   "preprocessor": {
     "tolerance": 0.1,
     "sample_distance": 1.0,

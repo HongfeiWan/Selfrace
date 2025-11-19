@@ -1,7 +1,6 @@
 import torch
 import os
 import sys
-import time
 import math
 from typing import Dict, Tuple, Optional
 
@@ -87,6 +86,7 @@ class TeraflowSimulator:
         self.agents_start_quad_ids: Optional[torch.Tensor] = None  # 存储所有智能体的起始quad_id
         self.agents_goal_quad_ids: Optional[torch.Tensor] = None  # 存储所有智能体的目标quad_id
         self.agents_path_plans: Optional[torch.Tensor] = None     # 存储所有智能体的路径规划 w_lane_id 序列
+        self.agents_path_plans_world: Optional[torch.Tensor] = None  # 存储所有智能体的路径规划（世界坐标 xy）(B, M, L, 2)
         self.agents_path_plans_local: Optional[torch.Tensor] = None  # 存储所有智能体的路径规划（局部坐标）
         self.goal_radius_tensor: Optional[torch.Tensor] = None
         self.goal_positions: Optional[torch.Tensor] = None
@@ -117,37 +117,38 @@ class TeraflowSimulator:
         # 将路径截断为前max_keep个有效 w_lane，并更新目标 quad_id
         max_keep = self.path_length
         invalid_marker = self.path_planner.INVALID_w_lane_id_MARKER
-        if max_keep > 0:
-            truncated_paths = self.agents_path_plans.clone()
-            if self.agents_path_plans.shape[2] > max_keep:
-                truncated_paths[:, :, max_keep:] = invalid_marker
-            self.agents_path_plans = truncated_paths
-            valid_mask = self.agents_path_plans != invalid_marker  # (B, M, L)
-            valid_counts = valid_mask.sum(dim=-1)  # (B, M)
-            has_valid = valid_counts > 0
-            if has_valid.any():
-                last_indices = valid_counts.clamp(min=1) - 1  # (B, M)
-                max_index = self.agents_path_plans.shape[2] - 1
-                last_indices = torch.clamp(last_indices, max=max_index)
-                gather_idx = last_indices.unsqueeze(-1)
-                last_ids = torch.gather(self.agents_path_plans, 2, gather_idx)  # (B, M, 1)
-                last_points = self.path_planner.get_w_lane_centers_by_id(last_ids).squeeze(2)  # (B, M, 2)
-                mask_flat = has_valid.view(-1)
-                selected_points = last_points.view(-1, 2)[mask_flat]
-                distances, nearest_indices = find_nearest_lanes(
-                    self.device,
-                    self.road_network.quad_centerlines,
-                    selected_points,
-                    k=1,
-                    spatial_hash=self.offroad_checker.spatial_hash
-                )
-                nearest_indices = nearest_indices.squeeze(1)
-                valid_goal_mask = nearest_indices >= 0
+
+        truncated_paths = self.agents_path_plans.clone()
+        if self.agents_path_plans.shape[2] > max_keep:
+            truncated_paths[:, :, max_keep:] = invalid_marker
+        self.agents_path_plans = truncated_paths
+
+        # 根据最后一个有效路径点的 w_lane_id 直接获取对应的 quad_id (poly_id)
+        valid_mask = self.agents_path_plans != invalid_marker  # (B, M, L)
+        valid_counts = valid_mask.sum(dim=-1)  # (B, M)
+        has_valid = valid_counts > 0
+        if has_valid.any():
+            last_indices = valid_counts.clamp(min=1) - 1  # (B, M)
+            max_index = self.agents_path_plans.shape[2] - 1
+            last_indices = torch.clamp(last_indices, max=max_index)
+            gather_idx = last_indices.unsqueeze(-1)
+            last_w_lane_ids = torch.gather(self.agents_path_plans, 2, gather_idx).squeeze(2)  # (B, M)
+            
+            # 使用 w_lane_id_to_quad_id_tensor 批量查询对应的 quad_id
+            # 只更新有有效路径点的 agent
+            mask_flat = has_valid.view(-1)
+            last_w_lane_ids_flat = last_w_lane_ids.view(-1)
+            valid_w_lane_ids = last_w_lane_ids_flat[mask_flat]  # 只取有效的 w_lane_id
+            
+            if valid_w_lane_ids.numel() > 0:
+                # 使用张量索引查询，无效的 w_lane_id 会返回 -1
+                valid_w_lane_ids_clamped = torch.clamp(valid_w_lane_ids, min=0, max=self.road_network.w_lane_id_to_quad_id_tensor.shape[0] - 1)
+                goal_poly_ids = self.road_network.w_lane_id_to_quad_id_tensor[valid_w_lane_ids_clamped]
+                valid_goal_mask = goal_poly_ids >= 0  # 过滤掉无效的映射
                 if valid_goal_mask.any():
-                    goal_poly_ids = self.road_network.quad_ids[nearest_indices[valid_goal_mask]]
                     goal_flat = self.agents_goal_quad_ids.view(-1)
                     flat_indices = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)[valid_goal_mask]
-                    goal_flat[flat_indices] = goal_poly_ids
+                    goal_flat[flat_indices] = goal_poly_ids[valid_goal_mask]
                     self.agents_goal_quad_ids = goal_flat.view_as(self.agents_goal_quad_ids)
 
         # 使用 preprocessor 预计算好的 quad centers（准确值）
@@ -156,6 +157,34 @@ class TeraflowSimulator:
         self.goal_positions = self.road_network.quad_centers[goal_center_indices]  # (B, M, 2)
         idx_delta_goal = self.reward_calculator._param_name_to_idx['delta_goal']
         self.goal_radius_tensor = self.reward_calculator.sampled_params[..., idx_delta_goal]
+
+        # 移除 reset 时已经处于 goal 半径内的前缀路径点，避免 Δs 错位
+        if self.agents_path_plans is not None and self.agents_path_plans.numel() > 0:
+            agent_positions = self.agents_state[..., :2]
+            waypoints_xy = self.path_planner.get_w_lane_centers_by_id(self.agents_path_plans)
+            diffs = waypoints_xy - agent_positions.unsqueeze(-2)
+            dists_wp = torch.norm(diffs, dim=-1)
+            goal_radii = self.goal_radius_tensor.unsqueeze(-1).expand_as(dists_wp)
+            valid_waypoints = self.agents_path_plans != invalid_marker
+            reached_mask = valid_waypoints & (dists_wp <= goal_radii)
+            reached_any = reached_mask.any(dim=-1)
+            if reached_any.any():
+                indices = torch.arange(self.agents_path_plans.shape[2], device=self.device).view(1, 1, -1)
+                last_reached = torch.where(
+                    reached_mask,
+                    indices,
+                    torch.full_like(indices, -1),
+                ).max(dim=-1).values
+                prefix_mask = (
+                    (indices <= last_reached.unsqueeze(-1))
+                    & (last_reached.unsqueeze(-1) >= 0)
+                    & reached_any.unsqueeze(-1)
+                )
+                inv_ids = torch.full_like(self.agents_path_plans, invalid_marker)
+                self.agents_path_plans = torch.where(prefix_mask, inv_ids, self.agents_path_plans)
+
+        # 预计算路径点的世界坐标（很多地方要用）
+        self.agents_path_plans_world = self.path_planner.get_w_lane_centers_by_id(self.agents_path_plans)  # (B, M, L, 2)
 
         # 预计算每个路径点到终点的累积距离
         self.precompute_path_plan_goal_distances()
@@ -278,7 +307,7 @@ class TeraflowSimulator:
 
         # TODO: 这里处理waypoint_reach的情况
         waypoint_reached = torch.zeros((B, M), dtype=torch.bool, device=self.device)
-
+        
         # 根据距离阈值移除已经过的路径点(贪吃蛇的部分)
         if self.agents_path_plans is not None and self.agents_path_plans.numel() > 0:
             invalid_marker = self.path_planner.INVALID_w_lane_id_MARKER
@@ -292,9 +321,17 @@ class TeraflowSimulator:
 
                 reached_any = reached_mask.any(dim=-1)
                 if reached_any.any():
-                    first_reached = torch.argmax(reached_mask.float(), dim=-1)
                     indices = torch.arange(self.agents_path_plans.shape[2], device=self.device).view(1, 1, -1)
-                    prefix_mask = (indices <= first_reached.unsqueeze(-1)) & reached_any.unsqueeze(-1)
+                    last_reached = torch.where(
+                        reached_mask,
+                        indices,
+                        torch.full_like(indices, -1),
+                    ).max(dim=-1).values
+                    prefix_mask = (
+                        (indices <= last_reached.unsqueeze(-1))
+                        & (last_reached.unsqueeze(-1) >= 0)
+                        & reached_any.unsqueeze(-1)
+                    )
                     reached_ids_before = torch.where(
                         prefix_mask,
                         self.agents_path_plans,
@@ -312,44 +349,42 @@ class TeraflowSimulator:
                             prefix_mask,
                             inv_dist,
                             self.agents_path_plan_goal_distances)
-                    sampled_exists = (
-                        self.sampled_waypoint_ids is not None
-                        and reached_ids_before is not None
-                    )
-                    if self.agents_path_plan_goal_distances is not None:
-                        if self.w_lane_goal_distances_full is not None:
-                            b_idx, m_idx, l_idx = torch.nonzero(prefix_mask, as_tuple=True)
-                            if b_idx.numel() > 0:
-                                reached_ids_vals = reached_ids_before[b_idx, m_idx, l_idx]
-                                valid_reached = reached_ids_vals != invalid_marker
-                                if valid_reached.any():
-                                    b_idx = b_idx[valid_reached]
-                                    m_idx = m_idx[valid_reached]
-                                    reached_ids_vals = reached_ids_vals[valid_reached]
-                                    lane_indices = self.path_planner.map_w_lane_ids_to_indices(reached_ids_vals)
-                                    valid_idx = lane_indices != self.path_planner.INVALID_w_lane_index_MARKER
-                                    if valid_idx.any():
-                                        b_sel = b_idx[valid_idx]
-                                        m_sel = m_idx[valid_idx]
-                                        lane_sel = lane_indices[valid_idx]
-                                        self.w_lane_goal_distances_full[b_sel, m_sel, lane_sel] = float(self.path_planner.INVALID_MARKER)
-                        else:
-                            print("w_lane_goal_distances_full is None")
-                    else:
-                        print("agents_path_plan_goal_distances is None")
-                    # 这里判断到达waypoint，且将到过的在self.sampled_waypoint_ids中标记为无效
-                    if sampled_exists:
+                    
+                    # 重新计算路径点到终点的距离（因为路径点被移除了）
+                    self.precompute_path_plan_goal_distances()
+                    
+                    # 重新构建全局 w_lane 的 Δs 特征（因为路径点被移除了，需要更新距离）
+                    self.w_lane_goal_distances_full = self._build_w_lane_features_with_goal()
+                    
+                    # 获取到达的路径点ID，用于更新 sampled_waypoint_ids
+                    # 初始化变量，确保在条件块外也能使用
+                    b_idx_reached = None
+                    m_idx_reached = None
+                    reached_ids_vals = None
+                    
+                    if self.w_lane_goal_distances_full is not None:
+                        b_idx, m_idx, l_idx = torch.nonzero(prefix_mask, as_tuple=True)
+                        if b_idx.numel() > 0:
+                            reached_ids_vals_temp = reached_ids_before[b_idx, m_idx, l_idx]
+                            valid_reached = reached_ids_vals_temp != invalid_marker
+                            if valid_reached.any():
+                                b_idx_reached = b_idx[valid_reached]
+                                m_idx_reached = m_idx[valid_reached]
+                                reached_ids_vals = reached_ids_vals_temp[valid_reached]
+                    
+                    # 更新 sampled_waypoint_ids：将到达的路径点标记为无效
+                    if self.sampled_waypoint_ids is not None and b_idx_reached is not None:
                         sample_mask = (
-                            self.sampled_waypoint_ids[b_idx, m_idx]
+                            self.sampled_waypoint_ids[b_idx_reached, m_idx_reached]
                             == reached_ids_vals.unsqueeze(-1)
                         )
                         if sample_mask.any():
-                            self.sampled_waypoint_ids[b_idx, m_idx] = torch.where(
+                            self.sampled_waypoint_ids[b_idx_reached, m_idx_reached] = torch.where(
                                 sample_mask,
-                                torch.full_like(self.sampled_waypoint_ids[b_idx, m_idx], invalid_marker),
-                                self.sampled_waypoint_ids[b_idx, m_idx],
+                                torch.full_like(self.sampled_waypoint_ids[b_idx_reached, m_idx_reached], invalid_marker),
+                                self.sampled_waypoint_ids[b_idx_reached, m_idx_reached],
                             )
-                            waypoint_reached[b_idx, m_idx] = True
+                            waypoint_reached[b_idx_reached, m_idx_reached] = True
                     self._update_observed_w_lane_features()
         
         # 7. 计算奖励（传入Frenet坐标和动作）
@@ -487,27 +522,73 @@ class TeraflowSimulator:
         if not valid_waypoints.any():
             self.agents_path_plan_goal_distances = distances
             return
-        coords = torch.where(
-            valid_waypoints.unsqueeze(-1),
-            waypoints_xy,
-            torch.zeros_like(waypoints_xy),
-        )
-        segment_vecs = coords[..., 1:, :] - coords[..., :-1, :]
-        segment_lengths = torch.norm(segment_vecs, dim=-1)
-        segment_valid = valid_waypoints[..., :-1] & valid_waypoints[..., 1:]
+        # 向量化计算累积距离，正确处理无效点，避免索引错位
+        # 策略：只对连续有效点之间的段进行累积，跳过无效点
+        
+        # 1. 计算所有相邻点之间的段长度（直接使用原始坐标，不将无效点设为0）
+        segment_vecs = waypoints_xy[..., 1:, :] - waypoints_xy[..., :-1, :]  # (B, M, L-1, 2)
+        segment_lengths = torch.norm(segment_vecs, dim=-1)  # (B, M, L-1)
+        # 2. 标记哪些段是有效的（两端点都有效）
+        segment_valid = valid_waypoints[..., :-1] & valid_waypoints[..., 1:]  # (B, M, L-1)
+        # 3. 将无效段的长度设为0（这些段会被跳过，不影响累积）
         segment_lengths = torch.where(segment_valid, segment_lengths, torch.zeros_like(segment_lengths))
+        # 4. 在末尾添加0（最后一个点到终点的距离为0）
         zeros_tail = torch.zeros(
             (*segment_lengths.shape[:-1], 1),
             device=self.device,
             dtype=segment_lengths.dtype,
         )
-        segment_with_tail = torch.cat([segment_lengths, zeros_tail], dim=-1)
+        segment_with_tail = torch.cat([segment_lengths, zeros_tail], dim=-1)  # (B, M, L)
+        # 5. 从后往前累积距离
         cumulative = torch.flip(
             torch.cumsum(torch.flip(segment_with_tail, dims=[-1]), dim=-1),
             dims=[-1],
-        )
-        distances = torch.where(valid_waypoints, cumulative, distances)
+        )  # (B, M, L)
+        # 6. 关键修复：找到每个路径的最后一个有效点，将其距离设为0
+        #    使用向量化操作找到最后一个有效点的位置
+        B, M, L = valid_waypoints.shape
+        # 6.1 创建位置索引：对于每个位置，如果是最后一个有效点，标记为True
+        #     使用 argmax 在反向维度上找到最后一个有效点的索引
+        valid_positions_reversed = torch.flip(valid_waypoints.long(), dims=[-1])  # (B, M, L)
+        # 对于每个 (B, M)，找到第一个有效点的位置（在反向序列中，即原序列的最后一个有效点）
+        last_valid_indices = (L - 1) - torch.argmax(valid_positions_reversed, dim=-1)  # (B, M)
+        # 处理没有有效点的情况（argmax 会返回0，需要检查）
+        has_any_valid = valid_waypoints.any(dim=-1)  # (B, M)
+        last_valid_indices = torch.where(has_any_valid, last_valid_indices, torch.zeros_like(last_valid_indices))
+        # 6.2 创建最后一个有效点的掩码
+        batch_indices = torch.arange(B, device=self.device).view(B, 1).expand(B, M)
+        agent_indices = torch.arange(M, device=self.device).view(1, M).expand(B, M)
+        last_valid_mask = torch.zeros_like(valid_waypoints, dtype=torch.bool)
+        last_valid_mask[batch_indices, agent_indices, last_valid_indices] = has_any_valid
+        # 6.3 将最后一个有效点的距离设为0
+        cumulative = torch.where(last_valid_mask, torch.zeros_like(cumulative), cumulative)
+        # 7. 给路径上所有点都赋予到终点的距离（包括无效点）
+        distances = cumulative
         self.agents_path_plan_goal_distances = distances
+
+    def get_path_plan_features_with_goal_distances(self) -> Optional[torch.Tensor]:
+        """返回包含 (x, y, angle, Δs) 的路径特征，保持与路径顺序一致，供可视化使用。"""
+        if (
+            self.agents_path_plans is None
+            or self.agents_path_plans.numel() == 0
+        ):
+            return None
+
+        coords = self.path_planner.get_w_lane_features_by_id(self.agents_path_plans)
+        if coords is None:
+            return None
+
+        if self.agents_path_plan_goal_distances is None:
+            delta = torch.full(
+                self.agents_path_plans.shape,
+                float(self.path_planner.INVALID_MARKER),
+                dtype=coords.dtype,
+                device=self.device,
+            )
+        else:
+            delta = self.agents_path_plan_goal_distances.to(device=self.device, dtype=coords.dtype)
+
+        return torch.cat([coords, delta.unsqueeze(-1)], dim=-1)
 
     def _build_w_lane_features_with_goal(self) -> Optional[torch.Tensor]:
         """为每个 agent 构建全局 w_lane 的 Δs 信息 (B, M, N_w_lane)。"""
@@ -528,29 +609,49 @@ class TeraflowSimulator:
         plan_dists = self.agents_path_plan_goal_distances
         idx = planner.map_w_lane_ids_to_indices(plan_ids)
 
-        valid_mask = (
-            (plan_ids != planner.INVALID_w_lane_id_MARKER)
-            & (idx != planner.INVALID_w_lane_index_MARKER)
-            & torch.isfinite(plan_dists)
-        )
-
-        B, M, _ = plan_ids.shape
+        B, M, L = plan_ids.shape
         invalid_value = float(planner.INVALID_MARKER)
-        full = torch.full(
-            (B, M, total_w_lanes),
-            invalid_value,
+
+        idx_mask = (idx >= 0) & (idx < total_w_lanes)
+        if not idx_mask.any():
+            return torch.full(
+                (B, M, total_w_lanes),
+                invalid_value,
+                dtype=plan_dists.dtype,
+                device=self.device,
+            )
+
+        b_idx, m_idx, l_idx = idx_mask.nonzero(as_tuple=True)
+        target_idx = idx[b_idx, m_idx, l_idx]
+        src_vals = plan_dists[b_idx, m_idx, l_idx]
+
+        flat_size = B * M
+        inf_value = torch.tensor(float("inf"), dtype=plan_dists.dtype, device=self.device)
+        flat_full = torch.full(
+            (flat_size * total_w_lanes,),
+            inf_value,
             dtype=plan_dists.dtype,
             device=self.device,
         )
+        flat_row = b_idx * M + m_idx
+        linear_idx = flat_row * total_w_lanes + target_idx
 
-        if valid_mask.any():
-            b_idx, m_idx, _ = valid_mask.nonzero(as_tuple=True)
-            target_idx = idx[valid_mask]
-            full[b_idx, m_idx, target_idx] = plan_dists[valid_mask]
+        flat_full.scatter_reduce_(
+            dim=0,
+            index=linear_idx,
+            src=src_vals,
+            reduce="amin",
+            include_self=True,
+        )
+
+        full = flat_full.view(B, M, total_w_lanes)
+        full = torch.where(torch.isinf(full), torch.full_like(full, invalid_value), full)
         return full
 
     def _update_observed_w_lane_features(self) -> None:
-        """结合观测到的 w_lane 与全局 Δs 构建网络输入特征。"""
+        """结合观测到的 w_lane 与全局 Δs 构建网络输入特征。
+        输出形状: (B, M, K, 4) = [dx, dy, angle_local, Δs]
+        """
         obs_gen = self.observation_generator
         if (
             self.w_lane_goal_distances_full is None
@@ -559,19 +660,41 @@ class TeraflowSimulator:
         ):
             self.w_lanes_local_with_goal_distances = None
             return
-        w_lanes_local = obs_gen.last_w_lanes_local.to(self.device)
-        w_lane_ids = obs_gen.last_w_lanes_ids.to(self.device)
+        w_lanes_local = obs_gen.last_w_lanes_local.to(self.device)  # (B, M, K, 2) = [dx, dy]
+        w_lane_ids = obs_gen.last_w_lanes_ids.to(self.device)  # (B, M, K)
         B, M, K, _ = w_lanes_local.shape
+        
+        # 获取 w_lane 的世界坐标特征 (x, y, angle)
+        w_lane_features_world = self.path_planner.get_w_lane_features_by_id(w_lane_ids)  # (B, M, K, 3)
+        angles_world = w_lane_features_world[..., 2]  # (B, M, K) - 提取 angle
+        
+        # 将 angle 转换到局部坐标系（相对于 ego 的 yaw）
+        ego_yaw = self.agents_state[..., 2]  # (B, M) - ego 的 yaw
+        angles_local = angles_world - ego_yaw.unsqueeze(-1)  # (B, M, K)
+        # 归一化到 [-π, π]
+        angles_local = torch.atan2(torch.sin(angles_local), torch.cos(angles_local))
+        
+        # 获取 Δs
         idx = self.path_planner.map_w_lane_ids_to_indices(w_lane_ids)
         invalid_value = float(self.path_planner.INVALID_MARKER)
         delta = torch.full((B, M, K), invalid_value, dtype=w_lanes_local.dtype, device=self.device)
-        valid = idx != self.path_planner.INVALID_w_lane_index_MARKER
+        
+        # 检查索引边界：确保索引在有效范围内，避免越界
+        total_w_lanes = self.w_lane_goal_distances_full.shape[-1]
+        valid = (idx >= 0) & (idx < total_w_lanes)
+        
         if valid.any():
             batch_idx = torch.arange(B, device=self.device).view(B, 1, 1).expand_as(idx)
             agent_idx = torch.arange(M, device=self.device).view(1, M, 1).expand_as(idx)
             delta_vals = self.w_lane_goal_distances_full[batch_idx[valid], agent_idx[valid], idx[valid]]
             delta[valid] = delta_vals
-        self.w_lanes_local_with_goal_distances = torch.cat([w_lanes_local, delta.unsqueeze(-1)], dim=-1)
+        
+        # 拼接: [dx, dy, angle_local, Δs] -> (B, M, K, 4)
+        self.w_lanes_local_with_goal_distances = torch.cat([
+            w_lanes_local,  # (B, M, K, 2)
+            angles_local.unsqueeze(-1),  # (B, M, K, 1)
+            delta.unsqueeze(-1)  # (B, M, K, 1)
+        ], dim=-1)
 
     def _sample_waypoint_ids_for_mask(self) -> None:
         """为每个 agent 从路径中随机抽取 0-3 个有效 w_lane id."""
@@ -589,23 +712,44 @@ class TeraflowSimulator:
         rand = torch.rand((B, M, L), device=self.device)
         rand = rand.masked_fill(~valid_mask, -1.0)
         perm = torch.argsort(rand, dim=-1, descending=True)
-        # 先取前 3 个，然后根据实际有效数量进行裁剪
-        top_indices = perm[..., :3]
-        sampled = torch.gather(path_ids, 2, top_indices)
-        selected_valid = torch.gather(valid_mask, 2, top_indices)
+        
+        # 确保输出形状始终是 (B, M, 3)，即使 L < 3
+        # 先取前 min(3, L) 个，然后填充到 3 个位置
+        num_samples = min(3, L)
+        top_indices = perm[..., :num_samples]  # (B, M, num_samples)
+        sampled = torch.gather(path_ids, 2, top_indices)  # (B, M, num_samples)
+        selected_valid = torch.gather(valid_mask, 2, top_indices)  # (B, M, num_samples)
+        
+        # 如果 L < 3，需要填充到 (B, M, 3) 形状
+        if L < 3:
+            # 创建填充值（无效标记）
+            padding_size = 3 - L
+            padding_ids = torch.full(
+                (B, M, padding_size),
+                invalid_marker,
+                dtype=sampled.dtype,
+                device=self.device,
+            )
+            padding_valid = torch.zeros(
+                (B, M, padding_size),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            # 拼接原始数据和填充数据
+            sampled = torch.cat([sampled, padding_ids], dim=-1)  # (B, M, 3)
+            selected_valid = torch.cat([selected_valid, padding_valid], dim=-1)  # (B, M, 3)
         
         # 对于每个 agent，如果有效点数量少于 3，将超出的位置标记为无效
         position_idx = torch.arange(3, device=self.device).view(1, 1, -1).expand(B, M, -1)
         count_mask = position_idx < max_samples_per_agent.unsqueeze(-1)  # (B, M, 3)
         final_valid = selected_valid & count_mask
-        
         self.sampled_waypoint_ids = torch.where(
             final_valid,
             sampled,
-            torch.full_like(sampled, invalid_marker),
-        )
+            torch.full_like(sampled, invalid_marker))
 
 if __name__ == "__main__":
+    
     # ==================== 1. 初始化 TeraflowSimulator ====================
     import json
     import numpy as np
@@ -628,14 +772,68 @@ if __name__ == "__main__":
             sim.observation_generator._world_to_ego_centric(
                 agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
             )
-        if sim.w_lanes_local_with_goal_distances is not None:
+        
+        # 只返回路径上的 w_lane，而不是所有观测到的 w_lane
+        # 直接计算路径上的 w_lane 的局部坐标和特征
+        w_lanes_path_only = None
+        if sim.agents_path_plans is not None:
             try:
-                w_lanes_with_goal = sim.w_lanes_local_with_goal_distances[b, m]
-            except Exception:
-                w_lanes_with_goal = sim.w_lanes_local_with_goal_distances
-        else:
-            w_lanes_with_goal = w_lanes_local_tmp[b, m]
-        return neighbors_local_tmp[b, m], w_lanes_with_goal, w_boundaries_local_tmp[b, m]
+                # 获取路径上的 w_lane_id
+                path_ids = sim.agents_path_plans[b, m]  # (L,)
+                invalid_marker = sim.path_planner.INVALID_w_lane_id_MARKER
+                valid_path_mask = path_ids != invalid_marker
+                valid_path_ids = path_ids[valid_path_mask]  # 路径上的有效 w_lane_id
+                
+                if valid_path_ids.numel() > 0:
+                    # 获取路径上的 w_lane 的世界坐标特征 (x, y, angle)
+                    path_features_world = sim.path_planner.get_w_lane_features_by_id(
+                        valid_path_ids.unsqueeze(0).unsqueeze(0)
+                    ).squeeze(0).squeeze(0)  # (L_valid, 3)
+                    
+                    # 获取 ego 状态
+                    ego_state = agents_state[b, m]  # (7,)
+                    ego_pos = ego_state[:2]  # (2,)
+                    ego_yaw = ego_state[2]  # scalar
+                    
+                    # 转换到局部坐标系
+                    cos_yaw = torch.cos(ego_yaw)
+                    sin_yaw = torch.sin(ego_yaw)
+                    rot_matrix = torch.stack([
+                        torch.stack([cos_yaw, -sin_yaw], dim=0),
+                        torch.stack([sin_yaw, cos_yaw], dim=0)
+                    ], dim=0)  # (2, 2)
+                    
+                    # 计算局部坐标 (dx, dy)
+                    world_pos = path_features_world[:, :2]  # (L_valid, 2)
+                    rel_pos = world_pos - ego_pos.unsqueeze(0)  # (L_valid, 2)
+                    local_pos = rel_pos @ rot_matrix.T  # (L_valid, 2)
+                    
+                    # 计算局部角度
+                    angles_world = path_features_world[:, 2]  # (L_valid,)
+                    angles_local = angles_world - ego_yaw
+                    angles_local = torch.atan2(torch.sin(angles_local), torch.cos(angles_local))
+                    
+                    # 获取 Δs
+                    if sim.agents_path_plan_goal_distances is not None:
+                        path_deltas = sim.agents_path_plan_goal_distances[b, m][valid_path_mask]  # (L_valid,)
+                    else:
+                        invalid_value = float(sim.path_planner.INVALID_MARKER)
+                        path_deltas = torch.full((valid_path_ids.shape[0],), invalid_value, 
+                                                device=sim.device, dtype=path_features_world.dtype)
+                    
+                    # 拼接: [dx, dy, angle_local, Δs] -> (L_valid, 4)
+                    w_lanes_path_only = torch.cat([
+                        local_pos,  # (L_valid, 2)
+                        angles_local.unsqueeze(-1),  # (L_valid, 1)
+                        path_deltas.unsqueeze(-1)  # (L_valid, 1)
+                    ], dim=-1)
+            except Exception as e:
+                print(f"获取路径上的 w_lane 失败: {e}")
+                import traceback
+                traceback.print_exc()
+                w_lanes_path_only = None
+        
+        return neighbors_local_tmp[b, m], w_lanes_path_only, w_boundaries_local_tmp[b, m]
 
     # 定义step回调：按 W 键时执行一步仿真并返回最新状态
     def step_callback(b_idx: int, m_idx: int):
@@ -656,9 +854,12 @@ if __name__ == "__main__":
                 sampled_ids_cpu = sim.sampled_waypoint_ids.detach().cpu()
             except Exception:
                 sampled_ids_cpu = None
+        path_features = sim.get_path_plan_features_with_goal_distances()
+        if path_features is not None:
+            path_features = path_features.detach().cpu()
         return (
             sim.agents_state,
-            sim.path_planner.get_w_lane_features_by_id(sim.agents_path_plans).detach().cpu(),
+            path_features,
             sim.goal_positions,
             sim.goal_radius_tensor,
             sim.cumulative_done_mask,
@@ -828,9 +1029,12 @@ if __name__ == "__main__":
             initial_sampled_ids = sim.sampled_waypoint_ids.detach().cpu()
         except Exception:
             initial_sampled_ids = None
+    path_features = sim.get_path_plan_features_with_goal_distances()
+    if path_features is not None:
+        path_features = path_features.detach().cpu()
     visualize_path_planning(
         agents_state=sim.agents_state,
-        agents_path_plans=sim.path_planner.get_w_lane_features_by_id(sim.agents_path_plans).detach().cpu(),
+        agents_path_plans=path_features,
         quads_vertices=sim.road_network.left_boundaries,
         batch_idx=0,
         invalid_marker_value=float(sim.path_planner.INVALID_MARKER),
