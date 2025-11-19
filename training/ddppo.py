@@ -164,9 +164,8 @@ class ddppo:
             # 重置完成计数（仅在 Linux 分布式模式下）
             if use_distributed and num_workers_done is not None:
                 num_workers_done.set("done", b"0")
-            
             # 初始化buffer
-            initial_observation, d, theta_f = simulator.reset()
+            simulator.reset()
             # 初始化本轮 rollout buffer（长度 T = rollout_steps），用于缓存采样到的数据
             buffer_T = self.rollout_steps
             states_buffer = [None] * buffer_T
@@ -176,11 +175,16 @@ class ddppo:
             old_log_probs_buffer = [None] * buffer_T
             actions_buffer = [None] * buffer_T
             buffer_step_count = 0  # 当前已写入的时间步计数
-            current_observation = initial_observation
-
             for episode_step in range(self.max_episode_steps):
-                components = self._collect_observation_components(simulator, current_observation, device)
-                snapshot = self._clone_components(components)
+                components = self._build_components_from_data(
+                    simulator,
+                    simulator.agents_state,
+                    simulator.agents_path_plans,
+                    simulator.agents_path_plan_goal_distances,
+                    simulator.reward_calculator.sampled_params,
+                    device,
+                )
+                snapshot = self._capture_agent_state_snapshot(simulator)
                 if buffer_step_count >= buffer_T:
                     raise RuntimeError("Buffer overflow detected before PPO update.")
                 states_buffer[buffer_step_count] = snapshot
@@ -188,6 +192,7 @@ class ddppo:
                 with torch.no_grad():
                     encoded_features = self._encode_features(
                         components,
+                        simulator,
                         w_boundary_net,
                         goals_net,
                         w_lane_net,
@@ -199,7 +204,7 @@ class ddppo:
                     values = mlp_value(*encoded_features)
 
                 actions, log_probs, _ = self._sample_actions(action_probs)
-                next_observation, rewards, dones, _ = simulator.step(actions.unsqueeze(-1))
+                _, rewards, dones = simulator.step(actions.unsqueeze(-1))
 
                 rewards_buffer[buffer_step_count] = rewards.detach().clone()
                 dones_buffer[buffer_step_count] = dones.detach().clone()
@@ -207,17 +212,23 @@ class ddppo:
                 old_log_probs_buffer[buffer_step_count] = log_probs.detach().clone()
                 actions_buffer[buffer_step_count] = actions.detach().clone()
                 buffer_step_count += 1
-                current_observation = next_observation
-
                 should_update = (buffer_step_count == buffer_T) or (episode_step == self.max_episode_steps - 1)
 
                 if should_update and buffer_step_count > 0:
                     valid_mask = torch.zeros(buffer_T, dtype=torch.bool, device=device)
                     valid_mask[:buffer_step_count] = True
-                    bootstrap_components = self._collect_observation_components(simulator, current_observation, device)
+                    bootstrap_components = self._build_components_from_data(
+                        simulator,
+                        simulator.agents_state,
+                        simulator.agents_path_plans,
+                        simulator.agents_path_plan_goal_distances,
+                        simulator.reward_calculator.sampled_params,
+                        device,
+                    )
                     with torch.no_grad():
                         bootstrap_encoded = self._encode_features(
                             bootstrap_components,
+                            simulator,
                             w_boundary_net,
                             goals_net,
                             w_lane_net,
@@ -236,6 +247,7 @@ class ddppo:
                         actions_buffer[:buffer_step_count],
                         valid_mask,
                         bootstrap_value,
+                        simulator,
                         w_boundary_net,
                         goals_net,
                         w_lane_net,
@@ -261,70 +273,216 @@ class ddppo:
             scheduler_policy.step()
             scheduler_value.step()
 
-    def _collect_observation_components(self, simulator, observation, device):
-        """收集当前环境状态下构建网络输入所需的全部数据。"""
-        components = {}
+    def _build_components_from_data(
+        self,
+        simulator,
+        agents_state,
+        path_plans,
+        path_plan_goal_distances,
+        reward_params,
+        device):
+        """根据给定状态信息即时生成观测组件。"""
         obs_gen = simulator.observation_generator
-        B, M = simulator.agents_state.shape[:2]
+        sim_device = simulator.device
+        agents_state_dev = agents_state.to(sim_device)
+
+        observation, d, theta_f = obs_gen.generate(agents_state_dev)
+        simulator.frenet_d = d
+        simulator.frenet_theta_f = theta_f
+
+        if path_plans is not None:
+            path_plans_dev = path_plans.to(sim_device)
+        else:
+            path_plans_dev = None
+        if path_plan_goal_distances is not None:
+            path_plan_goal_distances_dev = path_plan_goal_distances.to(sim_device)
+        else:
+            path_plan_goal_distances_dev = None
+
+        w_lane_features = self._compose_w_lane_features(
+            simulator,
+            agents_state_dev,
+            path_plans_dev,
+            path_plan_goal_distances_dev,
+        )
+
+        if path_plans_dev is not None:
+            path_centers = simulator.path_planner.get_w_lane_centers_by_id(path_plans_dev)
+            agents_path_plans_world = torch.cat(
+                [path_centers, torch.zeros_like(path_centers[..., :1])],
+                dim=-1,
+            )
+        else:
+            B, M = agents_state_dev.shape[:2]
+            agents_path_plans_world = torch.zeros((B, M, 0, 3), device=sim_device)
+
+        B, M = agents_state_dev.shape[:2]
+        target_device = device
 
         def _ensure_tensor(tensor, shape=None, fill_value=0.0):
             if tensor is None:
                 if shape is None:
-                    raise RuntimeError("Missing observation component without fallback shape.")
-                return torch.full(shape, fill_value, device=device)
-            return tensor.to(device)
+                    raise RuntimeError("Missing tensor for components.")
+                return torch.full(shape, fill_value, device=target_device)
+            return tensor.to(target_device)
 
-        components["observation"] = observation.to(device) if observation is not None else None
+        components = {}
+        components["observation"] = observation.to(target_device)
         components["w_boundaries_local"] = _ensure_tensor(obs_gen.last_w_boundaries_local)
         components["local_state"] = _ensure_tensor(obs_gen.last_local_state)
         components["neighbors_local"] = _ensure_tensor(obs_gen.last_neighbors_local)
-        components["w_lanes_local_with_goal_distances"] = _ensure_tensor(simulator.w_lanes_local_with_goal_distances)
-        components["agents_state"] = simulator.agents_state.to(device)
-
-        path_centers = simulator.path_planner.get_w_lane_centers_by_id(simulator.agents_path_plans)
-        agents_path_plans_world = torch.cat(
-            [path_centers, torch.zeros_like(path_centers[..., :1])],
-            dim=-1,
-        )
-        components["agents_path_plans_world"] = agents_path_plans_world.to(device)
+        components["w_lanes_local_with_goal_distances"] = w_lane_features.to(target_device)
+        components["agents_state"] = agents_state_dev.to(target_device)
+        components["agents_path_plans_world"] = agents_path_plans_world.to(target_device)
 
         curvature = getattr(obs_gen, "curvature", None)
         components["curvature"] = _ensure_tensor(curvature, (B, M))
-        components["reward_params"] = _ensure_tensor(simulator.reward_calculator.sampled_params)
 
-        wheelbase = torch.zeros((B, M), device=device)
+        if reward_params is None:
+            reward_params = simulator.reward_calculator.sampled_params
+        components["reward_params"] = reward_params.to(target_device)
+
+        wheelbase = torch.zeros((B, M), device=target_device)
         if hasattr(simulator.dynamics_model, "vehicle_params"):
             vehicle_params = simulator.dynamics_model.vehicle_params
             if isinstance(vehicle_params, dict) and "wheelbase" in vehicle_params:
-                wheelbase = vehicle_params["wheelbase"].view(B, M).to(device)
+                wheelbase = vehicle_params["wheelbase"].view(B, M).to(target_device)
         components["wheelbase"] = wheelbase
 
-        c_throttle = torch.zeros((B, M), device=device)
-        c_steer = torch.zeros((B, M), device=device)
-        c_acc = torch.zeros((B, M), device=device)
-        c_vel = torch.zeros((B, M), device=device)
-        if hasattr(simulator, "extend_state") and simulator.extend_state is not None:
-            c_acc = simulator.extend_state[..., 4].to(device)
-            c_vel = simulator.extend_state[..., 3].to(device)
+        c_throttle = torch.zeros((B, M), device=target_device)
+        c_steer = torch.zeros((B, M), device=target_device)
+        c_acc = torch.zeros((B, M), device=target_device)
+        c_vel = torch.zeros((B, M), device=target_device)
         components["c_throttle"] = c_throttle
         components["c_steer"] = c_steer
         components["c_acc"] = c_acc
         components["c_vel"] = c_vel
         return components
 
-    @staticmethod
-    def _clone_components(components):
-        snapshot = {}
-        for key, value in components.items():
-            if torch.is_tensor(value):
-                snapshot[key] = value.detach().clone()
-            else:
-                snapshot[key] = value
+    def _compose_w_lane_features(
+        self,
+        simulator,
+        agents_state,
+        path_plans,
+        path_plan_goal_distances):
+        obs_gen = simulator.observation_generator
+        w_lanes_local = obs_gen.last_w_lanes_local
+        w_lane_ids = obs_gen.last_w_lanes_ids
+        if w_lanes_local is None or w_lane_ids is None:
+            B, M = agents_state.shape[:2]
+            return torch.zeros((B, M, 0, 4), device=agents_state.device)
+
+        w_lanes_local = w_lanes_local.to(agents_state.device)
+        w_lane_ids = w_lane_ids.to(agents_state.device)
+        B, M, K, _ = w_lanes_local.shape
+        dtype = w_lanes_local.dtype
+        planner = simulator.path_planner
+
+        if path_plans is None or path_plan_goal_distances is None:
+            invalid_value = float(planner.INVALID_MARKER)
+            return torch.full((B, M, K, 4), invalid_value, dtype=dtype, device=agents_state.device)
+
+        w_lane_goal_full = self._build_w_lane_goal_full(
+            simulator,
+            path_plans,
+            path_plan_goal_distances,
+        )
+        total_w_lanes = w_lane_goal_full.shape[-1]
+
+        idx = planner.map_w_lane_ids_to_indices(w_lane_ids)
+        invalid_value = float(planner.INVALID_MARKER)
+        delta = torch.full((B, M, K), invalid_value, dtype=dtype, device=agents_state.device)
+        valid = (idx >= 0) & (idx < total_w_lanes)
+        if valid.any():
+            batch_idx = torch.arange(B, device=agents_state.device).view(B, 1, 1).expand_as(idx)
+            agent_idx = torch.arange(M, device=agents_state.device).view(1, M, 1).expand_as(idx)
+            delta_vals = w_lane_goal_full[batch_idx[valid], agent_idx[valid], idx[valid]]
+            delta[valid] = delta_vals
+
+        w_lane_features_world = planner.get_w_lane_features_by_id(w_lane_ids)
+        angles_world = w_lane_features_world[..., 2]
+        ego_yaw = agents_state[..., 2].unsqueeze(-1)
+        angles_local = angles_world - ego_yaw
+        angles_local = torch.atan2(torch.sin(angles_local), torch.cos(angles_local))
+
+        return torch.cat(
+            [
+                w_lanes_local,
+                angles_local.unsqueeze(-1),
+                delta.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+
+    def _build_w_lane_goal_full(
+        self,
+        simulator,
+        path_plans,
+        path_plan_goal_distances):
+        planner = simulator.path_planner
+        total_w_lanes = planner.w_lane_features.shape[0]
+        B, M, _ = path_plans.shape
+        if total_w_lanes == 0:
+            return torch.empty((B, M, 0), dtype=path_plan_goal_distances.dtype, device=path_plans.device)
+
+        idx = planner.map_w_lane_ids_to_indices(path_plans)
+        invalid_value = float(planner.INVALID_MARKER)
+        idx_mask = (idx >= 0) & (idx < total_w_lanes)
+
+        if not idx_mask.any():
+            return torch.full(
+                (B, M, total_w_lanes),
+                invalid_value,
+                dtype=path_plan_goal_distances.dtype,
+                device=path_plans.device,
+            )
+
+        b_idx, m_idx, l_idx = idx_mask.nonzero(as_tuple=True)
+        target_idx = idx[b_idx, m_idx, l_idx]
+        src_vals = path_plan_goal_distances[b_idx, m_idx, l_idx]
+        flat_size = B * M
+        inf_value = torch.tensor(float("inf"), dtype=path_plan_goal_distances.dtype, device=path_plans.device)
+        flat_full = torch.full(
+            (flat_size * total_w_lanes,),
+            inf_value,
+            dtype=path_plan_goal_distances.dtype,
+            device=path_plans.device,
+        )
+        flat_row = b_idx * M + m_idx
+        linear_idx = flat_row * total_w_lanes + target_idx
+        flat_full.scatter_reduce_(
+            dim=0,
+            index=linear_idx,
+            src=src_vals,
+            reduce="amin",
+            include_self=True,
+        )
+        full = flat_full.view(B, M, total_w_lanes)
+        return torch.where(torch.isinf(full), torch.full_like(full, invalid_value), full)
+
+    def _capture_agent_state_snapshot(self, simulator):
+        snapshot = {
+            "agents_state": simulator.agents_state.detach().to("cpu"),
+        }
+        if simulator.agents_path_plans is not None:
+            snapshot["agents_path_plans"] = simulator.agents_path_plans.detach().to("cpu")
+        else:
+            snapshot["agents_path_plans"] = None
+        if simulator.agents_path_plan_goal_distances is not None:
+            snapshot["agents_path_plan_goal_distances"] = simulator.agents_path_plan_goal_distances.detach().to("cpu")
+        else:
+            snapshot["agents_path_plan_goal_distances"] = None
+        reward_params = getattr(simulator.reward_calculator, "sampled_params", None)
+        if reward_params is not None:
+            snapshot["reward_params"] = reward_params.detach().to("cpu")
+        else:
+            snapshot["reward_params"] = None
         return snapshot
 
     def _encode_features(
         self,
         components,
+        simulator,
         w_boundary_net,
         goals_net,
         w_lane_net,
@@ -385,6 +543,7 @@ class ddppo:
         actions_buffer,
         valid_mask,
         bootstrap_value,
+        simulator,
         w_boundary_net,
         goals_net,
         w_lane_net,
@@ -414,7 +573,9 @@ class ddppo:
         actions_buffer = [actions_buffer[i] for i in idx_list]
 
         rewards = torch.stack(rewards_buffer, dim=0).to(device)
-        dones = torch.stack(dones_buffer, dim=0).to(device).float()
+        dones_tensor = torch.stack(dones_buffer, dim=0).to(device)
+        dones_bool = dones_tensor.bool()
+        dones = dones_tensor.float()
         values = torch.stack(values_buffer, dim=0).to(device).squeeze(-1)
         old_log_probs = torch.stack(old_log_probs_buffer, dim=0).to(device)
         actions = torch.stack(actions_buffer, dim=0).to(device)
@@ -441,17 +602,58 @@ class ddppo:
         )  # (B, M, T)
 
         advantages = advantages_bmt.permute(2, 0, 1)
-        returns = advantages + values
-        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+        raw_advantages = advantages.clone()
+        returns = raw_advantages + values
 
-        new_log_probs_list = []
-        new_values_list = []
-        entropy_list = []
-        
-        for snapshot, actions_t in zip(states_buffer, actions):
-            components = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in snapshot.items()}
+        dones_bmt_bool = dones_bool.permute(1, 2, 0)
+        done_seen = torch.cumsum(dones_bmt_bool.long(), dim=-1)
+        post_done_mask = torch.zeros_like(dones_bmt_bool, dtype=torch.bool)
+        post_done_mask[..., 1:] = done_seen[..., :-1] > 0
+        keep_mask_done = (~post_done_mask).permute(2, 0, 1)
+
+        abs_adv = raw_advantages.abs()
+        A_max = abs_adv.max().item()
+        if A_max <= 0:
+            keep_mask_adv = torch.ones_like(raw_advantages, dtype=torch.bool)
+            eta_value = 0.0
+        else:
+            eta_value = self.advantage_filter_threshold * A_max
+            keep_mask_adv = abs_adv >= eta_value
+
+        keep_mask = keep_mask_done & keep_mask_adv
+        if not keep_mask.any():
+            keep_mask = keep_mask_done
+        if not keep_mask.any():
+            keep_mask = torch.ones_like(keep_mask_done, dtype=torch.bool)
+
+        mask_flat = keep_mask.view(-1)
+        if not mask_flat.any():
+            return
+
+        time_keep_mask = keep_mask.any(dim=(1, 2))
+        time_indices = time_keep_mask.nonzero(as_tuple=True)[0].tolist()
+        if not time_indices:
+            return
+
+        new_log_probs_full = torch.zeros_like(old_log_probs)
+        new_values_full = torch.zeros_like(values)
+        entropies_full = torch.zeros_like(old_log_probs)
+
+        for t_idx in time_indices:
+            snapshot = states_buffer[t_idx]
+            if snapshot is None:
+                continue
+            components = self._build_components_from_data(
+                simulator,
+                snapshot["agents_state"],
+                snapshot.get("agents_path_plans"),
+                snapshot.get("agents_path_plan_goal_distances"),
+                snapshot.get("reward_params"),
+                device,
+            )
             encoded = self._encode_features(
                 components,
+                simulator,
                 w_boundary_net,
                 goals_net,
                 w_lane_net,
@@ -461,36 +663,82 @@ class ddppo:
             )
             action_probs = mlp_policy(*encoded)
             current_values = mlp_value(*encoded).squeeze(-1)
-            log_probs_now, entropy_now = self._compute_log_probs(action_probs, actions_t)
-            new_log_probs_list.append(log_probs_now)
-            new_values_list.append(current_values)
-            entropy_list.append(entropy_now)
+            log_probs_now, entropy_now = self._compute_log_probs(action_probs, actions[t_idx])
+            new_log_probs_full[t_idx] = log_probs_now
+            new_values_full[t_idx] = current_values
+            entropies_full[t_idx] = entropy_now
 
-        new_log_probs = torch.stack(new_log_probs_list, dim=0)
-        new_values = torch.stack(new_values_list, dim=0)
-        entropies = torch.stack(entropy_list, dim=0)
+        advantages_flat = raw_advantages.view(-1)[mask_flat]
+        returns_flat = returns.view(-1)[mask_flat]
+        old_log_probs_flat = old_log_probs.view(-1)[mask_flat]
+        new_log_probs_flat = new_log_probs_full.view(-1)[mask_flat]
+        new_values_flat = new_values_full.view(-1)[mask_flat]
+        entropies_flat = entropies_full.view(-1)[mask_flat]
 
-        ratio = torch.exp(new_log_probs - old_log_probs)
-        advantages_detached = advantages.detach()
-        surr1 = ratio * advantages_detached
-        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * advantages_detached
-        policy_loss = -torch.mean(torch.min(surr1, surr2))
-        entropy_bonus = entropies.mean()
-        total_policy_loss = policy_loss - self.entropy_coef * entropy_bonus
+        advantages_mean = advantages_flat.mean()
+        advantages_std = advantages_flat.std(unbiased=False)
+        if advantages_std.item() == 0:
+            advantages_std = advantages_std + 1e-8
+        advantages_norm = (advantages_flat - advantages_mean) / (advantages_std + 1e-8)
+        advantages_detached = advantages_norm.detach()
 
-        optimizer_policy.zero_grad()
-        total_policy_loss.backward()
-        optimizer_policy.step()
+        num_samples = advantages_norm.shape[0]
+        batch_size = min(self.batch_size, num_samples)
+        policy_loss_sum = 0.0
+        value_loss_sum = 0.0
+        entropy_sum = 0.0
+        total_weight = 0
 
-        value_loss = F.mse_loss(new_values, returns) * self.value_coef
-        optimizer_value.zero_grad()
-        value_loss.backward()
-        optimizer_value.step()
+        if num_samples == 0:
+            return
+        for epoch in range(max(1, self.ppo_epochs)):
+            if num_samples <= batch_size:
+                perm = torch.arange(num_samples, device=device)
+            else:
+                perm = torch.randperm(num_samples, device=device)
+            start = 0
+            while start < num_samples:
+                end = min(start + batch_size, num_samples)
+                idx = perm[start:end]
+                batch_len = idx.numel()
+                if batch_len == 0:
+                    break
+                ratio = torch.exp(new_log_probs_flat[idx] - old_log_probs_flat[idx])
+                advantages_batch = advantages_norm[idx]
+                advantages_detached_batch = advantages_detached[idx]
+                surr1 = ratio * advantages_detached_batch
+                surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * advantages_detached_batch
+                policy_loss = -torch.mean(torch.min(surr1, surr2))
+                entropy_bonus = entropies_flat[idx].mean()
+                total_policy_loss = policy_loss - self.entropy_coef * entropy_bonus
+
+                optimizer_policy.zero_grad()
+                total_policy_loss.backward()
+                optimizer_policy.step()
+
+                value_loss = F.mse_loss(new_values_flat[idx], returns_flat[idx]) * self.value_coef
+                optimizer_value.zero_grad()
+                value_loss.backward()
+                optimizer_value.step()
+
+                policy_loss_sum += policy_loss.item() * batch_len
+                value_loss_sum += value_loss.item() * batch_len
+                entropy_sum += entropy_bonus.item() * batch_len
+                total_weight += batch_len
+                start = end
+
+        if total_weight == 0:
+            return
 
         if is_master:
+            avg_policy_loss = policy_loss_sum / total_weight
+            avg_value_loss = value_loss_sum / total_weight
+            avg_entropy = entropy_sum / total_weight
             print(
-                f"PPO update -> policy_loss: {policy_loss.item():.6f}, "
-                f"value_loss: {value_loss.item():.6f}, entropy: {entropy_bonus.item():.6f}"
+                f"PPO update -> policy_loss: {avg_policy_loss:.6f}, "
+                f"value_loss: {avg_value_loss:.6f}, entropy: {avg_entropy:.6f}, "
+                f"eta: {eta_value:.6f}, kept_steps: {num_samples}, "
+                f"updates: {total_weight} (epochs={max(1, self.ppo_epochs)})"
             )
 
     def __init__(self, config_path):
@@ -508,11 +756,15 @@ class ddppo:
         self.learning_rate = float(training_config.get('learning_rate'))
         self.num_iterations = int(training_config.get('num_iterations'))
         # 每轮采样的时间步长度（默认 128），以及单个 episode 的最大步数
-        self.rollout_steps = int(training_config.get('rollout_steps', 128))
-        self.max_episode_steps = int(training_config.get('max_episode_steps', 1024))
-        self.ppo_clip = float(training_config.get('ppo_clip', 0.2))
-        self.entropy_coef = float(training_config.get('entropy_coef', 0.0))
-        self.value_coef = float(training_config.get('value_coef', 0.5))
+        self.rollout_steps = int(training_config.get('rollout_steps'))
+        self.max_episode_steps = int(training_config.get('max_episode_steps'))
+        self.batch_size = int(training_config.get('batch_size'))
+        self.ppo_epochs = int(training_config.get('ppo_epochs'))
+        self.ppo_clip = float(training_config.get('ppo_clip'))
+        self.entropy_coef = float(training_config.get('entropy_coef'))
+        self.value_coef = float(training_config.get('value_coef'))
+        self.advantage_filter_threshold = float(training_config.get('advantage_filter_threshold'))
+        self.advantage_filter_beta = float(training_config.get('advantage_filter_beta'))
         
         # 检查 GPU 信息并启动分布式进程
         cuda_available, cuda_ranks = self.check_gpu_info(print_info=True)

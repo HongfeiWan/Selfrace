@@ -280,6 +280,7 @@ class ObservationGenerator:
         self.last_local_state = local_state
         self.last_neighbors_local = neighbors_local
         self.last_w_boundaries_local = w_boundaries_local
+        
         if hasattr(self, "w_lanes_ids") and self.w_lanes_ids is not None:
             self.last_w_lanes_ids = self.w_lanes_ids.view(B, M, self.num_w_lanes)
         else:

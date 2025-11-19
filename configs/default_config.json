@@ -133,15 +133,21 @@
   "training": {
     "learning_rate": 0.0005,
     "num_iterations": 10000,
+    "batch_size": 1000,
     "rollout_steps": 128,
     "max_episode_steps": 1200,
+    "ppo_epochs": 3,
 
     "gamma": 0.999,
     "lambda": 0.95,
 
     "ppo_clip": 0.2,
     "entropy_coef": 0.01,
-    "value_coef": 0.5
+    "value_coef": 0.5,
+
+    "advantage_filter_beta":0.25,
+    "advantage_filter_threshold":0.01
+
   },
   "preprocessor": {
     "tolerance": 0.1,
