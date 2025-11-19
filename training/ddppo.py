@@ -10,6 +10,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.optim as optim
+import torch.nn.functional as F
+from torch.distributions import Categorical
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # 将 ../ 目录下的所有文件夹添加到 sys.path
@@ -80,7 +82,6 @@ class ddppo:
         print(f"Worker {rank}/{world_size} started on GPU {rank}")
         device = torch.device(f'cuda:{rank}')
         torch.cuda.set_device(device)
-        
         # Windows 上不使用分布式，只使用单卡
         if os.name == 'nt':
             is_master = True
@@ -175,92 +176,322 @@ class ddppo:
             old_log_probs_buffer = [None] * buffer_T
             actions_buffer = [None] * buffer_T
             buffer_step_count = 0  # 当前已写入的时间步计数
+            current_observation = initial_observation
 
-            if buffer_T > 0:
-                states_buffer[buffer_step_count] = initial_observation
-            
-            # 从 simulator 获取网络需要的各个输入
-            obs_gen = simulator.observation_generator
-            # 1. 从 observation_generator 的 self 属性中直接读取（已在 reset() 的 generate() 中计算并保存）
-            w_boundaries_local = obs_gen.last_w_boundaries_local  # (B, M, K, 2) - 用于 WBoundaryNet
-            local_state = obs_gen.last_local_state  # (B, M, 7) - 用于 VehicleStateNet
-            neighbors_local = obs_gen.last_neighbors_local  # (B, M, K, 7) - 用于 OtherAgentsNet
-            # 2. 获取 w_lanes_local_with_goal_distances (B, M, K, 3) - 用于 WlaneNet
-            w_lanes_local_with_goal_distances = simulator.w_lanes_local_with_goal_distances
-            # 3. 获取 agents_path_plans 的世界坐标 (B, M, L, 3) - 用于 GoalsNet
-            # 从 path_planner 获取路径点的世界坐标
-            path_centers = simulator.path_planner.get_w_lane_centers_by_id(simulator.agents_path_plans)  # (B, M, L, 2)
-            # 添加一个零的 z 维度使其成为 (B, M, L, 3)
-            agents_path_plans_world = torch.cat([
-                path_centers,
-                torch.zeros_like(path_centers[..., :1])
-            ], dim=-1)
-            # 4. 获取 curvature (B, M) - 用于 ConditionNet
-            curvature = obs_gen.curvature if hasattr(obs_gen, 'curvature') else torch.zeros(
-                (simulator.num_envs, simulator.max_agents), device=device
-            )
-            # 5. 获取 reward_params (B, M, R) - 用于 ConditionNet
-            reward_params = simulator.reward_calculator.sampled_params  # (B, M, R)
-            # 6. 获取 wheelbase (B*M,) - 用于 ConditionNet
-            # 从 dynamics_model 获取
-            if hasattr(simulator.dynamics_model, 'vehicle_params') and 'wheelbase' in simulator.dynamics_model.vehicle_params:
-                wheelbase_flat = simulator.dynamics_model.vehicle_params['wheelbase']  # (B*M,)
-                B, M = simulator.agents_state.shape[:2]
-                wheelbase = wheelbase_flat.view(B, M)  # (B, M)
+            for episode_step in range(self.max_episode_steps):
+                components = self._collect_observation_components(simulator, current_observation, device)
+                snapshot = self._clone_components(components)
+                if buffer_step_count >= buffer_T:
+                    raise RuntimeError("Buffer overflow detected before PPO update.")
+                states_buffer[buffer_step_count] = snapshot
+
+                with torch.no_grad():
+                    encoded_features = self._encode_features(
+                        components,
+                        w_boundary_net,
+                        goals_net,
+                        w_lane_net,
+                        other_agents_net,
+                        condition_net,
+                        vehicle_state_net,
+                    )
+                    action_probs = mlp_policy(*encoded_features)
+                    values = mlp_value(*encoded_features)
+
+                actions, log_probs, _ = self._sample_actions(action_probs)
+                next_observation, rewards, dones, _ = simulator.step(actions.unsqueeze(-1))
+
+                rewards_buffer[buffer_step_count] = rewards.detach().clone()
+                dones_buffer[buffer_step_count] = dones.detach().clone()
+                values_buffer[buffer_step_count] = values.detach().clone()
+                old_log_probs_buffer[buffer_step_count] = log_probs.detach().clone()
+                actions_buffer[buffer_step_count] = actions.detach().clone()
+                buffer_step_count += 1
+                current_observation = next_observation
+
+                should_update = (buffer_step_count == buffer_T) or (episode_step == self.max_episode_steps - 1)
+
+                if should_update and buffer_step_count > 0:
+                    valid_mask = torch.zeros(buffer_T, dtype=torch.bool, device=device)
+                    valid_mask[:buffer_step_count] = True
+                    bootstrap_components = self._collect_observation_components(simulator, current_observation, device)
+                    with torch.no_grad():
+                        bootstrap_encoded = self._encode_features(
+                            bootstrap_components,
+                            w_boundary_net,
+                            goals_net,
+                            w_lane_net,
+                            other_agents_net,
+                            condition_net,
+                            vehicle_state_net,
+                        )
+                        bootstrap_value = mlp_value(*bootstrap_encoded).detach()
+
+                    self._ppo_update_from_buffer(
+                        states_buffer[:buffer_step_count],
+                        rewards_buffer[:buffer_step_count],
+                        dones_buffer[:buffer_step_count],
+                        values_buffer[:buffer_step_count],
+                        old_log_probs_buffer[:buffer_step_count],
+                        actions_buffer[:buffer_step_count],
+                        valid_mask,
+                        bootstrap_value,
+                        w_boundary_net,
+                        goals_net,
+                        w_lane_net,
+                        other_agents_net,
+                        condition_net,
+                        vehicle_state_net,
+                        mlp_policy,
+                        mlp_value,
+                        optimizer_policy,
+                        optimizer_value,
+                        device,
+                        is_master,
+                    )
+
+                    states_buffer = [None] * buffer_T
+                    rewards_buffer = [None] * buffer_T
+                    dones_buffer = [None] * buffer_T
+                    values_buffer = [None] * buffer_T
+                    old_log_probs_buffer = [None] * buffer_T
+                    actions_buffer = [None] * buffer_T
+                    buffer_step_count = 0
+
+            scheduler_policy.step()
+            scheduler_value.step()
+
+    def _collect_observation_components(self, simulator, observation, device):
+        """收集当前环境状态下构建网络输入所需的全部数据。"""
+        components = {}
+        obs_gen = simulator.observation_generator
+        B, M = simulator.agents_state.shape[:2]
+
+        def _ensure_tensor(tensor, shape=None, fill_value=0.0):
+            if tensor is None:
+                if shape is None:
+                    raise RuntimeError("Missing observation component without fallback shape.")
+                return torch.full(shape, fill_value, device=device)
+            return tensor.to(device)
+
+        components["observation"] = observation.to(device) if observation is not None else None
+        components["w_boundaries_local"] = _ensure_tensor(obs_gen.last_w_boundaries_local)
+        components["local_state"] = _ensure_tensor(obs_gen.last_local_state)
+        components["neighbors_local"] = _ensure_tensor(obs_gen.last_neighbors_local)
+        components["w_lanes_local_with_goal_distances"] = _ensure_tensor(simulator.w_lanes_local_with_goal_distances)
+        components["agents_state"] = simulator.agents_state.to(device)
+
+        path_centers = simulator.path_planner.get_w_lane_centers_by_id(simulator.agents_path_plans)
+        agents_path_plans_world = torch.cat(
+            [path_centers, torch.zeros_like(path_centers[..., :1])],
+            dim=-1,
+        )
+        components["agents_path_plans_world"] = agents_path_plans_world.to(device)
+
+        curvature = getattr(obs_gen, "curvature", None)
+        components["curvature"] = _ensure_tensor(curvature, (B, M))
+        components["reward_params"] = _ensure_tensor(simulator.reward_calculator.sampled_params)
+
+        wheelbase = torch.zeros((B, M), device=device)
+        if hasattr(simulator.dynamics_model, "vehicle_params"):
+            vehicle_params = simulator.dynamics_model.vehicle_params
+            if isinstance(vehicle_params, dict) and "wheelbase" in vehicle_params:
+                wheelbase = vehicle_params["wheelbase"].view(B, M).to(device)
+        components["wheelbase"] = wheelbase
+
+        c_throttle = torch.zeros((B, M), device=device)
+        c_steer = torch.zeros((B, M), device=device)
+        c_acc = torch.zeros((B, M), device=device)
+        c_vel = torch.zeros((B, M), device=device)
+        if hasattr(simulator, "extend_state") and simulator.extend_state is not None:
+            c_acc = simulator.extend_state[..., 4].to(device)
+            c_vel = simulator.extend_state[..., 3].to(device)
+        components["c_throttle"] = c_throttle
+        components["c_steer"] = c_steer
+        components["c_acc"] = c_acc
+        components["c_vel"] = c_vel
+        return components
+
+    @staticmethod
+    def _clone_components(components):
+        snapshot = {}
+        for key, value in components.items():
+            if torch.is_tensor(value):
+                snapshot[key] = value.detach().clone()
             else:
-                B, M = simulator.agents_state.shape[:2]
-                wheelbase = torch.zeros((B, M), device=device)
-            # 7. 获取 c_throttle, c_steer, c_acc, c_vel - 用于 ConditionNet
-            # 这些参数通常从 reward_calculator 或 dynamics_model 获取
-            # 如果不存在，使用零值
-            B, M = simulator.agents_state.shape[:2]
-            c_throttle = torch.zeros((B, M), device=device)
-            c_steer = torch.zeros((B, M), device=device)
-            c_acc = torch.zeros((B, M), device=device)
-            c_vel = torch.zeros((B, M), device=device)
-            # 如果有 extend_state，可以从那里获取一些信息
-            if hasattr(simulator, 'extend_state') and simulator.extend_state is not None:
-                # extend_state: (B, M, 10) [x, y, heading, speed, along, alat, along_jerk, alat_jerk, theta_f, d]
-                c_acc = simulator.extend_state[..., 4]  # along 加速度
-                # c_vel 可以从 speed 获取
-                c_vel = simulator.extend_state[..., 3]  # speed
-            # 现在将所有输入传入网络
-            with torch.no_grad():
-                # WBoundaryNet
-                w_boundary_features = w_boundary_net(w_boundaries_local)  # (B, M, encoded_dim)
-                # GoalsNet
-                goals_features = goals_net(simulator.agents_state, agents_path_plans_world)  # (B, M, encoded_dim)
-                # WlaneNet
-                w_lane_features = w_lane_net(w_lanes_local_with_goal_distances)  # (B, M, encoded_dim)
-                # OtherAgentsNet
-                other_agents_features = other_agents_net(neighbors_local)  # (B, M, encoded_dim)
-                # ConditionNet
-                condition_features = condition_net(
-                    curvature, c_throttle, c_steer, c_acc, c_vel, reward_params, wheelbase
-                )  # (B, M, encoded_dim)
-                # VehicleStateNet
-                vehicle_state_features = vehicle_state_net(local_state)  # (B, M, encoded_dim)
-                # MLP_policy - 输出动作概率分布
-                action_probs = mlp_policy(
-                    w_boundary_features,
-                    goals_features,
-                    w_lane_features,
-                    other_agents_features,
-                    condition_features,
-                    vehicle_state_features,
-                )  # (B, M, action_dim)
-                # MLP_value - 输出价值估计
-                values = mlp_value(
-                    w_boundary_features,
-                    goals_features,
-                    w_lane_features,
-                    other_agents_features,
-                    condition_features,
-                    vehicle_state_features,
-                )  # (B, M, 1)
-            if is_master:
-                print(f"Iteration {k}: Networks forward pass completed")
-                print(f"  Action probs shape: {action_probs.shape}, Values shape: {values.shape}")
+                snapshot[key] = value
+        return snapshot
+
+    def _encode_features(
+        self,
+        components,
+        w_boundary_net,
+        goals_net,
+        w_lane_net,
+        other_agents_net,
+        condition_net,
+        vehicle_state_net):
+        w_boundary_features = w_boundary_net(components["w_boundaries_local"])
+        goals_features = goals_net(components["agents_state"], components["agents_path_plans_world"])
+        w_lane_features = w_lane_net(components["w_lanes_local_with_goal_distances"])
+        other_agents_features = other_agents_net(components["neighbors_local"])
+        condition_features = condition_net(
+            components["curvature"],
+            components["c_throttle"],
+            components["c_steer"],
+            components["c_acc"],
+            components["c_vel"],
+            components["reward_params"],
+            components["wheelbase"],
+        )
+        vehicle_state_features = vehicle_state_net(components["local_state"])
+        return (
+            w_boundary_features,
+            goals_features,
+            w_lane_features,
+            other_agents_features,
+            condition_features,
+            vehicle_state_features,
+        )
+
+    def _sample_actions(self, action_probs):
+        """依据策略分布采样动作，并返回动作及对应的 log_prob 与熵。"""
+        B, M, A = action_probs.shape
+        probs = torch.clamp(action_probs, min=1e-10).view(B * M, A)
+        dist = Categorical(probs)
+        actions_flat = dist.sample()
+        log_probs = dist.log_prob(actions_flat).view(B, M)
+        entropy = dist.entropy().view(B, M)
+        actions = actions_flat.view(B, M)
+        return actions, log_probs, entropy
+
+    def _compute_log_probs(self, action_probs, actions):
+        """根据给定的动作重新计算 log_prob 与熵。"""
+        B, M, A = action_probs.shape
+        probs = torch.clamp(action_probs, min=1e-10).view(B * M, A)
+        dist = Categorical(probs)
+        actions_flat = actions.view(B * M)
+        log_probs = dist.log_prob(actions_flat).view(B, M)
+        entropy = dist.entropy().view(B, M)
+        return log_probs, entropy
+
+    def _ppo_update_from_buffer(
+        self,
+        states_buffer,
+        rewards_buffer,
+        dones_buffer,
+        values_buffer,
+        old_log_probs_buffer,
+        actions_buffer,
+        valid_mask,
+        bootstrap_value,
+        w_boundary_net,
+        goals_net,
+        w_lane_net,
+        other_agents_net,
+        condition_net,
+        vehicle_state_net,
+        mlp_policy,
+        mlp_value,
+        optimizer_policy,
+        optimizer_value,
+        device,
+        is_master):
+        """使用缓冲区中的 rollout 数据执行一次 PPO 更新。"""
+        if valid_mask is None or valid_mask.numel() == 0:
+            return
+
+        valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+        if valid_indices.numel() == 0:
+            return
+        idx_list = valid_indices.tolist()
+
+        states_buffer = [states_buffer[i] for i in idx_list]
+        rewards_buffer = [rewards_buffer[i] for i in idx_list]
+        dones_buffer = [dones_buffer[i] for i in idx_list]
+        values_buffer = [values_buffer[i] for i in idx_list]
+        old_log_probs_buffer = [old_log_probs_buffer[i] for i in idx_list]
+        actions_buffer = [actions_buffer[i] for i in idx_list]
+
+        rewards = torch.stack(rewards_buffer, dim=0).to(device)
+        dones = torch.stack(dones_buffer, dim=0).to(device).float()
+        values = torch.stack(values_buffer, dim=0).to(device).squeeze(-1)
+        old_log_probs = torch.stack(old_log_probs_buffer, dim=0).to(device)
+        actions = torch.stack(actions_buffer, dim=0).to(device)
+
+        T = rewards.shape[0]
+        advantages = torch.zeros_like(rewards, device=device)
+        returns = torch.zeros_like(rewards, device=device)
+
+        rewards_bmt = rewards.permute(1, 2, 0)              # (B, M, T)
+        values_bmt = values.permute(1, 2, 0)                # (B, M, T)
+        dones_bmt = dones.permute(1, 2, 0)                  # (B, M, T)
+        bootstrap_bmt = bootstrap_value.to(device).squeeze(-1)  # (B, M)
+        values_with_bootstrap = torch.cat(
+            [values_bmt, bootstrap_bmt.unsqueeze(-1)],
+            dim=-1,
+        )  # (B, M, T+1)
+
+        advantages_bmt = self.GAE_calculate(
+            rewards_bmt,
+            values_with_bootstrap,
+            dones_bmt,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+        )  # (B, M, T)
+
+        advantages = advantages_bmt.permute(2, 0, 1)
+        returns = advantages + values
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+
+        new_log_probs_list = []
+        new_values_list = []
+        entropy_list = []
+        
+        for snapshot, actions_t in zip(states_buffer, actions):
+            components = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in snapshot.items()}
+            encoded = self._encode_features(
+                components,
+                w_boundary_net,
+                goals_net,
+                w_lane_net,
+                other_agents_net,
+                condition_net,
+                vehicle_state_net,
+            )
+            action_probs = mlp_policy(*encoded)
+            current_values = mlp_value(*encoded).squeeze(-1)
+            log_probs_now, entropy_now = self._compute_log_probs(action_probs, actions_t)
+            new_log_probs_list.append(log_probs_now)
+            new_values_list.append(current_values)
+            entropy_list.append(entropy_now)
+
+        new_log_probs = torch.stack(new_log_probs_list, dim=0)
+        new_values = torch.stack(new_values_list, dim=0)
+        entropies = torch.stack(entropy_list, dim=0)
+
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        advantages_detached = advantages.detach()
+        surr1 = ratio * advantages_detached
+        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * advantages_detached
+        policy_loss = -torch.mean(torch.min(surr1, surr2))
+        entropy_bonus = entropies.mean()
+        total_policy_loss = policy_loss - self.entropy_coef * entropy_bonus
+
+        optimizer_policy.zero_grad()
+        total_policy_loss.backward()
+        optimizer_policy.step()
+
+        value_loss = F.mse_loss(new_values, returns) * self.value_coef
+        optimizer_value.zero_grad()
+        value_loss.backward()
+        optimizer_value.step()
+
+        if is_master:
+            print(
+                f"PPO update -> policy_loss: {policy_loss.item():.6f}, "
+                f"value_loss: {value_loss.item():.6f}, entropy: {entropy_bonus.item():.6f}"
+            )
 
     def __init__(self, config_path):
         # 加载配置文件
@@ -276,9 +507,12 @@ class ddppo:
         self.gae_lambda = float(training_config.get('lambda'))
         self.learning_rate = float(training_config.get('learning_rate'))
         self.num_iterations = int(training_config.get('num_iterations'))
-        # 每轮采样的时间步长度（若未配置则使用 32）
-        self.rollout_steps = int(training_config.get('rollout_steps'))
-        self.max_episode_steps = int(training_config.get('max_episode_steps'))
+        # 每轮采样的时间步长度（默认 128），以及单个 episode 的最大步数
+        self.rollout_steps = int(training_config.get('rollout_steps', 128))
+        self.max_episode_steps = int(training_config.get('max_episode_steps', 1024))
+        self.ppo_clip = float(training_config.get('ppo_clip', 0.2))
+        self.entropy_coef = float(training_config.get('entropy_coef', 0.0))
+        self.value_coef = float(training_config.get('value_coef', 0.5))
         
         # 检查 GPU 信息并启动分布式进程
         cuda_available, cuda_ranks = self.check_gpu_info(print_info=True)

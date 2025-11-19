@@ -137,7 +137,11 @@
     "max_episode_steps": 1200,
 
     "gamma": 0.999,
-    "lambda": 0.95
+    "lambda": 0.95,
+
+    "ppo_clip": 0.2,
+    "entropy_coef": 0.01,
+    "value_coef": 0.5
   },
   "preprocessor": {
     "tolerance": 0.1,
