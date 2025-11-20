@@ -786,6 +786,141 @@ class MLP_value(nn.Module):
         values = self.mlp(combined.view(B * M, self.input_dim))  # (B*M, 1)
         return values.view(B, M, 1)
 
+class CompletePolicyNet(nn.Module):
+    """
+    完整的策略网络，包含所有编码网络和 policy MLP。
+    接收 components 字典作为输入，内部调用各个编码网络，然后直接传递给 MLP，
+    避免保存中间激活值，达到节约显存的效果。
+    """
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        if config is None:
+            config = _load_default_config()
+        
+        # 初始化所有编码网络
+        self.w_boundary_net = WBoundaryNet(config)
+        self.goals_net = GoalsNet(config)
+        self.w_lane_net = WlaneNet(config)
+        self.other_agents_net = OtherAgentsNet(config)
+        self.condition_net = ConditionNet(config)
+        self.vehicle_state_net = VehicleStateNet(config)
+        
+        # 初始化 policy MLP
+        self.policy_mlp = MLP_policy(config)
+    
+    def forward(self, components: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        前向传播：直接调用各个编码网络，然后传递给 policy MLP。
+        在 no_grad 模式下，中间激活值不会保存，达到节约显存的效果。
+        
+        Args:
+            components: 包含以下键的字典：
+                - "w_boundaries_local": (B, M, K, 2)
+                - "agents_state": (B, M, 7)
+                - "agents_path_plans_world": (B, M, L, 3)
+                - "w_lanes_local_with_goal_distances": (B, M, K, 4)
+                - "neighbors_local": (B, M, K, 7)
+                - "curvature": (B, M)
+                - "c_throttle": (B, M)
+                - "c_steer": (B, M)
+                - "c_acc": (B, M)
+                - "c_vel": (B, M)
+                - "reward_params": (B, M, 10)
+                - "wheelbase": (B, M)
+                - "local_state": (B, M, 7)
+        
+        Returns:
+            action_probs: (B, M, dynamics_jerk_dim) 动作空间的概率分布
+        """
+        # 逐个编码特征，直接传递给 MLP，不保存中间结果
+        # 在 no_grad 模式下，编码网络的中间激活值不会保存，达到节约显存的效果
+        # 编码网络的输出直接传递给 MLP，避免保存中间激活值
+        action_probs = self.policy_mlp(
+            self.w_boundary_net(components["w_boundaries_local"]),
+            self.goals_net(components["agents_state"], components["agents_path_plans_world"]),
+            self.w_lane_net(components["w_lanes_local_with_goal_distances"]),
+            self.other_agents_net(components["neighbors_local"]),
+            self.condition_net(
+                components["curvature"],
+                components["c_throttle"],
+                components["c_steer"],
+                components["c_acc"],
+                components["c_vel"],
+                components["reward_params"],
+                components["wheelbase"],
+            ),
+            self.vehicle_state_net(components["local_state"]),
+        )
+        
+        return action_probs
+
+class CompleteValueNet(nn.Module):
+    """
+    完整的价值网络，包含所有编码网络和 value MLP。
+    接收 components 字典作为输入，内部调用各个编码网络，然后直接传递给 MLP，
+    避免保存中间激活值，达到节约显存的效果。
+    """
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        if config is None:
+            config = _load_default_config()
+        
+        # 初始化所有编码网络
+        self.w_boundary_net = WBoundaryNet(config)
+        self.goals_net = GoalsNet(config)
+        self.w_lane_net = WlaneNet(config)
+        self.other_agents_net = OtherAgentsNet(config)
+        self.condition_net = ConditionNet(config)
+        self.vehicle_state_net = VehicleStateNet(config)
+        
+        # 初始化 value MLP
+        self.value_mlp = MLP_value(config)
+    
+    def forward(self, components: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        前向传播：直接调用各个编码网络，然后传递给 value MLP。
+        在 no_grad 模式下，中间激活值不会保存，达到节约显存的效果。
+        
+        Args:
+            components: 包含以下键的字典：
+                - "w_boundaries_local": (B, M, K, 2)
+                - "agents_state": (B, M, 7)
+                - "agents_path_plans_world": (B, M, L, 3)
+                - "w_lanes_local_with_goal_distances": (B, M, K, 4)
+                - "neighbors_local": (B, M, K, 7)
+                - "curvature": (B, M)
+                - "c_throttle": (B, M)
+                - "c_steer": (B, M)
+                - "c_acc": (B, M)
+                - "c_vel": (B, M)
+                - "reward_params": (B, M, 10)
+                - "wheelbase": (B, M)
+                - "local_state": (B, M, 7)
+        
+        Returns:
+            values: (B, M, 1) 价值估计
+        """
+        # 逐个编码特征，直接传递给 MLP，不保存中间结果
+        # 在 no_grad 模式下，编码网络的中间激活值不会保存，达到节约显存的效果
+        # 编码网络的输出直接传递给 MLP，避免保存中间激活值
+        values = self.value_mlp(
+            self.w_boundary_net(components["w_boundaries_local"]),
+            self.goals_net(components["agents_state"], components["agents_path_plans_world"]),
+            self.w_lane_net(components["w_lanes_local_with_goal_distances"]),
+            self.other_agents_net(components["neighbors_local"]),
+            self.condition_net(
+                components["curvature"],
+                components["c_throttle"],
+                components["c_steer"],
+                components["c_acc"],
+                components["c_vel"],
+                components["reward_params"],
+                components["wheelbase"],
+            ),
+            self.vehicle_state_net(components["local_state"]),
+        )
+        
+        return values
 
 if __name__ == "__main__":
     # 测试一下，WBoundaryNet 是否能正常工作
@@ -909,3 +1044,6 @@ if __name__ == "__main__":
     # print(goals_output).
     
     pass
+
+
+

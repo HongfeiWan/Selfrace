@@ -5,7 +5,7 @@
 
   "simulator": {
     "sim_dt": 0.3,
-    "B": 1320,
+    "B": 500,
     "M": 150,
     "num_npc_vehicles": 150,
 

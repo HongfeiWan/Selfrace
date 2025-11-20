@@ -45,11 +45,6 @@ class ObservationGenerator:
         # 预计算映射改由 RoadNetwork 在加载时完成，直接引用即可
         self.quad_to_w_lanes_ids = self.road_network.quad_to_w_lanes_ids
         self.quad_to_w_boundaries_ids = self.road_network.quad_to_w_boundaries_ids
-        self.last_w_lanes_local: Optional[torch.Tensor] = None
-        self.last_w_lanes_ids: Optional[torch.Tensor] = None
-        self.last_local_state: Optional[torch.Tensor] = None
-        self.last_neighbors_local: Optional[torch.Tensor] = None
-        self.last_w_boundaries_local: Optional[torch.Tensor] = None
 
     def get_observation_dim(self) -> int:
         """
@@ -73,7 +68,13 @@ class ObservationGenerator:
             agents_state: 形状为 (B, M, 7) 的agent状态张量
         Returns:
             tuple: (w_lanes_world, w_boundaries_world)
+                - w_lanes_world: (B, M, num_w_lanes, 2)
+                - w_boundaries_world: (B, M, num_w_boundaries, 2)
         """
+        # 检查输入形状
+        if agents_state.ndimension() != 3 or agents_state.shape[2] != 7:
+            raise ValueError(f"agents_state must be (B, M, 7), got {agents_state.shape}")
+        
         batch_size, max_agents, _ = agents_state.shape
         # 获取每个agent所在的quad_id
         agent_positions = agents_state[..., :2]  # (B, M, 2)
@@ -87,26 +88,42 @@ class ObservationGenerator:
         w_lanes_ids = self.quad_to_w_lanes_ids[quad_indices]      # (B*M, K_lanes)
         w_bounds_ids = self.quad_to_w_boundaries_ids[quad_indices]# (B*M, K_bounds)
         self.w_lanes_ids = w_lanes_ids
-        wl_world = self.road_network.global_w_lane[w_lanes_ids]   # (B*M, wl_K, 2)
-        wb_world = self.road_network.global_w_boundary[w_bounds_ids] # (B*M, wb_K, 2)
+        
+        # 索引 w_lanes
+        wl_world = self.road_network.global_w_lane[w_lanes_ids]   # (B*M, K_lanes, 2)
+        if wl_world.ndimension() != 3 or wl_world.shape[-1] != 2:
+            raise ValueError(f"global_w_lane indexing failed: expected (B*M, K, 2), got {wl_world.shape}")
+        
+        # 索引 w_boundaries
+        if self.road_network.global_w_boundary.shape[0] == 0:
+            # 如果 global_w_boundary 为空，创建零张量
+            wb_world = torch.zeros((batch_size * max_agents, w_bounds_ids.shape[1], 2), device=self.device)
+        else:
+            wb_world = self.road_network.global_w_boundary[w_bounds_ids]  # (B*M, K_bounds, 2)
+            if wb_world.ndimension() != 3 or wb_world.shape[-1] != 2:
+                raise ValueError(f"global_w_boundary indexing failed: expected (B*M, K, 2), got {wb_world.shape}")
 
-        # 若 K 与配置的目标数量不同，进行右侧零填充/裁剪
+        # 填充或裁剪到目标数量
         def _pad_or_trim(t: torch.Tensor, target_k: int) -> torch.Tensor:
-            N, K, D = t.shape if t.ndimension() == 3 else (t.shape[0], 0, 2)
+            """填充或裁剪张量到目标形状 (N, target_k, 2)"""
+            if t.ndimension() != 3 or t.shape[-1] != 2:
+                raise ValueError(f"Input tensor must be (N, K, 2), got {t.shape}")
+            N, K, D = t.shape
             if K == target_k:
                 return t
-            if K == 0:
-                return torch.zeros((N, target_k, D), device=self.device)
             if K > target_k:
-                return t[:, :, :target_k]
-            pad = torch.zeros((N, target_k - K, D), device=self.device)
+                return t[:, :target_k, :]
+            # K < target_k，需要填充
+            pad = torch.zeros((N, target_k - K, 2), device=t.device)
             return torch.cat([t, pad], dim=1)
+        
         wl_world = _pad_or_trim(wl_world, self.num_w_lanes)
         wb_world = _pad_or_trim(wb_world, self.num_w_boundaries)
         
         # 恢复原始形状
         w_lanes_world = wl_world.view(batch_size, max_agents, self.num_w_lanes, 2)
         w_boundaries_world = wb_world.view(batch_size, max_agents, self.num_w_boundaries, 2)
+        
         return w_lanes_world, w_boundaries_world
     
     def _get_nearest_neighbors(self, agents_state: torch.Tensor) -> torch.Tensor:
@@ -166,13 +183,24 @@ class ObservationGenerator:
             torch.stack([cos_yaw, -sin_yaw], dim=-1), 
             torch.stack([sin_yaw, cos_yaw], dim=-1)
         ], dim=-2)
+        
+        # 检查输入形状
+        if w_lanes_world.ndimension() != 4 or w_lanes_world.shape[-1] != 2:
+            raise ValueError(f"w_lanes_world must be (B, M, num_w_lanes, 2), got {w_lanes_world.shape}")
+        if w_boundaries_world.ndimension() != 4 or w_boundaries_world.shape[-1] != 2:
+            raise ValueError(f"w_boundaries_world must be (B, M, num_w_boundaries, 2), got {w_boundaries_world.shape}")
 
         # 向量化bmm操作：将 (B, M) 批次展平为 (B*M)，执行bmm，然后重塑
         def batch_rotate(points_world, ego_pos, rot_matrix):
             # points_world: (B, M, N, 2), ego_pos: (B, M, 2), rot_matrix: (B, M, 2, 2)
+            if points_world.ndimension() != 4 or points_world.shape[-1] != 2:
+                raise ValueError(f"points_world must be (B, M, N, 2), got {points_world.shape}")
             rel_pos = points_world - ego_pos.unsqueeze(2)
             B, M, N, D = rel_pos.shape
+            if D != 2:
+                raise ValueError(f"rel_pos last dim must be 2, got {D}")
             return torch.bmm(rel_pos.view(B*M, N, D), rot_matrix.view(B*M, D, D)).view(B, M, N, D)
+        
         # 将世界坐标系下的车道线和边界线转换到局部坐标系
         w_lanes_local = batch_rotate(w_lanes_world, ego_pos, rot_matrix)
         w_boundaries_local = batch_rotate(w_boundaries_world, ego_pos, rot_matrix)
@@ -260,6 +288,10 @@ class ObservationGenerator:
             agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
         )
         
+        # 检查输出形状
+        if w_boundaries_local.ndimension() != 4 or w_boundaries_local.shape[-1] != 2:
+            raise ValueError(f"w_boundaries_local must be (B, M, num_w_boundaries, 2), got {w_boundaries_local.shape}")
+        
         # 2.1 计算每个 agent 的 Frenet 坐标 d 与 theta_f（单独返回，不写入 local_state）
         try:
             d, theta_f = calculate_frenet_coordinates(
@@ -274,17 +306,6 @@ class ObservationGenerator:
         except Exception:
             d = torch.zeros(B, M, device=self.device)
             theta_f = torch.zeros(B, M, device=self.device)
-        
-        # 缓存当前观测的所有局部坐标变量，供网络使用
-        self.last_w_lanes_local = w_lanes_local
-        self.last_local_state = local_state
-        self.last_neighbors_local = neighbors_local
-        self.last_w_boundaries_local = w_boundaries_local
-        
-        if hasattr(self, "w_lanes_ids") and self.w_lanes_ids is not None:
-            self.last_w_lanes_ids = self.w_lanes_ids.view(B, M, self.num_w_lanes)
-        else:
-            self.last_w_lanes_ids = None
 
         # 3. 展平并拼接成最终的观测向量
         # 返回：自身绝对状态，邻居相对状态，车道线相对状态，边界线相对状态
@@ -295,6 +316,54 @@ class ObservationGenerator:
             w_boundaries_local.flatten(start_dim=2)
         ], dim=2)
         return observation, d, theta_f
+    
+    @staticmethod
+    def unpack_observation_components(observation: torch.Tensor, local_state_dim: int, 
+                                      num_neighbors: int, neighbor_feature_dim: int,
+                                      num_w_lanes: int, w_lane_feature_dim: int,
+                                      num_w_boundaries: int, boundary_feature_dim: int):
+        """从展平的 observation 中解包局部状态/邻居/车道/边界特征。
+        
+        注意：在 generate 方法中，w_lanes_local 和 w_boundaries_local 都是 (B, M, N, 2) 形状，
+        展平时都是 (B, M, N * 2)，所以这里使用固定的 feature_dim = 2 来解包。
+        """
+        B, M, total_dim = observation.shape
+        idx = 0
+        
+        # 1. local_state: (B, M, local_state_dim)
+        local_state = observation[..., idx : idx + local_state_dim]
+        idx += local_state_dim
+        
+        # 2. neighbors_local: 展平前是 (B, M, num_neighbors, neighbor_feature_dim)
+        #    展平后是 (B, M, num_neighbors * neighbor_feature_dim)
+        neighbors_size = num_neighbors * neighbor_feature_dim
+        neighbors_flat = observation[..., idx : idx + neighbors_size]
+        neighbors_local = neighbors_flat.view(B, M, num_neighbors, neighbor_feature_dim)
+        idx += neighbors_size
+        
+        # 3. w_lanes_local: 展平前是 (B, M, num_w_lanes, 2) - 只有 dx, dy
+        #    展平后是 (B, M, num_w_lanes * 2)
+        w_lanes_size = num_w_lanes * 2  # 固定为 2，因为 batch_rotate 返回的是 (B, M, N, 2)
+        w_lanes_flat = observation[..., idx : idx + w_lanes_size]
+        w_lanes_local = w_lanes_flat.view(B, M, num_w_lanes, 2)
+        idx += w_lanes_size
+        
+        # 4. w_boundaries_local: 展平前是 (B, M, num_w_boundaries, 2) - 只有 dx, dy
+        #    展平后是 (B, M, num_w_boundaries * 2)
+        w_boundaries_size = num_w_boundaries * 2  # 固定为 2，因为 batch_rotate 返回的是 (B, M, N, 2)
+        w_boundaries_flat = observation[..., idx : idx + w_boundaries_size]
+        w_boundaries_local = w_boundaries_flat.view(B, M, num_w_boundaries, 2)
+        
+        # 检查剩余大小是否匹配
+        remaining_size = total_dim - idx - w_boundaries_size
+        if remaining_size != 0:
+            raise ValueError(
+                f"Observation size mismatch: expected {total_dim} total dim, "
+                f"but after unpacking, {remaining_size} elements remain. "
+                f"idx after w_boundaries: {idx + w_boundaries_size}, total_dim: {total_dim}"
+            )
+        
+        return local_state, neighbors_local, w_lanes_local, w_boundaries_local
 
 if __name__ == '__main__':
     import json

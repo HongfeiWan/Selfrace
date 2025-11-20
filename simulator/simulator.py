@@ -197,11 +197,11 @@ class TeraflowSimulator:
         
         # 生成初始观测
         print("Generating initial observation...") 
-        initial_observation,d,theta_f = self.observation_generator.generate(self.agents_state)
+        initial_observation, d, theta_f = self.observation_generator.generate(self.agents_state)
         print("Initial observation generated")
         self.frenet_d = d
         self.frenet_theta_f = theta_f
-        self._update_observed_w_lane_features()
+        self._update_observed_w_lane_features(initial_observation)
 
         # 仍然没有traffic内容
         self.stop_lines = torch.ones((self.num_envs, self.max_agents,20), dtype=torch.int32, device=self.device)
@@ -295,7 +295,7 @@ class TeraflowSimulator:
             observation, d, theta_f = self.observation_generator.generate(self.agents_state)
         self.frenet_d = d
         self.frenet_theta_f = theta_f
-        self._update_observed_w_lane_features()
+        self._update_observed_w_lane_features(observation)
 
         # TODO:这里产生goal_reached的mask
         B, M = self.agents_state.shape[:2]
@@ -385,7 +385,7 @@ class TeraflowSimulator:
                                 self.sampled_waypoint_ids[b_idx_reached, m_idx_reached],
                             )
                             waypoint_reached[b_idx_reached, m_idx_reached] = True
-                    self._update_observed_w_lane_features()
+                    self._update_observed_w_lane_features(observation)
         
         # 7. 计算奖励（传入Frenet坐标和动作）
         reward = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, goal_reached, waypoint_reached, actions)
@@ -648,20 +648,33 @@ class TeraflowSimulator:
         full = torch.where(torch.isinf(full), torch.full_like(full, invalid_value), full)
         return full
 
-    def _update_observed_w_lane_features(self) -> None:
+    def _update_observed_w_lane_features(self, observation: torch.Tensor) -> None:
         """结合观测到的 w_lane 与全局 Δs 构建网络输入特征。
         输出形状: (B, M, K, 4) = [dx, dy, angle_local, Δs]
         """
         obs_gen = self.observation_generator
         if (
             self.w_lane_goal_distances_full is None
-            or obs_gen.last_w_lanes_local is None
-            or obs_gen.last_w_lanes_ids is None
+            or not hasattr(obs_gen, "w_lanes_ids")
+            or obs_gen.w_lanes_ids is None
         ):
             self.w_lanes_local_with_goal_distances = None
             return
-        w_lanes_local = obs_gen.last_w_lanes_local.to(self.device)  # (B, M, K, 2) = [dx, dy]
-        w_lane_ids = obs_gen.last_w_lanes_ids.to(self.device)  # (B, M, K)
+        
+        # 从 observation 中临时解包 w_lanes_local
+        _, _, w_lanes_local, _ = ObservationGenerator.unpack_observation_components(
+            observation,
+            obs_gen.local_state_dim,
+            obs_gen.num_neighbors,
+            obs_gen.neighbor_feature_dim,
+            obs_gen.num_w_lanes,
+            obs_gen.w_lane_feature_dim,
+            obs_gen.num_w_boundaries,
+            obs_gen.boundary_feature_dim,
+        )
+        w_lanes_local = w_lanes_local.to(self.device)  # (B, M, K, 2) = [dx, dy]
+        B, M = w_lanes_local.shape[:2]
+        w_lane_ids = obs_gen.w_lanes_ids.view(B, M, obs_gen.num_w_lanes).to(self.device)  # (B, M, K)
         B, M, K, _ = w_lanes_local.shape
         
         # 获取 w_lane 的世界坐标特征 (x, y, angle)
