@@ -5,7 +5,7 @@
 
   "simulator": {
     "sim_dt": 0.3,
-    "B": 500,
+    "B": 1400,
     "M": 150,
     "num_npc_vehicles": 150,
 
@@ -133,7 +133,7 @@
   "training": {
     "learning_rate": 0.0005,
     "num_iterations": 10000,
-    "batch_size": 1000,
+    "batch_size": 10000,
     "rollout_steps": 128,
     "max_episode_steps": 1200,
     "ppo_epochs": 3,

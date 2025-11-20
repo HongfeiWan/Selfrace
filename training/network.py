@@ -22,6 +22,150 @@ def _normalize_relative_distances(tensor: torch.Tensor, horizon: float) -> torch
     normalized = torch.clamp(tensor / scale, min=-1.0, max=1.0)
     return normalized
 
+def _get_cfg_value(cfg: Any, keys: Any, default: Any = None) -> Any:
+    """
+    Safe helper to access nested configuration values from either dict or object.
+    """
+    if not isinstance(keys, (list, tuple)):
+        keys = (keys,)
+    current = cfg
+    for key in keys:
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+        if current is None:
+            return default
+    return current
+
+class SimpleFeatureEncoder(nn.Module):
+    """
+    直接仿照示例脚本，实现用于矢量输入的简单 MLP 编码器。
+    """
+    def __init__(self, input_dim: int, output_dim: int = 64) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim),
+        )
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, M, vector_dim = x.shape
+        encoded = self.mlp(x.view(B * M, vector_dim))
+        return encoded.view(B, M, -1)
+
+class PermutationInvariantEncoder(nn.Module):
+    """
+    示例脚本里的排列不变编码器：对集合特征逐元素编码后做 max-pooling。
+    """
+    def __init__(self, feature_dim: int, output_dim: int = 64, element_dim: Optional[int] = None) -> None:
+        super().__init__()
+        self.flat_total_dim = feature_dim
+        self.element_dim = element_dim
+        self.output_dim = output_dim
+
+        element_input_dim = self.element_dim if self.element_dim is not None else feature_dim
+        self.element_encoder = nn.Sequential(
+            nn.Linear(element_input_dim, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim),
+        )
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if x.dim() == 3:
+            B, M, N = x.shape
+            if self.element_dim is not None:
+                if N % self.element_dim != 0:
+                    raise ValueError(
+                        f"total_dim={N} 不能被 element_dim={self.element_dim} 整除"
+                    )
+                K = N // self.element_dim
+                x = x.view(B, M, K, self.element_dim)
+            else:
+                x = x.unsqueeze(2)
+        elif x.dim() != 4:
+            raise ValueError(f"x 期望为 3D 或 4D 张量，得到 {x.dim()}D")
+
+        B, M, K, d = x.shape
+        encoded_elements = self.element_encoder(x.reshape(-1, d)).view(B, M, K, self.output_dim)
+
+        if mask is not None:
+            neg_inf = torch.finfo(encoded_elements.dtype).min
+            encoded_elements = encoded_elements.masked_fill(~mask.unsqueeze(-1), neg_inf)
+
+        return encoded_elements.max(dim=2).values
+
+class FeatureEncoder(nn.Module):
+    """
+    复用示例脚本里的 FeatureEncoder：根据配置裁剪各段特征并编码，最终返回拼接后的表示。
+    """
+    def __init__(self, config: Any) -> None:
+        super().__init__()
+        cfg = config if config is not None else _load_default_config()
+        training_cfg = _get_cfg_value(cfg, "training", {}) or {}
+        network_cfg = _get_cfg_value(training_cfg, "network", {}) or {}
+
+        self.encoder_dim = network_cfg.get("encoder_dim", 64)
+        self.simple_feature_dims = network_cfg.get("simple_feature_dims", [10, 1024, 10, 4])
+        self.permutation_feature_dims = network_cfg.get("permutation_feature_dims", [52, 50, 20, 140])
+
+        self.simple_encoders = nn.ModuleList([
+            SimpleFeatureEncoder(self.simple_feature_dims[0], self.encoder_dim),
+            SimpleFeatureEncoder(self.simple_feature_dims[1], self.encoder_dim),
+            SimpleFeatureEncoder(self.simple_feature_dims[2], self.encoder_dim),
+            SimpleFeatureEncoder(self.simple_feature_dims[3], self.encoder_dim),
+        ])
+
+        self.permutation_encoders = nn.ModuleList([
+            PermutationInvariantEncoder(self.permutation_feature_dims[0], self.encoder_dim, element_dim=2),
+            PermutationInvariantEncoder(self.permutation_feature_dims[1], self.encoder_dim, element_dim=2),
+            PermutationInvariantEncoder(self.permutation_feature_dims[2], self.encoder_dim, element_dim=2),
+            PermutationInvariantEncoder(self.permutation_feature_dims[3], self.encoder_dim, element_dim=7),
+        ])
+
+        self.total_output_dim = (len(self.simple_encoders) + len(self.permutation_encoders)) * self.encoder_dim
+
+    def forward(self, features_tensor: torch.Tensor) -> torch.Tensor:
+        B, M, _ = features_tensor.shape
+        if torch.isnan(features_tensor).any():
+            features_tensor = torch.nan_to_num(features_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        output = torch.zeros(B, M, self.total_output_dim, device=features_tensor.device, dtype=features_tensor.dtype)
+
+        s_offset = 0
+        for idx, encoder in enumerate(self.simple_encoders):
+            dim = self.simple_feature_dims[idx]
+            slice_tensor = features_tensor[:, :, s_offset:s_offset + dim]
+            output[:, :, idx * self.encoder_dim:(idx + 1) * self.encoder_dim] = encoder(slice_tensor)
+            s_offset += dim
+
+        simple_total = sum(self.simple_feature_dims)
+        p_offset = simple_total
+        base_idx = len(self.simple_encoders)
+        for idx, encoder in enumerate(self.permutation_encoders):
+            dim = self.permutation_feature_dims[idx]
+            slice_tensor = features_tensor[:, :, p_offset:p_offset + dim]
+            out_idx = base_idx + idx
+            output[:, :, out_idx * self.encoder_dim:(out_idx + 1) * self.encoder_dim] = encoder(slice_tensor)
+            p_offset += dim
+
+        return output
+
 def convert_path_world_to_ego(
     agents_state: torch.Tensor,
     path_world: torch.Tensor,
@@ -920,6 +1064,98 @@ class CompleteValueNet(nn.Module):
             self.vehicle_state_net(components["local_state"]),
         )
         
+        return values
+
+class SimplePolicyNet(nn.Module):
+    """
+    轻量策略网络：直接对拼接后的观测向量做多层感知机映射到动作 logits。
+    """
+    def __init__(self, input_dim: int, config: Optional[Any] = None) -> None:
+        super().__init__()
+        self.config = config if config is not None else _load_default_config()
+
+        training_cfg = _get_cfg_value(self.config, "training", {}) or {}
+        network_cfg = _get_cfg_value(training_cfg, "network", {}) or {}
+        simulator_cfg = _get_cfg_value(self.config, "simulator", {}) or {}
+        dynamics_cfg = _get_cfg_value(simulator_cfg, "dynamics", {}) or {}
+
+        self.input_dim = input_dim
+        self.hidden_dim = network_cfg.get("network_dim", 1024)
+        default_actions = dynamics_cfg.get("dynamics_jerk_dim", 12)
+        self.num_actions = network_cfg.get("num_actions", default_actions)
+
+        self.backbone = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+        )
+        self.policy_head = nn.Linear(self.hidden_dim, self.num_actions)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, features_tensor: torch.Tensor) -> torch.Tensor:
+        if features_tensor.dim() != 3 or features_tensor.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"SimplePolicyNet 期望输入形状 (B, M, {self.input_dim}), "
+                f"但得到 {tuple(features_tensor.shape)}"
+            )
+        if torch.isnan(features_tensor).any():
+            features_tensor = torch.nan_to_num(features_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+        B, M, _ = features_tensor.shape
+        hidden = self.backbone(features_tensor.view(B * M, self.input_dim))
+        logits = self.policy_head(hidden).view(B, M, self.num_actions)
+        return logits
+
+class SimpleValueNet(nn.Module):
+    """
+    轻量价值网络：对拼接后的观测向量做 MLP，输出状态价值。
+    """
+    def __init__(self, input_dim: int, config: Optional[Any] = None) -> None:
+        super().__init__()
+        self.config = config if config is not None else _load_default_config()
+
+        training_cfg = _get_cfg_value(self.config, "training", {}) or {}
+        network_cfg = _get_cfg_value(training_cfg, "network", {}) or {}
+
+        self.input_dim = input_dim
+        self.hidden_dim = network_cfg.get("network_dim", 1024)
+
+        self.backbone = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+        )
+        self.value_head = nn.Linear(self.hidden_dim, 1)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, features_tensor: torch.Tensor) -> torch.Tensor:
+        if features_tensor.dim() != 3 or features_tensor.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"SimpleValueNet 期望输入形状 (B, M, {self.input_dim}), "
+                f"但得到 {tuple(features_tensor.shape)}"
+            )
+        if torch.isnan(features_tensor).any():
+            features_tensor = torch.nan_to_num(features_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+        B, M, _ = features_tensor.shape
+        hidden = self.backbone(features_tensor.view(B * M, self.input_dim))
+        values = self.value_head(hidden).view(B, M, 1)
         return values
 
 if __name__ == "__main__":

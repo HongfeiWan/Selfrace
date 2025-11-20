@@ -4,6 +4,7 @@ import json
 import socket
 import tempfile
 import shutil
+import time
 from datetime import timedelta
 from typing import Dict
 
@@ -24,8 +25,9 @@ for item in os.listdir(parent_dir):
 
 from simulator import TeraflowSimulator
 from network import (
-    CompletePolicyNet,
-    CompleteValueNet)
+    SimplePolicyNet,
+    SimpleValueNet,
+    convert_path_world_to_ego)
 
 class ddppo:
     @staticmethod
@@ -98,91 +100,198 @@ class ddppo:
         
         return agents_state, neighbors_local, w_lanes_local, w_boundaries_local
 
-    @staticmethod
-    def build_network_features(
-        agents_state: torch.Tensor, 
-        neighbors_local: torch.Tensor, 
-        w_lanes_local: torch.Tensor, 
+    def _pad_or_trim(self, tensor, target_dim: int, B: int, M: int, device, dtype) -> torch.Tensor:
+        if target_dim <= 0:
+            return torch.zeros(B, M, 0, device=device, dtype=dtype)
+        if tensor is None:
+            return torch.zeros(B, M, target_dim, device=device, dtype=dtype)
+        if tensor.dim() == 2:
+            tensor = tensor.view(B, M, -1)
+        elif tensor.dim() == 3 and tensor.shape[0] == B and tensor.shape[1] == M:
+            pass
+        else:
+            tensor = tensor.reshape(B, M, -1)
+        current_dim = tensor.shape[-1]
+        if current_dim == target_dim:
+            return tensor
+        if current_dim > target_dim:
+            return tensor[..., :target_dim]
+        pad = torch.zeros(
+            B,
+            M,
+            target_dim - current_dim,
+            device=device,
+            dtype=dtype,
+        )
+        return torch.cat([tensor, pad], dim=-1)
+
+    def _reshape_reward_params(self, reward_params, B, M, device, dtype):
+        if reward_params is None or (hasattr(reward_params, "numel") and reward_params.numel() == 0):
+            tensor = torch.zeros(B, M, 10, device=device, dtype=dtype)
+            return self._normalize_reward_params(tensor)
+        tensor = reward_params.to(device)
+        if tensor.dim() == 2 and tensor.shape[0] == B * M:
+            tensor = tensor.view(B, M, -1)
+        elif tensor.dim() == 2 and tensor.shape[0] == B and tensor.shape[1] == 10:
+            tensor = tensor.unsqueeze(1).expand(-1, M, -1)
+        elif tensor.dim() == 3 and tensor.shape[0] == B and tensor.shape[1] == M:
+            pass
+        else:
+            tensor = tensor.view(B, M, -1)
+        if tensor.shape[-1] < 10:
+            pad = torch.zeros(B, M, 10 - tensor.shape[-1], device=device, dtype=dtype)
+            tensor = torch.cat([tensor, pad], dim=-1)
+        return self._normalize_reward_params(tensor[..., :10])
+
+    def _normalize_reward_params(self, reward_params: torch.Tensor) -> torch.Tensor:
+        B, M, _ = reward_params.shape
+        mins = self.reward_param_mins.view(1, 1, -1).to(reward_params.device).expand(B, M, -1)
+        maxs = self.reward_param_maxs.view(1, 1, -1).to(reward_params.device).expand(B, M, -1)
+        denoms = torch.clamp(maxs - mins, min=1e-6)
+        normalized = (reward_params - mins) / denoms
+        center_bias_idx = 7
+        center_bias = torch.clamp(normalized[..., center_bias_idx:center_bias_idx+1] * 2.0 - 1.0, -1.0, 1.0)
+        before = torch.clamp(normalized[..., :center_bias_idx], 0.0, 1.0)
+        after = torch.clamp(normalized[..., center_bias_idx+1:], 0.0, 1.0)
+        return torch.cat([before, center_bias, after], dim=-1)
+
+    def _normalize_relative(self, tensor: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(tensor / self.observation_horizon, min=-1.0, max=1.0)
+
+    def _normalize_speed(self, speed: torch.Tensor) -> torch.Tensor:
+        normalized = torch.zeros_like(speed)
+        mask_neg = (speed >= self.speed_min) & (speed < self.speed_mid)
+        normalized = torch.where(
+            mask_neg,
+            (speed - self.speed_mid) / (self.speed_mid - self.speed_min + 1e-6),
+            normalized,
+        )
+        mask_pos = (speed >= self.speed_mid) & (speed <= self.speed_max)
+        normalized = torch.where(
+            mask_pos,
+            (speed - self.speed_mid) / (self.speed_max - self.speed_mid + 1e-6),
+            normalized,
+        )
+        return torch.clamp(normalized, min=-1.0, max=1.0)
+
+    def _normalize_dimension(self, value: torch.Tensor, v_min: float, v_max: float) -> torch.Tensor:
+        denom = max(v_max - v_min, 1e-6)
+        normalized = (value - v_min) / denom
+        return torch.clamp(normalized, min=0.0, max=1.0)
+
+    def _build_local_state_features(self, agents_state: torch.Tensor) -> torch.Tensor:
+        yaw = agents_state[..., 2]
+        speed = agents_state[..., 3]
+        length = agents_state[..., 4]
+        width = agents_state[..., 5]
+        active = agents_state[..., 6]
+        zeros = torch.zeros_like(agents_state[..., :2])
+        cos_yaw = torch.cos(yaw).unsqueeze(-1)
+        sin_yaw = torch.sin(yaw).unsqueeze(-1)
+        speed_norm = self._normalize_speed(speed).unsqueeze(-1)
+        length_norm = self._normalize_dimension(length, self.l_min, self.l_max).unsqueeze(-1)
+        width_norm = self._normalize_dimension(width, self.w_min, self.w_max).unsqueeze(-1)
+        active = active.unsqueeze(-1)
+        return torch.cat([zeros, cos_yaw, sin_yaw, speed_norm, width_norm, length_norm, active], dim=-1)
+
+    def _normalize_neighbor_features(self, neighbors: torch.Tensor) -> torch.Tensor:
+        normalized = torch.zeros_like(neighbors)
+        normalized[..., :2] = self._normalize_relative(neighbors[..., :2])
+        dvx = neighbors[..., 2]
+        dvy = neighbors[..., 3]
+        mask_neg = (dvx >= self.dvx_min) & (dvx < self.dvx_mid)
+        normalized[..., 2] = torch.where(
+            mask_neg,
+            (dvx - self.dvx_mid) / (self.dvx_mid - self.dvx_min + 1e-6),
+            torch.zeros_like(dvx),
+        )
+        mask_pos = (dvx >= self.dvx_mid) & (dvx <= self.dvx_max)
+        normalized[..., 2] = torch.where(
+            mask_pos,
+            (dvx - self.dvx_mid) / (self.dvx_max - self.dvx_mid + 1e-6),
+            normalized[..., 2],
+        )
+        normalized[..., 2] = torch.clamp(normalized[..., 2], min=-1.0, max=1.0)
+
+        mask_neg = (dvy >= self.dvx_min) & (dvy < self.dvx_mid)
+        normalized[..., 3] = torch.where(
+            mask_neg,
+            (dvy - self.dvx_mid) / (self.dvx_mid - self.dvx_min + 1e-6),
+            torch.zeros_like(dvy),
+        )
+        mask_pos = (dvy >= self.dvx_mid) & (dvy <= self.dvx_max)
+        normalized[..., 3] = torch.where(
+            mask_pos,
+            (dvy - self.dvx_mid) / (self.dvx_max - self.dvx_mid + 1e-6),
+            normalized[..., 3],
+        )
+        normalized[..., 3] = torch.clamp(normalized[..., 3], min=-1.0, max=1.0)
+
+        normalized[..., 4] = self._normalize_dimension(neighbors[..., 4], self.w_min, self.w_max)
+        normalized[..., 5] = self._normalize_dimension(neighbors[..., 5], self.l_min, self.l_max)
+        normalized[..., 6] = neighbors[..., 6]
+        return normalized
+
+    def _compose_feature_tensor(
+        self,
+        agents_state: torch.Tensor,
+        neighbors_local: torch.Tensor,
+        w_lanes_local: torch.Tensor,
         w_boundaries_local: torch.Tensor,
         path_plan_features: torch.Tensor,
-        stop_lines: torch.Tensor,
-        reward_coef: torch.Tensor,
-        config) -> Dict[str, torch.Tensor]:
-        """
-        将拆解后的观测组件构建为网络输入的特征张量
-        Args:
-            agents_state: (B, M, 7) - 智能体状态
-            neighbors_local: (B, M, K, 7) - 邻居相对状态
-            w_lanes_local: (B, M, N_lanes, 2) - 车道线相对坐标
-            w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标
-            path_plan_features: (B, M, path_length, 3) - 路径规划特征 (x, y, angle)
-            stop_lines: (B, M, num_stop_lines, 20) - 停止线点
-            reward_coef: (B, M, 10) - 奖励系数
-            config: 配置对象（可以是 dict 或 SimpleNamespace）
-        Returns:
-            Dict[str, torch.Tensor]: 满足 CompletePolicy/ValueNet 输入需求的组件字典
-        """
-        batch_size, max_agents, _ = agents_state.shape
+        reward_params,
+        stop_lines) -> torch.Tensor:
+        B, M, _ = agents_state.shape
         device = agents_state.device
+        dtype = agents_state.dtype
 
-        components: Dict[str, torch.Tensor] = {}
+        if neighbors_local.device != device:
+            neighbors_local = neighbors_local.to(device)
+        if w_lanes_local.device != device:
+            w_lanes_local = w_lanes_local.to(device)
+        if w_boundaries_local.device != device:
+            w_boundaries_local = w_boundaries_local.to(device)
 
-        # w_boundaries_local is already (B, M, K, 2)
-        components["w_boundaries_local"] = w_boundaries_local.to(device)
+        segments = []
 
-        # local_state 与 agents_state 等价（本地坐标）
-        components["local_state"] = agents_state.to(device)
-        components["agents_state"] = agents_state.to(device)
+        local_feats = self._build_local_state_features(agents_state)
+        segments.append(self._pad_or_trim(local_feats, self.local_state_feature_dim, B, M, device, dtype))
 
-        # w_lanes_local_with_goal_distances: 需要 (B, M, K, 4) => [dx, dy, angle_local, Δs]
-        if w_lanes_local is None or w_lanes_local.numel() == 0:
-            components["w_lanes_local_with_goal_distances"] = torch.zeros(
-                batch_size, max_agents, 0, 4, device=device, dtype=agents_state.dtype
-            )
+        path_flat = None
+        if self.path_plan_feature_dim > 0 and path_plan_features is not None and path_plan_features.numel() > 0:
+            path_world = path_plan_features.to(device)
+            path_local = convert_path_world_to_ego(agents_state, path_world, self.observation_horizon)
+            path_local = self._normalize_relative(path_local)
+            path_flat = path_local.view(B, M, -1)
+        segments.append(self._pad_or_trim(path_flat, self.path_plan_feature_dim, B, M, device, dtype))
+
+        reward_tensor = self._reshape_reward_params(reward_params, B, M, device, dtype)
+        segments.append(self._pad_or_trim(reward_tensor, self.reward_param_dim, B, M, device, dtype))
+
+        boundary_norm = self._normalize_relative(w_boundaries_local)
+        boundary_tensor = boundary_norm.reshape(B, M, -1)
+        segments.append(self._pad_or_trim(boundary_tensor, self.w_boundary_feature_dim, B, M, device, dtype))
+
+        w_lanes_norm = self._normalize_relative(w_lanes_local)
+        w_lanes_tensor = w_lanes_norm.reshape(B, M, -1)
+        segments.append(self._pad_or_trim(w_lanes_tensor, self.w_lane_feature_dim, B, M, device, dtype))
+
+        if stop_lines is not None:
+            stop_lines_flat = stop_lines.to(device=device, dtype=dtype).reshape(B, M, -1)
         else:
-            angles = torch.zeros(
-                w_lanes_local.shape[:-1] + (1,), device=device, dtype=w_lanes_local.dtype
+            stop_lines_flat = None
+        segments.append(self._pad_or_trim(stop_lines_flat, self.stop_line_feature_dim, B, M, device, dtype))
+
+        neighbors_norm = self._normalize_neighbor_features(neighbors_local)
+        neighbors_tensor = neighbors_norm.reshape(B, M, -1)
+        segments.append(self._pad_or_trim(neighbors_tensor, self.neighbor_feature_dim, B, M, device, dtype))
+
+        features = torch.cat(segments, dim=-1)
+        if features.shape[-1] != self.total_feature_dim:
+            raise ValueError(
+                f"组合后的特征维度 {features.shape[-1]} 与预期 {self.total_feature_dim} 不一致，请检查配置"
             )
-            delta = torch.zeros_like(angles)
-            components["w_lanes_local_with_goal_distances"] = torch.cat(
-                [w_lanes_local.to(device), angles, delta], dim=-1
-            )
-
-        components["neighbors_local"] = neighbors_local.to(device)
-
-        # agents_path_plans_world: (B, M, L, 3) -> 使用 path_plan_features (x, y, angle)
-        if path_plan_features is None or path_plan_features.numel() == 0:
-            components["agents_path_plans_world"] = torch.zeros(
-                batch_size, max_agents, 0, 3, device=device, dtype=agents_state.dtype
-            )
-        else:
-            components["agents_path_plans_world"] = path_plan_features.to(device)
-
-        # Curvature / c_* / wheelbase 暂时使用 0（缺省条件）
-        components["curvature"] = torch.zeros(batch_size, max_agents, device=device, dtype=agents_state.dtype)
-        components["c_throttle"] = torch.zeros(batch_size, max_agents, device=device, dtype=agents_state.dtype)
-        components["c_steer"] = torch.zeros(batch_size, max_agents, device=device, dtype=agents_state.dtype)
-        components["c_acc"] = torch.zeros(batch_size, max_agents, device=device, dtype=agents_state.dtype)
-        components["c_vel"] = torch.zeros(batch_size, max_agents, device=device, dtype=agents_state.dtype)
-
-        if reward_coef is None:
-            components["reward_params"] = torch.zeros(
-                batch_size, max_agents, 10, device=device, dtype=agents_state.dtype
-            )
-        else:
-            if reward_coef.shape[-1] < 10:
-                pad = torch.zeros(
-                    batch_size, max_agents, 10 - reward_coef.shape[-1],
-                    device=reward_coef.device, dtype=reward_coef.dtype
-                )
-                reward_padded = torch.cat([reward_coef, pad], dim=-1)
-            else:
-                reward_padded = reward_coef
-            components["reward_params"] = reward_padded[..., :10].to(device)
-
-        components["wheelbase"] = torch.zeros(batch_size, max_agents, device=device, dtype=agents_state.dtype)
-
-        return components
+        return features
 
     @staticmethod
     def _find_free_port():
@@ -253,23 +362,21 @@ class ddppo:
             num_workers_done = dist.PrefixStore("num_workers_done", store)
             use_distributed = True
 
-        # 初始化完整的策略网络和价值网络（包含所有编码网络和 MLP）
-        complete_policy_net = CompletePolicyNet(config=self.config).to(device)
-        complete_value_net = CompleteValueNet(config=self.config).to(device)
+        # 初始化轻量策略与价值网络
+        policy_net = SimplePolicyNet(input_dim=self.total_feature_dim, config=self.config).to(device)
+        value_net = SimpleValueNet(input_dim=self.total_feature_dim, config=self.config).to(device)
         
         # 使用 DDP 包装网络（仅在分布式模式下）
         if use_distributed:
-            complete_policy_net = DDP(complete_policy_net, device_ids=[rank], output_device=rank)
-            complete_value_net = DDP(complete_value_net, device_ids=[rank], output_device=rank)
+            policy_net = DDP(policy_net, device_ids=[rank], output_device=rank)
+            value_net = DDP(value_net, device_ids=[rank], output_device=rank)
         if is_master:
             print(f"All networks initialized and moved to device {device}")
         simulator = TeraflowSimulator(config=self.config, device=device)
         
-        # 收集 policy 网络的参数（完整网络包含所有编码网络和 policy MLP）
-        policy_params = list(complete_policy_net.module.parameters() if isinstance(complete_policy_net, DDP) else complete_policy_net.parameters())
-        
-        # 收集 value 网络的参数（完整网络包含所有编码网络和 value MLP）
-        value_params = list(complete_value_net.module.parameters() if isinstance(complete_value_net, DDP) else complete_value_net.parameters())
+        # 收集网络参数
+        policy_params = list(policy_net.module.parameters() if isinstance(policy_net, DDP) else policy_net.parameters())
+        value_params = list(value_net.module.parameters() if isinstance(value_net, DDP) else value_net.parameters())
         
         # 创建分离的优化器和调度器
         optimizer_policy = optim.Adam(policy_params, lr=self.learning_rate)
@@ -304,8 +411,10 @@ class ddppo:
             current_observation = initial_observation
             # 获取 stop_lines（保持引用）
             stop_lines = getattr(simulator, 'stop_lines', None)
-            
+
+            start_time = time.time()
             for episode_step in range(self.max_episode_steps):
+                print(f"step花费时间={time.time()-start_time}")
                 # 获取当前路径（w_lane id）对应的世界特征 (x, y, angle)
                 path_plan_ids = simulator.agents_path_plans
                 if path_plan_ids is None:
@@ -316,28 +425,25 @@ class ddppo:
                 agents_state, neighbors_local, w_lanes_local, w_boundaries_local = self.decompose_observation(
                     current_observation, self.config
                 )
-                # 构建网络输入组件（满足 CompletePolicy/ValueNet 需求）
-                components = self.build_network_features(
+                # 构建轻量网络所需的扁平特征
+                features_tensor = self._compose_feature_tensor(
                     agents_state,
                     neighbors_local,
                     w_lanes_local,
                     w_boundaries_local,
                     path_plan_features,
-                    stop_lines,
                     simulator.reward_calculator.sampled_params,
-                    self.config,
+                    stop_lines,
                 )
                 snapshot = self._capture_agent_state_snapshot(simulator)
                 if buffer_step_count >= buffer_T:
                     raise RuntimeError("Buffer overflow detected before PPO update.")
                 states_buffer[buffer_step_count] = snapshot
                 with torch.no_grad():
-                    # 直接使用完整网络，避免产生大量中间激活值
-                    # 在 no_grad 模式下，编码网络的中间激活值不会保存，达到节约显存的效果
-                    action_probs = complete_policy_net.module.forward(components) if isinstance(complete_policy_net, DDP) else complete_policy_net.forward(components)
-                    values = complete_value_net.module.forward(components) if isinstance(complete_value_net, DDP) else complete_value_net.forward(components)
-                    # 立即释放 components，减少显存占用
-                    del components
+                    logits = policy_net.module.forward(features_tensor) if isinstance(policy_net, DDP) else policy_net.forward(features_tensor)
+                    action_probs = torch.softmax(logits, dim=-1)
+                    values = value_net.module.forward(features_tensor) if isinstance(value_net, DDP) else value_net.forward(features_tensor)
+                    del features_tensor, logits
                     # 释放解包后的组件（它们只是 view，但为了明确释放引用）
                     del agents_state, neighbors_local, w_lanes_local, w_boundaries_local
                     # 立即保存到 buffer 并释放，减少显存占用
@@ -369,24 +475,19 @@ class ddppo:
                         bootstrap_path_features = None
                     else:
                         bootstrap_path_features = simulator.path_planner.get_w_lane_features_by_id(bootstrap_path_ids)
-                    bootstrap_components = self.build_network_features(
+                    bootstrap_features = self._compose_feature_tensor(
                         bootstrap_agents_state,
                         bootstrap_neighbors_local,
                         bootstrap_w_lanes_local,
                         bootstrap_w_boundaries_local,
                         bootstrap_path_features,
-                        stop_lines,
                         simulator.reward_calculator.sampled_params,
-                        self.config,
+                        stop_lines,
                     )
                     with torch.no_grad():
-                        # 直接使用完整网络，避免产生大量中间激活值
-                        # 注意：当前网络架构使用 components 字典，需要适配
-                        # TODO: 修改网络架构使其接收 features_tensor
-                        bootstrap_value = complete_value_net.module.forward(bootstrap_components) if isinstance(complete_value_net, DDP) else complete_value_net.forward(bootstrap_components)
+                        bootstrap_value = value_net.module.forward(bootstrap_features) if isinstance(value_net, DDP) else value_net.forward(bootstrap_features)
                         bootstrap_value = bootstrap_value.detach()
-                        # 立即释放中间激活值
-                        del bootstrap_components
+                        del bootstrap_features
                         del bootstrap_agents_state, bootstrap_neighbors_local, bootstrap_w_lanes_local, bootstrap_w_boundaries_local
 
                     self._ppo_update_from_buffer(
@@ -399,8 +500,8 @@ class ddppo:
                         valid_mask,
                         bootstrap_value,
                         simulator,
-                        complete_policy_net,
-                        complete_value_net,
+                        policy_net,
+                        value_net,
                         optimizer_policy,
                         optimizer_value,
                         device,
@@ -470,8 +571,8 @@ class ddppo:
         valid_mask,
         bootstrap_value,
         simulator,
-        complete_policy_net,
-        complete_value_net,
+        policy_net,
+        value_net,
         optimizer_policy,
         optimizer_value,
         device,
@@ -546,74 +647,88 @@ class ddppo:
         if not keep_mask.any():
             keep_mask = torch.ones_like(keep_mask_done, dtype=torch.bool)
 
-        mask_flat = keep_mask.view(-1)
-        if not mask_flat.any():
+        kept_positions = keep_mask.nonzero(as_tuple=False)
+        total_kept = kept_positions.shape[0]
+        if total_kept == 0:
             return
 
-        time_keep_mask = keep_mask.any(dim=(1, 2))
-        time_indices = time_keep_mask.nonzero(as_tuple=True)[0].tolist()
-        if not time_indices:
+        if total_kept > self.batch_size:
+            perm = torch.randperm(total_kept, device=device)
+            kept_positions = kept_positions[perm[:self.batch_size]]
+
+        sel_t = kept_positions[:, 0]
+        sel_b = kept_positions[:, 1]
+        sel_m = kept_positions[:, 2]
+
+        advantages_flat = raw_advantages[sel_t, sel_b, sel_m]
+        returns_flat = returns[sel_t, sel_b, sel_m]
+        old_log_probs_flat = old_log_probs[sel_t, sel_b, sel_m]
+
+        num_samples = kept_positions.shape[0]
+        if num_samples == 0:
             return
 
-        # 只为需要的时间步创建张量，而不是为所有时间步创建
-        new_log_probs_full = torch.zeros_like(old_log_probs)
-        new_values_full = torch.zeros_like(values)
-        entropies_full = torch.zeros_like(old_log_probs)
+        features_flat = torch.empty((num_samples, self.total_feature_dim), device=device)
 
-        for t_idx in time_indices:
-            snapshot = states_buffer[t_idx]
-            if snapshot is None:
+        unique_times = torch.unique(sel_t, sorted=True)
+        for t_idx in unique_times:
+            time_mask = (sel_t == t_idx)
+            sample_indices = time_mask.nonzero(as_tuple=False).squeeze(-1)
+            b_indices = sel_b[sample_indices]
+            m_indices = sel_m[sample_indices]
+
+            snapshot = states_buffer[int(t_idx)]
+            if snapshot is None or sample_indices.numel() == 0:
                 continue
-            with torch.no_grad():
-                # 在 no_grad 下重建观测和组件（参考脚本方式）
-                agents_state_snapshot = snapshot["agents_state"].to(simulator.device)
-                observation, d, theta_f = simulator.observation_generator.generate(agents_state_snapshot)
-                agents_state, neighbors_local, w_lanes_local, w_boundaries_local = self.decompose_observation(
-                    observation, self.config
-                )
-                path_plan_snapshot = snapshot.get("agents_path_plans")
-                if path_plan_snapshot is not None:
-                    path_plan_snapshot = path_plan_snapshot.to(simulator.device)
-                    path_plan_features_snapshot = simulator.path_planner.get_w_lane_features_by_id(path_plan_snapshot)
-                else:
-                    path_plan_features_snapshot = None
-                stop_lines_snapshot = getattr(simulator, 'stop_lines', None)
-                reward_params_snapshot = snapshot.get("reward_params")
-                if reward_params_snapshot is not None:
-                    reward_params_snapshot = reward_params_snapshot.to(simulator.device)
-                else:
-                    reward_params_snapshot = simulator.reward_calculator.sampled_params
-                
-                # 构建网络输入组件（参考脚本方式）
-                components = self.build_network_features(
-                    agents_state,
-                    neighbors_local,
-                    w_lanes_local,
-                    w_boundaries_local,
-                    path_plan_features_snapshot,
-                    stop_lines_snapshot,
-                    reward_params_snapshot,
-                    self.config,
-                )
-                # 直接使用完整网络，避免产生大量中间激活值
-                action_probs = complete_policy_net.module.forward(components) if isinstance(complete_policy_net, DDP) else complete_policy_net.forward(components)
-                current_values = complete_value_net.module.forward(components) if isinstance(complete_value_net, DDP) else complete_value_net.forward(components)
-                current_values = current_values.squeeze(-1)
-                log_probs_now, entropy_now = self._compute_log_probs(action_probs, actions[t_idx])
-                # 立即保存并释放，减少显存占用
-                new_log_probs_full[t_idx] = log_probs_now.detach()
-                new_values_full[t_idx] = current_values.detach()
-                entropies_full[t_idx] = entropy_now.detach()
-                # 清理临时张量，释放显存
-                del components, action_probs, current_values, log_probs_now, entropy_now
-                del observation, agents_state, neighbors_local, w_lanes_local, w_boundaries_local
 
-        advantages_flat = raw_advantages.view(-1)[mask_flat]
-        returns_flat = returns.view(-1)[mask_flat]
-        old_log_probs_flat = old_log_probs.view(-1)[mask_flat]
-        new_log_probs_flat = new_log_probs_full.view(-1)[mask_flat]
-        new_values_flat = new_values_full.view(-1)[mask_flat]
-        entropies_flat = entropies_full.view(-1)[mask_flat]
+            env_ids, env_inverse = torch.unique(b_indices, sorted=False, return_inverse=True)
+            env_ids_cpu = env_ids.to("cpu")
+            env_ids_gpu = env_ids.to(simulator.device)
+            agents_state_env = snapshot["agents_state"][env_ids_cpu].to(simulator.device)
+            observation, _, _ = simulator.observation_generator.generate(agents_state_env)
+            agents_state_local, neighbors_local, w_lanes_local, w_boundaries_local = self.decompose_observation(
+                observation, self.config
+            )
+
+            path_plan_snapshot = snapshot.get("agents_path_plans")
+            if path_plan_snapshot is not None:
+                path_plan_env = path_plan_snapshot[env_ids_cpu].to(simulator.device)
+                path_plan_features_env = simulator.path_planner.get_w_lane_features_by_id(path_plan_env)
+            else:
+                path_plan_features_env = None
+
+            stop_lines_global = getattr(simulator, "stop_lines", None)
+            if stop_lines_global is not None and stop_lines_global.numel() > 0:
+                stop_lines_env = stop_lines_global[env_ids_gpu]
+            else:
+                stop_lines_env = None
+
+            reward_params_snapshot = snapshot.get("reward_params")
+            if reward_params_snapshot is not None:
+                reward_params_env = reward_params_snapshot[env_ids_cpu].to(simulator.device)
+            else:
+                reward_params_env = simulator.reward_calculator.sampled_params
+
+            features_env = self._compose_feature_tensor(
+                agents_state_local,
+                neighbors_local,
+                w_lanes_local,
+                w_boundaries_local,
+                path_plan_features_env,
+                reward_params_env,
+                stop_lines_env,
+            )
+            features_selected = features_env[env_inverse, m_indices].view(sample_indices.numel(), -1)
+            features_flat[sample_indices] = features_selected
+
+            del (
+                agents_state_env,
+                observation,
+                agents_state_local,
+                neighbors_local,
+                w_lanes_local,
+                w_boundaries_local,
+            )
 
         advantages_mean = advantages_flat.mean()
         advantages_std = advantages_flat.std(unbiased=False)
@@ -643,20 +758,27 @@ class ddppo:
                 batch_len = idx.numel()
                 if batch_len == 0:
                     break
-                ratio = torch.exp(new_log_probs_flat[idx] - old_log_probs_flat[idx])
+                feature_batch = features_flat[idx].view(batch_len, 1, self.total_feature_dim)
+                logits_batch = policy_net.module.forward(feature_batch) if isinstance(policy_net, DDP) else policy_net.forward(feature_batch)
+                action_probs_batch = torch.softmax(logits_batch, dim=-1)
+                actions_batch = actions[sel_t[idx], sel_b[idx], sel_m[idx]].view(batch_len, 1)
+                new_log_probs_batch, entropy_batch = self._compute_log_probs(action_probs_batch, actions_batch)
+                values_batch = value_net.module.forward(feature_batch) if isinstance(value_net, DDP) else value_net.forward(feature_batch)
+                values_batch = values_batch.view(batch_len)
+                ratio = torch.exp(new_log_probs_batch.view(-1) - old_log_probs_flat[idx])
                 advantages_batch = advantages_norm[idx]
                 advantages_detached_batch = advantages_detached[idx]
                 surr1 = ratio * advantages_detached_batch
                 surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * advantages_detached_batch
                 policy_loss = -torch.mean(torch.min(surr1, surr2))
-                entropy_bonus = entropies_flat[idx].mean()
+                entropy_bonus = entropy_batch.mean()
                 total_policy_loss = policy_loss - self.entropy_coef * entropy_bonus
 
                 optimizer_policy.zero_grad()
                 total_policy_loss.backward()
                 optimizer_policy.step()
 
-                value_loss = F.mse_loss(new_values_flat[idx], returns_flat[idx]) * self.value_coef
+                value_loss = F.mse_loss(values_batch, returns_flat[idx]) * self.value_coef
                 optimizer_value.zero_grad()
                 value_loss.backward()
                 optimizer_value.step()
@@ -705,6 +827,73 @@ class ddppo:
         self.value_coef = float(training_config.get('value_coef'))
         self.advantage_filter_threshold = float(training_config.get('advantage_filter_threshold'))
         self.advantage_filter_beta = float(training_config.get('advantage_filter_beta'))
+
+        simulator_config = self.config.get('simulator', {})
+        obs_config = simulator_config.get('observation', {})
+        dynamics_config = simulator_config.get('dynamics', {})
+        reward_config = simulator_config.get('reward', {})
+        self.local_state_feature_dim = 8  # [x,y,cos,sin,speed,length,width,active]
+        self.path_plan_length = int(obs_config.get('num_navigation_chains', 0))
+        self.path_plan_feature_dim = max(self.path_plan_length, 0) * 2  # 仅使用 dx, dy
+        self.reward_param_dim = 10
+        num_w_boundaries = int(obs_config.get('num_w_boundaries', 0))
+        boundary_feat_dim = int(obs_config.get('boundary_feature_dim', 2))
+        self.w_boundary_feature_dim = num_w_boundaries * boundary_feat_dim
+        num_w_lanes = int(obs_config.get('num_w_lanes', 0))
+        self.w_lane_feature_dim = num_w_lanes * 2  # dx, dy
+        num_neighbors = int(obs_config.get('num_neighbors', 0))
+        neighbor_feat_dim = int(obs_config.get('neighbor_feature_dim', 0))
+        self.neighbor_feature_dim = num_neighbors * neighbor_feat_dim
+        self.stop_line_feature_dim = int(simulator_config.get('stop_line_feature_dim', 20))
+        self.total_feature_dim = (
+            self.local_state_feature_dim
+            + self.path_plan_feature_dim
+            + self.reward_param_dim
+            + self.w_boundary_feature_dim
+            + self.w_lane_feature_dim
+            + self.stop_line_feature_dim
+            + self.neighbor_feature_dim
+        )
+        self.speed_min = float(dynamics_config.get('min_velocity', -2.0))
+        self.speed_mid = 0.0
+        self.speed_max = float(dynamics_config.get('max_velocity', 20.0))
+        self.w_min = float(dynamics_config.get('vehicle_width_min', 0.8))
+        self.w_max = float(dynamics_config.get('vehicle_width_max', 3.0))
+        self.l_min = float(dynamics_config.get('vehicle_length_min', 0.8))
+        self.l_max = float(dynamics_config.get('vehicle_length_max', 7.0))
+        self.dvx_min = -2.0
+        self.dvx_mid = 0.0
+        self.dvx_max = 20.0
+        reward_param_mins = torch.tensor([
+            float(reward_config.get("delta_goal_min", 2.0)),
+            float(reward_config.get("collision_alpha_min", 0.0)),
+            float(reward_config.get("boundary_alpha_min", 0.0)),
+            float(reward_config.get("comfort_alpha_min", 0.0)),
+            float(reward_config.get("l_align_alpha_min", 2.5e-4)),
+            float(reward_config.get("vel_align_alpha_min", 0.0)),
+            float(reward_config.get("l_center_alpha_min", 2.5e-4)),
+            float(reward_config.get("center_bias_alpha_min", -0.5)),
+            float(reward_config.get("reverse_alpha_min", 2.5e-4)),
+            float(reward_config.get("stop_line_alpha_min", 0.0)),
+        ], dtype=torch.float32)
+        reward_param_maxs = torch.tensor([
+            float(reward_config.get("delta_goal_max", 12.0)),
+            float(reward_config.get("collision_alpha_max", 3.0)),
+            float(reward_config.get("boundary_alpha_max", 3.0)),
+            float(reward_config.get("comfort_alpha_max", 0.1)),
+            float(reward_config.get("l_align_alpha_max", 2.5e-2)),
+            float(reward_config.get("vel_align_alpha_max", 1.0)),
+            float(reward_config.get("l_center_alpha_max", 7.5e-3)),
+            float(reward_config.get("center_bias_alpha_max", 0.5)),
+            float(reward_config.get("reverse_alpha_max", 7.5e-3)),
+            float(reward_config.get("stop_line_alpha_max", 1.0)),
+        ], dtype=torch.float32)
+        self.reward_param_mins = reward_param_mins
+        self.reward_param_maxs = reward_param_maxs
+
+        simulator_config = self.config.get('simulator', {})
+        obs_config = simulator_config.get('observation', {})
+        self.observation_horizon = float(obs_config.get('horizon', 200.0))
         
         # 检查 GPU 信息并启动分布式进程
         cuda_available, cuda_ranks = self.check_gpu_info(print_info=True)
