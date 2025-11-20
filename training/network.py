@@ -144,9 +144,7 @@ class FeatureEncoder(nn.Module):
         B, M, _ = features_tensor.shape
         if torch.isnan(features_tensor).any():
             features_tensor = torch.nan_to_num(features_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
-
         output = torch.zeros(B, M, self.total_output_dim, device=features_tensor.device, dtype=features_tensor.dtype)
-
         s_offset = 0
         for idx, encoder in enumerate(self.simple_encoders):
             dim = self.simple_feature_dims[idx]

@@ -6,7 +6,6 @@ import tempfile
 import shutil
 import time
 from datetime import timedelta
-from typing import Dict
 
 import torch
 import torch.distributed as dist
@@ -15,6 +14,9 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch.nn.parallel import DistributedDataParallel as DDP
+import swanlab
+
+
 
 # 将 ../ 目录下的所有文件夹添加到 sys.path
 parent_dir = os.path.join(os.path.dirname(__file__), '..')
@@ -293,6 +295,44 @@ class ddppo:
             )
         return features
 
+    def _save_checkpoint(
+        self,
+        iteration: int,
+        policy_net,
+        value_net,
+        optimizer_policy,
+        optimizer_value,
+        scheduler_policy,
+        scheduler_value,
+    ) -> None:
+        if self.checkpoint_interval <= 0:
+            return
+        policy_state = policy_net.module.state_dict() if isinstance(policy_net, DDP) else policy_net.state_dict()
+        value_state = value_net.module.state_dict() if isinstance(value_net, DDP) else value_net.state_dict()
+        checkpoint = {
+            "iteration": iteration,
+            "policy_state": policy_state,
+            "value_state": value_state,
+            "optimizer_policy": optimizer_policy.state_dict(),
+            "optimizer_value": optimizer_value.state_dict(),
+            "scheduler_policy": scheduler_policy.state_dict(),
+            "scheduler_value": scheduler_value.state_dict(),
+            "config": self.config,
+        }
+        ckpt_path = os.path.join(self.checkpoint_dir, f"iter_{iteration:06d}.pt")
+        torch.save(checkpoint, ckpt_path)
+        print(f"[Checkpoint] Saved iteration {iteration} to {ckpt_path}")
+
+    def _init_swanlab(self):
+        if not self.enable_swanlab or self._swan_initialized:
+            return
+        swanlab.init(
+            project=self.swanlab_project,
+            experiment_name=self.swanlab_run_name,
+            config=self.config,
+        )
+        self._swan_initialized = True
+
     @staticmethod
     def _find_free_port():
         """找到一个可用的端口号"""
@@ -372,6 +412,8 @@ class ddppo:
             value_net = DDP(value_net, device_ids=[rank], output_device=rank)
         if is_master:
             print(f"All networks initialized and moved to device {device}")
+            if self.enable_swanlab:
+                self._init_swanlab()
         simulator = TeraflowSimulator(config=self.config, device=device)
         
         # 收集网络参数
@@ -490,7 +532,10 @@ class ddppo:
                         del bootstrap_features
                         del bootstrap_agents_state, bootstrap_neighbors_local, bootstrap_w_lanes_local, bootstrap_w_boundaries_local
 
-                    self._ppo_update_from_buffer(
+                    rewards_tensor = torch.stack(rewards_buffer[:buffer_step_count], dim=0)
+                    avg_reward_value = rewards_tensor.mean().item()
+                    del rewards_tensor
+                    update_metrics = self._ppo_update_from_buffer(
                         states_buffer[:buffer_step_count],
                         rewards_buffer[:buffer_step_count],
                         dones_buffer[:buffer_step_count],
@@ -506,7 +551,21 @@ class ddppo:
                         optimizer_value,
                         device,
                         is_master,
+                        extra_metrics={"avg_reward": avg_reward_value},
                     )
+                    if (
+                        update_metrics is not None
+                        and is_master
+                        and self.enable_swanlab
+                        and self._swan_initialized
+                    ):
+                        self.global_update_step += 1
+                        log_data = dict(update_metrics)
+                        log_data["iteration"] = k + 1
+                        log_data["update_step"] = self.global_update_step
+                        log_data["learning_rate_policy"] = scheduler_policy.get_last_lr()[0]
+                        log_data["learning_rate_value"] = scheduler_value.get_last_lr()[0]
+                        swanlab.log(log_data, step=self.global_update_step)
                     states_buffer = [None] * buffer_T
                     rewards_buffer = [None] * buffer_T
                     dones_buffer = [None] * buffer_T
@@ -519,6 +578,20 @@ class ddppo:
                         torch.cuda.empty_cache()
             scheduler_policy.step()
             scheduler_value.step()
+            # 保存ckpt
+            if is_master and self.checkpoint_interval > 0 and (k + 1) % self.checkpoint_interval == 0:
+                self._save_checkpoint(
+                    iteration=k + 1,
+                    policy_net=policy_net,
+                    value_net=value_net,
+                    optimizer_policy=optimizer_policy,
+                    optimizer_value=optimizer_value,
+                    scheduler_policy=scheduler_policy,
+                    scheduler_value=scheduler_value,
+                )
+        if is_master and self.enable_swanlab and self._swan_initialized:
+            swanlab.finish()
+            self._swan_initialized = False
 
     def _capture_agent_state_snapshot(self, simulator):
         snapshot = {
@@ -576,7 +649,8 @@ class ddppo:
         optimizer_policy,
         optimizer_value,
         device,
-        is_master):
+        is_master,
+        extra_metrics=None):
         """使用缓冲区中的 rollout 数据执行一次 PPO 更新。"""
         if valid_mask is None or valid_mask.numel() == 0:
             return
@@ -790,18 +864,30 @@ class ddppo:
                 start = end
 
         if total_weight == 0:
-            return
+            return None
+
+        avg_policy_loss = policy_loss_sum / total_weight
+        avg_value_loss = value_loss_sum / total_weight
+        avg_entropy = entropy_sum / total_weight
+        metrics = {
+            "policy_loss": avg_policy_loss,
+            "value_loss": avg_value_loss,
+            "entropy": avg_entropy,
+            "eta": eta_value,
+            "kept_steps": float(num_samples),
+            "updates": float(total_weight),
+        }
+        if extra_metrics:
+            metrics.update(extra_metrics)
 
         if is_master:
-            avg_policy_loss = policy_loss_sum / total_weight
-            avg_value_loss = value_loss_sum / total_weight
-            avg_entropy = entropy_sum / total_weight
             print(
                 f"PPO update -> policy_loss: {avg_policy_loss:.6f}, "
                 f"value_loss: {avg_value_loss:.6f}, entropy: {avg_entropy:.6f}, "
                 f"eta: {eta_value:.6f}, kept_steps: {num_samples}, "
                 f"updates: {total_weight} (epochs={max(1, self.ppo_epochs)})"
             )
+        return metrics
 
     def __init__(self, config_path):
         # 加载配置文件
@@ -827,6 +913,17 @@ class ddppo:
         self.value_coef = float(training_config.get('value_coef'))
         self.advantage_filter_threshold = float(training_config.get('advantage_filter_threshold'))
         self.advantage_filter_beta = float(training_config.get('advantage_filter_beta'))
+        self.checkpoint_interval = int(training_config.get('checkpoint_interval', 0))
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        self.checkpoint_dir = os.path.join(base_dir, 'ckpt')
+        if self.checkpoint_interval > 0:
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.enable_swanlab = bool(training_config.get('swanlab_enable', True))
+        self.swanlab_project = training_config.get('swanlab_project', 'selfrace-ddppo')
+        default_run_name = training_config.get('swanlab_run_name')
+        self.swanlab_run_name = default_run_name or f"ddppo_{int(time.time())}"
+        self._swan_initialized = False
+        self.global_update_step = 0
 
         simulator_config = self.config.get('simulator', {})
         obs_config = simulator_config.get('observation', {})
