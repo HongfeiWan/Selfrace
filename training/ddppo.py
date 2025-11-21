@@ -16,8 +16,6 @@ from torch.distributions import Categorical
 from torch.nn.parallel import DistributedDataParallel as DDP
 import swanlab
 
-
-
 # 将 ../ 目录下的所有文件夹添加到 sys.path
 parent_dir = os.path.join(os.path.dirname(__file__), '..')
 for item in os.listdir(parent_dir):
@@ -432,6 +430,10 @@ class ddppo:
             print(f"Policy parameters: {sum(p.numel() for p in policy_params):,}")
             print(f"Value parameters: {sum(p.numel() for p in value_params):,}")
         
+        # 初始化上一次的平均奖励，用于跟踪 path_length 的动态调整
+        # 记录上一次是否已经因为 avg_reward > 0.5 而增加过 path_length
+        path_length_increased_for_current_threshold = False  # 标记当前阈值（0.5）是否已经增加过
+        
         for k in range(self.num_iterations):
             print(f"Iteration {k} started")
             # 重置完成计数（仅在 Linux 分布式模式下）
@@ -503,7 +505,33 @@ class ddppo:
                 old_log_probs_buffer[buffer_step_count] = log_probs.detach().clone()
                 actions_buffer[buffer_step_count] = actions.detach().clone()
                 buffer_step_count += 1
-                should_update = (buffer_step_count == buffer_T) or (episode_step == self.max_episode_steps - 1)
+                
+                # 检查所有 active 的 agent 是否都 done 了
+                active_mask = simulator.agents_state[..., 6] > 0.5  # (B, M) - 所有 active 的 agent
+                if hasattr(simulator, 'cumulative_done_mask') and simulator.cumulative_done_mask is not None:
+                    done_mask = simulator.cumulative_done_mask  # (B, M) - 所有 done 的 agent
+                    # 检查是否有 active 的 agent，且所有 active 的 agent 都 done 了
+                    has_active = active_mask.any()
+                    if has_active:
+                        # 所有 active 的 agent 都 done 了
+                        all_active_done = (active_mask & done_mask).all()
+                        if all_active_done:
+                            if is_master:
+                                print(f"所有 active 的 agent 都 done 了，提前结束 episode (step {episode_step + 1}/{self.max_episode_steps})")
+                            # 标记需要更新和重置
+                            should_update = True
+                            should_reset = True
+                        else:
+                            should_update = (buffer_step_count == buffer_T) or (episode_step == self.max_episode_steps - 1)
+                            should_reset = False
+                    else:
+                        # 没有 active 的 agent，正常检查
+                        should_update = (buffer_step_count == buffer_T) or (episode_step == self.max_episode_steps - 1)
+                        should_reset = False
+                else:
+                    # 如果没有 cumulative_done_mask，使用默认逻辑
+                    should_update = (buffer_step_count == buffer_T) or (episode_step == self.max_episode_steps - 1)
+                    should_reset = False
 
                 if should_update and buffer_step_count > 0:
                     valid_mask = torch.zeros(buffer_T, dtype=torch.bool, device=device)
@@ -532,9 +560,8 @@ class ddppo:
                         del bootstrap_features
                         del bootstrap_agents_state, bootstrap_neighbors_local, bootstrap_w_lanes_local, bootstrap_w_boundaries_local
 
-                    rewards_tensor = torch.stack(rewards_buffer[:buffer_step_count], dim=0)
-                    avg_reward_value = rewards_tensor.mean().item()
-                    del rewards_tensor
+                    # 不再预先计算 avg_reward，因为大部分样本会被过滤掉
+                    # 实际用于更新的平均奖励会在 _ppo_update_from_buffer 中计算
                     update_metrics = self._ppo_update_from_buffer(
                         states_buffer[:buffer_step_count],
                         rewards_buffer[:buffer_step_count],
@@ -551,21 +578,38 @@ class ddppo:
                         optimizer_value,
                         device,
                         is_master,
-                        extra_metrics={"avg_reward": avg_reward_value},
+                        extra_metrics=None,  # 不再传入预先计算的 avg_reward
                     )
-                    if (
-                        update_metrics is not None
-                        and is_master
-                        and self.enable_swanlab
-                        and self._swan_initialized
-                    ):
-                        self.global_update_step += 1
-                        log_data = dict(update_metrics)
-                        log_data["iteration"] = k + 1
-                        log_data["update_step"] = self.global_update_step
-                        log_data["learning_rate_policy"] = scheduler_policy.get_last_lr()[0]
-                        log_data["learning_rate_value"] = scheduler_value.get_last_lr()[0]
-                        swanlab.log(log_data, step=self.global_update_step)
+                    if update_metrics is not None:
+                        # 检查是否需要增加 path_length（当 avg_reward > 0.5 时）
+                        current_avg_reward = update_metrics.get("avg_reward", float('-inf'))
+                        if current_avg_reward > 0.5:
+                            # avg_reward 大于 0.5，如果还没有因为当前阈值增加过，就增加 path_length
+                            if not path_length_increased_for_current_threshold:
+                                if simulator.update_path_length(increment=1):
+                                    if is_master:
+                                        print(f"avg_reward = {current_avg_reward:.4f} > 0.5，path_length 已更新为 {simulator.path_length}")
+                                else:
+                                    if is_master:
+                                        print(f"avg_reward = {current_avg_reward:.4f} > 0.5，但 path_length 已达到最大值 {simulator.max_path_length}")
+                                path_length_increased_for_current_threshold = True
+                        else:
+                            # avg_reward <= 0.5，重置标记，以便下次大于 0.5 时可以再次增加
+                            path_length_increased_for_current_threshold = False
+                        
+                        if (
+                            is_master
+                            and self.enable_swanlab
+                            and self._swan_initialized
+                        ):
+                            self.global_update_step += 1
+                            log_data = dict(update_metrics)
+                            log_data["iteration"] = k + 1
+                            log_data["update_step"] = self.global_update_step
+                            log_data["learning_rate_policy"] = scheduler_policy.get_last_lr()[0]
+                            log_data["learning_rate_value"] = scheduler_value.get_last_lr()[0]
+                            log_data["path_length"] = simulator.path_length  # 记录当前的 path_length
+                            swanlab.log(log_data, step=self.global_update_step)
                     states_buffer = [None] * buffer_T
                     rewards_buffer = [None] * buffer_T
                     dones_buffer = [None] * buffer_T
@@ -576,6 +620,16 @@ class ddppo:
                     # 清理显存缓存
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    
+                    # 如果所有 active 的 agent 都 done 了，重置并提前结束当前 episode
+                    if should_reset:
+                        if is_master:
+                            print(f"重置环境并进入下一个 iteration")
+                        initial_observation, d, theta_f = simulator.reset()
+                        current_observation = initial_observation
+                        stop_lines = getattr(simulator, 'stop_lines', None)
+                        break  # 提前结束当前 episode 循环
+                    
             scheduler_policy.step()
             scheduler_value.step()
             # 保存ckpt
@@ -737,6 +791,8 @@ class ddppo:
         advantages_flat = raw_advantages[sel_t, sel_b, sel_m]
         returns_flat = returns[sel_t, sel_b, sel_m]
         old_log_probs_flat = old_log_probs[sel_t, sel_b, sel_m]
+        # 提取实际用于更新的奖励（只计算进入 PPO 更新的样本）
+        rewards_flat = rewards[sel_t, sel_b, sel_m]
 
         num_samples = kept_positions.shape[0]
         if num_samples == 0:
@@ -869,6 +925,8 @@ class ddppo:
         avg_policy_loss = policy_loss_sum / total_weight
         avg_value_loss = value_loss_sum / total_weight
         avg_entropy = entropy_sum / total_weight
+        # 计算实际用于更新的样本的平均奖励（只包括通过过滤的样本）
+        avg_reward_used = rewards_flat.mean().item()
         metrics = {
             "policy_loss": avg_policy_loss,
             "value_loss": avg_value_loss,
@@ -876,9 +934,13 @@ class ddppo:
             "eta": eta_value,
             "kept_steps": float(num_samples),
             "updates": float(total_weight),
+            "avg_reward": avg_reward_used,  # 实际用于更新的样本的平均奖励
         }
         if extra_metrics:
-            metrics.update(extra_metrics)
+            # 覆盖 extra_metrics 中的 avg_reward，使用实际用于更新的值
+            extra_metrics_copy = extra_metrics.copy()
+            extra_metrics_copy.pop("avg_reward", None)  # 移除预先计算的 avg_reward
+            metrics.update(extra_metrics_copy)
 
         if is_master:
             print(

@@ -93,6 +93,29 @@ class TeraflowSimulator:
         self.w_lanes_local_with_goal_distances: Optional[torch.Tensor] = None
         self.w_lane_goal_distances_full: Optional[torch.Tensor] = None
         self.sampled_waypoint_ids: Optional[torch.Tensor] = None
+        
+        # 获取最大路径长度（从配置中读取）
+        obs_config = simulator_config.get('observation', {})
+        self.max_path_length = int(obs_config.get('num_navigation_chains', 128))
+
+    def update_path_length(self, increment: int = 1) -> bool:
+        """
+        更新路径长度，每次增加 increment（默认为1）。
+        如果已达到最大值，则不再增加。
+        
+        Args:
+            increment: 要增加的路径长度（默认为1）
+            
+        Returns:
+            bool: 如果成功更新返回 True，如果已达到最大值返回 False
+        """
+        if self.path_length >= self.max_path_length:
+            return False
+        new_length = min(self.path_length + increment, self.max_path_length)
+        if new_length != self.path_length:
+            self.path_length = new_length
+            return True
+        return False
 
     def reset(self) -> torch.Tensor:
         """

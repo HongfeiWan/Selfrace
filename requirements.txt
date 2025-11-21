@@ -1,0 +1,10 @@
+torch>=2.0
+numpy>=1.24
+matplotlib>=3.5
+ezdxf>=1.4
+swanlab>=0.6
+pygame>=2.5
+PyOpenGL>=3.1
+PyOpenGL_accelerate>=3.1
+pywin32>=305
+
