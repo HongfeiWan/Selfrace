@@ -98,6 +98,14 @@ class selfrace:
         self.line_visual = None  # 保存 line visual 引用以便更新
         self.agent_visuals = []  # 保存 agent visual 引用列表
         self.path_visuals = []  # 保存路径 visual 引用列表
+        self.goal_quad_visual = None  # 保存目标quad visual 引用
+        self.observation_w_lanes_visual = None  # 保存观测w_lanes visual 引用
+        self.observation_w_boundaries_visual = None  # 保存观测w_boundaries visual 引用
+        
+        # 信息显示窗口相关
+        self.info_canvas = None  # 信息显示窗口
+        self.info_view = None
+        self.info_text_visuals = []  # 保存文本 visual 引用列表
 
         self.reset()
     
@@ -113,16 +121,18 @@ class selfrace:
         self.agents_state = self.agents_state.to(self.device)
         # 重置累积done状态
         self.cumulative_done_mask = None
-        # 初始化路径规划器 - 为所有智能体分配目标和生成路径规划
-        # 确保输入tensor在正确的设备上
         self.agents_start_quad_ids = self.agents_start_quad_ids.to(self.device)
         self.agents_goal_quad_ids = self.agents_goal_quad_ids.to(self.device)
-        # path_plan 期望输入: (B, M) 的 start_poly_ids 和 end_poly_ids
-        # 返回: (B, M, max_path_len) 的路径（lane索引）
         paths = self.path_planner.path_plan(self.agents_start_quad_ids, self.agents_goal_quad_ids)
-        # collect_path_w_lane_ids 期望输入: paths (B, M, max_path_len), start_poly_ids (B, M), end_poly_ids (B, M)
-        # 返回: (B, M, w_lane_ids_length) 的 w_lane_id 序列
         self.agents_path_plans = self.path_planner.collect_path_w_lane_ids(paths, self.agents_start_quad_ids, self.agents_goal_quad_ids)
+
+        # 生成初始观测
+        print("Generating initial observation...") 
+        initial_observation, d, theta_f = self.observation_generator.generate(self.agents_state)
+        print("Initial observation generated")
+        self.frenet_d = d
+        self.frenet_theta_f = theta_f
+        self.initial_observation = initial_observation  # 保存初始观测用于可视化
 
     def render(self):
         """使用 vispy OpenGL 加速可视化 road_network 中的 quads_vertices"""
@@ -292,9 +302,7 @@ class selfrace:
             
             # 为每个活跃的 agent 绘制车辆矩形
             # 定义颜色（循环使用）
-            colors = [(1.0, 0.0, 0.0, 0.8), (0.0, 0.0, 1.0, 0.8), (0.0, 1.0, 0.0, 0.8), 
-                    (1.0, 0.5, 0.0, 0.8), (0.5, 0.0, 1.0, 0.8), (0.5, 0.25, 0.0, 0.8),
-                    (1.0, 0.0, 1.0, 0.8), (0.5, 0.5, 0.5, 0.8), (0.5, 0.5, 0.0, 0.8), (0.0, 1.0, 1.0, 0.8)]
+            colors = [(1.0, 1.0, 1.0, 1.0),]
             
             for i in range(n_active):
                 quad_verts = corners_np[i]  # (4, 2)
@@ -326,65 +334,48 @@ class selfrace:
                 # self.agent_visuals.append(center_marker)
         
         def _render_paths(env_idx=0, agent_idx=0):
-            """绘制指定环境的指定 agent 路径规划：用白色点显示所有路径点，并带朝向箭头
-            使用 self.agents_state 来检查 active 状态，使用 self.agents_path_plans 来获取路径
-            """
+            """绘制指定环境的指定 agent 路径规划：用白色点显示所有路径点，并带朝向箭头"""
             if self.agents_path_plans is None or self.agents_path_plans.numel() == 0:
                 return
-            # 检查索引范围
             if env_idx >= self.agents_path_plans.shape[0]:
                 return
             env_path_ids = self.agents_path_plans[env_idx]  # (M, L)
             if agent_idx >= env_path_ids.shape[0]:
                 return
-            
-            # 检查指定的 agent 是否 active（使用 self.agents_state，与路径规划对应）
-            if self.agents_state is not None and self.agents_state.numel() > 0:
-                if env_idx < self.agents_state.shape[0]:
-                    env_states = self.agents_state[env_idx]  # (M, 7)
-                    if agent_idx >= env_states.shape[0] or env_states[agent_idx, 6] != 1.0:
-                        return
+            if self.agents_state is None or env_idx >= self.agents_state.shape[0]:
+                return
+            env_states = self.agents_state[env_idx]  # (M, 7)
+            if agent_idx >= env_states.shape[0] or env_states[agent_idx, 6] != 1.0:
+                return
             
             # 定义颜色（与 _render_agents 保持一致）
-            color = (1.0, 0.0, 0.0, 0.8)  # 红色，只绘制一个 agent 所以只需要一个颜色
+            color = (0.0, 1.0, 0.0, 0.8)  # 红色，只绘制一个 agent 所以只需要一个颜色
             
-            # 获取路径特征（包含坐标和角度）
             with torch.no_grad():
-                # 获取指定 agent 的路径 ID
-                # agents_path_plans 的形状是 (B, M, L)，其中 L = w_lane_ids_length
-                agent_path_ids = env_path_ids[agent_idx]  # (L,)
+                agent_path_ids = env_path_ids[agent_idx]
+                agent_path_features = self.path_planner.get_w_lane_features_by_id(agent_path_ids.unsqueeze(0))[0]
                 
-                # 获取路径点的特征 (L, 3) - (x, y, angle)
-                agent_path_features = self.path_planner.get_w_lane_features_by_id(agent_path_ids.unsqueeze(0))  # (1, L, 3)
-                agent_path_features = agent_path_features[0]  # (L, 3)
-                
-                # 过滤无效点
                 invalid_value = float(self.path_planner.INVALID_MARKER)
                 valid_mask = agent_path_features[:, 0] != invalid_value
                 if not valid_mask.any():
                     return
                 
-                valid_path = agent_path_features[valid_mask]  # (L_valid, 3)
-                valid_points = valid_path[:, :2]  # (L_valid, 2) - (x, y)
-                valid_angles = valid_path[:, 2]  # (L_valid,) - angle
+                valid_path = agent_path_features[valid_mask]
+                valid_points = valid_path[:, :2]
+                valid_angles = valid_path[:, 2]
                 
-                # 转换为 numpy
                 valid_points_np = valid_points.detach().cpu().numpy()
                 valid_angles_np = valid_angles.detach().cpu().numpy()
                 
                 if valid_points_np.shape[0] == 0:
                     return
             
-            # 移除旧的路径 visuals
             for visual in self.path_visuals:
                 if visual.parent is not None:
                     visual.parent = None
             self.path_visuals.clear()
             
-            # 绘制路径点和箭头
-            arrow_length = 0.5  # 箭头长度（可以根据地图尺度调整）
-            
-            # 绘制路径点
+            arrow_length = 4
             points_marker = visuals.Markers(
                 pos=valid_points_np,
                 size=8,
@@ -398,20 +389,14 @@ class selfrace:
             # 为每个点绘制朝向箭头
             arrow_segments = []
             for i in range(valid_points_np.shape[0]):
-                point = valid_points_np[i]  # (2,)
+                point = valid_points_np[i]
                 angle = valid_angles_np[i]
-                
-                # 计算箭头终点
                 arrow_end = point + arrow_length * np.array([np.cos(angle), np.sin(angle)])
-                
-                # 创建箭头线段：从点到箭头终点
                 arrow_segments.append(point)
                 arrow_segments.append(arrow_end)
             
             if arrow_segments:
-                arrow_segments_np = np.array(arrow_segments)  # (N_points*2, 2)
-                
-                # 绘制箭头线段（稍微透明）
+                arrow_segments_np = np.array(arrow_segments)
                 arrow_color = (color[0], color[1], color[2], 0.8)
                 arrow_lines = visuals.Line(
                     pos=arrow_segments_np,
@@ -423,21 +408,300 @@ class selfrace:
                 self.view.add(arrow_lines)
                 self.path_visuals.append(arrow_lines)
         
-        # 找到第一个 active 的 agent
+        def _render_goal_quad(env_idx=0, agent_idx=0):
+            """绘制指定环境的指定 agent 的目标quad的白色边框"""
+            if self.agents_goal_quad_ids is None:
+                return
+            if env_idx >= self.agents_goal_quad_ids.shape[0]:
+                return
+            if agent_idx >= self.agents_goal_quad_ids.shape[1]:
+                return
+            
+            goal_quad_id = self.agents_goal_quad_ids[env_idx, agent_idx].item()
+            invalid_marker = -1
+            if goal_quad_id == invalid_marker:
+                return
+            
+            # 通过 quad_id 找到在 quad_ids 中的索引
+            with torch.no_grad():
+                quad_ids = self.road_network.quad_ids  # (N,)
+                matching_indices = (quad_ids == goal_quad_id).nonzero(as_tuple=False)
+                if matching_indices.numel() == 0:
+                    return
+                quad_idx = matching_indices[0].item()
+                
+                # 从 quads_vertices 获取顶点
+                quads_vertices = self.road_network.quads_vertices  # (N, 4, 2)
+                if quad_idx >= quads_vertices.shape[0]:
+                    return
+                vertices = quads_vertices[quad_idx]  # (4, 2)
+                vertices_np = vertices.detach().cpu().numpy()
+                
+                # 闭合quad：添加第一个点到最后
+                closed_vertices = np.vstack([vertices_np, vertices_np[0:1]])  # (5, 2)
+            
+            # 移除旧的goal quad visual
+            if self.goal_quad_visual is not None and self.goal_quad_visual.parent is not None:
+                self.goal_quad_visual.parent = None
+            
+            # 绘制白色边框
+            self.goal_quad_visual = visuals.Line(
+                pos=closed_vertices,
+                color=(0.5, 0.5, 0.5, 0.8),  # 白色
+                width=5.0,  # 较粗的边框
+                connect='strip',
+                method='gl'
+            )
+            self.view.add(self.goal_quad_visual)
+        
+        def _render_observation(env_idx=0, agent_idx=0):
+            """绘制指定环境的指定 agent 的观测内容：w_lanes 和 w_boundaries"""
+            if not hasattr(self, 'initial_observation') or self.initial_observation is None:
+                return
+            if env_idx >= self.initial_observation.shape[0]:
+                return
+            if agent_idx >= self.initial_observation.shape[1]:
+                return
+            
+            # 解包观测以获取 w_lanes_local 和 w_boundaries_local
+            obs_gen = self.observation_generator
+            local_state, neighbors_local, w_lanes_local, w_boundaries_local = \
+                obs_gen.unpack_observation_components(
+                    self.initial_observation,
+                    obs_gen.local_state_dim,
+                    obs_gen.num_neighbors,
+                    obs_gen.neighbor_feature_dim,
+                    obs_gen.num_w_lanes,
+                    obs_gen.w_lane_feature_dim,
+                    obs_gen.num_w_boundaries,
+                    obs_gen.boundary_feature_dim
+                )
+            
+            # 获取指定agent的局部观测
+            w_lanes_local_agent = w_lanes_local[env_idx, agent_idx]  # (num_w_lanes, 2)
+            w_boundaries_local_agent = w_boundaries_local[env_idx, agent_idx]  # (num_w_boundaries, 2)
+            
+            # 获取ego状态以转换回世界坐标
+            ego_state = self.agents_state[env_idx, agent_idx]  # (7,)
+            ego_pos = ego_state[:2]  # (2,)
+            ego_yaw = ego_state[2]  # scalar
+            
+            # 构建逆旋转矩阵（从局部坐标到世界坐标）
+            cos_yaw = torch.cos(ego_yaw)
+            sin_yaw = torch.sin(ego_yaw)
+            rot_matrix = torch.stack([
+                torch.stack([cos_yaw, -sin_yaw], dim=0),
+                torch.stack([sin_yaw, cos_yaw], dim=0)
+            ], dim=0)  # (2, 2)
+            
+            # 将局部坐标转换回世界坐标
+            with torch.no_grad():
+                # w_lanes: (num_w_lanes, 2) -> (num_w_lanes, 2)
+                w_lanes_world_agent = (w_lanes_local_agent @ rot_matrix.T) + ego_pos.unsqueeze(0)
+                # w_boundaries: (num_w_boundaries, 2) -> (num_w_boundaries, 2)
+                w_boundaries_world_agent = (w_boundaries_local_agent @ rot_matrix.T) + ego_pos.unsqueeze(0)
+                
+                # 过滤掉无效点（距离为0的点通常表示超出视野范围）
+                w_lanes_dist = torch.norm(w_lanes_local_agent, dim=-1)
+                w_boundaries_dist = torch.norm(w_boundaries_local_agent, dim=-1)
+                w_lanes_valid = w_lanes_dist > 1e-6  # 有效点
+                w_boundaries_valid = w_boundaries_dist > 1e-6  # 有效点
+                
+                if w_lanes_valid.any():
+                    w_lanes_valid_points = w_lanes_world_agent[w_lanes_valid].detach().cpu().numpy()
+                else:
+                    w_lanes_valid_points = np.empty((0, 2))
+                
+                if w_boundaries_valid.any():
+                    w_boundaries_valid_points = w_boundaries_world_agent[w_boundaries_valid].detach().cpu().numpy()
+                else:
+                    w_boundaries_valid_points = np.empty((0, 2))
+            
+            # 移除旧的观测 visuals
+            if self.observation_w_lanes_visual is not None and self.observation_w_lanes_visual.parent is not None:
+                self.observation_w_lanes_visual.parent = None
+            if self.observation_w_boundaries_visual is not None and self.observation_w_boundaries_visual.parent is not None:
+                self.observation_w_boundaries_visual.parent = None
+            
+            # 绘制 w_lanes (橙色点)
+            if w_lanes_valid_points.shape[0] > 0:
+                self.observation_w_lanes_visual = visuals.Markers(
+                    pos=w_lanes_valid_points,
+                    size=6,
+                    face_color=(1.0, 0.5, 0.0, 0.8),  # 橙色
+                    edge_color=(1.0, 0.5, 0.0, 1.0),
+                    edge_width=1
+                )
+                self.view.add(self.observation_w_lanes_visual)
+            
+            # 绘制 w_boundaries (紫色点)
+            if w_boundaries_valid_points.shape[0] > 0:
+                self.observation_w_boundaries_visual = visuals.Markers(
+                    pos=w_boundaries_valid_points,
+                    size=5,
+                    face_color=(0.5, 0.0, 0.5, 0.8),  # 紫色
+                    edge_color=(0.5, 0.0, 0.5, 1.0),
+                    edge_width=1
+                )
+                self.view.add(self.observation_w_boundaries_visual)
+        
+        def _create_info_window():
+            """创建信息显示窗口，显示当前观测agent的状态信息"""
+            if self.info_canvas is None:
+                # 创建新的canvas用于显示信息（不使用交互），增大宽度以容纳更多文字
+                self.info_canvas = scene.SceneCanvas(keys=None, show=True, size=(1200, 400), 
+                                                     title='Agent State Information', bgcolor='black')
+                self.info_view = self.info_canvas.central_widget.add_view()
+                # 使用2D相机，禁用交互，设置固定范围
+                self.info_view.camera = scene.PanZoomCamera(aspect=1.0)
+                # 禁用相机的交互功能
+                self.info_view.camera.interactive = False
+            
+            # 获取窗口实际大小
+            canvas_size = self.info_canvas.size
+            width, height = canvas_size[0], canvas_size[1]
+            
+            # 根据窗口大小动态设置相机范围
+            self.info_view.camera.set_range(x=(0, width), y=(0, height))
+            
+            # 清除旧的文本visuals
+            for text_visual in self.info_text_visuals:
+                if text_visual.parent is not None:
+                    text_visual.parent = None
+            self.info_text_visuals.clear()
+            
+            # 获取当前观测的agent状态
+            env_idx, agent_idx = _find_first_active_agent()
+            if env_idx is not None and agent_idx is not None:
+                # 解包观测以获取local_state和neighbors_local
+                if hasattr(self, 'initial_observation') and self.initial_observation is not None:
+                    obs_gen = self.observation_generator
+                    local_state, neighbors_local, w_lanes_local, w_boundaries_local = \
+                        obs_gen.unpack_observation_components(
+                            self.initial_observation,
+                            obs_gen.local_state_dim,
+                            obs_gen.num_neighbors,
+                            obs_gen.neighbor_feature_dim,
+                            obs_gen.num_w_lanes,
+                            obs_gen.w_lane_feature_dim,
+                            obs_gen.num_w_boundaries,
+                            obs_gen.boundary_feature_dim
+                        )
+                    
+                    # 获取指定agent的local_state
+                    local_state_agent = local_state[env_idx, agent_idx]  # (local_state_dim,) 通常是 (7,)
+                    # local_state: 在局部坐标系下，前3个值(x, y, yaw)通常为0（因为是以自己为原点），
+                    #             只包含 [length, width, active] 等不变的特征
+                    # 将tensor转换为列表（不需要转到CPU，tolist()会自动处理）
+                    local_state_values = local_state_agent.detach().tolist()
+                    
+                    # 根据local_state_dim格式化显示（通常是7维）
+                    local_state_dim = local_state_agent.shape[0]
+                    if local_state_dim >= 7:
+                        x, y, yaw, v, length, width, active = local_state_values[:7]
+                        state_text = f"Local_State (env={env_idx}, agent={agent_idx}): x={x:.2f}, y={y:.2f}, yaw={yaw:.3f}, v={v:.2f}, len={length:.2f}, wid={width:.2f}, active={int(active)}"
+                    else:
+                        # 如果维度不足7，显示所有值
+                        values_str = ", ".join([f"{val:.3f}" for val in local_state_values])
+                        state_text = f"Local_State (env={env_idx}, agent={agent_idx}): [{values_str}]"
+                    
+                    # 在第一行显示local_state，位置动态匹配窗口大小（距离顶部和左边一定距离）
+                    margin_x = 10  # 距离左边的边距
+                    line_height = 22  # 行高（用于控制多行文本间距）
+                    margin_y = height - 20  # 距离顶部的边距（确保文字可见）
+                    text_visual = scene.visuals.Text(
+                        text=state_text,
+                        pos=(margin_x, margin_y),  # 使用左上角为锚点
+                        color='white',
+                        font_size=16,
+                        parent=self.info_view.scene,
+                        anchor_x='left',
+                        anchor_y='top'
+                    )
+                    self.info_text_visuals.append(text_visual)
+                    
+                    # 获取指定agent的neighbors_local，形状应该是 (num_neighbors, neighbor_feature_dim)
+                    neighbors_local_agent = neighbors_local[env_idx, agent_idx]  # (num_neighbors, neighbor_feature_dim)
+                    
+                    # 将neighbors_local转换为numpy并格式化为矩阵字符串
+                    neighbors_np = neighbors_local_agent.detach().cpu().numpy()
+                    # neighbors_np 形状: (num_neighbors, neighbor_feature_dim)，例如 (20, 7)
+                    
+                    # 格式化矩阵：以7x20矩阵形式呈现（7个特征，20个neighbors）
+                    # 矩阵转置：显示为7行（特征）x 20列（neighbors）
+                    matrix_lines = ["Neighbors (7x20 matrix - rows: features, cols: neighbors):"]
+                    
+                    # 转置矩阵以便显示：从 (20, 7) 转为 (7, 20)
+                    neighbors_t = neighbors_np.T  # (7, 20)
+                    
+                    # 显示7行，每行对应一个特征，包含20个neighbors的值
+                    feature_names = ["x", "y", "yaw", "v", "len", "wid", "active"]
+                    for feat_idx in range(neighbors_t.shape[0]):  # 遍历7个特征
+                        feature_values = neighbors_t[feat_idx]  # (20,)
+                        # 格式化：每个值保留2位小数，紧凑格式
+                        values_str = " ".join([f"{val:7.2f}" for val in feature_values])
+                        matrix_lines.append(f"  {feature_names[feat_idx]:6s}: [{values_str}]")
+                    
+                    # 第二行开始：显示neighbors矩阵（每行单独创建Text visual以避免重叠）
+                    # neighbors矩阵起始位置：在state下方，留出足够空间
+                    neighbors_start_y = margin_y - line_height   # state下方留出更多空间
+                    current_y = neighbors_start_y
+                    
+                    # 显示标题行
+                    title_visual = scene.visuals.Text(
+                        text=matrix_lines[0],
+                        pos=(margin_x, current_y),
+                        color='cyan',
+                        font_size=12,
+                        parent=self.info_view.scene,
+                        anchor_x='left',
+                        anchor_y='top'
+                    )
+                    self.info_text_visuals.append(title_visual)
+                    current_y -= line_height  # 移动到下一行
+                    
+                    # 显示7行特征数据（每行单独创建Text visual）
+                    for i in range(1, len(matrix_lines)):  # 跳过标题行
+                        feature_visual = scene.visuals.Text(
+                            text=matrix_lines[i],
+                            pos=(margin_x, current_y),
+                            color='cyan',
+                            font_size=12,
+                            parent=self.info_view.scene,
+                            anchor_x='left',
+                            anchor_y='top'
+                        )
+                        self.info_text_visuals.append(feature_visual)
+                        current_y -= line_height  # 移动到下一行
+            else:
+                # 没有active agent时显示提示信息
+                margin_x = 10
+                margin_y = height - 30
+                text_visual = scene.visuals.Text(
+                    text="No active agent found",
+                    pos=(margin_x, margin_y),
+                    color='yellow',
+                    font_size=16,
+                    parent=self.info_view.scene
+                )
+                self.info_text_visuals.append(text_visual)
+        
         env_idx, agent_idx = _find_first_active_agent()
-        if env_idx is None or agent_idx is None:
-            print("Warning: No active agents found")
+        if env_idx is not None and agent_idx is not None:
             _render_quads()
-        else:
-            # 绘制顺序：先绘制背景（quads），再绘制路径，最后绘制 agents（确保 agents 在最上层）
-            _render_quads()
+            _render_observation(env_idx, agent_idx)  # 先绘制观测（在背景上）
             _render_paths(env_idx, agent_idx)
             _render_agents(env_idx, agent_idx)
-        # 设置标题
+            _render_goal_quad(env_idx, agent_idx)
+        else:
+            _render_quads()
+        
+        # 创建信息显示窗口
+        _create_info_window()
+        
         self.canvas.title = f'Selfrace(OpenGL)'
-        # 运行应用（如果还没有运行）
         vispy.app.run()
-    
+
 if __name__ == '__main__':
     import json
     config = json.load(open('configs/default_config.json'))

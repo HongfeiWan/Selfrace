@@ -25,23 +25,28 @@ class ObservationGenerator:
         obs_cfg = sim_cfg.get('observation', {}) if isinstance(sim_cfg.get('observation', {}), dict) else {}
         self.config = obs_cfg
         self.device = device
+
         # 标量/数量配置（提供合理的缺省）
         self.num_neighbors = int(obs_cfg.get('num_neighbors'))           # 邻居数量
         self.num_w_lanes = int(obs_cfg.get('num_w_lanes'))               # 车道数量
         self.num_w_boundaries = int(obs_cfg.get('num_w_boundaries'))     # 边界数量
-        self.horizon = float(obs_cfg.get('horizon'))                  # 视野范围
+        self.horizon = float(obs_cfg.get('horizon'))                     # 视野范围
+
         # 观测维度配置（与 default_config.json 对齐）
         # local_state: x, y, yaw, speed, length, width, active
         self.local_state_dim = int(obs_cfg.get('local_state_dim'))
         self.neighbor_feature_dim = int(obs_cfg.get('neighbor_feature_dim'))
         self.w_lane_feature_dim = int(obs_cfg.get('w_lane_feature_dim'))
         self.boundary_feature_dim = int(obs_cfg.get('boundary_feature_dim'))
+
         # 额外：导航与链长度（供上游模块使用时读取）
         self.navigation_feature_dim = int(obs_cfg.get('navigation_feature_dim'))
         self.num_start_end_chains = int(obs_cfg.get('num_start&end_chains'))
         self.num_navigation_chains = int(obs_cfg.get('num_navigation_chains'))
+
         # 使用来自 SelfraceSimulator 的共享哈希，仅作网格坐标与单元ID计算，不在此处重建静态索引
         self.spatial_hash = spatial_hash
+
         # 预计算映射改由 RoadNetwork 在加载时完成，直接引用即可
         self.quad_to_w_lanes_ids = self.road_network.quad_to_w_lanes_ids
         self.quad_to_w_boundaries_ids = self.road_network.quad_to_w_boundaries_ids
@@ -172,27 +177,43 @@ class ObservationGenerator:
         horizon_radius = self.horizon 
         dist_sq[self_mask | inactive_mask] = float('inf')
         dist_sq[dist_sq > horizon_radius**2] = float('inf') 
-        # 4. 找到最近的 K 个
-        _, topk_indices = torch.topk(dist_sq, k=self.num_neighbors, dim=-1, largest=False) # (B, M, K)
+        # 4. 找到最近的 K 个（处理 M < num_neighbors 的情况）
+        # 实际可用的邻居数量：M - 1（排除自己）
+        actual_k = min(self.num_neighbors, max(0, max_agents - 1))
+        if actual_k > 0:
+            _, topk_indices = torch.topk(dist_sq, k=actual_k, dim=-1, largest=False) # (B, M, actual_k)
+        else:
+            topk_indices = torch.empty(batch_size, max_agents, 0, dtype=torch.long, device=self.device)
+        
         # 5. 使用高级索引高效地收集邻居状态
         batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1, 1)
         agent_idx = torch.arange(max_agents, device=self.device).view(1, max_agents, 1)
-        neighbor_states = agents_state[batch_idx, topk_indices] # (B, M, K, 7)
-        # 6. 如果邻居是无效的 (距离为inf)，则其状态需要被掩码；
-        #    为避免后续局部坐标计算出现 dx,dy = -ego_pos 的伪值，
-        #    将无效邻居的状态设置为等同于对应 ego 的状态（使相对量为0）。
-        valid_neighbor_dists = dist_sq[batch_idx, agent_idx, topk_indices]
-        is_valid_neighbor = torch.isfinite(valid_neighbor_dists) # (B, M, K)
-        if (~is_valid_neighbor).any():
-            K_neighbors = topk_indices.shape[-1]
-            ego_states_expanded = agents_state.unsqueeze(2).expand(-1, -1, K_neighbors, -1)  # (B, M, K, 7)
-            # 使无效邻居的相对位置/速度为0：复制ego的 [x,y,yaw,speed]
-            # 同时将尺寸与active置零，避免下游看到伪造的车辆尺寸与激活标志
-            replacement = ego_states_expanded.clone()
-            replacement[..., 4] = 0.0  # length
-            replacement[..., 5] = 0.0  # width
-            replacement[..., 6] = 0.0  # active
-            neighbor_states[~is_valid_neighbor] = replacement[~is_valid_neighbor]
+        
+        if actual_k > 0:
+            neighbor_states = agents_state[batch_idx, topk_indices] # (B, M, actual_k, 7)
+            # 6. 如果邻居是无效的 (距离为inf)，则其状态需要被掩码
+            valid_neighbor_dists = dist_sq[batch_idx, agent_idx, topk_indices]
+            is_valid_neighbor = torch.isfinite(valid_neighbor_dists) # (B, M, actual_k)
+            if (~is_valid_neighbor).any():
+                ego_states_expanded = agents_state.unsqueeze(2).expand(-1, -1, actual_k, -1)
+                replacement = ego_states_expanded.clone()
+                replacement[..., 4] = 0.0  # length
+                replacement[..., 5] = 0.0  # width
+                replacement[..., 6] = 0.0  # active
+                neighbor_states[~is_valid_neighbor] = replacement[~is_valid_neighbor]
+        else:
+            neighbor_states = torch.empty(batch_size, max_agents, 0, 7, device=self.device)
+        
+        # 7. 如果实际邻居数量小于 num_neighbors，需要填充到 num_neighbors
+        if actual_k < self.num_neighbors:
+            pad_size = self.num_neighbors - actual_k
+            ego_states_expanded = agents_state.unsqueeze(2).expand(-1, -1, pad_size, -1)
+            pad_neighbors = ego_states_expanded.clone()
+            pad_neighbors[..., 4] = 0.0  # length
+            pad_neighbors[..., 5] = 0.0  # width
+            pad_neighbors[..., 6] = 0.0  # active
+            neighbor_states = torch.cat([neighbor_states, pad_neighbors], dim=2)  # (B, M, num_neighbors, 7)
+        
         return neighbor_states
     
     def _world_to_ego_centric(self, ego_states, neighbor_states, w_lanes_world, w_boundaries_world):
