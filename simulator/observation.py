@@ -87,9 +87,35 @@ class ObservationGenerator:
         # 使用预计算的关联获取 w_lane 索引并直接索引坐标
         w_lanes_ids = self.quad_to_w_lanes_ids[quad_indices]      # (B*M, K_lanes)
         w_bounds_ids = self.quad_to_w_boundaries_ids[quad_indices]# (B*M, K_bounds)
-        self.w_lanes_ids = w_lanes_ids
+        
+        # 填充或裁剪 IDs 到目标数量
+        def _pad_or_trim_ids(t: torch.Tensor, target_k: int, pad_val: int) -> torch.Tensor:
+            N, K = t.shape
+            if K == target_k:
+                return t
+            if K > target_k:
+                return t[:, :target_k]
+            # K < target_k，需要填充
+            pad = torch.full((N, target_k - K), pad_val, dtype=t.dtype, device=t.device)
+            return torch.cat([t, pad], dim=1)
+
+        # 获取无效标记
+        invalid_marker = int(self.config.get('INVALID_MARKER', -1))
+        
+        # 处理 w_lanes_ids 并保存
+        self.w_lanes_ids = _pad_or_trim_ids(w_lanes_ids, self.num_w_lanes, invalid_marker)
         
         # 索引 w_lanes
+        # 注意：这里我们使用原始的 w_lanes_ids (未padding的) 来索引，因为padding的-1会导致索引越界(除非-1是指向最后一个元素)
+        # 实际上 RoadNetwork 的 ids 如果不足 k_lanes 应该已经在 RoadNetwork 层面处理好了或者就是变长的？
+        # RoadNetwork.quad_to_w_lanes_ids 是 Tensor (NumQuads, K_road) 固定形状。
+        # 如果 K_road != num_w_lanes (config)，我们需要小心。
+        # 如果 we padded with -1, we can't use it to index global_w_lane directly unless we handle -1.
+        
+        # 方案：
+        # 1. 索引坐标时，先用原始 ids 索引得到 (B*M, K_road, 2)
+        # 2. 然后对坐标进行 pad_or_trim 到 num_w_lanes
+        
         wl_world = self.road_network.global_w_lane[w_lanes_ids]   # (B*M, K_lanes, 2)
         if wl_world.ndimension() != 3 or wl_world.shape[-1] != 2:
             raise ValueError(f"global_w_lane indexing failed: expected (B*M, K, 2), got {wl_world.shape}")
@@ -103,7 +129,7 @@ class ObservationGenerator:
             if wb_world.ndimension() != 3 or wb_world.shape[-1] != 2:
                 raise ValueError(f"global_w_boundary indexing failed: expected (B*M, K, 2), got {wb_world.shape}")
 
-        # 填充或裁剪到目标数量
+        # 填充或裁剪到目标数量 (坐标)
         def _pad_or_trim(t: torch.Tensor, target_k: int) -> torch.Tensor:
             """填充或裁剪张量到目标形状 (N, target_k, 2)"""
             if t.ndimension() != 3 or t.shape[-1] != 2:

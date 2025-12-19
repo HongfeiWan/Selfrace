@@ -38,7 +38,7 @@ class PathPlanner:
         config_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'default_config.json')
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        
+
         device_obj = torch.device(device)
 
         # ==================== 初始化所有 self 变量 ====================
@@ -115,11 +115,9 @@ class PathPlanner:
         self.path_matrix = None
         
         # 5.5. 预计算w_lane_ids生成所需的数据结构
-        print("预计算w_lane_ids生成所需的数据结构...")
         self._precompute_w_lane_ids_data(rn.w_lanes_raw, rn.quads_by_id, rn.lane_groups, rn.w_lane_id_to_idx)
         
         # 6. 预计算所有起点到终点的最短路径并存储在显存中
-        print(f"开始预计算所有 {self.n_lanes} x {self.n_lanes} = {self.n_lanes * self.n_lanes} 条路径...")
         self._precompute_all_paths()
         print("路径预计算完成")
 
@@ -238,9 +236,6 @@ class PathPlanner:
         self.lane_start_w_lane_idx = torch.tensor(lane_start_w_lane_idx, dtype=torch.long, device=self.device)
         self.lane_end_w_lane_idx = torch.tensor(lane_end_w_lane_idx, dtype=torch.long, device=self.device)
         
-        print(f"  预计算完成: {n_w_lanes} 个w_lanes, {self.n_lanes} 个lanes")
-        print(f"  每个lane最多 {max_w_lanes_per_lane} 个w_lane_ids")
-
     def _precompute_all_paths(self):
         """
         预计算所有起点到终点的最短路径
@@ -409,11 +404,9 @@ class PathPlanner:
     def path_plan(self, start_poly_ids, end_poly_ids):
         """
         批量路径规划：从poly_id到poly_id的最短路径（完全GPU并行化）
-        
         Args:
             start_poly_ids: (B, M) 起点poly_id的tensor
             end_poly_ids: (B, M) 终点poly_id的tensor
-            
         Returns:
             torch.Tensor: (B, M, max_path_len) 批量路径结果，无路径用INVALID_PATH_MARKER填充
         """
@@ -707,7 +700,7 @@ if __name__ == '__main__':
     from road import RoadNetwork
     import numpy as np
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    rn = RoadNetwork(map_path=os.path.join(os.path.dirname(__file__), '..', 'maps', 'town2.json'), device=torch.device(device))
+    rn = RoadNetwork(map_path=os.path.join(os.path.dirname(__file__), '..', 'maps', 'town1.json'), device=torch.device(device))
     planner = PathPlanner(device=device, road_network=rn)
 
     # ==================== 2. 生成测试数据 ====================

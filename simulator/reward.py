@@ -93,6 +93,20 @@ class RewardCalculator:
         """
         # 重新采样所有参数
         self.sampled_params = self.parameter_sampler.sample_all_parameters(self.B, self.M)
+        
+        # 清除所有 last_* 变量，确保状态完全重置
+        # 这些变量会在下次 calculate() 调用时被重新赋值
+        # 使用 None 初始化，避免在 reset 后第一次调用 calculate() 之前访问这些变量时出错
+        self.last_goal_reward = None
+        self.last_collision_penalty = None
+        self.last_offroad_penalty = None
+        self.last_comfort_penalty = None
+        self.last_lane_alignment_reward = None
+        self.last_lane_center_reward = None
+        self.last_velocity_reward = None
+        self.last_reverse_penalty = None
+        self.last_stop_line_penalty = None
+        self.last_timestep_penalty = None
     
     def calculate_goal_reward(self, 
                              goal_reached: torch.Tensor,

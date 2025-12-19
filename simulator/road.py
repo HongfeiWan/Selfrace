@@ -1,5 +1,4 @@
 import torch
-import math
 import json
 from typing import Dict, List
 import sys
@@ -30,6 +29,7 @@ class RoadNetwork:
         self.right_boundaries: torch.Tensor = torch.empty((0, 2, 2), dtype=torch.float32, device=self.device)
         self.quad_directions: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
         self.quad_curvatures: torch.Tensor = torch.empty((0,), dtype=torch.float32, device=self.device)
+        
         # 元数据/索引
         self.quad_ids: torch.Tensor = torch.empty((0,), dtype=torch.int64, device=self.device)
         self.lane_ids: torch.Tensor = torch.empty((0,), dtype=torch.int32, device=self.device)
@@ -45,7 +45,6 @@ class RoadNetwork:
 
         # ===== 预先初始化 _store_metadata 中会写入的成员 =====
         # 原始数据缓存
-        self.quads_raw = []
         self.w_lanes_raw = []
         # 分组与查找表
         self.lane_groups = {}
@@ -56,10 +55,11 @@ class RoadNetwork:
         self.n_lanes: int = 0
         self.lane_to_idx = {}
         self.w_lane_id_to_idx = {}
-        # 起终点坐标
+
+        # 每条lane起终点坐标
         self.start_positions: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
         self.end_positions: torch.Tensor = torch.empty((0, 2), dtype=torch.float32, device=self.device)
-        # w_lane 特征
+        # w_lane 特征（x, y, direction_angle）
         self.w_lane_features: torch.Tensor = torch.empty((0, 3), dtype=torch.float32, device=self.device)
         # 图结构
         self.adjacency_matrix: torch.Tensor = torch.empty((0, 0), dtype=torch.float32, device=self.device)
@@ -67,7 +67,9 @@ class RoadNetwork:
         # poly 映射
         self.poly_id_to_lane_idx = {}
         self.poly_id_lookup: torch.Tensor = torch.empty((0,), dtype=torch.long, device=self.device)
-        # 观测所需的预计算映射（quad -> 最近航点ID）
+        # w_lane_id 到 quad_id 的映射张量
+        self.w_lane_id_to_quad_id_tensor: torch.Tensor = torch.empty((0,), dtype=torch.long, device=self.device)
+        # 观测所需的预计算映射（quad -> 最近航点ID/oob）
         self.quad_to_w_lanes_ids: torch.Tensor = torch.empty((0, 0), dtype=torch.long, device=self.device)
         self.quad_to_w_boundaries_ids: torch.Tensor = torch.empty((0, 0), dtype=torch.long, device=self.device)
         # 加载和处理地图数据
@@ -88,15 +90,13 @@ class RoadNetwork:
         """构建几何、存储元数据与全局航点（合并版），并预计算规划所需索引"""
         quads_data = map_data['quads']
         # 保留原始数据以便上层复用
-        self.quads_raw = quads_data
         self.w_lanes_raw = map_data.get('w_lanes', [])
-        
         # 直接从 JSON 加载 quad centers（preprocessor 已经计算好的准确值）
         self.quad_centers = torch.tensor(
             [[q['center'][0], q['center'][1]] for q in quads_data], 
             dtype=torch.float32, device=self.device
         )
-        
+
         # 顶点与中心线
         TL = torch.tensor([[q['vertices'][0][0], q['vertices'][0][1]] for q in quads_data], dtype=torch.float32, device=self.device)
         TR = torch.tensor([[q['vertices'][1][0], q['vertices'][1][1]] for q in quads_data], dtype=torch.float32, device=self.device)
@@ -157,7 +157,6 @@ class RoadNetwork:
         w_boundary_points = map_data.get('oob_points', [])
         self.global_w_boundary = torch.tensor([[p['x'], p['y']] for p in w_boundary_points], dtype=torch.float32, device=self.device) if w_boundary_points else torch.empty((0, 2), device=self.device)
 
-
         # ===== 预计算供 PathPlanner 复用的数据结构 =====
         # 1) (road_id, lane_id) 分组与每组起终点 w_lane_id
         from collections import defaultdict
@@ -196,8 +195,6 @@ class RoadNetwork:
 
         # 3) w_lane_id 到索引的映射（与 global_w_lane 行对应）
         self.w_lane_id_to_idx = {wl['w_lane_id']: i for i, wl in enumerate(self.w_lanes_raw)}
-        # w_lane_id 到 quad_id (poly_id) 的映射（用于快速查询）
-        self.w_lane_id_to_quad_id = {wl['w_lane_id']: wl['poly_id'] for wl in self.w_lanes_raw}
         # 创建 GPU 张量用于批量查询（如果 w_lane_id 是连续的整数索引）
         if self.w_lanes_raw:
             max_w_lane_id = max(wl['w_lane_id'] for wl in self.w_lanes_raw)
@@ -298,7 +295,7 @@ if __name__ == "__main__":
     from matplotlib.patches import Polygon
     from matplotlib.widgets import CheckButtons
     # 简单测试接口：加载JSON并可视化基础quads与可选层
-    default_json = os.path.join(os.path.dirname(__file__), "..", "maps", "town2.json")
+    default_json = os.path.join(os.path.dirname(__file__), "..", "maps", "town1.json")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rn = RoadNetwork(default_json, device=device)
 

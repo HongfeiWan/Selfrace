@@ -14,7 +14,6 @@ from reward import RewardCalculator
 from world_init import WorldInitializer
 from observation import ObservationGenerator
 from dynamics import KinematicBicycleModel
-from utils.geometry_utils import find_nearest_lanes
 
 # 在 __init__ 方法中:
 class TeraflowSimulator:
@@ -696,9 +695,22 @@ class TeraflowSimulator:
             obs_gen.boundary_feature_dim,
         )
         w_lanes_local = w_lanes_local.to(self.device)  # (B, M, K, 2) = [dx, dy]
-        B, M = w_lanes_local.shape[:2]
-        w_lane_ids = obs_gen.w_lanes_ids.view(B, M, obs_gen.num_w_lanes).to(self.device)  # (B, M, K)
         B, M, K, _ = w_lanes_local.shape
+        # Reshape w_lanes_ids to match the actual K dimension from w_lanes_local
+        # Calculate actual K from w_lanes_ids size to handle potential mismatches
+        total_elements = obs_gen.w_lanes_ids.numel()
+        actual_K = total_elements // (B * M)
+        if total_elements != B * M * actual_K:
+            raise ValueError(f"Cannot reshape w_lanes_ids: {obs_gen.w_lanes_ids.shape} to (B={B}, M={M}, K=?)")
+        w_lane_ids = obs_gen.w_lanes_ids.view(B, M, actual_K).to(self.device)  # (B, M, actual_K)
+        # Trim or pad to match w_lanes_local's K dimension
+        if actual_K > K:
+            w_lane_ids = w_lane_ids[:, :, :K]
+        elif actual_K < K:
+            # Pad with invalid marker to match K
+            invalid_marker = int(self.config.get('simulator', {}).get('observation', {}).get('INVALID_MARKER', -1))
+            pad = torch.full((B, M, K - actual_K), invalid_marker, dtype=w_lane_ids.dtype, device=w_lane_ids.device)
+            w_lane_ids = torch.cat([w_lane_ids, pad], dim=2)
         
         # 获取 w_lane 的世界坐标特征 (x, y, angle)
         w_lane_features_world = self.path_planner.get_w_lane_features_by_id(w_lane_ids)  # (B, M, K, 3)

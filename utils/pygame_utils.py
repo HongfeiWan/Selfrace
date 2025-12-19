@@ -357,7 +357,6 @@ class PathPlanningVisualizer:
                 glColor4f(0.2, 0.4, 0.9, 0.8)
                 glPointSize(4.0)
                 glBegin(GL_POINTS)
-                text_entries = []
                 for i in range(wlane_np.shape[0]):
                     dx, dy = wlane_np[i, 0], wlane_np[i, 1]
                     if abs(dx) < 1e-5 and abs(dy) < 1e-5:
@@ -368,92 +367,7 @@ class PathPlanningVisualizer:
                     # 注意：根据 simulator.py 中的转换逻辑，rot_matrix 是 ego -> world
                     world_pos = dx_dy @ rot + np.array([ego_x, ego_y])
                     glVertex2f(world_pos[0], world_pos[1])
-                    
-                    # 处理不同维度的数据：
-                    # 2维: [dx, dy]
-                    # 3维: [dx, dy, Δs] (旧格式) 或 [dx, dy, angle_local] (新格式的一部分)
-                    # 4维: [dx, dy, angle_local, Δs] (新格式)
-                    delta_val = None
-                    angle_local = None
-                    if wlane_np.shape[1] >= 4:
-                        # 新格式：4维 [dx, dy, angle_local, Δs]
-                        angle_local = wlane_np[i, 2]
-                        delta_val = wlane_np[i, 3]
-                    elif wlane_np.shape[1] >= 3:
-                        # 兼容旧格式：3维，可能是 [dx, dy, Δs] 或 [dx, dy, angle_local]
-                        # 假设是 Δs（向后兼容）
-                        delta_val = wlane_np[i, 2]
-                    
-                    text_entries.append((
-                        world_pos[0], world_pos[1], 
-                        float(dx), float(dy), 
-                        None if angle_local is None else float(angle_local),
-                        None if delta_val is None else float(delta_val)
-                    ))
                 glEnd()
-                if text_entries:
-                    offset_x = (self.current_view_width / max(1, self.screen_width)) * 12.0
-                    offset_y = (self.current_view_height / max(1, self.screen_height)) * 12.0
-                    for wx, wy, dx_val, dy_val, angle_val, delta_val in text_entries:
-                        # 构建标签：显示 dx, dy, angle (可选), Δs
-                        try:
-                            parts = []
-                            
-                            # 检查并格式化 dx（使用科学计数法处理大值）
-                            try:
-                                if math.isfinite(dx_val):
-                                    if abs(dx_val) > 1000:
-                                        parts.append(f"dx:{dx_val:.2e}")
-                                    else:
-                                        parts.append(f"dx:{dx_val:.1f}")
-                                else:
-                                    parts.append("dx:NaN")
-                            except Exception:
-                                parts.append(f"dx:{dx_val}")
-                            
-                            # 检查并格式化 dy（使用科学计数法处理大值）
-                            try:
-                                if math.isfinite(dy_val):
-                                    if abs(dy_val) > 1000:
-                                        parts.append(f"dy:{dy_val:.2e}")
-                                    else:
-                                        parts.append(f"dy:{dy_val:.1f}")
-                                else:
-                                    parts.append("dy:NaN")
-                            except Exception:
-                                parts.append(f"dy:{dy_val}")
-                            
-                            # 检查并格式化 angle
-                            try:
-                                if angle_val is not None and math.isfinite(angle_val):
-                                    angle_deg = math.degrees(angle_val)
-                                    parts.append(f"θ:{angle_deg:.1f}°")
-                            except Exception:
-                                pass
-                            
-                            # 检查并格式化 Δs
-                            try:
-                                if delta_val is None or not math.isfinite(delta_val) or abs(delta_val - self.invalid_marker_value) < 1e-3:
-                                    delta_str = "Δ:∞"
-                                else:
-                                    delta_str = f"Δ:{delta_val:.1f}"
-                                parts.append(delta_str)
-                            except Exception:
-                                delta_str = f"Δ:{delta_val}"
-                                parts.append(delta_str)
-                            
-                            label = " ".join(parts)
-                            # 确保标签不为空（至少显示 Δs）
-                            if not label.strip():
-                                label = delta_str if 'delta_str' in locals() else "Δ:?"
-                        except Exception as e:
-                            # 如果格式化失败，至少显示基本信息
-                            try:
-                                label = f"dx:{dx_val} dy:{dy_val} Δ:{delta_val}"
-                            except Exception:
-                                label = f"Δ:{delta_val}" if delta_val is not None else "Δ:?"
-                        
-                        self.draw_text_world(label, wx + offset_x, wy + offset_y, color=(0.2, 0.4, 0.9), alpha=0.65)
         except Exception as e:
             print(f"绘制 w_lanes 失败: {e}")
             import traceback
@@ -578,24 +492,6 @@ class PathPlanningVisualizer:
             glVertex2f(x + dx, y + dy)
             glEnd()
 
-        # 4. 显示路径 Δs 信息（若提供）
-        if valid_path.shape[1] >= 4:
-            offset_x = (self.current_view_width / max(1, self.screen_width)) * 12.0
-            offset_y = (self.current_view_height / max(1, self.screen_height)) * 12.0
-            for p in valid_path:
-                delta_val = float(p[3])
-                if not math.isfinite(delta_val) or abs(delta_val - self.invalid_marker_value) < 1e-3:
-                    delta_str = "Δ:∞"
-                else:
-                    delta_str = f"Δ:{delta_val:.1f}"
-                self.draw_text_world(
-                    delta_str,
-                    float(p[0]) + offset_x,
-                    float(p[1]) + offset_y,
-                    color=(0.5, 0.1, 0.7),
-                    alpha=0.65,
-                )
-        
         # 4. 绘制起点
         self.draw_point_xy(valid_path[0, 0], valid_path[0, 1], 0.2, 0.8, 0.2, size=10.0)
         
@@ -612,16 +508,10 @@ class PathPlanningVisualizer:
             return
         if features_np.size == 0:
             return
-        ids_np = None
-        if sampled_ids is not None:
-            try:
-                ids_np = sampled_ids.detach().cpu().numpy() if torch.is_tensor(sampled_ids) else np.asarray(sampled_ids)
-            except Exception:
-                ids_np = None
+        # 不再绘制 ID 文本，只画点
         glColor4f(0.95, 0.75, 0.1, 0.9)
         glPointSize(8.0)
         glBegin(GL_POINTS)
-        text_entries = []
         for idx, point in enumerate(features_np):
             if point.shape[0] < 2:
                 continue
@@ -631,19 +521,7 @@ class PathPlanningVisualizer:
             if abs(x_val - self.invalid_marker_value) < 1e-3 or abs(y_val - self.invalid_marker_value) < 1e-3:
                 continue
             glVertex2f(float(x_val), float(y_val))
-            waypoint_id = None
-            if ids_np is not None and idx < ids_np.shape[0]:
-                val = ids_np[idx]
-                if np.isfinite(val):
-                    waypoint_id = int(val)
-            text_entries.append((float(x_val), float(y_val), waypoint_id))
         glEnd()
-        if text_entries:
-            offset_x = (self.current_view_width / max(1, self.screen_width)) * 14.0
-            offset_y = (self.current_view_height / max(1, self.screen_height)) * 14.0
-            for wx, wy, waypoint_id in text_entries:
-                label = f"id:{waypoint_id}" if waypoint_id is not None else "id:?"
-                self.draw_text_world(label, wx + offset_x, wy + offset_y, color=(0.95, 0.75, 0.1), alpha=0.8)
     
     def _format_info_lines(self, info_obj: Optional[object]) -> Optional[list]:
         if info_obj is None:
@@ -749,58 +627,78 @@ class PathPlanningVisualizer:
                         exit_reason = 'quit'
                     elif event.key == pygame.K_SPACE:
                         self.cur_idx = (self.cur_idx + 1) % len(self.active_agents_list)
-                    elif event.key == pygame.K_w:
-                        if self.step_callback is not None:
-                            try:
-                                m = self.active_agents_list[self.cur_idx]
-                                step_result = self.step_callback(self.batch_idx, m)
-                                if step_result is not None:
-                                    if isinstance(step_result, tuple):
-                                        new_agents_state = step_result[0] if len(step_result) > 0 else None
-                                        new_agents_path_plans = step_result[1] if len(step_result) > 1 else None
-                                        new_goal_positions = step_result[2] if len(step_result) > 2 else None
-                                        new_goal_radii = step_result[3] if len(step_result) > 3 else None
-                                        new_done_mask = step_result[4] if len(step_result) > 4 else None
-                                        new_sampled_features = step_result[5] if len(step_result) > 5 else None
-                                        new_sampled_ids = step_result[6] if len(step_result) > 6 else None
-                                    else:
-                                        new_agents_state = step_result
-                                        new_agents_path_plans = None
-                                        new_goal_positions = None
-                                        new_goal_radii = None
-                                        new_done_mask = None
-                                        new_sampled_features = None
-                                        new_sampled_ids = None
-                                    if new_agents_state is not None:
-                                        self.agents_state = new_agents_state
-                                    if new_agents_path_plans is not None:
-                                        self.agents_path_plans = new_agents_path_plans
-                                    if new_goal_positions is not None:
-                                        self.goal_positions = new_goal_positions
-                                    if new_goal_radii is not None:
-                                        self.goal_radii = new_goal_radii
-                                    if new_done_mask is not None:
-                                        self.done_mask = new_done_mask
-                                    if new_sampled_features is not None:
-                                        self.sampled_waypoint_features = new_sampled_features
-                                    if new_sampled_ids is not None:
-                                        self.sampled_waypoint_ids = new_sampled_ids
-                                    active_mask = self.agents_state[..., 6] > 0.5
-                                    active_agents = torch.nonzero(active_mask[self.batch_idx], as_tuple=False).squeeze(-1)
-                                    if active_agents.numel() > 0:
-                                        self.active_agents_list = active_agents.tolist()
-                                        self.cur_idx %= len(self.active_agents_list)
-                                    else:
-                                        print("警告：Step 后没有 active 车辆。")
-                            except Exception as e:
-                                print(f"执行 step_callback 失败: {e}")
-                                import traceback
-                                traceback.print_exc()
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 4:  # 滚轮向上
                         self.zoom_level = min(self.zoom_level * 1.2, self.zoom_max)
                     elif event.button == 5:  # 滚轮向下
                         self.zoom_level = max(self.zoom_level / 1.2, self.zoom_min)
+
+            # 每一帧自动调用 step_callback 推进模拟
+            if self.step_callback is not None:
+                try:
+                    m_step = self.active_agents_list[self.cur_idx]
+                    step_result = self.step_callback(self.batch_idx, m_step)
+                    if step_result is not None:
+                        if isinstance(step_result, tuple):
+                            new_agents_state = step_result[0] if len(step_result) > 0 else None
+                            new_agents_path_plans = step_result[1] if len(step_result) > 1 else None
+                            new_goal_positions = step_result[2] if len(step_result) > 2 else None
+                            new_goal_radii = step_result[3] if len(step_result) > 3 else None
+                            new_done_mask = step_result[4] if len(step_result) > 4 else None
+                            new_sampled_features = step_result[5] if len(step_result) > 5 else None
+                            new_sampled_ids = step_result[6] if len(step_result) > 6 else None
+                        else:
+                            new_agents_state = step_result
+                            new_agents_path_plans = None
+                            new_goal_positions = None
+                            new_goal_radii = None
+                            new_done_mask = None
+                            new_sampled_features = None
+                            new_sampled_ids = None
+                        # 记录当前正在观测的 agent 索引（用于尽量保持视角）
+                        current_agent_idx = None
+                        if self.active_agents_list:
+                            try:
+                                current_agent_idx = self.active_agents_list[self.cur_idx]
+                            except Exception:
+                                current_agent_idx = None
+
+                        if new_agents_state is not None:
+                            self.agents_state = new_agents_state
+                        if new_agents_path_plans is not None:
+                            self.agents_path_plans = new_agents_path_plans
+                        if new_goal_positions is not None:
+                            self.goal_positions = new_goal_positions
+                        if new_goal_radii is not None:
+                            self.goal_radii = new_goal_radii
+                        if new_done_mask is not None:
+                            self.done_mask = new_done_mask
+                        if new_sampled_features is not None:
+                            self.sampled_waypoint_features = new_sampled_features
+                        if new_sampled_ids is not None:
+                            self.sampled_waypoint_ids = new_sampled_ids
+                        # 仅选择“仍然存活”的 agent：active 且未 done
+                        active_mask = self.agents_state[..., 6] > 0.5
+                        if self.done_mask is not None:
+                            world_done = self.done_mask[self.batch_idx]
+                            alive_mask_world = active_mask[self.batch_idx] & (~world_done)
+                        else:
+                            alive_mask_world = active_mask[self.batch_idx]
+                        alive_agents = torch.nonzero(alive_mask_world, as_tuple=False).squeeze(-1)
+                        if alive_agents.numel() > 0:
+                            alive_list = alive_agents.tolist()
+                            self.active_agents_list = alive_list
+                            # 如果当前观测的 agent 仍然存活，则保持不变；否则切到第一个存活的
+                            if current_agent_idx is not None and current_agent_idx in alive_list:
+                                self.cur_idx = alive_list.index(current_agent_idx)
+                            else:
+                                self.cur_idx = 0
+                        else:
+                            print("警告：Step 后没有存活的车辆。")
+                except Exception as e:
+                    print(f"执行 step_callback 失败: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # 获取当前车辆数据
             m = self.active_agents_list[self.cur_idx]

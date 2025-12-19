@@ -111,6 +111,7 @@ class WorldInitializer:
         agents_start_quad_ids = torch.full((B, M), self.INVALID_MARKER, dtype=torch.long, device=self.device)
         # 存储每个智能体的目标quad_id（新增）
         agents_goal_quad_ids = torch.full((B, M), self.INVALID_MARKER, dtype=torch.long, device=self.device)
+        
         max_retries = 1
         for retry in range(max_retries):
             # 1. 并行生成所有环境的所有agent slot的候选状态
@@ -127,7 +128,8 @@ class WorldInitializer:
             all_candidate_states = self._generate_states_on_quads(spawn_quad_indices, lengths, widths)
 
             # 重塑为 (num_envs, num_agents_per_env, 7)
-            candidate_states = all_candidate_states.view(B, M, self.neighbor_feature_dim)
+            # 注意：all_candidate_states 的形状是 (B*M, 7)，所以应该使用 local_state_dim
+            candidate_states = all_candidate_states.view(B, M, self.local_state_dim)
             
             # 2. 将候选状态放入agents_state张量
             agents_state[:, :M] = candidate_states

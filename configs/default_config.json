@@ -1,13 +1,13 @@
 {
   "map_path": "./maps",
-  "default_map": "town2.json",
+  "default_map": "town1.json",
   "device": "cuda",
 
   "simulator": {
     "sim_dt": 0.3,
     "B": 2500,
-    "M": 150,
-    "num_npc_vehicles": 150,
+    "M": 1,
+    "num_npc_vehicles": 1,
 
     "dynamics": {
       "min_longitudinal_jerk": -15.0,
@@ -130,6 +130,7 @@
   "training": {
     "learning_rate": 0.0005,
     "num_iterations": 10000,
+
     "batch_size": 15000,
     "rollout_steps": 128,
     "max_episode_steps": 1200,
@@ -145,16 +146,19 @@
     "advantage_filter_beta":0.25,
     "advantage_filter_threshold":0.01,
 
-    "checkpoint_interval":1000
-
+    "checkpoint_interval":100
   },
   "preprocessor": {
     "tolerance": 0.1,
     "sample_distance": 1.0,
+
     "rectangle_length": 1.0,
     "rectangle_width": 3.5,
+
     "oob_nudge_distance": 0.1,
+
     "cell_size": 20,
+
     "intersection_threshold": 0.8,
     "w_lane_sample_distance": 40.0
   }

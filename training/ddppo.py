@@ -762,11 +762,23 @@ class ddppo:
 
         abs_adv = raw_advantages.abs()
         A_max = abs_adv.max().item()
+        # 使用跨迭代 EWMA 的 A_max（参考 Advantage filtering 算法）
         if A_max <= 0:
+            # 当前 batch 没有有效优势，直接不过滤
             keep_mask_adv = torch.ones_like(raw_advantages, dtype=torch.bool)
             eta_value = 0.0
         else:
-            eta_value = self.advantage_filter_threshold * A_max
+            # 初始化或更新跨迭代的 A_max 平滑值
+            if getattr(self, "advantage_Amax_ewma", None) is None:
+                # 首次迭代：直接使用当前 A_max
+                self.advantage_Amax_ewma = A_max
+            else:
+                beta = self.advantage_filter_beta
+                self.advantage_Amax_ewma = (
+                    beta * A_max + (1.0 - beta) * self.advantage_Amax_ewma
+                )
+            # 按论文：eta = c * \bar{A}_max，这里 c 由 advantage_filter_threshold 控制（例如 0.01）
+            eta_value = self.advantage_filter_threshold * self.advantage_Amax_ewma
             keep_mask_adv = abs_adv >= eta_value
 
         keep_mask = keep_mask_done & keep_mask_adv
@@ -926,12 +938,21 @@ class ddppo:
         avg_value_loss = value_loss_sum / total_weight
         avg_entropy = entropy_sum / total_weight
         # 计算实际用于更新的样本的平均奖励（只包括通过过滤的样本）
-        avg_reward_used = rewards_flat.mean().item()
+        # 只统计 active 且未 done 的样本的奖励（奖励非零的样本）
+        # 这样可以避免非 active 的 agent（奖励为 0）影响平均值
+        active_reward_mask = rewards_flat != 0
+        if active_reward_mask.any():
+            avg_reward_used = rewards_flat[active_reward_mask].mean().item()
+        else:
+            # 如果所有样本的奖励都是 0，返回 0
+            avg_reward_used = 0.0
         metrics = {
             "policy_loss": avg_policy_loss,
             "value_loss": avg_value_loss,
             "entropy": avg_entropy,
             "eta": eta_value,
+            "A_max": float(A_max),
+            "A_max_ewma": float(getattr(self, "advantage_Amax_ewma", A_max)),
             "kept_steps": float(num_samples),
             "updates": float(total_weight),
             "avg_reward": avg_reward_used,  # 实际用于更新的样本的平均奖励

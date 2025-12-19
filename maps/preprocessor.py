@@ -29,7 +29,7 @@ def load_config():
 config = load_config()
 
 # 读取DXF文件
-dxf_path = os.path.join(os.path.dirname(__file__), "town2.dxf")
+dxf_path = os.path.join(os.path.dirname(__file__), "town1.dxf")
 doc = ezdxf.readfile(dxf_path)
 msp = doc.modelspace()
 # 创建matplotlib图形
