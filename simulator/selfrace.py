@@ -88,8 +88,6 @@ class selfrace:
         self.goal_radius_tensor: Optional[torch.Tensor] = None
         self.goal_positions: Optional[torch.Tensor] = None
 
-        self.w_lanes_local_with_goal_distances: Optional[torch.Tensor] = None
-        self.w_lane_goal_distances_full: Optional[torch.Tensor] = None
         self.sampled_waypoint_ids: Optional[torch.Tensor] = None
 
         # 可视化相关
@@ -101,14 +99,136 @@ class selfrace:
         self.goal_quad_visual = None  # 保存目标quad visual 引用
         self.observation_w_lanes_visual = None  # 保存观测w_lanes visual 引用
         self.observation_w_boundaries_visual = None  # 保存观测w_boundaries visual 引用
+        self.path_delta_text_visuals = []  # 保存路径上 w_lanes Δs 文本 visual 引用列表
         
         # 信息显示窗口相关
         self.info_canvas = None  # 信息显示窗口
         self.info_view = None
         self.info_text_visuals = []  # 保存文本 visual 引用列表
-
         self.reset()
-    
+
+    def precompute_path_plan_goal_distances_and_build_global(self) -> None:
+        """
+        合并函数：预计算每个路径点到终点的累积距离，同时构建全局 w_lane 的 Δs 信息。
+        使用 GPU 向量化操作，一次遍历完成两个任务，提高性能。
+        """
+        if self.agents_path_plans is None or self.agents_path_plans.numel() == 0:
+            self.agents_path_plan_goal_distances = None
+            self.w_lane_goal_distances_full = None
+            return
+        
+        planner = self.path_planner
+        invalid_marker = planner.INVALID_w_lane_id_MARKER
+        invalid_distance_marker = float(planner.INVALID_MARKER)
+        total_w_lanes = planner.w_lane_features.shape[0]
+        
+        B, M, L = self.agents_path_plans.shape
+        
+        # 如果没有 w_lane，直接返回
+        if total_w_lanes == 0:
+            self.agents_path_plan_goal_distances = torch.full(
+                (B, M, L), invalid_distance_marker, device=self.device, dtype=torch.float32
+            )
+            self.w_lane_goal_distances_full = torch.empty((B, M, 0), device=self.device, dtype=torch.float32)
+            return
+        
+        # 1. 计算累积距离（与原逻辑相同）
+        valid_waypoints = self.agents_path_plans != invalid_marker
+        waypoints_xy = planner.get_w_lane_centers_by_id(self.agents_path_plans)
+        distances = torch.full(
+            valid_waypoints.shape,
+            invalid_distance_marker,
+            device=self.device,
+            dtype=waypoints_xy.dtype,
+        )
+        
+        if valid_waypoints.any():
+            # 向量化计算累积距离
+            segment_vecs = waypoints_xy[..., 1:, :] - waypoints_xy[..., :-1, :]  # (B, M, L-1, 2)
+            segment_lengths = torch.norm(segment_vecs, dim=-1)  # (B, M, L-1)
+            segment_valid = valid_waypoints[..., :-1] & valid_waypoints[..., 1:]  # (B, M, L-1)
+            segment_lengths = torch.where(segment_valid, segment_lengths, torch.zeros_like(segment_lengths))
+            
+            zeros_tail = torch.zeros(
+                (*segment_lengths.shape[:-1], 1),
+                device=self.device,
+                dtype=segment_lengths.dtype,
+            )
+            segment_with_tail = torch.cat([segment_lengths, zeros_tail], dim=-1)  # (B, M, L)
+            
+            cumulative = torch.flip(
+                torch.cumsum(torch.flip(segment_with_tail, dims=[-1]), dim=-1),
+                dims=[-1],
+            )  # (B, M, L)
+            
+            # 找到每个路径的最后一个有效点，将其距离设为0
+            valid_positions_reversed = torch.flip(valid_waypoints.long(), dims=[-1])
+            last_valid_indices = (L - 1) - torch.argmax(valid_positions_reversed, dim=-1)
+            has_any_valid = valid_waypoints.any(dim=-1)
+            last_valid_indices = torch.where(has_any_valid, last_valid_indices, torch.zeros_like(last_valid_indices))
+            batch_indices = torch.arange(B, device=self.device).view(B, 1).expand(B, M)
+            agent_indices = torch.arange(M, device=self.device).view(1, M).expand(B, M)
+            last_valid_mask = torch.zeros_like(valid_waypoints, dtype=torch.bool)
+            last_valid_mask[batch_indices, agent_indices, last_valid_indices] = has_any_valid
+            cumulative = torch.where(last_valid_mask, torch.zeros_like(cumulative), cumulative)
+            distances = cumulative
+        
+        self.agents_path_plan_goal_distances = distances
+        
+        # 2. 同时构建全局 w_lane 的 Δs 信息（使用 scatter_reduce_ 向量化操作）
+        # 将 w_lane_ids 映射为索引
+        idx = planner.map_w_lane_ids_to_indices(self.agents_path_plans)  # (B, M, L)
+        idx_mask = (idx >= 0) & (idx < total_w_lanes) & valid_waypoints
+        
+        if not idx_mask.any():
+            # 没有有效索引，返回全 invalid 的全局信息
+            self.w_lane_goal_distances_full = torch.full(
+                (B, M, total_w_lanes),
+                invalid_distance_marker,
+                dtype=distances.dtype,
+                device=self.device,
+            )
+            return
+        
+        # 提取所有有效位置的索引和距离值
+        b_idx, m_idx, l_idx = idx_mask.nonzero(as_tuple=True)
+        target_idx = idx[b_idx, m_idx, l_idx]  # 有效的 w_lane 索引
+        src_vals = distances[b_idx, m_idx, l_idx]  # 对应的距离值
+        
+        # 使用 scatter_reduce_ 进行向量化的最小值归约操作
+        # 将 (B, M, total_w_lanes) 展平为 (B*M*total_w_lanes,) 的一维张量
+        flat_size = B * M
+        inf_value = torch.tensor(float("inf"), dtype=distances.dtype, device=self.device)
+        flat_full = torch.full(
+            (flat_size * total_w_lanes,),
+            inf_value,
+            dtype=distances.dtype,
+            device=self.device,
+        )
+        
+        # 计算线性索引：flat_row = b_idx * M + m_idx，然后 linear_idx = flat_row * total_w_lanes + target_idx
+        flat_row = b_idx * M + m_idx
+        linear_idx = flat_row * total_w_lanes + target_idx
+        
+        # 使用 scatter_reduce_ 进行向量化的最小值归约操作（对于相同的 w_lane_id，取最小的 Δs）
+        flat_full.scatter_reduce_(
+            dim=0,
+            index=linear_idx,
+            src=src_vals,
+            reduce="amin",
+            include_self=True,
+        )
+        
+        # 将展平的张量 reshape 回 (B, M, total_w_lanes)
+        w_lane_goal_distances_full = flat_full.view(B, M, total_w_lanes)
+        
+        # 将 inf 值替换为 invalid_value
+        self.w_lane_goal_distances_full = torch.where(
+            torch.isinf(w_lane_goal_distances_full),
+            torch.full_like(w_lane_goal_distances_full, invalid_distance_marker),
+            w_lane_goal_distances_full
+        )
+  
     def reset(self):
         """重置模拟世界"""
          # 必须先reset world。产生不同大小的车
@@ -125,6 +245,9 @@ class selfrace:
         self.agents_goal_quad_ids = self.agents_goal_quad_ids.to(self.device)
         paths = self.path_planner.path_plan(self.agents_start_quad_ids, self.agents_goal_quad_ids)
         self.agents_path_plans = self.path_planner.collect_path_w_lane_ids(paths, self.agents_start_quad_ids, self.agents_goal_quad_ids)
+
+        # 预计算路径距离和构建全局 w_lane 的 Δs 信息（合并函数，一次完成，必须在生成观测之前完成）
+        self.precompute_path_plan_goal_distances_and_build_global()
 
         # 生成初始观测
         print("Generating initial observation...") 
@@ -374,6 +497,11 @@ class selfrace:
                 if visual.parent is not None:
                     visual.parent = None
             self.path_visuals.clear()
+            # 清除旧的路径 Δs 文本
+            for text_visual in self.path_delta_text_visuals:
+                if text_visual.parent is not None:
+                    text_visual.parent = None
+            self.path_delta_text_visuals.clear()
             
             arrow_length = 4
             points_marker = visuals.Markers(
@@ -407,6 +535,55 @@ class selfrace:
                 )
                 self.view.add(arrow_lines)
                 self.path_visuals.append(arrow_lines)
+
+            # ===== 为绿色路径上的所有 w_lane（路径点）绘制 Δs 数值 =====
+            if hasattr(self, 'w_lane_goal_distances_full') and self.w_lane_goal_distances_full is not None:
+                try:
+                    planner = self.path_planner
+                    invalid_distance_marker = float(planner.INVALID_MARKER)
+                    total_w_lanes = self.w_lane_goal_distances_full.shape[-1]
+
+                    if env_idx < self.w_lane_goal_distances_full.shape[0] and agent_idx < self.w_lane_goal_distances_full.shape[1]:
+                        # 当前 agent 对所有全局 w_lane 的 Δs
+                        w_lane_global_dists = self.w_lane_goal_distances_full[env_idx, agent_idx]  # (total_w_lanes,)
+
+                        # 当前 agent 路径上的 w_lane id 序列（与 valid_points_np 顺序一致）
+                        # agent_path_ids: (L,)，其中部分可能为 invalid_marker
+                        agent_path_ids_cpu = agent_path_ids.detach().cpu()
+
+                        # 映射到 PathPlanner 的全局索引空间
+                        ids_reshaped = agent_path_ids.view(1, 1, -1)  # (1,1,L)
+                        mapped_indices = planner.map_w_lane_ids_to_indices(ids_reshaped)[0, 0]  # (L,)
+
+                        # 先拿到所有有效点在原始序列中的索引（这些索引与 valid_points_np 的顺序一一对应）
+                        valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)  # (N_valid,)
+
+                        # 遍历所有有效的路径点，绘制 Δs 文本
+                        for k, idx_tensor in enumerate(valid_indices):
+                            i = int(idx_tensor.item())  # 原始路径中的索引
+                            idx_global = int(mapped_indices[i].item())
+                            if idx_global < 0 or idx_global >= total_w_lanes:
+                                continue
+                            delta_s = float(w_lane_global_dists[idx_global].item())
+                            if delta_s == invalid_distance_marker:
+                                continue
+
+                            # valid_points_np 是压缩后的坐标数组，其下标 k 与 valid_indices 的顺序一致
+                            x, y = valid_points_np[k, 0], valid_points_np[k, 1]
+                            text_str = f"{delta_s:.1f}"
+                            text_visual = scene.Text(
+                                text=text_str,
+                                pos=(x, y),
+                                color='white',
+                                font_size=8,
+                                parent=self.view.scene,
+                                anchor_x='left',
+                                anchor_y='bottom'
+                            )
+                            self.path_delta_text_visuals.append(text_visual)
+                except Exception:
+                    # 仅为可视化辅助，出错时忽略，不影响主流程
+                    pass
         
         def _render_goal_quad(env_idx=0, agent_idx=0):
             """绘制指定环境的指定 agent 的目标quad的白色边框"""
@@ -455,7 +632,7 @@ class selfrace:
             self.view.add(self.goal_quad_visual)
         
         def _render_observation(env_idx=0, agent_idx=0):
-            """绘制指定环境的指定 agent 的观测内容：w_lanes 和 w_boundaries"""
+            """绘制指定环境的指定 agent 的观测内容：w_lanes、w_boundaries 以及带数值的 Δs。"""
             if not hasattr(self, 'initial_observation') or self.initial_observation is None:
                 return
             if env_idx >= self.initial_observation.shape[0]:
@@ -494,7 +671,7 @@ class selfrace:
                 torch.stack([sin_yaw, cos_yaw], dim=0)
             ], dim=0)  # (2, 2)
             
-            # 将局部坐标转换回世界坐标
+            # 将局部坐标转换回世界坐标，并筛选有效点
             with torch.no_grad():
                 # w_lanes: (num_w_lanes, 2) -> (num_w_lanes, 2)
                 w_lanes_world_agent = (w_lanes_local_agent @ rot_matrix.T) + ego_pos.unsqueeze(0)
@@ -517,7 +694,7 @@ class selfrace:
                 else:
                     w_boundaries_valid_points = np.empty((0, 2))
             
-            # 移除旧的观测 visuals
+            # 移除旧的观测 visuals（点）
             if self.observation_w_lanes_visual is not None and self.observation_w_lanes_visual.parent is not None:
                 self.observation_w_lanes_visual.parent = None
             if self.observation_w_boundaries_visual is not None and self.observation_w_boundaries_visual.parent is not None:
@@ -544,6 +721,9 @@ class selfrace:
                     edge_width=1
                 )
                 self.view.add(self.observation_w_boundaries_visual)
+
+            # 注意：橙色观测 w_lanes 仅作为“传感器可见点”进行可视化，不再叠加 Δs 文本，
+            # 以免与路径上的绿色 Δs 文本重复导致画面混乱。
         
         def _create_info_window():
             """创建信息显示窗口，显示当前观测agent的状态信息"""

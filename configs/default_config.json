@@ -6,8 +6,8 @@
   "simulator": {
     "sim_dt": 0.3,
     "B": 2500,
-    "M": 1,
-    "num_npc_vehicles": 1,
+    "M": 150,
+    "num_npc_vehicles": 150,
 
     "dynamics": {
       "min_longitudinal_jerk": -15.0,
