@@ -2,7 +2,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
+
+FEATURE_PAD_VALUE = -2.0
 
 class SimpleFeatureEncoder(nn.Module):
     """
@@ -98,6 +99,9 @@ class PermutationInvariantEncoder(nn.Module):
             encoded_elements = encoded_elements.masked_fill(~mask.unsqueeze(-1), neg_inf)
 
         encoded = torch.max(encoded_elements, dim=2)[0]  # [B, M, output_dim]
+        if mask is not None:
+            all_invalid = ~mask.any(dim=2)
+            encoded = torch.where(all_invalid.unsqueeze(-1), torch.zeros_like(encoded), encoded)
         return encoded
 
 class FeatureEncoder(nn.Module):
@@ -131,6 +135,16 @@ class FeatureEncoder(nn.Module):
         # 计算总输出维度 - 固定8个编码器
         self.total_output_dim = (len(self.simple_encoders) + len(self.permutation_encoders)) * self.encoder_dim
 
+    @staticmethod
+    def _flat_set_mask(x, element_dim, active_channel=None):
+        """从扁平特征中恢复 padding mask，避免空元素参与 max pooling。"""
+        B, M, N = x.shape
+        K = N // element_dim
+        elements = x.view(B, M, K, element_dim)
+        if active_channel is not None:
+            return elements[..., active_channel] > 0.5
+        return torch.isfinite(elements).all(dim=-1) & (elements > FEATURE_PAD_VALUE + 0.5).all(dim=-1)
+
     def forward(self, features_tensor):
         """
         完全向量化的特征编码 - 直接使用两个编码器列表
@@ -140,12 +154,10 @@ class FeatureEncoder(nn.Module):
             output: [B, M, total_output_dim] 编码后的特征张量
         """
         B, M, _ = features_tensor.shape
-        # 批量NaN处理
-        if torch.isnan(features_tensor).any():
-            features_tensor = torch.nan_to_num(features_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
-        
+        features_tensor = torch.nan_to_num(features_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # 预分配输出张量 [B, M, total_output_dim]
-        output = torch.zeros(B, M, self.total_output_dim, device=features_tensor.device)
+        output = torch.zeros(B, M, self.total_output_dim, device=features_tensor.device, dtype=features_tensor.dtype)
         
         # 编码简单特征 - 直接使用固定索引
         # S(t): 10维
@@ -169,19 +181,23 @@ class FeatureEncoder(nn.Module):
         
         # road_boundary: 52维
         road_boundary = features_tensor[:, :, simple_end:simple_end + self.permutation_feature_dims[0]]
-        output[:, :, 4*self.encoder_dim:5*self.encoder_dim] = self.permutation_encoders[0](road_boundary)
-        
+        road_boundary_mask = self._flat_set_mask(road_boundary, element_dim=2)
+        output[:, :, 4*self.encoder_dim:5*self.encoder_dim] = self.permutation_encoders[0](road_boundary, mask=road_boundary_mask)
+
         # lane_points: 50维
         lane_points = features_tensor[:, :, simple_end + self.permutation_feature_dims[0]:simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1]]
-        output[:, :, 5*self.encoder_dim:6*self.encoder_dim] = self.permutation_encoders[1](lane_points)
-        
+        lane_points_mask = self._flat_set_mask(lane_points, element_dim=2)
+        output[:, :, 5*self.encoder_dim:6*self.encoder_dim] = self.permutation_encoders[1](lane_points, mask=lane_points_mask)
+
         # stop_lines: 20维
         stop_lines = features_tensor[:, :, simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1]:simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1] + self.permutation_feature_dims[2]]
-        output[:, :, 6*self.encoder_dim:7*self.encoder_dim] = self.permutation_encoders[2](stop_lines)
-        
+        stop_lines_mask = self._flat_set_mask(stop_lines, element_dim=2)
+        output[:, :, 6*self.encoder_dim:7*self.encoder_dim] = self.permutation_encoders[2](stop_lines, mask=stop_lines_mask)
+
         # other_agents: 140维
         other_agents = features_tensor[:, :, simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1] + self.permutation_feature_dims[2]:self.total_input_dim]
-        output[:, :, 7*self.encoder_dim:8*self.encoder_dim] = self.permutation_encoders[3](other_agents)
+        other_agents_mask = self._flat_set_mask(other_agents, element_dim=7, active_channel=6)
+        output[:, :, 7*self.encoder_dim:8*self.encoder_dim] = self.permutation_encoders[3](other_agents, mask=other_agents_mask)
         
         return output
 
@@ -229,9 +245,7 @@ class SharedNetwork(nn.Module):
         """
         # 编码各种特征
         encoded_features = self.feature_encoder(features_tensor)
-        # 向量化NaN处理
-        if torch.isnan(encoded_features).any():
-            encoded_features = torch.nan_to_num(encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        encoded_features = torch.nan_to_num(encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
         # 符合论文描述的MLP骨干网络：[1024 × 1024 × 1024]
         x = F.relu(self.fc1(encoded_features))
         x = F.relu(self.fc2(x))
@@ -294,6 +308,14 @@ class IndependentNetwork(nn.Module):
         if isinstance(module, nn.Linear):
             torch.nn.init.orthogonal_(module.weight, gain=1.0)
             torch.nn.init.constant_(module.bias, 0)
+
+    def policy_parameters(self):
+        yield from self.policy_feature_encoder.parameters()
+        yield from self.policy_network.parameters()
+
+    def value_parameters(self):
+        yield from self.value_feature_encoder.parameters()
+        yield from self.value_network.parameters()
     
     def forward(self, features_tensor, mode="both"):
         """
@@ -323,9 +345,7 @@ class IndependentNetwork(nn.Module):
         """
         # 策略网络特征编码
         policy_encoded_features = self.policy_feature_encoder(features_tensor)
-        # 向量化NaN处理
-        if torch.isnan(policy_encoded_features).any():
-            policy_encoded_features = torch.nan_to_num(policy_encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        policy_encoded_features = torch.nan_to_num(policy_encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
         # 策略网络前向传播
         action_logits = self.policy_network(policy_encoded_features)
         return action_logits
@@ -340,9 +360,7 @@ class IndependentNetwork(nn.Module):
         """
         # 值函数网络特征编码
         value_encoded_features = self.value_feature_encoder(features_tensor)
-        # 向量化NaN处理
-        if torch.isnan(value_encoded_features).any():
-            value_encoded_features = torch.nan_to_num(value_encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        value_encoded_features = torch.nan_to_num(value_encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
         # 值函数网络前向传播
         value = self.value_network(value_encoded_features).squeeze(-1)
         return value

@@ -9,7 +9,7 @@ import traceback
 class DrivingStyleSampler:
     """
     车辆行驶风格抽样器
-    从混合均匀分布 X(a) = 0.5U(a-1,1) + 0.5U(1,a) 中采样 Cthrottle、Csteer 和 Cacc
+    从混合均匀分布 X(a) = 0.5U(a^{-1},1) + 0.5U(1,a) 中采样控制系数
     其中 a > 1，用于生成不同的车辆行驶风格
     其中 Cthrottle 和 Csteer 从 X(1.25) 采样，Cacc 从 X(1.5) 采样
     """
@@ -23,7 +23,7 @@ class DrivingStyleSampler:
 
     def sample_mixed_uniform(self, a: float, size: int = 1) -> torch.Tensor:
         """
-        从混合均匀分布 X(a) = 0.5U(a-1,1) + 0.5U(1,a) 中采样
+        从混合均匀分布 X(a) = 0.5U(a^{-1},1) + 0.5U(1,a) 中采样
         Args:
             a (float): 混合均匀分布参数，必须大于1
             size (int): 采样数量
@@ -32,32 +32,15 @@ class DrivingStyleSampler:
         """
         if a <= 1:
             raise ValueError("Parameter 'a' must be greater than 1")
-        # 计算混合均匀分布的参数
-        lower_bound_1 = a - 1  # 第一个均匀分布的下界
+        lower_bound_1 = 1.0 / a  # 第一个均匀分布的下界
         upper_bound_1 = 1.0    # 第一个均匀分布的上界
         lower_bound_2 = 1.0    # 第二个均匀分布的下界
         upper_bound_2 = a      # 第二个均匀分布的上界
-        # 生成随机数决定使用哪个均匀分布
-        uniform_choice = np.random.random(size)
-        # 初始化结果数组
-        samples = np.zeros(size)
-        # 50% 的概率从第一个均匀分布采样
-        mask_1 = uniform_choice < 0.5
-        if np.any(mask_1):
-            samples[mask_1] = np.random.uniform(
-                lower_bound_1, 
-                upper_bound_1, 
-                size=np.sum(mask_1)
-            )
-        # 50% 的概率从第二个均匀分布采样
-        mask_2 = uniform_choice >= 0.5
-        if np.any(mask_2):
-            samples[mask_2] = np.random.uniform(
-                lower_bound_2, 
-                upper_bound_2, 
-                size=np.sum(mask_2)
-            )
-        return torch.tensor(samples, dtype=torch.float32, device=self.device)
+        shape = (size,) if isinstance(size, int) else tuple(size)
+        choose_upper = torch.rand(shape, device=self.device) >= 0.5
+        lower_samples = torch.empty(shape, device=self.device).uniform_(lower_bound_1, upper_bound_1)
+        upper_samples = torch.empty(shape, device=self.device).uniform_(lower_bound_2, upper_bound_2)
+        return torch.where(choose_upper, upper_samples, lower_samples)
     
     def sample_driving_style(self, size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -94,6 +77,18 @@ class DrivingStyleSampler:
         """
         Cvel = self.sample_mixed_uniform(a=1.5, size=size)
         return Cvel    
+
+    def sample_driving_style_params(self, *shape: int) -> torch.Tensor:
+        """
+        批量采样 [Cthrottle, Csteer, Cacc, Cvel]，返回形状为 (*shape, 4) 的张量。
+        """
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        Cthrottle = self.sample_mixed_uniform(a=1.25, size=shape)
+        Csteer = self.sample_mixed_uniform(a=1.25, size=shape)
+        Cacc = self.sample_mixed_uniform(a=1.5, size=shape)
+        Cvel = self.sample_mixed_uniform(a=1.5, size=shape)
+        return torch.stack([Cthrottle, Csteer, Cacc, Cvel], dim=-1)
     
     def get_distribution_info(self, a: float) -> Dict:
         """
@@ -106,7 +101,7 @@ class DrivingStyleSampler:
         if a <= 1:
             raise ValueError("Parameter 'a' must be greater than 1")
         
-        lower_bound_1 = a - 1
+        lower_bound_1 = 1.0 / a
         upper_bound_1 = 1.0
         lower_bound_2 = 1.0
         upper_bound_2 = a

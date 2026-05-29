@@ -1,8 +1,6 @@
 import torch
 from typing import Dict, Tuple
 import math
-import numpy as np
-from randomize_components import DrivingStyleSampler
 
 class DiscreteActionSpace:
     # 离散动作空间定义，支持jerk控制
@@ -63,7 +61,8 @@ class KinematicBicycleModel:
         self.device = device
         
         # 获取dynamics配置，支持嵌套配置结构
-        dynamics_config = config.get('dynamics', config)
+        simulator_config = config.get('simulator', config)
+        dynamics_config = simulator_config.get('dynamics', simulator_config)
         
         # 从配置中读取车辆参数
         self.L = dynamics_config.get('vehicle_wheelbase', 2.9)  # 轴距, m
@@ -112,13 +111,16 @@ class KinematicBicycleModel:
         self.current_alat = None
         self.current_steering_angle = None  # 当前有效转向角
 
-    def step(self, states: torch.Tensor, actions: torch.Tensor, dt: float) -> torch.Tensor:
+    def step(self, states: torch.Tensor, actions: torch.Tensor, dt: float,
+             style_params: torch.Tensor = None, active_mask: torch.Tensor = None) -> torch.Tensor:
         """
         对一批车辆状态进行一步精确更新。
         Args:
             states (torch.Tensor): 形状为 (N, 4) 的当前状态张量 [x, y, yaw, speed]。
             actions (torch.Tensor): 动作张量，形状为 (N,) 的动作索引。
             dt (float): 模拟时间步长 (s)。
+            style_params: 可选，形状为 (N, 4)，对应 [Cthrottle, Csteer, Cacc, Cvel]。
+            active_mask: 可选，形状为 (N,)，False 的车辆保留/清零控制状态。
         Returns:
             torch.Tensor: 形状为 (N, 4) 的下一时刻状态张量。
         """
@@ -133,41 +135,48 @@ class KinematicBicycleModel:
         # 检查并初始化控制状态（确保batch_size正确）
         if (self.current_along is None or self.current_along.shape[0] != batch_size or
             self.current_alat is None or self.current_alat.shape[0] != batch_size):
-            print(f"Initializing dynamics state for batch_size: {batch_size}")
-            self.current_along = torch.zeros(batch_size, device=self.device)
-            self.current_alat = torch.zeros(batch_size, device=self.device)
+            self.current_along = torch.zeros(batch_size, device=self.device, dtype=states.dtype)
+            self.current_alat = torch.zeros(batch_size, device=self.device, dtype=states.dtype)
             # 同时重置prev_along以确保一致性
             if hasattr(self, 'prev_along'):
-                self.prev_along = torch.zeros(batch_size, device=self.device)
+                self.prev_along = torch.zeros(batch_size, device=self.device, dtype=states.dtype)
         
         # 获取实际的jerk动作
         jerk_actions = self.discrete_action_space.get_action(actions)  # (N, 2) [along_jerk, alat_jerk]
+        if style_params is not None:
+            style_params = style_params.to(device=self.device, dtype=states.dtype)
+            Cthrottle = style_params[:, 0]
+            Csteer = style_params[:, 1]
+            Cacc = style_params[:, 2]
+            Cvel = style_params[:, 3]
+        else:
+            Cthrottle = torch.full((batch_size,), float(self.Cthrottle), device=self.device, dtype=states.dtype)
+            Csteer = torch.full((batch_size,), float(self.Csteer), device=self.device, dtype=states.dtype)
+            Cacc = torch.full((batch_size,), float(self.Cacc), device=self.device, dtype=states.dtype)
+            Cvel = torch.full((batch_size,), float(self.Cvel), device=self.device, dtype=states.dtype)
+        if active_mask is not None:
+            active_mask = active_mask.to(device=self.device, dtype=torch.bool)
         
         # 更新当前加速度和转向角（jerk控制）
         along_jerk = jerk_actions[:, 0]  # 纵向jerk
         alat_jerk = jerk_actions[:, 1]   # 横向jerk
         
         # 更新加速度和转向角（应用控制系数）
-        new_along = self.current_along + along_jerk * dt * self.Cthrottle
-        new_alat = self.current_alat + alat_jerk * dt * self.Csteer
+        new_along = self.current_along + along_jerk * dt * Cthrottle
+        new_alat = self.current_alat + alat_jerk * dt * Csteer
         
         # 检测纵向加速度符号变化：a(t-1)_long * a(t)_long < 0
         accel_sign_change = (self.current_along * new_along) < 0
         
-        # 如果纵向加速度改变符号，将横向加速度设置为0,纵向加速度设置为0
-        if torch.any(accel_sign_change):
-            new_alat = torch.where(accel_sign_change, torch.zeros_like(new_alat), new_alat)
-            new_along = torch.where(accel_sign_change, torch.zeros_like(new_along), new_along)
-            # 如果纵向加速度改变符号，将纵向加速度设置为0，并保持当前的横向加速度
-            # 会使得agent更容易停在原地，或者驾驶时速度变化更平缓
+        # 如果纵向加速度改变符号，将横向加速度和纵向加速度置零。
+        new_alat = torch.where(accel_sign_change, torch.zeros_like(new_alat), new_alat)
+        new_along = torch.where(accel_sign_change, torch.zeros_like(new_along), new_along)
         
         # 应用约束：a(t)_long ← clip(a(t)_long, min_long_accel, max_long_accel*Cacc), a(t)_lat ← clip(a(t)_lat, min_lat_accel, max_lat_accel)
-        along = torch.clamp(new_along, self.min_longitudinal_accel, self.max_longitudinal_accel * self.Cacc)
+        min_long = torch.full_like(new_along, float(self.min_longitudinal_accel))
+        max_long = self.max_longitudinal_accel * Cacc
+        along = torch.minimum(torch.maximum(new_along, min_long), max_long)
         alat = torch.clamp(new_alat, self.min_lateral_accel, self.max_lateral_accel) # 横向加速度约束
-        
-        # 更新当前状态
-        self.current_along = along
-        self.current_alat = alat
             
         # 从状态张量中解包
         x, y, yaw, speed = states.T
@@ -182,15 +191,13 @@ class KinematicBicycleModel:
         # 检测速度符号变化：v(t-1) * v(t) < 0
         speed_sign_change = (speed * new_speed) < 0
         
-        # 如果速度改变符号，将速度设置为0
-        if torch.any(speed_sign_change):
-            new_speed = torch.where(speed_sign_change, torch.zeros_like(new_speed), new_speed)
+        # 如果速度改变符号，将速度设置为0。
+        new_speed = torch.where(speed_sign_change, torch.zeros_like(new_speed), new_speed)
         
         # 应用速度约束：v(t) ← clip(v(t), min_velocity, max_velocity*Cvel)
-        new_speed = torch.clamp(new_speed, self.min_velocity, self.max_velocity * self.Cvel)
-        
-        # 更新前一步的纵向加速度
-        self.prev_along = along.clone()
+        min_velocity = torch.full_like(new_speed, float(self.min_velocity))
+        max_velocity = self.max_velocity * Cvel
+        new_speed = torch.minimum(torch.maximum(new_speed, min_velocity), max_velocity)
 
         # 使用时间步内的平均速度进行位移计算，提高精度
         avg_speed = (speed + new_speed) / 2.0
@@ -200,7 +207,7 @@ class KinematicBicycleModel:
         
         # 初始化当前转向角（如果还没有初始化）
         if self.current_steering_angle is None or self.current_steering_angle.shape[0] != batch_size:
-            self.current_steering_angle = torch.zeros(batch_size, device=self.device)
+            self.current_steering_angle = torch.zeros(batch_size, device=self.device, dtype=states.dtype)
         
         # 计算转向角变化：δφ = φ_target - φ(t-1)
         steering_change = target_steering_angle - self.current_steering_angle
@@ -213,9 +220,6 @@ class KinematicBicycleModel:
         new_steering_angle = self.current_steering_angle + limited_steering_change
         steering_angle = torch.clamp(new_steering_angle, -self.max_steer_rad, self.max_steer_rad)
         
-        # 更新当前转向角状态
-        self.current_steering_angle = steering_angle
-        
         # 根据有效转向角更新曲率和横向加速度
         # ρ^(-1) ← tan(φ^(t)) / l_wb
         effective_curvature = torch.tan(steering_angle) / self.L
@@ -224,7 +228,15 @@ class KinematicBicycleModel:
         
         # 在计算 effective_alat 后，再次应用约束
         effective_alat = torch.clamp(effective_alat, self.min_lateral_accel, self.max_lateral_accel)
+
+        if active_mask is not None:
+            along = torch.where(active_mask, along, torch.zeros_like(along))
+            effective_alat = torch.where(active_mask, effective_alat, torch.zeros_like(effective_alat))
+            steering_angle = torch.where(active_mask, steering_angle, torch.zeros_like(steering_angle))
+        self.current_along = along
         self.current_alat = effective_alat
+        self.current_steering_angle = steering_angle
+        self.prev_along = along.clone()
         
         # 使用自行车动力学模型更新车辆位置
         # 计算位移：d = 0.5(v(t) + v(t-1)) * Δt
@@ -265,7 +277,6 @@ class KinematicBicycleModel:
         # 清除前一步的纵向加速度，让step方法重新创建
         if hasattr(self, 'prev_along'):
             delattr(self, 'prev_along')
-        print("Dynamics control state reset - variables cleared for fresh initialization")
 
     def calculate_steering_angle(self, alat: torch.Tensor, speed: torch.Tensor, epsilon: float = None) -> torch.Tensor:
         """

@@ -160,7 +160,7 @@ class RoadNetwork:
             if point_indices.numel() > 0:
                 # 计算每个点的候选数量
                 point_counts = torch.bincount(point_indices, minlength=N)  # (N,) - 每个点的候选数量
-                max_candidates_per_point = point_counts.max().item()
+                max_candidates_per_point = int(getattr(spatial_hash, 'static_max_candidates_per_cell', 0))
                 
                 if max_candidates_per_point > 0:
                     # 创建排序索引以便按点分组
@@ -437,6 +437,5 @@ if __name__ == '__main__':
 
         traceback.print_exc()
     
-
 
 

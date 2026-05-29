@@ -5,8 +5,10 @@ import time
 from typing import Dict, Tuple, List, Optional, Any
 
 class PathPlanner:
-    def __init__(self,map_path: str, device: torch.device):
-        print(f"==========PathPlanner init==========")
+    def __init__(self, map_path: str, device: torch.device, verbose: bool = False):
+        self.verbose = verbose
+        if self.verbose:
+            print(f"==========PathPlanner init==========")
         start_time = time.time()
         self.device = device
         # 如果提供了map，自动加载数据
@@ -429,7 +431,8 @@ class PathPlanner:
             self.waypoint_graph_gpu = None
         
         total_init_time = time.time() - start_time
-        print(f"PathPlanner模块初始化(预存数据)总耗时: {total_init_time:.4f}秒")
+        if self.verbose:
+            print(f"PathPlanner模块初始化(预存数据)总耗时: {total_init_time:.4f}秒")
 
     def plan_path(self, start_quad_id: torch.Tensor, goal_quad_id: torch.Tensor) -> torch.Tensor:
         '''
@@ -991,7 +994,8 @@ class PathPlanner:
         path = path_flat.view(start_quad_id.shape[0], start_quad_id.shape[1], Lmax, 2)
         # 在这里已经得到了start_ids，end_ids。通过cross_data内部的"waypoint_graph"得到两个节点之间的其它节点。
         plan_total_time = time.time() - plan_start_time
-        print(f"plan_path总耗时: {plan_total_time:.4f}秒")
+        if self.verbose:
+            print(f"plan_path总耗时: {plan_total_time:.4f}秒")
         return path
         
 #=======================查找工具函数=======================

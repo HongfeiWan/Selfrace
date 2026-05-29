@@ -28,6 +28,7 @@ class SpatialHash:
         # 用于静态几何体索引的属性
         self.static_sorted_items = torch.empty((0,), dtype=torch.long, device=self.device)
         self.static_cell_starts = torch.empty((0,), dtype=torch.long, device=self.device)
+        self.static_max_candidates_per_cell = 0
         #print(f"SpatialHash initialized with grid {self.grid_size.cpu().numpy()} and cell size {self.cell_size:.2f}m.")
 
     def get_cell_idx(self, points: torch.Tensor) -> torch.Tensor:
@@ -46,6 +47,7 @@ class SpatialHash:
         num_items = static_items_bounds.shape[0]
         if num_items == 0:
             self.static_cell_starts = torch.zeros(self.grid_total_cells + 1, dtype=torch.long, device=self.device)
+            self.static_max_candidates_per_cell = 0
             return
 
         item_min_bounds = static_items_bounds[:, 0]
@@ -71,6 +73,7 @@ class SpatialHash:
         if item_cell_pairs.numel() == 0:
             self.static_sorted_items = torch.empty(0, dtype=torch.long, device=self.device)
             self.static_cell_starts = torch.zeros(self.grid_total_cells + 1, dtype=torch.long, device=self.device)
+            self.static_max_candidates_per_cell = 0
             return
 
         sorted_pairs = item_cell_pairs[item_cell_pairs[:, 1].argsort()]
@@ -79,6 +82,7 @@ class SpatialHash:
         unique_cells, counts = torch.unique_consecutive(sorted_pairs[:, 1], return_counts=True)
         self.static_cell_starts[unique_cells + 1] = counts
         self.static_cell_starts = self.static_cell_starts.cumsum_(0)
+        self.static_max_candidates_per_cell = int(counts.max().item()) if counts.numel() > 0 else 0
         #print(f"Built static index for {num_items} items.")
 
     def query_points(self, points: torch.Tensor) -> torch.Tensor:
@@ -92,12 +96,12 @@ class SpatialHash:
         starts = self.static_cell_starts[cell_indices_flat]
         ends = self.static_cell_starts[cell_indices_flat + 1]
         num_candidates_per_point = ends - starts
-        if num_candidates_per_point.sum() == 0:
+        max_candidates = self.static_max_candidates_per_cell
+        if max_candidates <= 0:
             return torch.empty((0, 2), dtype=torch.long, device=self.device)
         point_indices_out = torch.arange(len(points), device=self.device).repeat_interleave(num_candidates_per_point)
         # GPU加速版本：避免for循环
         # 使用高级索引操作替代torch.cat和for循环
-        max_candidates = num_candidates_per_point.max().item()
         # 创建索引偏移矩阵
         offsets = torch.arange(max_candidates, device=self.device).unsqueeze(0)  # (1, max_candidates)
         # 扩展starts以匹配最大候选数

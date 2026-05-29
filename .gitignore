@@ -191,6 +191,22 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.log
+*.lot
+*.out
+*.run.xml
+*.spl
+*.synctex.gz
+*.xdv
+
 # PyPI configuration file
 .pypirc
 

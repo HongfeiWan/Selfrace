@@ -44,6 +44,7 @@ class WorldInitializer:
         self.config = config
         # 获取simulator配置，支持嵌套配置结构
         simulator_config = config.get('simulator', config)
+        self.verbose = simulator_config.get('verbose', False)
         self.max_agents = simulator_config.get('max_agents_num')
         self.num_agents_per_env = simulator_config.get('num_npc_vehicles')
         if self.num_agents_per_env > self.max_agents:
@@ -153,10 +154,11 @@ class WorldInitializer:
                 # 修复形状不匹配：将spawn_quad_indices重塑为2D，然后更新
                 spawn_quad_indices_2d = spawn_quad_indices.view(num_envs, self.num_agents_per_env)
                 agents_start_quad_ids[:, :self.num_agents_per_env][valid_placement_mask] = spawn_quad_indices_2d[valid_placement_mask]
-            if retry == 0:  # 只在第一次迭代时打印性能信息
+            if self.verbose and retry == 0:  # 只在第一次迭代时打印性能信息
                 print(f"Retry {retry}: gen_time={gen_time:.4f}s, check_time={check_time:.4f}s, offroad_time={offroad_time:.4f}s, collision_time={collision_time:.4f}s")
         end_time = time.time()
-        print(f"World initialization time: {end_time - start_time} seconds")
+        if self.verbose:
+            print(f"World initialization time: {end_time - start_time} seconds")
         ego_agents_idx = torch.zeros(num_envs, dtype=torch.int64, device=self.device)
         logging.info("World initialization complete.")
         return agents_state, ego_agents_idx, agents_start_quad_ids
@@ -462,6 +464,5 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Error during visualization: {e}")
         print("Vehicle visualization failed.")
-
 
 

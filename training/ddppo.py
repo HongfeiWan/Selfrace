@@ -5,6 +5,7 @@ import socket
 import math
 from datetime import timedelta
 from types import SimpleNamespace
+from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -55,8 +56,11 @@ def save_checkpoint(model, policy_optimizer, value_optimizer, step: int, checkpo
 		save_model = model.module if hasattr(model, 'module') else model
 		state = {
 			'step': step,
+			'model_state_dict': save_model.state_dict(),
 			'policy_state_dict': save_model.policy_network.state_dict(),
 			'value_state_dict': save_model.value_network.state_dict(),
+			'policy_feature_encoder_state_dict': save_model.policy_feature_encoder.state_dict(),
+			'value_feature_encoder_state_dict': save_model.value_feature_encoder.state_dict(),
 			'policy_optim_state_dict': policy_optimizer.state_dict(),
 			'value_optim_state_dict': value_optimizer.state_dict(),
 		}
@@ -145,15 +149,37 @@ def normalize_to_minus1_1(x: torch.Tensor, min_val, max_val) -> torch.Tensor:
     y = y * 2 - 1
     # 裁剪到 [-1, 1]
     y = torch.clamp(y, -1.0, 1.0)
-    # 退化处理：max==min
+    # 退化处理：max==min。这里避免 Python if 读取 GPU 标量造成同步。
     deg_mask = (denom == 0)
-    if torch.any(deg_mask):
-        y_degen = torch.where(
-            x > max_t, torch.ones_like(x),
-            torch.where(x < min_t, -torch.ones_like(x), torch.zeros_like(x))
-        )
-        y = torch.where(deg_mask, y_degen, y)
-    return y
+    y_degen = torch.where(
+        x > max_t, torch.ones_like(x),
+        torch.where(x < min_t, -torch.ones_like(x), torch.zeros_like(x))
+    )
+    return torch.where(deg_mask, y_degen, y)
+
+FEATURE_PAD_VALUE = -2.0
+
+def pad_or_truncate_flat(flat: torch.Tensor, target_size: int, pad_value: float = 0.0) -> torch.Tensor:
+    B, M, D = flat.shape
+    out = torch.full((B, M, target_size), pad_value, device=flat.device, dtype=flat.dtype)
+    copy_size = min(D, target_size)
+    if copy_size > 0:
+        out[:, :, :copy_size] = flat[:, :, :copy_size]
+    return out
+
+def normalize_point_set(points: torch.Tensor, target_size: int, element_dim: int = 2,
+                        min_val: float = -100.0, max_val: float = 100.0) -> torch.Tensor:
+    if points is None or points.numel() == 0:
+        return None
+    if points.dim() == 3:
+        B, M, N = points.shape
+        elements = points.view(B, M, N // element_dim, element_dim)
+    else:
+        elements = points
+    valid = torch.isfinite(elements).all(dim=-1) & (elements.abs().sum(dim=-1) > 1e-6)
+    normalized = normalize_to_minus1_1(torch.nan_to_num(elements, nan=0.0, posinf=max_val, neginf=min_val), min_val, max_val)
+    normalized = torch.where(valid.unsqueeze(-1), normalized, torch.full_like(normalized, FEATURE_PAD_VALUE))
+    return pad_or_truncate_flat(normalized.flatten(start_dim=2), target_size, FEATURE_PAD_VALUE)
 
 def build_network_features(agents_state: torch.Tensor, 
                           neighbors_local: torch.Tensor, 
@@ -162,7 +188,8 @@ def build_network_features(agents_state: torch.Tensor,
                           path_plan: torch.Tensor,
                           stop_lines: torch.Tensor,
                           reward_coef: torch.Tensor,
-                          config: SimpleNamespace) -> torch.Tensor:
+                          config: SimpleNamespace,
+                          vehicle_style: torch.Tensor = None) -> torch.Tensor:
     """
     将拆解后的观测组件构建为网络输入的特征张量
     Args:
@@ -188,32 +215,33 @@ def build_network_features(agents_state: torch.Tensor,
     total_input_dim = sum(simple_feature_dims) + sum(permutation_feature_dims)
     
     # 初始化输出张量
-    features_tensor = torch.zeros(batch_size, max_agents, total_input_dim, device=agents_state.device)
+    features_tensor = torch.zeros(batch_size, max_agents, total_input_dim, device=agents_state.device, dtype=agents_state.dtype)
     
     # 1. 构建简单特征 (S(t), G(t), reward系数, 车辆风格参数)
     simple_end = sum(simple_feature_dims)
     
-    # S(t): 7维 - 使用agents_state，但将 yaw 替换为 cos(yaw) 保持数值稳定
+    # S(t): 7维。局部观测中 x/y/yaw 通常为 0，这里显式写成稳定特征。
     s_t_size = simple_feature_dims[0]  # 7
-    agents_state_stable = agents_state.clone()
-    try:
-        agents_state_stable[:, :, 2] = torch.cos(agents_state_stable[:, :, 2])
-        agents_state_stable[:, :, 1] = torch.sin(agents_state_stable[:, :, 2]) # 占用一个位置写入sin(yaw)进入网络
-        # TODO:后续这里的最大最小最好改为从config中获取
-        agents_state_stable[:, :, 3] = normalize_to_minus1_1(agents_state_stable[:, :, 3], -2, 20)
-        agents_state_stable[:, :, 4] = normalize_to_minus1_1(agents_state_stable[:, :, 4], 0.8, 3)
-        agents_state_stable[:, :, 5] = normalize_to_minus1_1(agents_state_stable[:, :, 5], 0.8, 7)
-    except Exception:
-        # 若维度不符则回退为原值
-        print('error')
-        pass 
+    agents_state_stable = torch.empty_like(agents_state)
+    yaw = agents_state[:, :, 2]
+    agents_state_stable[:, :, 0] = normalize_to_minus1_1(agents_state[:, :, 0], -100, 100)
+    agents_state_stable[:, :, 1] = torch.sin(yaw)
+    agents_state_stable[:, :, 2] = torch.cos(yaw)
+    agents_state_stable[:, :, 3] = normalize_to_minus1_1(agents_state[:, :, 3], -2, 20)
+    agents_state_stable[:, :, 4] = normalize_to_minus1_1(agents_state[:, :, 4], 0.8, 7)
+    agents_state_stable[:, :, 5] = normalize_to_minus1_1(agents_state[:, :, 5], 0.8, 3)
+    agents_state_stable[:, :, 6] = agents_state[:, :, 6]
     features_tensor[:, :, :s_t_size] = agents_state_stable
     
     # G(t): 256维 - 使用路径规划信息
     g_t_size = simple_feature_dims[1]  # 256
     g_t_start = s_t_size
     g_t_end = g_t_start + g_t_size
-    path_plan_stable = path_plan.clone().flatten(start_dim=2) #复制，展平
+    if path_plan is None:
+        path_plan_stable = torch.zeros(batch_size, max_agents, g_t_size, device=agents_state.device, dtype=agents_state.dtype)
+    else:
+        path_plan_stable = path_plan.to(device=agents_state.device, dtype=agents_state.dtype).flatten(start_dim=2)
+        path_plan_stable = pad_or_truncate_flat(path_plan_stable, g_t_size, pad_value=0.0)
     path_plan_stable = normalize_to_minus1_1(path_plan_stable, -100, 100) #归一化
     features_tensor[:, :, g_t_start:g_t_end] = path_plan_stable
 
@@ -222,27 +250,31 @@ def build_network_features(agents_state: torch.Tensor,
     reward_coef_start = g_t_start + g_t_size
     reward_coef_end = reward_coef_start + reward_coef_size
 
-    reward_coef_stable = reward_coef.clone()
-
-    reward_coef_stable[:, :, 0] = normalize_to_minus1_1(reward_coef_stable[:, :, 0], 2, 12)
-    reward_coef_stable[:, :, 1] = normalize_to_minus1_1(reward_coef_stable[:, :, 1], 0, 3)
-    reward_coef_stable[:, :, 2] = normalize_to_minus1_1(reward_coef_stable[:, :, 2], 0, 3)
-    reward_coef_stable[:, :, 3] = normalize_to_minus1_1(reward_coef_stable[:, :, 3], 0, 0.1)
-    reward_coef_stable[:, :, 4] = normalize_to_minus1_1(reward_coef_stable[:, :, 4], 0.00025, 0.025)
-    reward_coef_stable[:, :, 5] = normalize_to_minus1_1(reward_coef_stable[:, :, 5], 0, 1)
-    reward_coef_stable[:, :, 6] = normalize_to_minus1_1(reward_coef_stable[:, :, 6], 0.00025, 0.0075)
-    reward_coef_stable[:, :, 7] = normalize_to_minus1_1(reward_coef_stable[:, :, 7], -0.5, 0.5)
-    reward_coef_stable[:, :, 8] = normalize_to_minus1_1(reward_coef_stable[:, :, 8], 0.00025, 0.0075)
-    reward_coef_stable[:, :, 9] = normalize_to_minus1_1(reward_coef_stable[:, :, 9], 0, 1)
+    reward_coef = reward_coef.to(device=agents_state.device, dtype=agents_state.dtype)
+    reward_coef_stable = torch.zeros(batch_size, max_agents, reward_coef_size, device=agents_state.device, dtype=agents_state.dtype)
+    reward_bounds = (
+        (2, 12), (0, 3), (0, 3), (0, 0.1), (0.00025, 0.025),
+        (0, 1), (0.00025, 0.0075), (-0.5, 0.5), (0.00025, 0.0075), (0, 1),
+    )
+    copy_reward = min(reward_coef.shape[-1], reward_coef_size, len(reward_bounds))
+    for i in range(copy_reward):
+        reward_coef_stable[:, :, i] = normalize_to_minus1_1(reward_coef[:, :, i], *reward_bounds[i])
     features_tensor[:, :, reward_coef_start:reward_coef_end] = reward_coef_stable
 
     # 车辆风格参数: 4维 - 从agents_state中提取
     vehicle_style_size = simple_feature_dims[3]  # 4
     vehicle_style_start = reward_coef_start + reward_coef_size
     vehicle_style_end = vehicle_style_start + vehicle_style_size
-    # TODO:车辆风格暂置为四个0，后续改为传入的风格参数且要做归一化
-    vehicle_style = torch.zeros(batch_size, max_agents, vehicle_style_size, device=agents_state.device, dtype=agents_state.dtype)
-    features_tensor[:, :, vehicle_style_start:vehicle_style_end] = vehicle_style
+    if vehicle_style is None:
+        vehicle_style = torch.ones(batch_size, max_agents, vehicle_style_size, device=agents_state.device, dtype=agents_state.dtype)
+    else:
+        vehicle_style = vehicle_style.to(device=agents_state.device, dtype=agents_state.dtype)
+    vehicle_style_stable = torch.zeros(batch_size, max_agents, vehicle_style_size, device=agents_state.device, dtype=agents_state.dtype)
+    style_bounds = ((1 / 1.25, 1.25), (1 / 1.25, 1.25), (1 / 1.5, 1.5), (1 / 1.5, 1.5))
+    copy_style = min(vehicle_style.shape[-1], vehicle_style_size, len(style_bounds))
+    for i in range(copy_style):
+        vehicle_style_stable[:, :, i] = normalize_to_minus1_1(vehicle_style[:, :, i], *style_bounds[i])
+    features_tensor[:, :, vehicle_style_start:vehicle_style_end] = vehicle_style_stable
     
     # 2. 构建排列不变特征 (road_boundary, lane_points, stop_lines, other_agents)
     permutation_start = simple_end
@@ -252,66 +284,54 @@ def build_network_features(agents_state: torch.Tensor,
     road_boundary_start = permutation_start
     road_boundary_end = road_boundary_start + road_boundary_size
     
-    # 将边界线展平并填充
-    w_boundaries_flat = w_boundaries_local.flatten(start_dim=2)  # (B, M, N_boundaries*2)
-    w_boundaries_flat = normalize_to_minus1_1(w_boundaries_flat, -100, 100) #归一化
-    if w_boundaries_flat.shape[2] <= road_boundary_size:
-        features_tensor[:, :, road_boundary_start:road_boundary_start + w_boundaries_flat.shape[2]] = w_boundaries_flat
+    w_boundaries_flat = normalize_point_set(w_boundaries_local, road_boundary_size)
+    if w_boundaries_flat is not None:
+        features_tensor[:, :, road_boundary_start:road_boundary_end] = w_boundaries_flat
     else:
-        features_tensor[:, :, road_boundary_start:road_boundary_end] = w_boundaries_flat[:, :, :road_boundary_size]
+        features_tensor[:, :, road_boundary_start:road_boundary_end] = FEATURE_PAD_VALUE
     
     # lane_points: 50维 - 使用车道线信息
     lane_points_size = permutation_feature_dims[1]  # 50
     lane_points_start = road_boundary_end
     lane_points_end = lane_points_start + lane_points_size
     
-    # 将车道线展平并填充
-    w_lanes_flat = w_lanes_local.flatten(start_dim=2)  # (B, M, N_lanes*2)
-    w_lanes_flat = normalize_to_minus1_1(w_lanes_flat, -100, 100) #归一化
-    if w_lanes_flat.shape[2] <= lane_points_size:
-        features_tensor[:, :, lane_points_start:lane_points_start + w_lanes_flat.shape[2]] = w_lanes_flat
+    w_lanes_flat = normalize_point_set(w_lanes_local, lane_points_size)
+    if w_lanes_flat is not None:
+        features_tensor[:, :, lane_points_start:lane_points_end] = w_lanes_flat
     else:
-        features_tensor[:, :, lane_points_start:lane_points_end] = w_lanes_flat[:, :, :lane_points_size]
+        features_tensor[:, :, lane_points_start:lane_points_end] = FEATURE_PAD_VALUE
     
     # stop_lines: 20维 - 使用停止线信息
     stop_lines_size = permutation_feature_dims[2]  # 20
     stop_lines_start = lane_points_end
     stop_lines_end = stop_lines_start + stop_lines_size
     
-    # 将停止线展平并填充
     if stop_lines is not None and stop_lines.numel() > 0:
-        stop_lines_flat = stop_lines.flatten(start_dim=2)  # (B, M, num_stop_lines*2)
-        stop_lines_flat = normalize_to_minus1_1(stop_lines_flat, -100, 100) #归一化
-        if stop_lines_flat.shape[2] <= stop_lines_size:
-            features_tensor[:, :, stop_lines_start:stop_lines_start + stop_lines_flat.shape[2]] = stop_lines_flat
+        stop_lines_flat = normalize_point_set(stop_lines.to(device=agents_state.device, dtype=agents_state.dtype), stop_lines_size)
+        if stop_lines_flat is not None:
+            features_tensor[:, :, stop_lines_start:stop_lines_end] = stop_lines_flat
         else:
-            features_tensor[:, :, stop_lines_start:stop_lines_end] = stop_lines_flat[:, :, :stop_lines_size]
+            features_tensor[:, :, stop_lines_start:stop_lines_end] = FEATURE_PAD_VALUE
     else:
-        # 如果没有停止线信息，使用零填充
-        features_tensor[:, :, stop_lines_start:stop_lines_end] = 0.0
+        features_tensor[:, :, stop_lines_start:stop_lines_end] = FEATURE_PAD_VALUE
     
     # other_agents: 140维 - 使用邻居信息
     other_agents_size = permutation_feature_dims[3]  # 140
     other_agents_start = stop_lines_end
     other_agents_end = other_agents_start + other_agents_size
     
-    # 将邻居信息按通道做归一化后再展平并填充
-    neighbors_proc = neighbors_local.clone()
-    try:
-        neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_proc[:, :, :, 0], -100, 100)
-        neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_proc[:, :, :, 1], -100, 100)
-        neighbors_proc[:, :, :, 2] = normalize_to_minus1_1(neighbors_proc[:, :, :, 2], -40, 40)
-        neighbors_proc[:, :, :, 3] = normalize_to_minus1_1(neighbors_proc[:, :, :, 3], -40, 40)
-        neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_proc[:, :, :, 4], 0.8, 3)
-        neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_proc[:, :, :, 5], 0.8, 7)
-        # 通道 6 为 active 标志，保持原样
-    except Exception:
-        pass
+    # 将邻居信息按通道做归一化后再展平并填充，active=0 的 padding 不参与网络 maxpool。
+    neighbors_local = neighbors_local.to(device=agents_state.device, dtype=agents_state.dtype)
+    neighbors_proc = torch.empty_like(neighbors_local)
+    neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_local[:, :, :, 0], -100, 100)
+    neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_local[:, :, :, 1], -100, 100)
+    neighbors_proc[:, :, :, 2] = normalize_to_minus1_1(neighbors_local[:, :, :, 2], -40, 40)
+    neighbors_proc[:, :, :, 3] = normalize_to_minus1_1(neighbors_local[:, :, :, 3], -40, 40)
+    neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_local[:, :, :, 4], 0.8, 7)
+    neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_local[:, :, :, 5], 0.8, 3)
+    neighbors_proc[:, :, :, 6] = neighbors_local[:, :, :, 6]
     neighbors_flat = neighbors_proc.flatten(start_dim=2)  # (B, M, K*7)
-    if neighbors_flat.shape[2] <= other_agents_size:
-        features_tensor[:, :, other_agents_start:other_agents_start + neighbors_flat.shape[2]] = neighbors_flat
-    else:
-        features_tensor[:, :, other_agents_start:other_agents_end] = neighbors_flat[:, :, :other_agents_size]
+    features_tensor[:, :, other_agents_start:other_agents_end] = pad_or_truncate_flat(neighbors_flat, other_agents_size, pad_value=0.0)
     
     return features_tensor
 
@@ -387,6 +407,185 @@ def check_gpu_info(print_info: bool = True, **kwargs):
 		log("💡 请确保已正确安装CUDA和对应版本的PyTorch")
 		return False, []
 
+def unwrap_model(model):
+	return model.module if hasattr(model, 'module') else model
+
+def get_policy_parameters(model):
+	base = unwrap_model(model)
+	if hasattr(base, 'policy_parameters'):
+		return list(base.policy_parameters())
+	return list(base.policy_network.parameters())
+
+def get_value_parameters(model):
+	base = unwrap_model(model)
+	if hasattr(base, 'value_parameters'):
+		return list(base.value_parameters())
+	return list(base.value_network.parameters())
+
+def forward_model(model, features_tensor, mode="both"):
+	return model(features_tensor, mode=mode)
+
+def make_autocast_context(device: torch.device, precision: str):
+	use_amp = device.type == 'cuda' and str(precision).lower() in {"16-bit", "fp16", "float16", "amp"}
+	if not use_amp:
+		return nullcontext()
+	if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+		return torch.amp.autocast(device_type='cuda', enabled=True)
+	return torch.cuda.amp.autocast(enabled=True)
+
+def make_grad_scaler(device: torch.device, precision: str):
+	use_amp = device.type == 'cuda' and str(precision).lower() in {"16-bit", "fp16", "float16", "amp"}
+	if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+		try:
+			return torch.amp.GradScaler('cuda', enabled=use_amp)
+		except TypeError:
+			return torch.amp.GradScaler(enabled=use_amp)
+	return torch.cuda.amp.GradScaler(enabled=use_amp)
+
+def cuda_memory_stats(device: torch.device) -> dict:
+	if device.type != 'cuda' or not torch.cuda.is_available():
+		return {
+			'max_memory_allocated_mb': 0.0,
+			'max_memory_reserved_mb': 0.0,
+		}
+	return {
+		'max_memory_allocated_mb': torch.cuda.max_memory_allocated(device) / (1024 ** 2),
+		'max_memory_reserved_mb': torch.cuda.max_memory_reserved(device) / (1024 ** 2),
+	}
+
+def make_update_stats(reason: str = "", device: torch.device = None) -> dict:
+	stats = {
+		'did_optimizer_step': False,
+		'skip_reason': reason,
+		'num_candidates': 0,
+		'num_selected': 0,
+		'num_epochs': 0,
+		'policy_loss': None,
+		'value_loss': None,
+		'entropy': None,
+		'ppo_update_time_s': 0.0,
+		'max_memory_allocated_mb': 0.0,
+		'max_memory_reserved_mb': 0.0,
+	}
+	if device is not None:
+		stats.update(cuda_memory_stats(device))
+	return stats
+
+def get_profile_cfg(config):
+	training_cfg = getattr(config, 'training', SimpleNamespace())
+	profile_cfg = getattr(training_cfg, 'profile', SimpleNamespace())
+	return profile_cfg
+
+def profile_enabled(config) -> bool:
+	return bool(getattr(get_profile_cfg(config), 'enabled', False))
+
+def profile_cuda_sync(config) -> bool:
+	return bool(getattr(get_profile_cfg(config), 'cuda_sync', False))
+
+def profile_log_interval(config) -> int:
+	return int(getattr(get_profile_cfg(config), 'log_interval', 10))
+
+def maybe_cuda_sync(device: torch.device, config):
+	if device.type == 'cuda' and profile_cuda_sync(config):
+		torch.cuda.synchronize(device)
+
+def profile_timer_start(device: torch.device, config) -> float:
+	maybe_cuda_sync(device, config)
+	return time.time()
+
+def profile_elapsed_ms(start_time: float, device: torch.device, config) -> float:
+	maybe_cuda_sync(device, config)
+	return (time.time() - start_time) * 1000.0
+
+def format_profile(profile_dict: dict) -> str:
+	if not profile_dict:
+		return ""
+	return ", ".join(f"{key}={value:.2f}ms" for key, value in profile_dict.items())
+
+def step_schedulers_if_updated(policy_scheduler, value_scheduler, update_stats_accum: dict):
+	if update_stats_accum.get('did_optimizer_step', False):
+		policy_scheduler.step()
+		value_scheduler.step()
+		return True
+	return False
+
+def current_path_plan(simulator):
+	return simulator.agents_path_plans_local if getattr(simulator, 'agents_path_plans_local', None) is not None else simulator.agents_path_plans
+
+def build_features_from_observation(observation, simulator, config):
+	agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
+	return build_network_features(
+		agents_state,
+		neighbors_local,
+		w_lanes_local,
+		w_boundaries_local,
+		current_path_plan(simulator),
+		getattr(simulator, 'stop_lines', None),
+		simulator.reward_calculator.sampled_params,
+		config,
+		vehicle_style=getattr(simulator, 'driving_style_params', None),
+	)
+
+def sync_bool_across_ranks(value: bool, device: torch.device, op=dist.ReduceOp.MIN) -> bool:
+	if not dist.is_available() or not dist.is_initialized():
+		return value
+	t = torch.tensor([1 if value else 0], dtype=torch.int32, device=device)
+	dist.all_reduce(t, op=op)
+	return bool(t.item())
+
+def validate_rollout_buffers(states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							 rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer):
+	T = len(states_buffer)
+	buffer_lengths = [
+		len(path_plan_buffer), len(reward_coef_buffer), len(vehicle_style_buffer), len(stop_lines_buffer),
+		len(rewards_buffer), len(dones_buffer), len(values_buffer), len(old_log_probs_buffer), len(actions_buffer)
+	]
+	if any(length != T for length in buffer_lengths):
+		raise ValueError(f"Rollout buffer length mismatch: states={T}, others={buffer_lengths}")
+	if T == 0:
+		return
+	base_shape = states_buffer[0].shape
+	base_device = states_buffer[0].device
+	if len(base_shape) != 3 or base_shape[-1] < 7:
+		raise ValueError(f"states_buffer expected (T,B,M,S>=7), got {base_shape}")
+	B, M, _ = base_shape
+	for name, buf in (
+		('states', states_buffer),
+		('path_plan', path_plan_buffer),
+		('reward_coef', reward_coef_buffer),
+		('vehicle_style', vehicle_style_buffer),
+		('stop_lines', stop_lines_buffer),
+	):
+		for i, tensor in enumerate(buf):
+			if tensor.device != base_device:
+				raise ValueError(f"{name}[{i}] device mismatch: {tensor.device} != {base_device}")
+			if tensor.shape[0] != B or tensor.shape[1] != M:
+				raise ValueError(f"{name}[{i}] leading shape mismatch: {tensor.shape[:2]} != {(B, M)}")
+	for name, buf in (
+		('rewards', rewards_buffer),
+		('dones', dones_buffer),
+		('values', values_buffer),
+		('old_log_probs', old_log_probs_buffer),
+		('actions', actions_buffer),
+	):
+		for i, tensor in enumerate(buf):
+			if tensor.device != base_device:
+				raise ValueError(f"{name}[{i}] device mismatch: {tensor.device} != {base_device}")
+			if tensor.shape[:2] != (B, M):
+				raise ValueError(f"{name}[{i}] shape mismatch: {tensor.shape[:2]} != {(B, M)}")
+
+def merge_update_stats(accum: dict, update_stats: dict):
+	if update_stats is None:
+		return accum
+	accum['did_optimizer_step'] = accum.get('did_optimizer_step', False) or update_stats.get('did_optimizer_step', False)
+	accum['num_candidates'] = accum.get('num_candidates', 0) + int(update_stats.get('num_candidates', 0) or 0)
+	accum['num_selected'] = accum.get('num_selected', 0) + int(update_stats.get('num_selected', 0) or 0)
+	accum['ppo_update_time_s'] = accum.get('ppo_update_time_s', 0.0) + float(update_stats.get('ppo_update_time_s', 0.0) or 0.0)
+	for key in ('max_memory_allocated_mb', 'max_memory_reserved_mb'):
+		accum[key] = max(float(accum.get(key, 0.0) or 0.0), float(update_stats.get(key, 0.0) or 0.0))
+	accum['last_update'] = update_stats
+	return accum
+
 # ============================== 检查是否所有世界无存活agent ==============================
 def all_worlds_no_alive_agents(simulator, cumulative_done_all=None) -> bool:
 	"""
@@ -395,379 +594,241 @@ def all_worlds_no_alive_agents(simulator, cumulative_done_all=None) -> bool:
 	"""
 	try:
 		states = simulator.agents_state  # (B, M, S)
-		B, M, S = states.shape
-		
-		# 如果没有done状态记录，检查是否有active的agents
+		active_mask = states[..., 6] > 0.5
 		if cumulative_done_all is None:
-			# 初始化时，只要有active的agents就认为有存活的
-			for b in range(B):
-				world_agents = states[b]  # (M, S)
-				active_mask = world_agents[:, 6] > 0.5  # active状态
-				if active_mask.any():
-					return False  # 有active的agents，认为有存活的
-			return True  # 没有active的agents
-		
-		# 检查每个世界是否有存活的agents
-		for b in range(B):
-			world_agents = states[b]  # (M, S)
-			active_mask = world_agents[:, 6] > 0.5  # active状态
-			# 如果有active的agents，检查是否有存活的
-			if active_mask.any():
-				world_done = cumulative_done_all[b].to(active_mask.device)  # 使用累积done状态
-				alive_mask = active_mask & (~world_done)
-				if alive_mask.any():
-					return False  # 这个世界还有存活的agents
-		return True  # 所有世界都没有存活的agents
+			alive_mask = active_mask
+		else:
+			alive_mask = active_mask & (~cumulative_done_all.to(active_mask.device))
+		return not bool(alive_mask.any().item())
 	except Exception:
 		return True
 
-# ============================== 单卡PPO更新函数 ==============================
-def perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer, 
-								 states_buffer, rewards_buffer, dones_buffer, 
-								 values_buffer, old_log_probs_buffer, actions_buffer,
-								 features_tensor, simulator, config, iteration):
-	"""执行PPO更新，模仿game.py的逻辑"""
+# ============================== PPO更新函数 ==============================
+def perform_ppo_update(model, policy_optimizer, value_optimizer,
+					   states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+					   rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+					   features_tensor, simulator, config, iteration, rank=None, a_max_ewma=None, amp_scaler=None):
+	"""执行 PPO 更新。buffer 中保存真实世界状态和对应时刻的条件特征。"""
+	is_rank0 = (rank is None or rank == 0)
+	update_start_time = time.time()
 	if len(states_buffer) == 0:
-		print("⚠️ Buffer为空，无法进行PPO更新")
-		return
-	print(f"🎯 开始经验采样训练，Buffer长度: {len(states_buffer)}")
-	
-	# 将buffer转换为tensor
-	T = len(states_buffer)
-	B, M, S = states_buffer[0].shape
-	
-	# 构建tensor buffer
-	states_tensor = torch.stack(states_buffer, dim=0)  # (T, B, M, S)
-	rewards_tensor = torch.stack(rewards_buffer, dim=0)  # (T, B, M)
-	dones_tensor = torch.stack(dones_buffer, dim=0)  # (T, B, M)
-	values_tensor = torch.stack(values_buffer, dim=0)  # (T, B, M)
-	old_log_probs_tensor = torch.stack(old_log_probs_buffer, dim=0)  # (T, B, M)
-	actions_tensor = torch.stack(actions_buffer, dim=0)  # (T, B, M)
-	
-	# 计算最后一个状态的价值（bootstrap）
-	with torch.no_grad():
-		last_value_pred = model.forward(features_tensor, mode="value")
-	
-	# 构建values_tp1用于GAE计算
-	if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
-		last_value_pred = last_value_pred.squeeze(-1)  # (B, M)
-	values_tp1 = torch.cat([values_tensor, last_value_pred.unsqueeze(0)], dim=0)
-	
-	# 计算GAE优势（使用段内前缀 OR 的累计 done 掩码，符合PPO定义）
-	dones_accum = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
-	advantages, returns = gae_advantages(rewards_tensor, values_tp1, dones_accum, 0.999, 0.95)
-	
-	# 优势过滤
-	A_max = torch.max(torch.abs(advantages)).item()
-	eta = 0.01 * A_max
-	keep_mask = (torch.abs(advantages) >= eta)
-	
-	# 额外剔除：每个(B,M)智能体在第一次 done 之后的所有时间步
-	seen_done_inclusive = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
-	seen_done_prev = torch.roll(seen_done_inclusive, shifts=1, dims=0)
-	seen_done_prev[0] = False
-	first_done_step = dones_tensor & (~seen_done_prev)
-	post_done_mask = seen_done_inclusive & (~first_done_step)
-	keep_mask = keep_mask & (~post_done_mask)
-	cand_idx = keep_mask.nonzero(as_tuple=False)
-	
-	print(f"🎯 第 {iteration} 个iteration - 最大|A|: {A_max:.4f}, 阈值: {eta:.4f}")
-	print(f"📊 过滤前: {keep_mask.numel()}, 过滤后: {keep_mask.sum().item()}")
-	if cand_idx.numel() == 0:
-		print("⚠️ 无可用样本，跳过更新")
-		return
-	
-	# 随机选择样本进行更新
-	N = cand_idx.shape[0]
-	K = min(2000, N)  # batch_size_per_gpu
-	if N >= K:
-		rand_pos = torch.randperm(N, device=states_tensor.device)[:K]
-		selected_idx = cand_idx[rand_pos]
-	else:
-		rand_pos = torch.randint(0, N, (K,), device=states_tensor.device)
-		selected_idx = cand_idx[rand_pos]
-	
-	selected_t = selected_idx[:, 0]
-	selected_b = selected_idx[:, 1]
-	selected_m = selected_idx[:, 2]
-	print(f"🎯 随机选取 {K} 个样本用于更新（候选 {N}）")
-	
-	# 提取选中的样本
-	agent_indices_batch = selected_m.to(states_tensor.device)
-	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
-	advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
-	returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
-	actions_batch = actions_tensor[selected_t, selected_b, selected_m].view(-1)
-	advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
-	
-	batch_N = old_log_probs_batch.shape[0]
-	print(f"🎯 开始PPO更新，样本数量: {batch_N}")
-	
-	# 训练模式
-	model.train()
-	# PPO更新循环
-	for epoch in range(3):  # ppo_epochs
-		# 重新生成观测和特征
-		mb_idx = torch.arange(batch_N, device=states_tensor.device)
-		mb_old_logp = old_log_probs_batch[mb_idx]
-		mb_adv = advantages_batch[mb_idx]
-		mb_ret = returns_batch[mb_idx]
-		mb_agent_idx = agent_indices_batch[mb_idx]
-		mb_actions = actions_batch[mb_idx]
-		
-		# 基于选中的样本重建特征
-		mb_t = selected_t[mb_idx]
-		mb_b = selected_b[mb_idx]
-		mb_m = selected_m[mb_idx]
-		
-		# 获取唯一的状态组合
-		uniq_tbm, inverse_mb = torch.unique(torch.stack([mb_t, mb_b, mb_m], dim=1), dim=0, return_inverse=True)
-		t_u_mb = uniq_tbm[:, 0]
-		b_u_mb = uniq_tbm[:, 1]
-		m_u_mb = uniq_tbm[:, 2]
-		
-		# 为每个唯一的(t,b,m)组合生成观测
-		agents_states_mb = states_tensor[t_u_mb, b_u_mb]  # (unique_samples, M, S)
-		
-		# 生成观测
-		obs_mb = simulator.observation_generator.generate(agents_states_mb)
-		agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
-		
-		# 构建特征
-		path_plan_mb = simulator.agents_path_plans[b_u_mb]
-		stop_lines_mb = simulator.stop_lines[b_u_mb] if (simulator.stop_lines is not None and simulator.stop_lines.numel() > 0) else simulator.stop_lines
-		reward_coef_mb = simulator.reward_calculator.sampled_params[b_u_mb]
-		
-		features_u_mb = build_network_features(
-			agents_state_dec_mb,
-			neighbors_local_mb,
-			w_lanes_local_mb,
-			w_boundaries_local_mb,
-			path_plan_mb,
-			stop_lines_mb,
-			reward_coef_mb,
-			config
-		)
-		u_idx_mb = inverse_mb.to(states_tensor.device)
-		mb_features = features_u_mb[u_idx_mb]
-		
-		# 策略更新
-		action_logits = model.forward(mb_features, mode="policy")
-		row_idx = torch.arange(mb_actions.shape[0], device=states_tensor.device)
-		logits_selected = action_logits[row_idx, mb_agent_idx]
-		dist_selected = torch.distributions.Categorical(logits=logits_selected)
-		new_log_probs = dist_selected.log_prob(mb_actions)
-		
-		# 计算比率和损失
-		ratio = torch.exp(new_log_probs - mb_old_logp)
-		surr1 = ratio * mb_adv
-		surr2 = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * mb_adv
-		policy_loss = -torch.min(surr1, surr2).mean()
-		
-		# 熵损失
-		entropy = dist_selected.entropy().mean()
-		policy_total_loss = policy_loss - 0.01 * entropy
-		
-		# 策略网络更新
-		policy_optimizer.zero_grad()
-		policy_total_loss.backward()
-		torch.nn.utils.clip_grad_norm_(model.policy_network.parameters(), 1.0)
-		policy_optimizer.step()
-		
-		# 价值网络更新
-		value_pred_full = model.forward(mb_features, mode="value").squeeze(-1)
-		value_pred = value_pred_full[row_idx, mb_agent_idx]
-		value_loss = (value_pred - mb_ret).pow(2).mean()
-		value_loss = 0.5 * value_loss
-		
-		value_optimizer.zero_grad()
-		value_loss.backward()
-		torch.nn.utils.clip_grad_norm_(model.value_network.parameters(), 1.0)
-		value_optimizer.step()
-		
-		print(f"   Epoch {epoch+1}/2: Policy Loss: {policy_loss.item():.6f}, Value Loss: {value_loss.item():.6f}, Entropy: {entropy.item():.6f}")
-	
-	# 切回评估模式
-	model.eval()
-	print(f"✅ 第 {iteration} 个iteration - 经验采样训练完成")
-
-# ============================== 多卡PPO更新函数 ==============================
-def perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer, 
-								states_buffer, rewards_buffer, dones_buffer, 
-								values_buffer, old_log_probs_buffer, actions_buffer,
-								features_tensor, simulator, config, iteration, rank):
-	"""执行多卡PPO更新，模仿game.py的逻辑"""
-	if len(states_buffer) == 0:
-		if rank == 0:
+		device = features_tensor.device if isinstance(features_tensor, torch.Tensor) else torch.device('cpu')
+		if is_rank0:
 			print("⚠️ Buffer为空，无法进行PPO更新")
-		return
-	if rank == 0:
+		return a_max_ewma, make_update_stats("empty_buffer", device)
+	if is_rank0:
 		print(f"🎯 开始经验采样训练，Buffer长度: {len(states_buffer)}")
-	
-	# 将buffer转换为tensor
-	T = len(states_buffer)
-	B, M, S = states_buffer[0].shape
-	
-	# 构建tensor buffer
-	states_tensor = torch.stack(states_buffer, dim=0)  # (T, B, M, S)
-	rewards_tensor = torch.stack(rewards_buffer, dim=0)  # (T, B, M)
-	dones_tensor = torch.stack(dones_buffer, dim=0)  # (T, B, M)
-	values_tensor = torch.stack(values_buffer, dim=0)  # (T, B, M)
-	old_log_probs_tensor = torch.stack(old_log_probs_buffer, dim=0)  # (T, B, M)
-	actions_tensor = torch.stack(actions_buffer, dim=0)  # (T, B, M)
-	
-	# 计算最后一个状态的价值（bootstrap）
-	with torch.no_grad():
-		last_value_pred = model.module.forward(features_tensor, mode="value")
-	
-	# 构建values_tp1用于GAE计算
+
+	training_cfg = getattr(config, 'training')
+	gamma = getattr(training_cfg, 'gamma', 0.999)
+	gae_lambda = getattr(training_cfg, 'gae_lambda', 0.95)
+	ppo_epochs = int(getattr(training_cfg, 'ppo_epochs', 3))
+	clip_ratio = float(getattr(training_cfg, 'clip_ratio', 0.2))
+	entropy_coef = float(getattr(training_cfg, 'entropy_coef', 0.01))
+	value_loss_coef = float(getattr(training_cfg, 'value_loss_coef', 0.5))
+	max_grad_norm = float(getattr(training_cfg, 'max_grad_norm', 1.0))
+	batch_size_per_gpu = int(getattr(training_cfg, 'batch_size_per_gpu', 2000))
+	advantage_filter_threshold = float(getattr(training_cfg, 'advantage_filter_threshold', 0.01))
+	beta = float(getattr(training_cfg, 'advantage_filter_beta', 0.25))
+	precision = getattr(training_cfg, 'precision', '32-bit')
+	device = states_buffer[0].device
+	validate_rollout_buffers(
+		states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+		rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+	)
+	if device.type == 'cuda':
+		torch.cuda.reset_peak_memory_stats(device)
+
+	states_tensor = torch.stack(states_buffer, dim=0)  # (T, B, M, 7)
+	path_plan_tensor = torch.stack(path_plan_buffer, dim=0) if path_plan_buffer else None
+	reward_coef_tensor = torch.stack(reward_coef_buffer, dim=0) if reward_coef_buffer else None
+	vehicle_style_tensor = torch.stack(vehicle_style_buffer, dim=0) if vehicle_style_buffer else None
+	stop_lines_tensor = torch.stack(stop_lines_buffer, dim=0) if stop_lines_buffer else None
+	rewards_tensor = torch.stack(rewards_buffer, dim=0)
+	dones_tensor = torch.stack(dones_buffer, dim=0).bool()
+	values_tensor = torch.stack(values_buffer, dim=0)
+	old_log_probs_tensor = torch.stack(old_log_probs_buffer, dim=0)
+	actions_tensor = torch.stack(actions_buffer, dim=0)
+
+	with torch.no_grad(), make_autocast_context(device, precision):
+		_, last_value_pred = forward_model(model, features_tensor, mode="both")
 	if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
-		last_value_pred = last_value_pred.squeeze(-1)  # (B, M)
+		last_value_pred = last_value_pred.squeeze(-1)
 	values_tp1 = torch.cat([values_tensor, last_value_pred.unsqueeze(0)], dim=0)
-	
-	# 计算GAE优势（使用段内前缀 OR 的累计 done 掩码，符合PPO定义）
+
 	dones_accum = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
-	advantages, returns = gae_advantages(rewards_tensor, values_tp1, dones_accum, 0.999, 0.95)
-	
-	# 优势过滤
-	A_max = torch.max(torch.abs(advantages)).item()
-	eta = 0.01 * A_max
+	advantages, returns = gae_advantages(rewards_tensor, values_tp1, dones_accum, gamma, gae_lambda)
+
+	A_max_tensor = torch.max(torch.abs(advantages)).detach()
+	a_max_ewma = A_max_tensor if a_max_ewma is None else (beta * a_max_ewma.to(device) + (1.0 - beta) * A_max_tensor)
+	eta = advantage_filter_threshold * a_max_ewma
 	keep_mask = (torch.abs(advantages) >= eta)
-	
-	# 额外剔除：每个(B,M)智能体在第一次 done 之后的所有时间步
+
 	seen_done_inclusive = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
 	seen_done_prev = torch.roll(seen_done_inclusive, shifts=1, dims=0)
 	seen_done_prev[0] = False
 	first_done_step = dones_tensor & (~seen_done_prev)
 	post_done_mask = seen_done_inclusive & (~first_done_step)
 	keep_mask = keep_mask & (~post_done_mask)
+	active_sample_mask = states_tensor[..., 6] > 0.5
+	keep_mask = keep_mask & active_sample_mask
 	cand_idx = keep_mask.nonzero(as_tuple=False)
-	
-	if rank == 0:
-		print(f"🎯 第 {iteration} 个iteration - 最大|A|: {A_max:.4f}, 阈值: {eta:.4f}")
+
+	if is_rank0:
+		print(f"🎯 第 {iteration} 个iteration - 最大|A|: {A_max_tensor.item():.4f}, 阈值: {eta.item():.4f}")
 		print(f"📊 过滤前: {keep_mask.numel()}, 过滤后: {keep_mask.sum().item()}")
-	if cand_idx.numel() == 0:
-		if rank == 0:
-			print("⚠️ 无可用样本，跳过更新")
-		return
-	
-	# 随机选择样本进行更新
+
+	local_has_samples = cand_idx.numel() > 0
+	if not sync_bool_across_ranks(local_has_samples, device, op=dist.ReduceOp.MIN):
+		if is_rank0:
+			print("⚠️ 至少一个rank无可用样本，本轮跳过以避免DDP不同步")
+		stats = make_update_stats("no_samples_after_filter", device)
+		stats['num_candidates'] = int(cand_idx.shape[0])
+		stats['ppo_update_time_s'] = time.time() - update_start_time
+		return a_max_ewma.detach(), stats
+
 	N = cand_idx.shape[0]
-	K = min(2000, N)  # batch_size_per_gpu
+	K = batch_size_per_gpu if batch_size_per_gpu > 0 else N
 	if N >= K:
-		rand_pos = torch.randperm(N, device=states_tensor.device)[:K]
-		selected_idx = cand_idx[rand_pos]
+		rand_pos = torch.randperm(N, device=device)[:K]
 	else:
-		rand_pos = torch.randint(0, N, (K,), device=states_tensor.device)
-		selected_idx = cand_idx[rand_pos]
-	
+		rand_pos = torch.randint(0, N, (K,), device=device)
+	selected_idx = cand_idx[rand_pos]
 	selected_t = selected_idx[:, 0]
 	selected_b = selected_idx[:, 1]
 	selected_m = selected_idx[:, 2]
-	if rank == 0:
+	if is_rank0:
 		print(f"🎯 随机选取 {K} 个样本用于更新（候选 {N}）")
-	
-	# 提取选中的样本
-	agent_indices_batch = selected_m.to(states_tensor.device)
+
+	agent_indices_batch = selected_m.to(device)
 	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
 	advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
 	returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
 	actions_batch = actions_tensor[selected_t, selected_b, selected_m].view(-1)
-	advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
-	
+	advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std(unbiased=False) + 1e-8)
 	batch_N = old_log_probs_batch.shape[0]
-	if rank == 0:
-		print(f"🎯 开始PPO更新，样本数量: {batch_N}")
-	
-	# 训练模式
+
+	uniq_tb, inverse_mb = torch.unique(torch.stack([selected_t, selected_b], dim=1), dim=0, return_inverse=True)
+	t_u_mb = uniq_tb[:, 0]
+	b_u_mb = uniq_tb[:, 1]
+	agents_states_mb = states_tensor[t_u_mb, b_u_mb]
+	obs_mb = simulator.observation_generator.generate(agents_states_mb)
+	agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
+	path_plan_mb = path_plan_tensor[t_u_mb, b_u_mb] if path_plan_tensor is not None else None
+	stop_lines_mb = stop_lines_tensor[t_u_mb, b_u_mb] if stop_lines_tensor is not None else None
+	reward_coef_mb = reward_coef_tensor[t_u_mb, b_u_mb] if reward_coef_tensor is not None else simulator.reward_calculator.sampled_params[b_u_mb]
+	vehicle_style_mb = vehicle_style_tensor[t_u_mb, b_u_mb] if vehicle_style_tensor is not None else getattr(simulator, 'driving_style_params', None)
+	features_u_mb = build_network_features(
+		agents_state_dec_mb,
+		neighbors_local_mb,
+		w_lanes_local_mb,
+		w_boundaries_local_mb,
+		path_plan_mb,
+		stop_lines_mb,
+		reward_coef_mb,
+		config,
+		vehicle_style=vehicle_style_mb,
+	)
+	mb_features = features_u_mb[inverse_mb.to(device)]
+	row_idx = torch.arange(batch_N, device=device)
+
+	policy_params = get_policy_parameters(model)
+	value_params = get_value_parameters(model)
 	model.train()
-	# PPO更新循环
-	for epoch in range(3):  # ppo_epochs
-		# 重新生成观测和特征
-		mb_idx = torch.arange(batch_N, device=states_tensor.device)
+	did_optimizer_step = False
+	last_policy_loss = None
+	last_value_loss = None
+	last_entropy = None
+	for epoch in range(ppo_epochs):
+		mb_idx = torch.arange(batch_N, device=device)
 		mb_old_logp = old_log_probs_batch[mb_idx]
 		mb_adv = advantages_batch[mb_idx]
 		mb_ret = returns_batch[mb_idx]
 		mb_agent_idx = agent_indices_batch[mb_idx]
 		mb_actions = actions_batch[mb_idx]
-		
-		# 基于选中的样本重建特征
-		mb_t = selected_t[mb_idx]
-		mb_b = selected_b[mb_idx]
-		mb_m = selected_m[mb_idx]
-		
-		# 获取唯一的状态组合
-		uniq_tbm, inverse_mb = torch.unique(torch.stack([mb_t, mb_b, mb_m], dim=1), dim=0, return_inverse=True)
-		t_u_mb = uniq_tbm[:, 0]
-		b_u_mb = uniq_tbm[:, 1]
-		m_u_mb = uniq_tbm[:, 2]
-		
-		# 为每个唯一的(t,b,m)组合生成观测
-		agents_states_mb = states_tensor[t_u_mb, b_u_mb]  # (unique_samples, M, S)
-		
-		# 生成观测
-		obs_mb = simulator.observation_generator.generate(agents_states_mb)
-		agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
-		
-		# 构建特征
-		path_plan_mb = simulator.agents_path_plans[b_u_mb]
-		stop_lines_mb = simulator.stop_lines[b_u_mb] if (simulator.stop_lines is not None and simulator.stop_lines.numel() > 0) else simulator.stop_lines
-		reward_coef_mb = simulator.reward_calculator.sampled_params[b_u_mb]
-		
-		features_u_mb = build_network_features(
-			agents_state_dec_mb,
-			neighbors_local_mb,
-			w_lanes_local_mb,
-			w_boundaries_local_mb,
-			path_plan_mb,
-			stop_lines_mb,
-			reward_coef_mb,
-			config
-		)
-		u_idx_mb = inverse_mb.to(states_tensor.device)
-		mb_features = features_u_mb[u_idx_mb]
-		
-		# 策略更新（DDP自动同步）
-		action_logits = model.module.forward(mb_features, mode="policy")
-		row_idx = torch.arange(mb_actions.shape[0], device=states_tensor.device)
-		logits_selected = action_logits[row_idx, mb_agent_idx]
-		dist_selected = torch.distributions.Categorical(logits=logits_selected)
-		new_log_probs = dist_selected.log_prob(mb_actions)
-		
-		# 计算比率和损失
-		ratio = torch.exp(new_log_probs - mb_old_logp)
-		surr1 = ratio * mb_adv
-		surr2 = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * mb_adv
-		policy_loss = -torch.min(surr1, surr2).mean()
-		
-		# 熵损失
-		entropy = dist_selected.entropy().mean()
-		policy_total_loss = policy_loss - 0.01 * entropy
-		
-		# 策略网络更新
-		policy_optimizer.zero_grad()
-		policy_total_loss.backward()
-		torch.nn.utils.clip_grad_norm_(model.module.policy_network.parameters(), 1.0)
-		policy_optimizer.step()
-		
-		# 价值网络更新（DDP自动同步）
-		value_pred_full = model.module.forward(mb_features, mode="value").squeeze(-1)
-		value_pred = value_pred_full[row_idx, mb_agent_idx]
-		value_loss = (value_pred - mb_ret).pow(2).mean()
-		value_loss = 0.5 * value_loss
-		
-		value_optimizer.zero_grad()
-		value_loss.backward()
-		torch.nn.utils.clip_grad_norm_(model.module.value_network.parameters(), 1.0)
-		value_optimizer.step()
-		
-		if rank == 0:
-			print(f"   Epoch {epoch+1}/2: Policy Loss: {policy_loss.item():.6f}, Value Loss: {value_loss.item():.6f}, Entropy: {entropy.item():.6f}")
-	
-	# 切回评估模式
+
+		policy_optimizer.zero_grad(set_to_none=True)
+		value_optimizer.zero_grad(set_to_none=True)
+		with make_autocast_context(device, precision):
+			action_logits, value_pred_full = forward_model(model, mb_features, mode="both")
+			logits_selected = action_logits[row_idx, mb_agent_idx]
+			dist_selected = torch.distributions.Categorical(logits=logits_selected)
+			new_log_probs = dist_selected.log_prob(mb_actions)
+			ratio = torch.exp(new_log_probs - mb_old_logp)
+			surr1 = ratio * mb_adv
+			surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
+			policy_loss = -torch.min(surr1, surr2).mean()
+			entropy = dist_selected.entropy().mean()
+			value_pred = value_pred_full[row_idx, mb_agent_idx]
+			value_loss = (value_pred - mb_ret).pow(2).mean()
+			total_loss = policy_loss - entropy_coef * entropy + value_loss_coef * value_loss
+
+		if amp_scaler is not None and getattr(amp_scaler, 'is_enabled', lambda: False)():
+			old_scale = amp_scaler.get_scale()
+			amp_scaler.scale(total_loss).backward()
+			amp_scaler.unscale_(policy_optimizer)
+			amp_scaler.unscale_(value_optimizer)
+			torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
+			torch.nn.utils.clip_grad_norm_(value_params, max_grad_norm)
+			amp_scaler.step(policy_optimizer)
+			amp_scaler.step(value_optimizer)
+			amp_scaler.update()
+			did_optimizer_step = did_optimizer_step or (amp_scaler.get_scale() >= old_scale)
+		else:
+			total_loss.backward()
+			torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
+			torch.nn.utils.clip_grad_norm_(value_params, max_grad_norm)
+			policy_optimizer.step()
+			value_optimizer.step()
+			did_optimizer_step = True
+
+		last_policy_loss = float(policy_loss.detach().item())
+		last_value_loss = float(value_loss.detach().item())
+		last_entropy = float(entropy.detach().item())
+
+		if is_rank0:
+			print(f"   Epoch {epoch+1}/{ppo_epochs}: Policy Loss: {last_policy_loss:.6f}, Value Loss: {last_value_loss:.6f}, Entropy: {last_entropy:.6f}")
+
 	model.eval()
-	if rank == 0:
+	if is_rank0:
 		print(f"✅ 第 {iteration} 个iteration - 经验采样训练完成")
+	stats = make_update_stats("", device)
+	stats.update({
+		'did_optimizer_step': did_optimizer_step,
+		'num_candidates': int(N),
+		'num_selected': int(K),
+		'num_epochs': int(ppo_epochs),
+		'policy_loss': last_policy_loss,
+		'value_loss': last_value_loss,
+		'entropy': last_entropy,
+		'ppo_update_time_s': time.time() - update_start_time,
+	})
+	stats.update(cuda_memory_stats(device))
+	return a_max_ewma.detach(), stats
+
+def perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer,
+								 states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								 rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+								 features_tensor, simulator, config, iteration, a_max_ewma=None, amp_scaler=None):
+	return perform_ppo_update(
+		model, policy_optimizer, value_optimizer,
+		states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+		rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+		features_tensor, simulator, config, iteration,
+		rank=None, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
+	)
+
+def perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer,
+								states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+								features_tensor, simulator, config, iteration, rank, a_max_ewma=None, amp_scaler=None):
+	return perform_ppo_update(
+		model, policy_optimizer, value_optimizer,
+		states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+		rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+		features_tensor, simulator, config, iteration,
+		rank=rank, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
+	)
 		
 # ============================== 寻找空闲端口 ==============================
 def _find_free_port() -> int:
@@ -819,10 +880,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		max_grad_norm = getattr(training_cfg, 'max_grad_norm')
 		checkpoint_interval = getattr(training_cfg, 'checkpoint_interval')
 		checkpoint_dir = getattr(training_cfg, 'checkpoint_dir')
+		log_interval = getattr(training_cfg, 'log_interval', 10)
 		
 		# 分别创建策略网络和价值网络的优化器
-		policy_optimizer = optim.Adam(model.policy_network.parameters(), lr=learning_rate)
-		value_optimizer = optim.Adam(model.value_network.parameters(), lr=learning_rate)
+		policy_optimizer = optim.Adam(get_policy_parameters(model), lr=learning_rate)
+		value_optimizer = optim.Adam(get_value_parameters(model), lr=learning_rate)
 
 		# 分别创建策略网络和价值网络的调度器
 		policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(policy_optimizer, T_max=num_iterations, eta_min=0.0)
@@ -834,34 +896,40 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		A_max_ewma = None 		# EWMA of max absolute advantage
 		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 2000)  # 每GPU的batch size
 		rollout_length = getattr(training_cfg, 'rollout_length', 128)  # rollout长度
+		precision = getattr(training_cfg, 'precision', '32-bit')
+		amp_scaler = make_grad_scaler(device, precision)
 		
 		for k in range(num_iterations):
 			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")
 
 			episode_start_time = time.time()
 			# ============================== 采样（初始化） ==============================
+			reset_profile_start = profile_timer_start(device, config)
 			initial_observation = simulator.reset()
-			path_plan = simulator.agents_path_plans
-			stop_lines = simulator.stop_lines
-			# 拆解initial_observation为网络需要的组件
-			agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(initial_observation, config)
-			# 构建网络输入特征
-			features_tensor = build_network_features(
-				agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
-				path_plan, stop_lines, simulator.reward_calculator.sampled_params, config)
+			reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
+			feature_profile_start = profile_timer_start(device, config)
+			features_tensor = build_features_from_observation(initial_observation, simulator, config)
+			initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
+			if profile_enabled(config):
+				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build={initial_feature_ms:.2f}ms")
 			
 			# =========================== 步进式训练：与game.py完全一致 ==============================
-			B, M, S = agents_state.shape
+			B, M, S = simulator.agents_state.shape
 			step_count = 0
 			
 			# 初始化全局buffer（与game.py一致）
 			states_buffer = []
+			path_plan_buffer = []
+			reward_coef_buffer = []
+			vehicle_style_buffer = []
+			stop_lines_buffer = []
 			rewards_buffer = []
 			dones_buffer = []
 			values_buffer = []
 			old_log_probs_buffer = []
 			actions_buffer = []
 			buffer_step_count = 0
+			iteration_update_stats = make_update_stats("no_update", device)
 			
 			# 初始化累积done状态（与game.py一致）
 			cumulative_done_all = None
@@ -871,30 +939,43 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				if all_worlds_no_alive_agents(simulator, cumulative_done_all):
 					if buffer_step_count > 0:
 						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
-						perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer, 
-													states_buffer, rewards_buffer, dones_buffer, 
-													values_buffer, old_log_probs_buffer, actions_buffer,
-													features_tensor, simulator, config, k+1)
+						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
+							model, policy_optimizer, value_optimizer,
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
+						merge_update_stats(iteration_update_stats, update_stats)
 					else:
 						print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
 					break
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
-				with torch.no_grad():
-					action_logits = model.forward(features_tensor, mode="policy")
-					value_pred = model.forward(features_tensor, mode="value")
+				policy_profile_start = profile_timer_start(device, config)
+				with torch.no_grad(), make_autocast_context(device, precision):
+					action_logits, value_pred = forward_model(model, features_tensor, mode="both")
+				policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
 				action_dist = torch.distributions.Categorical(logits=action_logits)
 				actions = action_dist.sample()
 				
 				# 在推进环境前缓存当前状态
-				pre_state = agents_state.clone()
+				pre_state = simulator.agents_state.detach().clone()
+				pre_path_plan = current_path_plan(simulator).detach().clone()
+				pre_reward_coef = simulator.reward_calculator.sampled_params.detach().clone()
+				pre_vehicle_style = simulator.driving_style_params.detach().clone()
+				pre_stop_lines = simulator.stop_lines.detach().clone()
 				
 				# 环境步进
+				env_profile_start = profile_timer_start(device, config)
 				observation, reward, done = simulator.step(actions)
+				env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
 				
 				# 写入训练buffer（与game.py一致）
 				states_buffer.append(pre_state)
+				path_plan_buffer.append(pre_path_plan)
+				reward_coef_buffer.append(pre_reward_coef)
+				vehicle_style_buffer.append(pre_vehicle_style)
+				stop_lines_buffer.append(pre_stop_lines)
 				rewards_buffer.append(reward.clone())
 				dones_buffer.append(done.clone())
 				values_buffer.append(value_pred.clone())
@@ -903,47 +984,58 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				buffer_step_count += 1
 				
 				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
-				current_done_all = done.detach().to('cpu').bool()  # (B, M)
+				current_done_all = done.detach().bool()  # (B, M)
 				if cumulative_done_all is None:
 					cumulative_done_all = current_done_all.clone()
 				else:
 					cumulative_done_all = cumulative_done_all | current_done_all
 				
 				# 更新观测与特征
-				agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
-				features_tensor = build_network_features(
-					agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
-					path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
-				)
+				feature_profile_start = profile_timer_start(device, config)
+				features_tensor = build_features_from_observation(observation, simulator, config)
+				feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				
 				step_count += 1
-				print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
+				if step_count % log_interval == 0:
+					print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
+				if profile_enabled(config) and step_count % profile_log_interval(config) == 0:
+					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
+					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
+						  + (f", {step_profile}" if step_profile else ""))
 				
 				# 检查是否需要PPO更新（与game.py一致）
 				if buffer_step_count >= rollout_length or step_count >= max_episode_length:
 					if step_count >= max_episode_length:
 						print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
-						perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer, 
-													states_buffer, rewards_buffer, dones_buffer, 
-													values_buffer, old_log_probs_buffer, actions_buffer,
-													features_tensor, simulator, config, k+1)
+						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
+							model, policy_optimizer, value_optimizer,
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
+						merge_update_stats(iteration_update_stats, update_stats)
 						print("🔄 达到最大步数，强制开启新iteration...")
 						break
 					else:
 						print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
-						perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer, 
-													states_buffer, rewards_buffer, dones_buffer, 
-													values_buffer, old_log_probs_buffer, actions_buffer,
-													features_tensor, simulator, config, k+1)
+						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
+							model, policy_optimizer, value_optimizer,
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
+						merge_update_stats(iteration_update_stats, update_stats)
 						
 						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
-						if all_worlds_no_alive_agents(simulator):
+						if all_worlds_no_alive_agents(simulator, cumulative_done_all):
 							print("🔄 所有世界都没有存活agents，开启新iteration...")
 							break
 						else:
 							print("✅ 仍有世界有存活agents，继续下一个128step...")
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
 							states_buffer = []
+							path_plan_buffer = []
+							reward_coef_buffer = []
+							vehicle_style_buffer = []
+							stop_lines_buffer = []
 							rewards_buffer = []
 							dones_buffer = []
 							values_buffer = []
@@ -953,9 +1045,15 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 
 
-			# 分别更新学习率调度器
-			policy_scheduler.step()
-			value_scheduler.step()
+			# 只有真实完成 optimizer step 后才推进学习率，避免空样本或 AMP skip 时跳过首个LR。
+			scheduler_stepped = step_schedulers_if_updated(policy_scheduler, value_scheduler, iteration_update_stats)
+			if profile_enabled(config):
+				last_update = iteration_update_stats.get('last_update', {})
+				print(f"\t⏱️ update profile: scheduler_step={scheduler_stepped}, "
+					  f"samples={iteration_update_stats.get('num_selected', 0)}, "
+					  f"ppo={iteration_update_stats.get('ppo_update_time_s', 0.0):.3f}s, "
+					  f"mem_alloc={iteration_update_stats.get('max_memory_allocated_mb', 0.0):.1f}MB, "
+					  f"skip={last_update.get('skip_reason', '')}")
 			# 保存检查点
 			if (k + 1) % checkpoint_interval == 0:
 				save_checkpoint(model, policy_optimizer, value_optimizer, k + 1, checkpoint_dir)
@@ -1012,6 +1110,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		max_grad_norm = getattr(training_cfg, 'max_grad_norm', 1.0)
 		checkpoint_interval = getattr(training_cfg, 'checkpoint_interval', 1)
 		checkpoint_dir = getattr(training_cfg, 'checkpoint_dir')
+		log_interval = getattr(training_cfg, 'log_interval', 10)
 		# 优势过滤参数
 		beta = getattr(training_cfg, 'advantage_filter_beta', 0.25)
 		advantage_filter_threshold = getattr(training_cfg, 'advantage_filter_threshold', 0.01)
@@ -1019,9 +1118,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 2000)
 		rollout_length = getattr(training_cfg, 'rollout_length', 128)
 
-		# 分别创建策略网络和价值网络的优化器（DDP下需访问 module）
-		policy_optimizer = optim.Adam(model.module.policy_network.parameters(), lr=learning_rate)
-		value_optimizer = optim.Adam(model.module.value_network.parameters(), lr=learning_rate)
+		precision = getattr(training_cfg, 'precision', '32-bit')
+		amp_scaler = make_grad_scaler(device, precision)
+
+		# 分别创建策略网络和价值网络的优化器，包含 encoder + head
+		policy_optimizer = optim.Adam(get_policy_parameters(model), lr=learning_rate)
+		value_optimizer = optim.Adam(get_value_parameters(model), lr=learning_rate)
 		policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(policy_optimizer, T_max=num_iterations, eta_min=0.0)
 		value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(value_optimizer, T_max=num_iterations, eta_min=0.0)
 		
@@ -1031,41 +1133,49 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			num_workers_done.set("done", b"0")
 
 			# 采样初始化
+			reset_profile_start = profile_timer_start(device, config)
 			initial_observation = simulator.reset()
-			path_plan = simulator.agents_path_plans
-			stop_lines = simulator.stop_lines
-			agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(initial_observation, config)
-			features_tensor = build_network_features(
-				agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
-				path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
-			)
+			reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
+			feature_profile_start = profile_timer_start(device, config)
+			features_tensor = build_features_from_observation(initial_observation, simulator, config)
+			initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
+			if rank == 0 and profile_enabled(config):
+				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build={initial_feature_ms:.2f}ms")
 
 			# =========================== 步进式训练：与game.py完全一致 ==============================
-			B, M, S = agents_state.shape
+			B, M, S = simulator.agents_state.shape
 			step_count = 0
 			
 			# 初始化全局buffer（与game.py一致）
 			states_buffer = []
+			path_plan_buffer = []
+			reward_coef_buffer = []
+			vehicle_style_buffer = []
+			stop_lines_buffer = []
 			rewards_buffer = []
 			dones_buffer = []
 			values_buffer = []
 			old_log_probs_buffer = []
 			actions_buffer = []
 			buffer_step_count = 0
+			iteration_update_stats = make_update_stats("no_update", device)
 			
 			# 初始化累积done状态（与game.py一致）
 			cumulative_done_all = None
 
 			while step_count < max_episode_length:
 				# 全局死亡检测：如果所有世界都没有存活agents，执行PPO更新后开始新iteration
-				if all_worlds_no_alive_agents(simulator, cumulative_done_all):
+				local_no_alive = all_worlds_no_alive_agents(simulator, cumulative_done_all)
+				if sync_bool_across_ranks(local_no_alive, device, op=dist.ReduceOp.MIN):
 					if buffer_step_count > 0:
 						if rank == 0:
 							print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
-						perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer, 
-													states_buffer, rewards_buffer, dones_buffer, 
-													values_buffer, old_log_probs_buffer, actions_buffer,
-													features_tensor, simulator, config, k+1, rank)
+						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
+							model, policy_optimizer, value_optimizer,
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
+						merge_update_stats(iteration_update_stats, update_stats)
 					else:
 						if rank == 0:
 							print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
@@ -1073,20 +1183,31 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
-				with torch.no_grad():
-					action_logits = model.module.forward(features_tensor, mode="policy")
-					value_pred = model.module.forward(features_tensor, mode="value")
+				policy_profile_start = profile_timer_start(device, config)
+				with torch.no_grad(), make_autocast_context(device, precision):
+					action_logits, value_pred = forward_model(model, features_tensor, mode="both")
+				policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
 				action_dist = torch.distributions.Categorical(logits=action_logits)
 				actions = action_dist.sample()
 				
 				# 在推进环境前缓存当前状态
-				pre_state = agents_state.clone()
+				pre_state = simulator.agents_state.detach().clone()
+				pre_path_plan = current_path_plan(simulator).detach().clone()
+				pre_reward_coef = simulator.reward_calculator.sampled_params.detach().clone()
+				pre_vehicle_style = simulator.driving_style_params.detach().clone()
+				pre_stop_lines = simulator.stop_lines.detach().clone()
 				
 				# 环境步进
+				env_profile_start = profile_timer_start(device, config)
 				observation, reward, done = simulator.step(actions)
+				env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
 				
 				# 写入训练buffer（与game.py一致）
 				states_buffer.append(pre_state)
+				path_plan_buffer.append(pre_path_plan)
+				reward_coef_buffer.append(pre_reward_coef)
+				vehicle_style_buffer.append(pre_vehicle_style)
+				stop_lines_buffer.append(pre_stop_lines)
 				rewards_buffer.append(reward.clone())
 				dones_buffer.append(done.clone())
 				values_buffer.append(value_pred.clone())
@@ -1095,45 +1216,52 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				buffer_step_count += 1
 				
 				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
-				current_done_all = done.detach().to('cpu').bool()  # (B, M)
+				current_done_all = done.detach().bool()  # (B, M)
 				if cumulative_done_all is None:
 					cumulative_done_all = current_done_all.clone()
 				else:
 					cumulative_done_all = cumulative_done_all | current_done_all
 				
 				# 更新观测与特征
-				agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
-				features_tensor = build_network_features(
-					agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
-					path_plan, stop_lines, simulator.reward_calculator.sampled_params, config
-				)
+				feature_profile_start = profile_timer_start(device, config)
+				features_tensor = build_features_from_observation(observation, simulator, config)
+				feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				
 				step_count += 1
-				if rank == 0:
+				if rank == 0 and step_count % log_interval == 0:
 					print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
+				if rank == 0 and profile_enabled(config) and step_count % profile_log_interval(config) == 0:
+					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
+					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
+						  + (f", {step_profile}" if step_profile else ""))
 				
 				# 检查是否需要PPO更新（与game.py一致）
 				if buffer_step_count >= rollout_length or step_count >= max_episode_length:
 					if step_count >= max_episode_length:
 						if rank == 0:
 							print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
-						perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer, 
-													states_buffer, rewards_buffer, dones_buffer, 
-													values_buffer, old_log_probs_buffer, actions_buffer,
-													features_tensor, simulator, config, k+1, rank)
+						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
+							model, policy_optimizer, value_optimizer,
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
+						merge_update_stats(iteration_update_stats, update_stats)
 						if rank == 0:
 							print("🔄 达到最大步数，强制开启新iteration...")
 						break
 					else:
 						if rank == 0:
 							print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
-						perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer, 
-													states_buffer, rewards_buffer, dones_buffer, 
-													values_buffer, old_log_probs_buffer, actions_buffer,
-													features_tensor, simulator, config, k+1, rank)
+						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
+							model, policy_optimizer, value_optimizer,
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
+						merge_update_stats(iteration_update_stats, update_stats)
 						
 						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
-						if all_worlds_no_alive_agents(simulator, cumulative_done_all):
+						local_no_alive = all_worlds_no_alive_agents(simulator, cumulative_done_all)
+						if sync_bool_across_ranks(local_no_alive, device, op=dist.ReduceOp.MIN):
 							if rank == 0:
 								print("🔄 所有世界都没有存活agents，开启新iteration...")
 							break
@@ -1142,6 +1270,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 								print("✅ 仍有世界有存活agents，继续下一个128step...")
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
 							states_buffer = []
+							path_plan_buffer = []
+							reward_coef_buffer = []
+							vehicle_style_buffer = []
+							stop_lines_buffer = []
 							rewards_buffer = []
 							dones_buffer = []
 							values_buffer = []
@@ -1150,9 +1282,15 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							buffer_step_count = 0
 							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 
-			# 7) 在优化器更新后调用学习率调度器（与单卡一致）
-			policy_scheduler.step()
-			value_scheduler.step()
+			# 7) 只有真实完成 optimizer step 后才推进学习率，避免空样本或 AMP skip 时跳过首个LR。
+			scheduler_stepped = step_schedulers_if_updated(policy_scheduler, value_scheduler, iteration_update_stats)
+			if rank == 0 and profile_enabled(config):
+				last_update = iteration_update_stats.get('last_update', {})
+				print(f"\t⏱️ update profile: scheduler_step={scheduler_stepped}, "
+					  f"samples={iteration_update_stats.get('num_selected', 0)}, "
+					  f"ppo={iteration_update_stats.get('ppo_update_time_s', 0.0):.3f}s, "
+					  f"mem_alloc={iteration_update_stats.get('max_memory_allocated_mb', 0.0):.1f}MB, "
+					  f"skip={last_update.get('skip_reason', '')}")
 
 			# 标记本worker完成（保留原计数器结构）
 			try:

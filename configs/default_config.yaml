@@ -3,7 +3,9 @@ simulator:
   # 设备配置 - 8张显卡的分布式设置
   device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
 
-  num_envs: 100          # 总并行环境数量 (8 * 4800 = 38400)
+  # num_envs 是每个 rank/GPU 上的并行环境数；DDP 全局环境数 = num_envs * GPU 数。
+  num_envs: 100
+  verbose: false         # 热路径调试日志开关，训练时保持关闭
   sim_dt: 0.3             # 模拟时间步长
   max_agents_num: 150     # 最大车辆数量,定义每个环境中最大可能的智能体数量
   # num_npc_vehicles <= max_agents_num，否则会报错
@@ -143,8 +145,8 @@ training:
     backend: "nccl"            # 分布式后端
     init_method: "tcp://localhost:12355"  # 初始化方法
 
-  # 修正batch size (每张显卡的训练batch size)
-  batch_size: 256000        # 总batch size
+  # batch_size 是全局目标批量；实际每卡 PPO 抽样量优先使用 batch_size_per_gpu。
+  batch_size: 256000
   batch_size_per_gpu: 2000  # 每GPU batch size
   iteration: 10000
   
@@ -175,6 +177,11 @@ training:
 
   # 训练参数
   total_timesteps: 1_000_000_000_000 # As per paper
+
+  profile:
+    enabled: false       # 可选训练链路 profiler，默认关闭
+    cuda_sync: false     # 打开后为计时做 CUDA 同步，会降低训练速度
+    log_interval: 10     # profiler 日志间隔
   
   # 内存和性能优化
   checkpoint_interval: 100                  # 检查点保存间隔

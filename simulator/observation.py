@@ -237,8 +237,10 @@ class ObservationGenerator:
         # 3. 距离超过视野范围的邻居不考虑
         dist_sq[self_mask | inactive_mask] = float('inf')
         dist_sq[dist_sq > self.horizon**2] = float('inf') 
-        # 4. 找到最近的 K 个
-        _, topk_indices = torch.topk(dist_sq, k=self.num_neighbors, dim=-1, largest=False) # (B, M, K)
+        # 4. 找到最近的 K 个。小规模 smoke test 中 M 可能小于配置的 num_neighbors，
+        #    因此先取可用数量，再在后面补齐到固定观测维度。
+        k_eff = min(self.num_neighbors, max_agents)
+        _, topk_indices = torch.topk(dist_sq, k=k_eff, dim=-1, largest=False) # (B, M, k_eff)
         # 5. 使用高级索引高效地收集邻居状态
         batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1, 1)
         agent_idx = torch.arange(max_agents, device=self.device).view(1, max_agents, 1)
@@ -248,16 +250,18 @@ class ObservationGenerator:
         #    将无效邻居的状态设置为等同于对应 ego 的状态（使相对量为0）。
         valid_neighbor_dists = dist_sq[batch_idx, agent_idx, topk_indices]
         is_valid_neighbor = torch.isfinite(valid_neighbor_dists) # (B, M, K)
-        if (~is_valid_neighbor).any():
-            K_neighbors = topk_indices.shape[-1]
-            ego_states_expanded = agents_state.unsqueeze(2).expand(-1, -1, K_neighbors, -1)  # (B, M, K, 7)
-            # 使无效邻居的相对位置/速度为0：复制ego的 [x,y,yaw,speed]
-            # 同时将尺寸与active置零，避免下游看到伪造的车辆尺寸与激活标志
-            replacement = ego_states_expanded.clone()
-            replacement[..., 4] = 0.0  # length
-            replacement[..., 5] = 0.0  # width
-            replacement[..., 6] = 0.0  # active
-            neighbor_states[~is_valid_neighbor] = replacement[~is_valid_neighbor]
+        K_neighbors = topk_indices.shape[-1]
+        ego_states_expanded = agents_state.unsqueeze(2).expand(-1, -1, K_neighbors, -1)  # (B, M, K, 7)
+        # 使无效邻居的相对位置/速度为0：复制ego的 [x,y,yaw,speed]；
+        # 同时将尺寸与active置零，避免下游看到伪造的车辆尺寸与激活标志。
+        replacement = ego_states_expanded.clone()
+        replacement[..., 4] = 0.0  # length
+        replacement[..., 5] = 0.0  # width
+        replacement[..., 6] = 0.0  # active
+        neighbor_states = torch.where(is_valid_neighbor.unsqueeze(-1), neighbor_states, replacement)
+        if k_eff < self.num_neighbors:
+            pad = replacement.new_zeros(batch_size, max_agents, self.num_neighbors - k_eff, 7)
+            neighbor_states = torch.cat([neighbor_states, pad], dim=2)
         return neighbor_states
     
     def _world_to_ego_centric(self, ego_states, neighbor_states, w_lanes_world, w_boundaries_world):
@@ -320,6 +324,10 @@ class ObservationGenerator:
             neighbors_local = torch.zeros(B, M, 0, self.neighbor_feature_dim, device=self.device)
         # --- 创建每个 Agent 自身在局部坐标系下的状态 ---
         local_state = torch.zeros(B, M, self.local_state_dim, device=self.device) # 7个特征：x, y, yaw, speed, length, width, active
+        local_state[..., 0] = 0.0
+        local_state[..., 1] = 0.0
+        local_state[..., 2] = 0.0
+        local_state[..., 3] = ego_states[..., 3] # 自车速度保留为标量特征
         local_state[..., 4] = ego_states[..., 4] # 长度
         local_state[..., 5] = ego_states[..., 5] # 宽度
         local_state[..., 6] = ego_states[..., 6] # 活跃状态
@@ -792,4 +800,3 @@ if __name__ == '__main__':
         print(f"测试过程中发生错误: {e}")
         import traceback
         traceback.print_exc()
-
