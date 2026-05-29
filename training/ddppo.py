@@ -80,21 +80,21 @@ def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) ->
     
     Returns:
         tuple: (agents_state, neighbors_local, w_lanes_local, w_boundaries_local)
-            - agents_state: (B, M, 7) - 智能体状态 [x, y, yaw, speed, length, width, active]
+            - agents_state: (B, M, S_dim) - 原文式 S(t) 局部状态
             - neighbors_local: (B, M, K, 7) - 邻居相对状态 [dx, dy, vx, vy, length, width, active]
-            - w_lanes_local: (B, M, N_lanes, 2) - 车道线相对坐标 [dx, dy]
+            - w_lanes_local: (B, M, N_lanes, lane_dim) - W_lane raw features
             - w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标 [dx, dy]
     """
     batch_size, max_agents, total_obs_dim = observation.shape
     
     # 从配置中获取维度信息
     simulator_config = config.simulator
-    local_state_dim = simulator_config.observation.local_state_dim  # 7
+    local_state_dim = simulator_config.observation.local_state_dim
     neighbor_feature_dim = simulator_config.observation.neighbor_feature_dim  # 7
-    waypoint_feature_dim = simulator_config.observation.waypoint_feature_dim  # 2
+    waypoint_feature_dim = simulator_config.observation.waypoint_feature_dim
     boundary_feature_dim = simulator_config.observation.boundary_feature_dim  # 2
     num_neighbors = simulator_config.observation.num_neighbors  # 20
-    num_w_lanes = simulator_config.observation.num_w_lanes  # 25
+    num_w_lanes = simulator_config.observation.num_w_lanes
     num_w_boundaries = simulator_config.observation.num_w_boundaries  # 26
     
     # 计算各部分在观测向量中的位置
@@ -104,7 +104,7 @@ def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) ->
     w_boundaries_size = num_w_boundaries * boundary_feature_dim
     
     # 1. 提取agents_state (前7个维度)
-    agents_state = observation[:, :, :local_state_dim]  # (B, M, 7)
+    agents_state = observation[:, :, :local_state_dim]
     
     # 2. 提取neighbors_local
     neighbors_start = local_state_size
@@ -181,6 +181,126 @@ def normalize_point_set(points: torch.Tensor, target_size: int, element_dim: int
     normalized = torch.where(valid.unsqueeze(-1), normalized, torch.full_like(normalized, FEATURE_PAD_VALUE))
     return pad_or_truncate_flat(normalized.flatten(start_dim=2), target_size, FEATURE_PAD_VALUE)
 
+def normalize_s_features(s_t: torch.Tensor, target_size: int, vehicle_style: torch.Tensor = None,
+                         control_state: torch.Tensor = None) -> torch.Tensor:
+    """原文式 S(t): c,theta,kappa,v,v_lim,phi,a_long,a_lat,Cacc,Cthrottle,Csteer,l,w。"""
+    B, M, _ = s_t.shape
+    out = torch.zeros(B, M, target_size, device=s_t.device, dtype=s_t.dtype)
+    copy = min(s_t.shape[-1], target_size)
+    if copy > 0:
+        out[:, :, :copy] = s_t[:, :, :copy]
+    if control_state is not None and target_size >= 8:
+        control_state = control_state.to(device=s_t.device, dtype=s_t.dtype)
+        out[:, :, 5:8] = control_state[:, :, :3]
+    if vehicle_style is not None and target_size >= 11:
+        vehicle_style = vehicle_style.to(device=s_t.device, dtype=s_t.dtype)
+        out[:, :, 8] = vehicle_style[:, :, 2]   # Cacc
+        out[:, :, 9] = vehicle_style[:, :, 0]   # Cthrottle
+        out[:, :, 10] = vehicle_style[:, :, 1]  # Csteer
+
+    if target_size >= 13:
+        normalized = torch.empty_like(out)
+        bounds = (
+            (-5.0, 5.0), (-math.pi, math.pi), (-0.2, 0.2), (-2.0, 20.0), (0.0, 30.0),
+            (-0.7, 0.7), (-5.0, 5.0), (-4.0, 4.0),
+            (1 / 1.5, 1.5), (1 / 1.25, 1.25), (1 / 1.25, 1.25),
+            (0.8, 7.0), (0.8, 3.0),
+        )
+        for i in range(target_size):
+            if i < len(bounds):
+                normalized[:, :, i] = normalize_to_minus1_1(out[:, :, i], *bounds[i])
+            else:
+                normalized[:, :, i] = out[:, :, i]
+        return normalized
+
+    # 兼容旧7维 local state。
+    normalized = torch.zeros_like(out)
+    if target_size > 0:
+        normalized[:, :, 0] = normalize_to_minus1_1(out[:, :, 0], -100, 100)
+    if target_size > 1:
+        normalized[:, :, 1] = out[:, :, 1]
+    if target_size > 2:
+        normalized[:, :, 2] = out[:, :, 2]
+    if target_size > 3:
+        normalized[:, :, 3] = normalize_to_minus1_1(out[:, :, 3], -2, 20)
+    if target_size > 4:
+        normalized[:, :, 4] = normalize_to_minus1_1(out[:, :, 4], 0.8, 7)
+    if target_size > 5:
+        normalized[:, :, 5] = normalize_to_minus1_1(out[:, :, 5], 0.8, 3)
+    if target_size > 6:
+        normalized[:, :, 6] = out[:, :, 6]
+    return normalized
+
+def build_lane_map_features(w_lanes_local: torch.Tensor, path_plan: torch.Tensor,
+                            target_size: int, element_dim: int = 7) -> torch.Tensor:
+    """构造原文式 W_lane: 位置、车道方向、车道宽度、到下一目标的绝对/相对距离。"""
+    if w_lanes_local is None or w_lanes_local.numel() == 0:
+        return None
+    lanes = w_lanes_local
+    if lanes.dim() == 3:
+        B, M, N = lanes.shape
+        if N % 5 == 0:
+            raw_dim = 5
+        elif N % 2 == 0:
+            raw_dim = 2
+        else:
+            raw_dim = lanes.shape[-1]
+        lanes = lanes.view(B, M, N // raw_dim, raw_dim)
+    B, M, K, raw_dim = lanes.shape
+    lane_xy = lanes[..., :2]
+    valid = torch.isfinite(lane_xy).all(dim=-1)
+
+    if raw_dim >= 4:
+        lane_dir = lanes[..., 2:4].clamp(-1.0, 1.0)
+        valid = valid & torch.isfinite(lanes[..., 2:4]).all(dim=-1)
+    else:
+        lane_dir = torch.zeros(B, M, K, 2, device=lanes.device, dtype=lanes.dtype)
+    if raw_dim >= 5:
+        lane_width = lanes[..., 4]
+        valid = valid & torch.isfinite(lane_width) & (lane_width > 0)
+    else:
+        lane_width = torch.zeros(B, M, K, device=lanes.device, dtype=lanes.dtype)
+        valid = valid & (lane_xy.abs().sum(dim=-1) > 1e-6)
+
+    if path_plan is not None and path_plan.numel() > 0:
+        path = path_plan.to(device=lanes.device, dtype=lanes.dtype)
+        path_valid = torch.isfinite(path).all(dim=-1) & ~((path[..., 0] == -1.0) & (path[..., 1] == -1.0))
+        L = path.shape[2]
+        idx = torch.arange(L, device=lanes.device).view(1, 1, L)
+        last_idx = torch.where(path_valid, idx, torch.zeros_like(idx)).amax(dim=2)
+        has_goal = path_valid.any(dim=2)
+        b_idx = torch.arange(B, device=lanes.device).view(B, 1).expand(B, M)
+        m_idx = torch.arange(M, device=lanes.device).view(1, M).expand(B, M)
+        goal_local = path[b_idx, m_idx, last_idx]
+        goal_local = torch.where(has_goal.unsqueeze(-1), goal_local, torch.zeros_like(goal_local))
+    else:
+        goal_local = torch.zeros(B, M, 2, device=lanes.device, dtype=lanes.dtype)
+        has_goal = torch.zeros(B, M, dtype=torch.bool, device=lanes.device)
+
+    goal_dist = torch.norm(lane_xy - goal_local.unsqueeze(2), dim=-1)
+    goal_dist = torch.where(valid & has_goal.unsqueeze(-1), goal_dist, torch.zeros_like(goal_dist))
+    masked_goal_dist = goal_dist.masked_fill(~(valid & has_goal.unsqueeze(-1)), float('inf'))
+    min_goal_dist = masked_goal_dist.amin(dim=2)
+    min_goal_dist = torch.where(torch.isfinite(min_goal_dist), min_goal_dist, torch.zeros_like(min_goal_dist))
+    rel_goal_dist = goal_dist - min_goal_dist.unsqueeze(-1)
+
+    out = torch.full((B, M, K, element_dim), FEATURE_PAD_VALUE, device=lanes.device, dtype=lanes.dtype)
+    if element_dim > 0:
+        out[..., 0] = normalize_to_minus1_1(lane_xy[..., 0], -200, 200)
+    if element_dim > 1:
+        out[..., 1] = normalize_to_minus1_1(lane_xy[..., 1], -200, 200)
+    if element_dim > 2:
+        dir_end = min(element_dim, 4)
+        out[..., 2:dir_end] = lane_dir[..., :dir_end - 2]
+    if element_dim > 4:
+        out[..., 4] = normalize_to_minus1_1(lane_width, 0.0, 8.0)
+    if element_dim > 5:
+        out[..., 5] = normalize_to_minus1_1(goal_dist, 0.0, 400.0)
+    if element_dim > 6:
+        out[..., 6] = normalize_to_minus1_1(rel_goal_dist, 0.0, 200.0)
+    out = torch.where(valid.unsqueeze(-1), out, torch.full_like(out, FEATURE_PAD_VALUE))
+    return pad_or_truncate_flat(out.flatten(start_dim=2), target_size, FEATURE_PAD_VALUE)
+
 def build_network_features(agents_state: torch.Tensor, 
                           neighbors_local: torch.Tensor, 
                           w_lanes_local: torch.Tensor, 
@@ -189,13 +309,14 @@ def build_network_features(agents_state: torch.Tensor,
                           stop_lines: torch.Tensor,
                           reward_coef: torch.Tensor,
                           config: SimpleNamespace,
-                          vehicle_style: torch.Tensor = None) -> torch.Tensor:
+                          vehicle_style: torch.Tensor = None,
+                          control_state: torch.Tensor = None) -> torch.Tensor:
     """
     将拆解后的观测组件构建为网络输入的特征张量
     Args:
-        agents_state: (B, M, 7) - 智能体状态
+        agents_state: (B, M, S_dim) - 原文式 S(t) 局部状态
         neighbors_local: (B, M, K, 7) - 邻居相对状态
-        w_lanes_local: (B, M, N_lanes, 2) - 车道线相对坐标
+        w_lanes_local: (B, M, N_lanes, lane_dim) - map lane raw feature
         w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标
         path_plan: (B, M, path_length, 2) - 路径规划点
         stop_lines: (B, M, num_stop_lines, 20) - 停止线点
@@ -208,8 +329,9 @@ def build_network_features(agents_state: torch.Tensor,
     
     # 从配置中获取网络需要的特征维度
     network_config = config.training.network
-    simple_feature_dims = network_config.simple_feature_dims  # [7, 256, 10, 4]
-    permutation_feature_dims = network_config.permutation_feature_dims  # [52, 50, 20, 140]
+    simple_feature_dims = network_config.simple_feature_dims
+    permutation_feature_dims = network_config.permutation_feature_dims
+    permutation_element_dims = getattr(network_config, 'permutation_element_dims', [2, 7, 2, 7])
     
     # 计算总输入维度
     total_input_dim = sum(simple_feature_dims) + sum(permutation_feature_dims)
@@ -220,18 +342,14 @@ def build_network_features(agents_state: torch.Tensor,
     # 1. 构建简单特征 (S(t), G(t), reward系数, 车辆风格参数)
     simple_end = sum(simple_feature_dims)
     
-    # S(t): 7维。局部观测中 x/y/yaw 通常为 0，这里显式写成稳定特征。
-    s_t_size = simple_feature_dims[0]  # 7
-    agents_state_stable = torch.empty_like(agents_state)
-    yaw = agents_state[:, :, 2]
-    agents_state_stable[:, :, 0] = normalize_to_minus1_1(agents_state[:, :, 0], -100, 100)
-    agents_state_stable[:, :, 1] = torch.sin(yaw)
-    agents_state_stable[:, :, 2] = torch.cos(yaw)
-    agents_state_stable[:, :, 3] = normalize_to_minus1_1(agents_state[:, :, 3], -2, 20)
-    agents_state_stable[:, :, 4] = normalize_to_minus1_1(agents_state[:, :, 4], 0.8, 7)
-    agents_state_stable[:, :, 5] = normalize_to_minus1_1(agents_state[:, :, 5], 0.8, 3)
-    agents_state_stable[:, :, 6] = agents_state[:, :, 6]
-    features_tensor[:, :, :s_t_size] = agents_state_stable
+    # S(t): c, theta, kappa, v, v_lim, phi, a_long, a_lat, Cacc, Cthrottle, Csteer, l, w.
+    s_t_size = simple_feature_dims[0]
+    features_tensor[:, :, :s_t_size] = normalize_s_features(
+        agents_state,
+        s_t_size,
+        vehicle_style=vehicle_style,
+        control_state=control_state,
+    )
     
     # G(t): 256维 - 使用路径规划信息
     g_t_size = simple_feature_dims[1]  # 256
@@ -290,12 +408,13 @@ def build_network_features(agents_state: torch.Tensor,
     else:
         features_tensor[:, :, road_boundary_start:road_boundary_end] = FEATURE_PAD_VALUE
     
-    # lane_points: 50维 - 使用车道线信息
-    lane_points_size = permutation_feature_dims[1]  # 50
+    # lane_points: 原文式 map lane feature，每个元素包含位置、方向、宽度、目标距离。
+    lane_points_size = permutation_feature_dims[1]
     lane_points_start = road_boundary_end
     lane_points_end = lane_points_start + lane_points_size
     
-    w_lanes_flat = normalize_point_set(w_lanes_local, lane_points_size)
+    lane_element_dim = permutation_element_dims[1] if len(permutation_element_dims) > 1 else 7
+    w_lanes_flat = build_lane_map_features(w_lanes_local, path_plan, lane_points_size, lane_element_dim)
     if w_lanes_flat is not None:
         features_tensor[:, :, lane_points_start:lane_points_end] = w_lanes_flat
     else:
@@ -512,6 +631,38 @@ def step_schedulers_if_updated(policy_scheduler, value_scheduler, update_stats_a
 def current_path_plan(simulator):
 	return simulator.agents_path_plans_local if getattr(simulator, 'agents_path_plans_local', None) is not None else simulator.agents_path_plans
 
+def current_control_state(simulator):
+	"""返回当前动力学控制状态 [phi, a_long, a_lat]，形状 (B, M, 3)。"""
+	if hasattr(simulator, '_current_control_state'):
+		return simulator._current_control_state()
+	states = simulator.agents_state
+	B, M = states.shape[:2]
+	control = torch.zeros(B, M, 3, device=states.device, dtype=states.dtype)
+	dynamics = getattr(simulator, 'dynamics_model', None)
+	if dynamics is None:
+		return control
+	for idx, name in enumerate(('current_steering_angle', 'current_along', 'current_alat')):
+		value = getattr(dynamics, name, None)
+		if value is not None and value.numel() == B * M:
+			control[:, :, idx] = value.to(device=states.device, dtype=states.dtype).view(B, M)
+	return control
+
+def observation_state_from_buffer(world_state: torch.Tensor) -> torch.Tensor:
+	"""PPO buffer 可额外拼接控制状态；重建 observation 时只使用世界状态前7维。"""
+	return world_state[..., :7]
+
+def control_from_buffer_state(world_state: torch.Tensor) -> torch.Tensor:
+	if world_state.shape[-1] >= 10:
+		return world_state[..., 7:10]
+	return torch.zeros(*world_state.shape[:2], 3, device=world_state.device, dtype=world_state.dtype)
+
+def state_with_control_for_buffer(simulator, alive_mask: torch.Tensor) -> torch.Tensor:
+	pre_state = simulator.agents_state.detach().clone()
+	pre_state[..., 6] = alive_mask.to(dtype=pre_state.dtype)
+	pre_control_state = current_control_state(simulator).detach().clone()
+	pre_control_state = pre_control_state * alive_mask.unsqueeze(-1).to(dtype=pre_control_state.dtype)
+	return torch.cat([pre_state, pre_control_state], dim=-1)
+
 def build_features_from_observation(observation, simulator, config):
 	agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
 	return build_network_features(
@@ -524,6 +675,7 @@ def build_features_from_observation(observation, simulator, config):
 		simulator.reward_calculator.sampled_params,
 		config,
 		vehicle_style=getattr(simulator, 'driving_style_params', None),
+		control_state=current_control_state(simulator),
 	)
 
 def sync_bool_across_ranks(value: bool, device: torch.device, op=dist.ReduceOp.MIN) -> bool:
@@ -607,6 +759,25 @@ def all_worlds_no_alive_agents(simulator, cumulative_done_all=None) -> bool:
 	except Exception:
 		return True
 
+def rollout_alive_mask(simulator, cumulative_done_all=None) -> torch.Tensor:
+	"""返回本 rollout 当前仍应参与采样/训练的 agent mask。"""
+	states = simulator.agents_state
+	active_mask = states[..., 6] > 0.5
+	if cumulative_done_all is None:
+		return active_mask
+	return active_mask & (~cumulative_done_all.to(active_mask.device))
+
+def sample_actions_for_alive(action_logits: torch.Tensor, alive_mask: torch.Tensor):
+	"""只为仍存活的 agent 采样动作，已 done 的 slot 填 dummy 动作与零 logprob。"""
+	actions = torch.zeros(action_logits.shape[:2], dtype=torch.long, device=action_logits.device)
+	old_log_probs = torch.zeros(action_logits.shape[:2], dtype=action_logits.dtype, device=action_logits.device)
+	if bool(alive_mask.any().item()):
+		dist_alive = torch.distributions.Categorical(logits=action_logits[alive_mask])
+		actions_alive = dist_alive.sample()
+		actions[alive_mask] = actions_alive
+		old_log_probs[alive_mask] = dist_alive.log_prob(actions_alive).to(old_log_probs.dtype)
+	return actions, old_log_probs
+
 # ============================== PPO更新函数 ==============================
 def perform_ppo_update(model, policy_optimizer, value_optimizer,
 					   states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
@@ -654,10 +825,13 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	old_log_probs_tensor = torch.stack(old_log_probs_buffer, dim=0)
 	actions_tensor = torch.stack(actions_buffer, dim=0)
 
-	with torch.inference_mode(), make_autocast_context(device, precision):
-		_, last_value_pred = forward_model(model, features_tensor, mode="both")
-	if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
-		last_value_pred = last_value_pred.squeeze(-1)
+	if features_tensor is None:
+		last_value_pred = torch.zeros_like(values_tensor[-1])
+	else:
+		with torch.inference_mode(), make_autocast_context(device, precision):
+			_, last_value_pred = forward_model(model, features_tensor, mode="both")
+		if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
+			last_value_pred = last_value_pred.squeeze(-1)
 	values_tp1 = torch.cat([values_tensor, last_value_pred.unsqueeze(0)], dim=0)
 
 	dones_accum = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
@@ -715,13 +889,22 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	uniq_tb, inverse_mb = torch.unique(torch.stack([selected_t, selected_b], dim=1), dim=0, return_inverse=True)
 	t_u_mb = uniq_tb[:, 0]
 	b_u_mb = uniq_tb[:, 1]
-	agents_states_mb = states_tensor[t_u_mb, b_u_mb]
-	obs_mb = simulator.observation_generator.generate(agents_states_mb)
-	agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
 	path_plan_mb = path_plan_tensor[t_u_mb, b_u_mb] if path_plan_tensor is not None else None
 	stop_lines_mb = stop_lines_tensor[t_u_mb, b_u_mb] if stop_lines_tensor is not None else None
 	reward_coef_mb = reward_coef_tensor[t_u_mb, b_u_mb] if reward_coef_tensor is not None else simulator.reward_calculator.sampled_params[b_u_mb]
-	vehicle_style_mb = vehicle_style_tensor[t_u_mb, b_u_mb] if vehicle_style_tensor is not None else getattr(simulator, 'driving_style_params', None)
+	if vehicle_style_tensor is not None:
+		vehicle_style_mb = vehicle_style_tensor[t_u_mb, b_u_mb]
+	else:
+		current_style = getattr(simulator, 'driving_style_params', None)
+		vehicle_style_mb = current_style[b_u_mb] if current_style is not None else None
+	world_states_mb = states_tensor[t_u_mb, b_u_mb]
+	control_state_mb = control_from_buffer_state(world_states_mb)
+	obs_mb = simulator.observation_generator.generate(
+		observation_state_from_buffer(world_states_mb),
+		control_state=control_state_mb,
+		driving_style_params=vehicle_style_mb,
+	)
+	agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
 	features_u_mb = build_network_features(
 		agents_state_dec_mb,
 		neighbors_local_mb,
@@ -732,6 +915,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		reward_coef_mb,
 		config,
 		vehicle_style=vehicle_style_mb,
+		control_state=control_state_mb,
 	)
 	mb_features = features_u_mb[inverse_mb.to(device)]
 	row_idx = torch.arange(batch_N, device=device)
@@ -957,6 +1141,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					else:
 						print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
 					break
+				alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
@@ -964,15 +1149,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					policy_profile_start = profile_timer_start(device, config)
 				with torch.inference_mode(), make_autocast_context(device, precision):
 					action_logits, value_pred = forward_model(model, features_tensor, mode="both")
-					action_dist = torch.distributions.Categorical(logits=action_logits)
-					actions = action_dist.sample()
-					old_log_probs = action_dist.log_prob(actions)
+					if value_pred.dim() == 3 and value_pred.shape[-1] == 1:
+						value_pred = value_pred.squeeze(-1)
+					value_pred = torch.where(alive_mask, value_pred, torch.zeros_like(value_pred))
+					actions, old_log_probs = sample_actions_for_alive(action_logits, alive_mask)
 				if profile_on:
 					policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
-				del action_dist, action_logits
+				del action_logits
 				
 				# 在推进环境前缓存当前状态
-				pre_state = simulator.agents_state.detach().clone()
+				pre_state = state_with_control_for_buffer(simulator, alive_mask)
 				pre_path_plan = current_path_plan(simulator).detach().clone()
 				pre_reward_coef = simulator.reward_calculator.sampled_params.detach().clone()
 				pre_vehicle_style = simulator.driving_style_params.detach().clone()
@@ -1004,13 +1190,18 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					cumulative_done_all = current_done_all.clone()
 				else:
 					cumulative_done_all = cumulative_done_all | current_done_all
+				no_alive_after_step = all_worlds_no_alive_agents(simulator, cumulative_done_all)
 				
 				# 更新观测与特征
-				if profile_on:
-					feature_profile_start = profile_timer_start(device, config)
-				features_tensor = build_features_from_observation(observation, simulator, config)
-				if profile_on:
-					feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
+				if no_alive_after_step:
+					features_tensor = None
+					feature_build_ms = 0.0
+				else:
+					if profile_on:
+						feature_profile_start = profile_timer_start(device, config)
+					features_tensor = build_features_from_observation(observation, simulator, config)
+					if profile_on:
+						feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				
 				step_count += 1
 				if step_count % log_interval == 0:
@@ -1019,6 +1210,20 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
 					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
 						  + (f", {step_profile}" if step_profile else ""))
+
+				if no_alive_after_step:
+					print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
+					A_max_ewma, update_stats = perform_ppo_update_single_gpu(
+						model, policy_optimizer, value_optimizer,
+						states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+						features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
+					merge_update_stats(iteration_update_stats, update_stats)
+					clear_rollout_buffers(
+						states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+					)
+					break
 				
 				# 检查是否需要PPO更新（与game.py一致）
 				if buffer_step_count >= rollout_length or step_count >= max_episode_length:
@@ -1207,6 +1412,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						if rank == 0:
 							print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
 					break
+				alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
@@ -1214,15 +1420,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					policy_profile_start = profile_timer_start(device, config)
 				with torch.inference_mode(), make_autocast_context(device, precision):
 					action_logits, value_pred = forward_model(model, features_tensor, mode="both")
-					action_dist = torch.distributions.Categorical(logits=action_logits)
-					actions = action_dist.sample()
-					old_log_probs = action_dist.log_prob(actions)
+					if value_pred.dim() == 3 and value_pred.shape[-1] == 1:
+						value_pred = value_pred.squeeze(-1)
+					value_pred = torch.where(alive_mask, value_pred, torch.zeros_like(value_pred))
+					actions, old_log_probs = sample_actions_for_alive(action_logits, alive_mask)
 				if profile_on:
 					policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
-				del action_dist, action_logits
+				del action_logits
 				
 				# 在推进环境前缓存当前状态
-				pre_state = simulator.agents_state.detach().clone()
+				pre_state = state_with_control_for_buffer(simulator, alive_mask)
 				pre_path_plan = current_path_plan(simulator).detach().clone()
 				pre_reward_coef = simulator.reward_calculator.sampled_params.detach().clone()
 				pre_vehicle_style = simulator.driving_style_params.detach().clone()
@@ -1254,13 +1461,19 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					cumulative_done_all = current_done_all.clone()
 				else:
 					cumulative_done_all = cumulative_done_all | current_done_all
+				local_no_alive_after_step = all_worlds_no_alive_agents(simulator, cumulative_done_all)
+				no_alive_after_step = sync_bool_across_ranks(local_no_alive_after_step, device, op=dist.ReduceOp.MIN)
 				
 				# 更新观测与特征
-				if profile_on:
-					feature_profile_start = profile_timer_start(device, config)
-				features_tensor = build_features_from_observation(observation, simulator, config)
-				if profile_on:
-					feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
+				if no_alive_after_step:
+					features_tensor = None
+					feature_build_ms = 0.0
+				else:
+					if profile_on:
+						feature_profile_start = profile_timer_start(device, config)
+					features_tensor = build_features_from_observation(observation, simulator, config)
+					if profile_on:
+						feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				
 				step_count += 1
 				if rank == 0 and step_count % log_interval == 0:
@@ -1269,6 +1482,21 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
 					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
 						  + (f", {step_profile}" if step_profile else ""))
+
+				if no_alive_after_step:
+					if rank == 0:
+						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
+					A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
+						model, policy_optimizer, value_optimizer,
+						states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+						features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
+					merge_update_stats(iteration_update_stats, update_stats)
+					clear_rollout_buffers(
+						states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+					)
+					break
 				
 				# 检查是否需要PPO更新（与game.py一致）
 				if buffer_step_count >= rollout_length or step_count >= max_episode_length:

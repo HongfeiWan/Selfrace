@@ -118,8 +118,18 @@ class TeraflowSimulator:
         # 这些张量将在 reset() 中被具体填充
         self.agents_state: Optional[torch.Tensor] = None
         self.agents_goal_quad_ids: Optional[torch.Tensor] = None  # 存储所有智能体的目标quad_id
+        self.agents_route_quad_ids: Optional[torch.Tensor] = None  # 中间waypoint + final goal的quad序列
+        self.agents_route_target_count: Optional[torch.Tensor] = None
+        self.agents_current_route_idx: Optional[torch.Tensor] = None
+        self.max_route_targets: int = 4  # N_wp ~ U{0,3} plus one final goal
         self.agents_path_plans: Optional[torch.Tensor] = None     # 存储所有智能体的路径规划（世界坐标）
         self.agents_path_plans_local: Optional[torch.Tensor] = None  # 存储所有智能体的路径规划（局部坐标）
+        self.goal_positions: Optional[torch.Tensor] = None
+        self.final_goal_positions: Optional[torch.Tensor] = None
+        self.route_candidate_samples: int = int(simulator_config.get('route_candidate_samples', 64))
+        self.route_min_goal_distance: float = float(simulator_config.get('route_min_goal_distance', 20.0))
+        self.route_max_goal_distance: float = float(simulator_config.get('route_max_goal_distance', 200.0))
+        self.route_max_heading_delta: float = float(simulator_config.get('route_max_heading_delta_deg', 60.0)) * torch.pi / 180.0
         self.driving_style_params: Optional[torch.Tensor] = None
         self.traffic_light_states: Optional[torch.Tensor] = None
         self.stop_lines: Optional[torch.Tensor] = None
@@ -128,6 +138,28 @@ class TeraflowSimulator:
     def _log(self, *args, **kwargs):
         if self.verbose:
             print(*args, **kwargs)
+
+    def _current_control_state(self) -> torch.Tensor:
+        """返回当前动力学控制状态 [phi, a_long, a_lat]，用于原文式 S(t)。"""
+        if self.agents_state is None:
+            return torch.empty((0, 0, 3), dtype=torch.float32, device=self.device)
+        B, M = self.agents_state.shape[:2]
+        control = torch.zeros(B, M, 3, dtype=self.agents_state.dtype, device=self.device)
+        fields = (
+            ('current_steering_angle', 0),
+            ('current_along', 1),
+            ('current_alat', 2),
+        )
+        for name, idx in fields:
+            value = getattr(self.dynamics_model, name, None)
+            if value is not None and value.numel() == B * M:
+                control[:, :, idx] = value.to(device=self.device, dtype=self.agents_state.dtype).view(B, M)
+        if self.agents_state.shape[-1] > 6:
+            active_mask = self.agents_state[..., 6] > 0.5
+            if getattr(self, 'last_done', None) is not None:
+                active_mask = active_mask & (~self.last_done)
+            control = control * active_mask.unsqueeze(-1).to(dtype=control.dtype)
+        return control
 
     def _profile_now(self) -> float:
         if self.profile_enabled and self.profile_cuda_sync and self.device.type == 'cuda':
@@ -309,7 +341,11 @@ class TeraflowSimulator:
 
         # 生成初始观测。路径规划先完成，训练首帧才能拿到同步的局部路径特征。
         self._log("Generating initial observation...")
-        initial_observation = self.observation_generator.generate(self.agents_state)
+        initial_observation = self.observation_generator.generate(
+            self.agents_state,
+            control_state=self._current_control_state(),
+            driving_style_params=self.driving_style_params,
+        )
         self._log(initial_observation.shape)
         self._log("Initial observation generated")
         self._log("Path planning initialized")
@@ -410,33 +446,36 @@ class TeraflowSimulator:
         d, theta_f = self.road_network.calculate_frenet_coordinates(vehicle_positions, vehicle_headings, self.spatial_hash)
         profile_cursor = self._profile_record(profile, 'frenet_ms', profile_cursor)
 
-        # 5. 更新path_plans的局部坐标
+        # 5. 计算奖励。中间 waypoint 到达会给 R_goal，但只有最终目标到达才 done。
+        reward, final_goal_reached, intermediate_goal_reached = self._calculate_reward(
+            all_collisions, offroad_mask, d, theta_f, actions
+        )
+        profile_cursor = self._profile_record(profile, 'reward_ms', profile_cursor)
+
+        # 6. 推进 route target，并把已经经过的路径前缀从后续观测中移除。
+        self._advance_route_targets(intermediate_goal_reached)
         self._update_path_plans_local()
         profile_cursor = self._profile_record(profile, 'path_local_update_ms', profile_cursor)
-        
-        # 5.5. 检查并移除已到达的路径点
         self._check_and_remove_reached_waypoints()
         profile_cursor = self._profile_record(profile, 'waypoint_update_ms', profile_cursor)
 
-        # 6. 生成新的观测（排除done的车辆）
-        # 临时将done车辆的状态设置为无效，避免它们参与观测生成
+        # 7. 生成新的观测（排除上一时刻已经done的车辆）。
         if hasattr(self, 'last_done') and self.last_done is not None:
-            # 将done车辆的状态设置为无效（active=0）
             agents_state_for_obs = self.agents_state.clone()
             agents_state_for_obs[..., 6] = torch.where(self.last_done, 0.0, agents_state_for_obs[..., 6])
         else:
             agents_state_for_obs = self.agents_state
 
         self._update_stop_line_observation(agents_state_for_obs)
-        observation = self.observation_generator.generate(agents_state_for_obs)
+        observation = self.observation_generator.generate(
+            agents_state_for_obs,
+            control_state=self._current_control_state(),
+            driving_style_params=self.driving_style_params,
+        )
         profile_cursor = self._profile_record(profile, 'observation_ms', profile_cursor)
 
-        # 7. 计算奖励（传入Frenet坐标和动作）
-        reward, goal_reached = self._calculate_reward(all_collisions, offroad_mask, d, theta_f, actions)
-        profile_cursor = self._profile_record(profile, 'reward_ms', profile_cursor)
-
-        # 8. 检查是否结束（包含目标到达判断）
-        done = all_collisions|offroad_mask|goal_reached
+        # 8. 检查是否结束：中间 waypoint 不终止 episode。
+        done = all_collisions | offroad_mask | final_goal_reached
         
         # 保存done状态供下次step使用（累积done状态，一旦done就保持done）
         if hasattr(self, 'last_done') and self.last_done is not None:
@@ -450,7 +489,7 @@ class TeraflowSimulator:
 
         return observation, reward, done
     
-    def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         为所有智能体计算奖励。
         Args:
@@ -460,7 +499,8 @@ class TeraflowSimulator:
             theta_f (torch.Tensor): Frenet角度误差 (B, M)
             actions (torch.Tensor): 动作索引 (B, M)，用于直接获取jerk值
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (奖励值 (B, M), 目标到达标志 (B, M))
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                reward, final_goal_reached, intermediate_goal_reached
         """
 
         # 构建扩展的状态张量，包含加速度信息
@@ -527,12 +567,10 @@ class TeraflowSimulator:
         extended_state[..., 9] = d        # d - Frenet横向距离
         # 准备目标奖励计算的参数
 
-        # 计算目标和初始化goal_reached，速度很快
-        # print(self.agents_goal_quad_ids)
-
-        # goal_positions = self.path_planner.get_quad_centers(self.agents_goal_quad_ids)
         goal_positions = self.goal_positions
-        waypoint_reached = torch.zeros((B, M), dtype=torch.bool, device=self.device)
+        if goal_positions is None:
+            goal_positions = self.agents_state[..., :2]
+        current_target_is_waypoint = self._current_target_is_intermediate()
 
         # 调用奖励计算器，这个速度很快
         reward, goal_reached = self.reward_calculator.calculate(
@@ -541,7 +579,7 @@ class TeraflowSimulator:
             offroad_mask,
             dt=self.dt,
             goal_positions=goal_positions,
-            waypoint_reached=waypoint_reached,
+            waypoint_reached=current_target_is_waypoint,
             stop_line_violation=self.stop_line_violation,
         )
         
@@ -553,84 +591,264 @@ class TeraflowSimulator:
             not_done_mask = torch.ones_like(active_mask, dtype=torch.bool)
         effective_mask = active_mask & not_done_mask
         reward = reward * effective_mask.float()  # 非有效车辆的奖励设为0，等价于“done后奖励不再更新”
+        goal_reached = goal_reached & effective_mask
+        # 碰撞/离路终止的同一步即便碰巧进入中间 waypoint 半径，也不再推进 route。
+        still_valid_route = ~(all_collisions | offroad_mask)
+        intermediate_goal_reached = goal_reached & current_target_is_waypoint & still_valid_route
+        final_goal_reached = goal_reached & (~current_target_is_waypoint)
 
         self.extend_state = extended_state # 用于传入网络
-        return reward, goal_reached & effective_mask
+        return reward, final_goal_reached, intermediate_goal_reached
     
+    def _left_align_path_tensor(self, path: torch.Tensor) -> torch.Tensor:
+        """左对齐每个 agent 的有效路径点，保持点的原始顺序。"""
+        if path is None or path.numel() == 0:
+            return path
+        B, M, L, _ = path.shape
+        valid = (path[..., 0] != -1) & (path[..., 1] != -1)
+        col_idx = torch.arange(L, device=self.device).view(1, 1, L).expand(B, M, -1)
+        order_score = (~valid).long() * L + col_idx
+        order = torch.argsort(order_score, dim=2, stable=True)
+        path_left = path.gather(2, order.unsqueeze(-1).expand(-1, -1, -1, 2))
+        path_left = torch.where(valid.gather(2, order).unsqueeze(-1), path_left, torch.full_like(path_left, -1.0))
+        return path_left
+
+    def _sample_next_route_quads(
+        self,
+        prev_quad: torch.Tensor,
+        valid_mask: torch.Tensor,
+        min_distance: float,
+        max_distance: float,
+        max_heading_delta: float,
+    ) -> torch.Tensor:
+        """
+        在上一目标附近采样下一目标：优先满足距离与车道朝向约束，失败时逐步放宽。
+        这对应原文中 waypoint 序列的采样方式，避免目标序列在地图上随机跳跃。
+        """
+        B, M = prev_quad.shape
+        if self.road_network.num_quads <= 0:
+            return torch.full_like(prev_quad, -1, dtype=torch.int32)
+
+        K = max(1, self.route_candidate_samples)
+        sampled = torch.randint(
+            0,
+            self.road_network.num_quads,
+            (B, M, K),
+            dtype=torch.long,
+            device=self.device,
+        )
+        safe_prev = torch.clamp(prev_quad.long(), 0, self.road_network.num_quads - 1)
+        quad_centers = self.road_network.quad_centerlines.mean(dim=1)
+        quad_dirs = self.road_network.quad_directions
+
+        prev_centers = quad_centers[safe_prev].unsqueeze(2)
+        prev_dirs = quad_dirs[safe_prev].unsqueeze(2)
+        cand_centers = quad_centers[sampled]
+        cand_dirs = quad_dirs[sampled]
+
+        distances = torch.norm(cand_centers - prev_centers, dim=-1)
+        cos_delta = (cand_dirs * prev_dirs).sum(dim=-1).clamp(-1.0, 1.0)
+        not_same = sampled != safe_prev.unsqueeze(-1)
+        base_mask = valid_mask.unsqueeze(-1) & not_same
+
+        strict_mask = (
+            base_mask
+            & (distances >= min_distance)
+            & (distances <= max_distance)
+            & (cos_delta >= torch.cos(torch.as_tensor(max_heading_delta, device=self.device)))
+        )
+        relaxed_mask = (
+            base_mask
+            & (distances >= 0.5 * min_distance)
+            & (distances <= 1.5 * max_distance)
+            & (cos_delta >= torch.cos(torch.as_tensor(max_heading_delta * 2.0, device=self.device)))
+        )
+
+        def choose_from(mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            counts = mask.sum(dim=-1)
+            max_counts = torch.clamp(counts, min=1)
+            ranks = torch.floor(torch.rand((B, M), device=self.device) * max_counts.float()).long()
+            cumsum = mask.long().cumsum(dim=-1)
+            selected = (cumsum == (ranks.unsqueeze(-1) + 1)) & mask
+            selected_idx = selected.float().argmax(dim=-1)
+            chosen = sampled.gather(2, selected_idx.unsqueeze(-1)).squeeze(-1).to(torch.int32)
+            return chosen, counts > 0
+
+        strict_choice, has_strict = choose_from(strict_mask)
+        relaxed_choice, has_relaxed = choose_from(relaxed_mask)
+        fallback_choice, has_fallback = choose_from(base_mask)
+
+        chosen = torch.where(has_strict, strict_choice, relaxed_choice)
+        chosen = torch.where(has_strict | has_relaxed, chosen, fallback_choice)
+        return torch.where(valid_mask & (has_strict | has_relaxed | has_fallback), chosen, torch.full_like(chosen, -1))
+
+    def _sample_route_quad_ids(self, active_mask: torch.Tensor, start_i32: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """采样 final goal 与 N_wp ~ U{0,3} 个中间 waypoint，并构造受距离/朝向约束的目标序列。"""
+        B, M = active_mask.shape
+        valid_start = active_mask & (start_i32 >= 0)
+        num_intermediate = torch.randint(
+            0,
+            self.max_route_targets,
+            (B, M),
+            dtype=torch.long,
+            device=self.device,
+        )
+        target_count = torch.where(valid_start, num_intermediate + 1, torch.zeros_like(num_intermediate))
+        route_slots = torch.arange(self.max_route_targets, device=self.device).view(1, 1, -1)
+        route_mask = route_slots < target_count.unsqueeze(-1)
+        route_quads = torch.full((B, M, self.max_route_targets), -1, dtype=torch.int32, device=self.device)
+
+        first_target = torch.randint(
+            0,
+            self.road_network.num_quads,
+            (B, M),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if self.road_network.num_quads > 1:
+            same_as_start = valid_start & (first_target == start_i32)
+            first_target = torch.where(
+                same_as_start,
+                ((first_target.long() + 1) % self.road_network.num_quads).to(torch.int32),
+                first_target,
+            )
+        route_quads[..., 0] = torch.where(valid_start & route_mask[..., 0], first_target, route_quads[..., 0])
+
+        for route_idx in range(1, self.max_route_targets):
+            valid_next = valid_start & route_mask[..., route_idx]
+            prev_quad = route_quads[..., route_idx - 1]
+            route_quads[..., route_idx] = self._sample_next_route_quads(
+                prev_quad,
+                valid_next,
+                self.route_min_goal_distance,
+                self.route_max_goal_distance,
+                self.route_max_heading_delta,
+            )
+            target_count = torch.where(
+                valid_next & (route_quads[..., route_idx] < 0),
+                torch.full_like(target_count, route_idx),
+                target_count,
+            )
+            route_mask = route_slots < target_count.unsqueeze(-1)
+
+        return route_quads, target_count
+
+    def _build_route_path(self, start_i32: torch.Tensor, route_quads: torch.Tensor,
+                          target_count: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
+        """按 start -> waypoint(s) -> final goal 逐段规划，并拼接成一条训练路径。"""
+        B, M = start_i32.shape
+        path_segments = []
+        segment_start = start_i32
+        for leg_idx in range(self.max_route_targets):
+            segment_goal = route_quads[..., leg_idx]
+            leg_valid = active_mask & (target_count > leg_idx) & (segment_start >= 0) & (segment_goal >= 0)
+            start_valid = torch.where(leg_valid, segment_start, torch.zeros_like(segment_start))
+            goal_valid = torch.where(leg_valid, segment_goal, torch.zeros_like(segment_goal))
+            if bool(leg_valid.any().item()):
+                segment_path = self.path_planner.plan_path(start_valid.unsqueeze(-1), goal_valid.unsqueeze(-1))
+            else:
+                segment_path = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
+            segment_path = torch.where(
+                leg_valid.unsqueeze(-1).unsqueeze(-1),
+                segment_path,
+                torch.full_like(segment_path, -1.0),
+            )
+            # 后续段去掉重复的段起点，避免 waypoint 附近出现连续重复点。
+            path_segments.append(segment_path if leg_idx == 0 else segment_path[:, :, 1:, :])
+            segment_start = segment_goal
+
+        full_path = torch.cat(path_segments, dim=2)
+        full_path = self._left_align_path_tensor(full_path)
+        path = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
+        use_len = min(128, full_path.shape[2])
+        path[:, :, :use_len, :] = full_path[:, :, :use_len, :]
+        return path
+
+    def _route_quad_at(self, indices: torch.Tensor) -> torch.Tensor:
+        safe_indices = torch.clamp(indices, 0, self.max_route_targets - 1).long()
+        return torch.gather(self.agents_route_quad_ids, 2, safe_indices.unsqueeze(-1)).squeeze(-1)
+
+    def _refresh_goal_positions(self):
+        """刷新当前目标点和最终目标点坐标。"""
+        if self.agents_route_quad_ids is None or self.agents_current_route_idx is None:
+            return
+        current_quad = self._route_quad_at(self.agents_current_route_idx)
+        final_idx = torch.clamp(self.agents_route_target_count - 1, min=0)
+        final_quad = self._route_quad_at(final_idx)
+        current_positions = self.agents_state[..., :2]
+        current_goal_positions = self.path_planner.get_quad_centers(current_quad.to(torch.long))
+        final_goal_positions = self.path_planner.get_quad_centers(final_quad.to(torch.long))
+        current_valid = current_quad >= 0
+        final_valid = final_quad >= 0
+        self.goal_positions = torch.where(current_valid.unsqueeze(-1), current_goal_positions, current_positions)
+        self.final_goal_positions = torch.where(final_valid.unsqueeze(-1), final_goal_positions, current_positions)
+        self.agents_goal_quad_ids = final_quad
+
+    def _current_target_is_intermediate(self) -> torch.Tensor:
+        if self.agents_route_target_count is None or self.agents_current_route_idx is None:
+            B, M, _ = self.agents_state.shape
+            return torch.zeros((B, M), dtype=torch.bool, device=self.device)
+        return (
+            (self.agents_route_target_count > 0)
+            & (self.agents_current_route_idx < (self.agents_route_target_count - 1))
+        )
+
+    def _drop_path_prefix_to_targets(self, reached_mask: torch.Tensor, target_positions: torch.Tensor):
+        if self.agents_path_plans is None or not bool(reached_mask.any().item()):
+            return
+        valid_path = (self.agents_path_plans[..., 0] != -1) & (self.agents_path_plans[..., 1] != -1)
+        dist = torch.norm(self.agents_path_plans - target_positions.unsqueeze(2), dim=-1)
+        dist = dist.masked_fill(~valid_path | ~reached_mask.unsqueeze(-1), float('inf'))
+        nearest_dist, nearest_idx = torch.min(dist, dim=2)
+        has_nearest = torch.isfinite(nearest_dist)
+        L = self.agents_path_plans.shape[2]
+        prefix_mask = torch.arange(L, device=self.device).view(1, 1, L) <= nearest_idx.unsqueeze(-1)
+        drop_mask = reached_mask.unsqueeze(-1) & has_nearest.unsqueeze(-1) & prefix_mask
+        self.agents_path_plans = torch.where(
+            drop_mask.unsqueeze(-1),
+            torch.full_like(self.agents_path_plans, -1.0),
+            self.agents_path_plans,
+        )
+        self.agents_path_plans = self._left_align_path_tensor(self.agents_path_plans)
+
+    def _advance_route_targets(self, intermediate_goal_reached: torch.Tensor):
+        """中间 waypoint 到达后推进到下一个 route target；final goal 不在这里推进。"""
+        if self.agents_current_route_idx is None or self.agents_route_target_count is None:
+            return
+        advance_mask = intermediate_goal_reached & self._current_target_is_intermediate()
+        if not bool(advance_mask.any().item()):
+            self._refresh_goal_positions()
+            return
+        self._drop_path_prefix_to_targets(advance_mask, self.goal_positions)
+        max_idx = torch.clamp(self.agents_route_target_count - 1, min=0)
+        next_idx = torch.minimum(self.agents_current_route_idx + advance_mask.long(), max_idx)
+        self.agents_current_route_idx = next_idx
+        self._refresh_goal_positions()
+
     def _initialize_path_planning(self):
         """
         为所有智能体初始化路径规划：
-        1. 为每个激活的智能体随机分配一个目标quad_id
-        2. 使用plan_path批量生成从起始位置到目标的路径规划
+        1. 为每个激活智能体采样 final goal 与 0~3 个中间 waypoint
+        2. waypoint 序列按距离与车道朝向约束顺序生成
+        3. 使用 plan_path 批量生成 start -> waypoint(s) -> final goal 的完整路径
         """
-        prepare_time = time.time()
         if self.agents_state is None:
             return
-        # 基本尺寸与激活掩码（GPU）
         B, M, _ = self.agents_state.shape
         active_mask = self.agents_state[..., 6] > 0.5
-        # 起点与目标（纯GPU、极简随机目标，仅在激活位赋值）
         if not hasattr(self, 'agents_start_quad_ids') or self.agents_start_quad_ids is None:
             self._log("Warning: No start quad IDs available for path planning")
             return
+
         start_i32 = self.agents_start_quad_ids.to(dtype=torch.int32, device=self.device)
-        goal_i32 = torch.full_like(start_i32, -1, dtype=torch.int32, device=self.device)
-        # 仅对"激活且起点有效"的样本，从最近K个quads中随机选一个作为终点
-        valid_mask = (active_mask) & (start_i32 >= 0)
-        rand_vals = torch.randint(0, self.road_network.num_quads, start_i32.shape, device=self.device, dtype=torch.int32)
-        goal_i32 = torch.where(valid_mask, rand_vals, goal_i32)
-        # 一次性调用 planner（形状为 (B,M,1)）
-        start_3d = start_i32.unsqueeze(-1)
-        goal_3d = goal_i32.unsqueeze(-1)
-        prepare_time_done = time.time()
-        self._log(f"prepare_time_done: {prepare_time_done-prepare_time:.4f}s")
-        
-        # 只对有效的起点和终点进行路径规划
-        valid_planning_mask = (start_i32 >= 0) & (goal_i32 >= 0) & active_mask
-        if valid_planning_mask.any():
-            # 创建临时的起点和终点，将无效的设置为-1
-            start_3d_valid = torch.where(valid_planning_mask.unsqueeze(-1), start_3d, torch.full_like(start_3d, -1))
-            goal_3d_valid = torch.where(valid_planning_mask.unsqueeze(-1), goal_3d, torch.full_like(goal_3d, -1))
-            path_plans = self.path_planner.plan_path(start_3d_valid, goal_3d_valid)  # 形状 (B,M,L,2)
-        else:
-            # 如果没有有效的路径规划，创建空的路径
-            path_plans = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
-        # 存储结果
-        self.agents_goal_quad_ids = goal_i32
-        self.agents_path_plans = path_plans
-        
-        # 由于收敛性问题，需要将agents_path_plans的路径逐渐放长
-        # 使用动态的path_observation_length，可以通过外部设置
+        route_quads, target_count = self._sample_route_quad_ids(active_mask, start_i32)
+        self.agents_route_quad_ids = route_quads
+        self.agents_route_target_count = target_count
+        self.agents_current_route_idx = torch.zeros((B, M), dtype=torch.long, device=self.device)
+        self.agents_path_plans = self._build_route_path(start_i32, route_quads, target_count, active_mask)
         if not hasattr(self, 'path_observation_length'):
-            self.path_observation_length = 2  # 初始值
-        path_observation_length = self.path_observation_length
-        # 创建全-1的中间tensor，保持原始长度128
-        B, M, _, _ = self.agents_path_plans.shape
-        filtered_paths = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
-        # 只将前path_observation_length个位置赋予有效值
-        filtered_paths[:, :, :path_observation_length, :] = self.agents_path_plans[:, :, :path_observation_length, :]
-        self.agents_path_plans = filtered_paths
-        
-        # 设置goal_positions为最终有效路径点，避免起步附近的中间点过早触发 done。
-        B, M, L, _ = self.agents_path_plans.shape
-        # 批量找到所有有效点
-        valid_mask = (self.agents_path_plans[..., 0] != -1) & (self.agents_path_plans[..., 1] != -1)  # (B, M, L)
-        # 对每个路径，找到最后一个有效点的位置
-        ar = torch.arange(L, device=self.device).unsqueeze(0).unsqueeze(0).expand(B, M, -1)
-        target_indices = torch.where(valid_mask, ar, torch.zeros_like(ar)).amax(dim=2)
-        has_target = valid_mask.any(dim=2)
-        
-        # 批量获取目标位置
-        batch_indices = torch.arange(B, device=self.device).unsqueeze(1).expand(-1, M)
-        agent_indices = torch.arange(M, device=self.device).unsqueeze(0).expand(B, -1)
-        
-        # 获取目标位置
-        self.goal_positions = self.agents_path_plans[batch_indices, agent_indices, target_indices]
-        
-        # 对于没有有效点的智能体，使用当前位置
-        no_valid_points = ~has_target
-        current_positions = self.agents_state[..., :2]  # (B, M, 2)
-        self.goal_positions = torch.where(no_valid_points.unsqueeze(-1), current_positions, self.goal_positions)
+            self.path_observation_length = 128
+        self._refresh_goal_positions()
 
         # 初始化path_plans的局部坐标版本
         self._update_path_plans_local()
@@ -640,30 +858,22 @@ class TeraflowSimulator:
         动态设置路径观察长度
         
         Args:
-            length (int): 新的路径观察长度，范围[2, 128]
+            length (int): 新的路径观察长度，范围[2, 128]。训练路径本身始终保留完整 route。
         """
         length = max(2, min(128, length))  # 限制在合理范围内
         self.path_observation_length = length
         self._log(f"路径观察长度已更新为: {self.path_observation_length}")
         
-        # 如果当前有路径规划，需要重新应用新的长度
+        # 不再截断 agents_path_plans；完整 route 需要用于最终 goal/waypoint 奖励。
         if hasattr(self, 'agents_path_plans') and self.agents_path_plans is not None:
             self._apply_path_observation_length()
     
     def _apply_path_observation_length(self):
         """
-        应用当前的path_observation_length到现有的路径规划
+        保留兼容入口：不裁剪世界坐标路径，只刷新局部路径。
         """
         if not hasattr(self, 'agents_path_plans') or self.agents_path_plans is None:
             return
-            
-        B, M, _, _ = self.agents_path_plans.shape
-        filtered_paths = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
-        # 只将前path_observation_length个位置赋予有效值
-        filtered_paths[:, :, :self.path_observation_length, :] = self.agents_path_plans[:, :, :self.path_observation_length, :]
-        self.agents_path_plans = filtered_paths
-        
-        # 重新更新局部坐标
         self._update_path_plans_local()
 
     def _update_path_plans_local(self):

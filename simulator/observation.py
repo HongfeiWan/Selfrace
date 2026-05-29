@@ -30,13 +30,14 @@ class ObservationGenerator:
         self.config = config
         self.device = device
         self.num_neighbors = config.get('num_neighbors', 1) # 邻居数量
-        self.num_w_lanes = config.get('num_w_lanes', 25) # 车道数量
+        self.num_w_lanes = config.get('num_w_lanes', 80) # 原文 W_lane 使用 80 个 coarse map features
         self.num_w_boundaries = config.get('num_w_boundaries', 26) # 边界数量
-        self.horizon = config.get('horizon', 100.0) # 视野范围
+        self.horizon = config.get('horizon', 200.0) # 原文 coarse map horizon 200m
+        self.speed_limit = float(config.get('speed_limit', 20.0))
         # 定义观测空间维度
-        self.local_state_dim = config.get('local_state_dim', 7)            # 修改为7个特征: x, y, yaw, speed, length, width, active       
+        self.local_state_dim = config.get('local_state_dim', 13)           # 原文式 S(t)
         self.neighbor_feature_dim = config.get('neighbor_feature_dim', 7)  # 修改为7个特征：dx, dy, vx, vy, length, width, active 
-        self.waypoint_feature_dim = config.get('waypoint_feature_dim', 2)  # 修改为2个特征：x,y
+        self.waypoint_feature_dim = config.get('waypoint_feature_dim', 5)  # W_lane: dx,dy,dir_x,dir_y,width
         self.boundary_feature_dim = config.get('boundary_feature_dim', 2)  # 修改为2个特征：x,y
         # 使用来自 SelfraceSimulator 的共享哈希，仅作网格坐标与单元ID计算，不在此处重建静态索引
         self.spatial_hash = spatial_hash
@@ -63,7 +64,7 @@ class ObservationGenerator:
                 self.num_w_lanes
             )  # (num_quads, num_w_lanes)
         else:
-            self.quad_to_w_lanes_ids = torch.zeros(num_quads, self.num_w_lanes, dtype=torch.long, device=self.device)
+            self.quad_to_w_lanes_ids = torch.full((num_quads, self.num_w_lanes), -1, dtype=torch.long, device=self.device)
         
         # 预计算w_boundaries关联
         if self.road_network.global_w_boundary_points.numel() > 0:
@@ -73,7 +74,7 @@ class ObservationGenerator:
                 self.num_w_boundaries
             )  # (num_quads, num_w_boundaries)
         else:
-            self.quad_to_w_boundaries_ids = torch.zeros(num_quads, self.num_w_boundaries, dtype=torch.long, device=self.device)
+            self.quad_to_w_boundaries_ids = torch.full((num_quads, self.num_w_boundaries), -1, dtype=torch.long, device=self.device)
 
     def _compute_nearest_waypoint_ids(self, query_points: torch.Tensor, waypoints: torch.Tensor, num_nearest: int) -> torch.Tensor:
         """
@@ -86,7 +87,7 @@ class ObservationGenerator:
             最近点的ID (N, num_nearest)
         """
         if waypoints.numel() == 0 or num_nearest == 0:
-            return torch.zeros(query_points.shape[0], num_nearest, dtype=torch.long, device=self.device)
+            return torch.full((query_points.shape[0], num_nearest), -1, dtype=torch.long, device=self.device)
         
         # 计算所有查询点到所有waypoints的距离
         distances = torch.cdist(query_points, waypoints, p=2)  # (N, M)
@@ -94,9 +95,9 @@ class ObservationGenerator:
         # 找到最近的num_nearest个点
         _, nearest_indices = torch.topk(distances, k=min(num_nearest, waypoints.shape[0]), dim=1, largest=False)
         
-        # 如果waypoints数量不足，用0填充
+        # 如果waypoints数量不足，用-1填充，避免把真实第0个点误当padding。
         if waypoints.shape[0] < num_nearest:
-            padding = torch.zeros(query_points.shape[0], num_nearest - waypoints.shape[0], dtype=torch.long, device=self.device)
+            padding = torch.full((query_points.shape[0], num_nearest - waypoints.shape[0]), -1, dtype=torch.long, device=self.device)
             nearest_indices = torch.cat([nearest_indices, padding], dim=1)
         
         return nearest_indices
@@ -107,7 +108,7 @@ class ObservationGenerator:
         Args:
             agents_state: 形状为 (B, M, 7) 的agent状态张量
         Returns:
-            tuple: (w_lanes_world, w_boundaries_world)
+            tuple: (w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices)
         """
         batch_size, max_agents, _ = agents_state.shape
         
@@ -118,20 +119,29 @@ class ObservationGenerator:
         # 找到每个agent最近的quad索引
         distances, quad_indices = self.road_network.find_nearest_lanes(agent_positions_flat, k=1, spatial_hash=self.spatial_hash)
         quad_indices = quad_indices.squeeze(-1)  # (B*M,)
+        valid_quad = quad_indices >= 0
+        safe_quad_indices = torch.where(valid_quad, quad_indices, torch.zeros_like(quad_indices))
         
         # 使用预计算的关联获取waypoint IDs
-        w_lanes_ids = self.quad_to_w_lanes_ids[quad_indices]  # (B*M, num_w_lanes)
-        w_boundaries_ids = self.quad_to_w_boundaries_ids[quad_indices]  # (B*M, num_w_boundaries)
+        w_lanes_ids = self.quad_to_w_lanes_ids[safe_quad_indices]  # (B*M, num_w_lanes)
+        w_boundaries_ids = self.quad_to_w_boundaries_ids[safe_quad_indices]  # (B*M, num_w_boundaries)
+        w_lanes_ids = torch.where(valid_quad.unsqueeze(-1), w_lanes_ids, torch.full_like(w_lanes_ids, -1))
+        w_boundaries_ids = torch.where(valid_quad.unsqueeze(-1), w_boundaries_ids, torch.full_like(w_boundaries_ids, -1))
         
         # 通过ID获取waypoint坐标
         w_lanes_world = self._get_waypoints_by_ids(w_lanes_ids, self.road_network.global_w_lane_waypoints)
+        w_lane_dirs_world = self._get_waypoints_by_ids(w_lanes_ids, self.road_network.global_w_lane_directions)
+        w_lane_widths = self._get_scalar_by_ids(w_lanes_ids, self.road_network.global_w_lane_widths)
         w_boundaries_world = self._get_waypoints_by_ids(w_boundaries_ids, self.road_network.global_w_boundary_points)
         
         # 恢复原始形状
         w_lanes_world = w_lanes_world.view(batch_size, max_agents, self.num_w_lanes, 2)
+        w_lane_dirs_world = w_lane_dirs_world.view(batch_size, max_agents, self.num_w_lanes, 2)
+        w_lane_widths = w_lane_widths.view(batch_size, max_agents, self.num_w_lanes)
         w_boundaries_world = w_boundaries_world.view(batch_size, max_agents, self.num_w_boundaries, 2)
+        quad_indices = quad_indices.view(batch_size, max_agents)
         
-        return w_lanes_world, w_boundaries_world
+        return w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices
 
     def _get_waypoints_by_ids(self, waypoint_ids: torch.Tensor, waypoints: torch.Tensor) -> torch.Tensor:
         """
@@ -145,21 +155,20 @@ class ObservationGenerator:
         if waypoints.numel() == 0:
             return torch.zeros(waypoint_ids.shape[0], waypoint_ids.shape[1], 2, device=self.device)
         
-        # 创建有效ID掩码（ID为0表示无效）
-        valid_mask = waypoint_ids > 0
+        # 创建有效ID掩码（-1表示无效）
+        valid_mask = waypoint_ids >= 0
         
-        # 初始化输出张量
-        result = torch.zeros(waypoint_ids.shape[0], waypoint_ids.shape[1], 2, device=self.device)
-        
-        # 只对有效的ID进行索引
-        if valid_mask.any():
-            valid_ids = waypoint_ids[valid_mask]
-            # 确保ID在有效范围内
-            valid_ids = torch.clamp(valid_ids, 0, waypoints.shape[0] - 1)
-            valid_coords = waypoints[valid_ids]
-            result[valid_mask] = valid_coords
-        
-        return result
+        safe_ids = torch.clamp(waypoint_ids, 0, waypoints.shape[0] - 1)
+        result = waypoints[safe_ids]
+        return torch.where(valid_mask.unsqueeze(-1), result, torch.zeros_like(result))
+
+    def _get_scalar_by_ids(self, waypoint_ids: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        if values.numel() == 0:
+            return torch.zeros(waypoint_ids.shape[0], waypoint_ids.shape[1], device=self.device)
+        valid_mask = waypoint_ids >= 0
+        safe_ids = torch.clamp(waypoint_ids, 0, values.shape[0] - 1)
+        result = values[safe_ids]
+        return torch.where(valid_mask, result, torch.zeros_like(result))
 
     def get_observation_dim(self) -> int:
         """
@@ -176,7 +185,9 @@ class ObservationGenerator:
         total_dim = local_state_size + neighbors_size + w_lanes_size + w_boundaries_size
         return total_dim
         
-    def generate(self, agents_state: torch.Tensor) -> torch.Tensor:
+    def generate(self, agents_state: torch.Tensor,
+                 control_state: torch.Tensor = None,
+                 driving_style_params: torch.Tensor = None) -> torch.Tensor:
         """
         为所有环境中的所有 agent 生成一批观测。
         Args:
@@ -190,9 +201,9 @@ class ObservationGenerator:
             agents_state[..., 6] = active
         Returns:
             torch.Tensor: 展平后的观测向量张量 (B, M, feature_dim)。
-            local_state: (B, M, 4)
+            local_state: (B, M, 13)
             neighbors_local: (B, M, K, 7)  # dx, dy, vx, vy, length, width, active
-            w_lanes_local: (B, M, N_lanes, 2)
+            w_lanes_local: (B, M, N_lanes, 5)
             w_boundaries_local: (B, M, N_boundaries, 2)
         """
         # 1. 获取世界坐标系下的特征
@@ -200,11 +211,12 @@ class ObservationGenerator:
         neighbor_states_world = self._get_nearest_neighbors(agents_state)
         
         # 使用预计算的数据获取w_lanes和w_boundaries
-        w_lanes_world, w_boundaries_world = self._get_precomputed_waypoints(agents_state)
+        w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices = self._get_precomputed_waypoints(agents_state)
 
         # 2. 将所有信息转换到每个 Agent 的局部坐标系
         local_state, neighbors_local, w_lanes_local, w_boundaries_local = self._world_to_ego_centric(
-            agents_state, neighbor_states_world, w_lanes_world, w_boundaries_world
+            agents_state, neighbor_states_world, w_lanes_world, w_lane_dirs_world,
+            w_lane_widths, w_boundaries_world, quad_indices, control_state, driving_style_params
         )
 
         # 3. 展平并拼接成最终的观测向量
@@ -260,11 +272,13 @@ class ObservationGenerator:
         replacement[..., 6] = 0.0  # active
         neighbor_states = torch.where(is_valid_neighbor.unsqueeze(-1), neighbor_states, replacement)
         if k_eff < self.num_neighbors:
-            pad = replacement.new_zeros(batch_size, max_agents, self.num_neighbors - k_eff, 7)
+            pad = replacement.new_zeros(batch_size, max_agents, self.num_neighbors - k_eff, neighbor_states.shape[-1])
             neighbor_states = torch.cat([neighbor_states, pad], dim=2)
         return neighbor_states
     
-    def _world_to_ego_centric(self, ego_states, neighbor_states, w_lanes_world, w_boundaries_world):
+    def _world_to_ego_centric(self, ego_states, neighbor_states, w_lanes_world, w_lane_dirs_world,
+                              w_lane_widths, w_boundaries_world, quad_indices,
+                              control_state=None, driving_style_params=None):
         """将世界坐标系下的状态转换为以每个 agent 为中心的坐标系。"""
         B, M, _ = ego_states.shape
         K_neighbors = neighbor_states.shape[2]
@@ -286,8 +300,14 @@ class ObservationGenerator:
             B, M, N, D = rel_pos.shape
             return torch.bmm(rel_pos.view(B*M, N, D), rot_matrix.view(B*M, D, D)).view(B, M, N, D)
         # 将世界坐标系下的车道线和边界线转换到局部坐标系
-        w_lanes_local = batch_rotate(w_lanes_world, ego_pos, rot_matrix)
+        w_lanes_xy_local = batch_rotate(w_lanes_world, ego_pos, rot_matrix)
         w_boundaries_local = batch_rotate(w_boundaries_world, ego_pos, rot_matrix)
+        B_l, M_l, N_lanes, _ = w_lane_dirs_world.shape
+        w_lane_dirs_local = torch.bmm(
+            w_lane_dirs_world.view(B_l * M_l, N_lanes, 2),
+            rot_matrix.view(B_l * M_l, 2, 2)
+        ).view(B_l, M_l, N_lanes, 2)
+        w_lanes_local = torch.cat([w_lanes_xy_local, w_lane_dirs_local, w_lane_widths.unsqueeze(-1)], dim=-1)
         # --- 转换邻居 ---
         if K_neighbors > 0:
             rel_pos_neighbors = neighbor_states[..., :2] - ego_pos.unsqueeze(2) # (B, M, K, 2)
@@ -322,15 +342,47 @@ class ObservationGenerator:
         else:
             # 如果没有邻居，创建空的邻居特征张量
             neighbors_local = torch.zeros(B, M, 0, self.neighbor_feature_dim, device=self.device)
-        # --- 创建每个 Agent 自身在局部坐标系下的状态 ---
-        local_state = torch.zeros(B, M, self.local_state_dim, device=self.device) # 7个特征：x, y, yaw, speed, length, width, active
-        local_state[..., 0] = 0.0
-        local_state[..., 1] = 0.0
-        local_state[..., 2] = 0.0
-        local_state[..., 3] = ego_states[..., 3] # 自车速度保留为标量特征
-        local_state[..., 4] = ego_states[..., 4] # 长度
-        local_state[..., 5] = ego_states[..., 5] # 宽度
-        local_state[..., 6] = ego_states[..., 6] # 活跃状态
+        # --- 创建每个 Agent 自身的原文式 S(t) ---
+        local_state = torch.zeros(B, M, self.local_state_dim, device=self.device, dtype=ego_states.dtype)
+        safe_quad_indices = torch.where(quad_indices >= 0, quad_indices, torch.zeros_like(quad_indices))
+        road_directions = self.road_network.quad_directions[safe_quad_indices]
+        nearest_centerlines = self.road_network.quad_centerlines[safe_quad_indices]
+        road_starts = nearest_centerlines[:, :, 0, :]
+        ap = ego_pos - road_starts
+        # 与局部坐标系保持一致：x 为车道前向，y 为车道左侧，c/theta 左正右负。
+        lane_center_dist = road_directions[..., 0] * ap[..., 1] - road_directions[..., 1] * ap[..., 0]
+        vehicle_directions = torch.stack([torch.cos(ego_yaw), torch.sin(ego_yaw)], dim=-1)
+        cross_heading = road_directions[..., 0] * vehicle_directions[..., 1] - road_directions[..., 1] * vehicle_directions[..., 0]
+        dot_heading = (road_directions * vehicle_directions).sum(dim=-1)
+        theta = torch.atan2(cross_heading, dot_heading)
+        valid_quad = quad_indices >= 0
+        lane_center_dist = torch.where(valid_quad, lane_center_dist, torch.zeros_like(lane_center_dist))
+        theta = torch.where(valid_quad, theta, torch.zeros_like(theta))
+
+        control = torch.zeros(B, M, 3, device=self.device, dtype=ego_states.dtype) if control_state is None else control_state.to(self.device, dtype=ego_states.dtype)
+        style = torch.ones(B, M, 4, device=self.device, dtype=ego_states.dtype) if driving_style_params is None else driving_style_params.to(self.device, dtype=ego_states.dtype)
+        if self.local_state_dim >= 13:
+            local_state[..., 0] = lane_center_dist
+            local_state[..., 1] = theta
+            local_state[..., 2] = self.road_network.quad_curvatures[safe_quad_indices]
+            local_state[..., 3] = ego_states[..., 3]
+            local_state[..., 4] = self.speed_limit
+            local_state[..., 5] = control[..., 0]  # steering angle phi
+            local_state[..., 6] = control[..., 1]  # a_long
+            local_state[..., 7] = control[..., 2]  # a_lat
+            local_state[..., 8] = style[..., 2]   # C_acc
+            local_state[..., 9] = style[..., 0]   # C_throttle
+            local_state[..., 10] = style[..., 1]  # C_steer
+            local_state[..., 11] = ego_states[..., 4]
+            local_state[..., 12] = ego_states[..., 5]
+        else:
+            local_state[..., 0] = 0.0
+            local_state[..., 1] = 0.0
+            local_state[..., 2] = 0.0
+            local_state[..., 3] = ego_states[..., 3]
+            local_state[..., 4] = ego_states[..., 4]
+            local_state[..., 5] = ego_states[..., 5]
+            local_state[..., 6] = ego_states[..., 6]
         return local_state, neighbors_local, w_lanes_local, w_boundaries_local
 
 if __name__ == '__main__':

@@ -116,21 +116,22 @@ class FeatureEncoder(nn.Module):
         self.encoder_dim = network_config.encoder_dim
         self.simple_feature_dims = network_config.simple_feature_dims
         self.permutation_feature_dims = network_config.permutation_feature_dims
+        self.permutation_element_dims = getattr(network_config, 'permutation_element_dims', [2, 7, 2, 7])
         # 计算总输入维度
         self.total_input_dim = sum(self.simple_feature_dims) + sum(self.permutation_feature_dims)
         # 创建简单特征编码器 - 直接创建4个
         self.simple_encoders = nn.ModuleList([
-            SimpleFeatureEncoder(self.simple_feature_dims[0], self.encoder_dim),  # S(t): 7维
+            SimpleFeatureEncoder(self.simple_feature_dims[0], self.encoder_dim),  # S(t)
             SimpleFeatureEncoder(self.simple_feature_dims[1], self.encoder_dim),  # G(t): 256维
             SimpleFeatureEncoder(self.simple_feature_dims[2], self.encoder_dim),  # reward系数: 10维
             SimpleFeatureEncoder(self.simple_feature_dims[3], self.encoder_dim)   # 车辆风格参数: 4维
         ])
         # 创建排列不变特征编码器 - 直接创建4个
         self.permutation_encoders = nn.ModuleList([
-            PermutationInvariantEncoder(self.permutation_feature_dims[0], self.encoder_dim, element_dim=2),  # road_boundary: 26x2=52
-            PermutationInvariantEncoder(self.permutation_feature_dims[1], self.encoder_dim, element_dim=2),  # lane_points: 25x2=50
-            PermutationInvariantEncoder(self.permutation_feature_dims[2], self.encoder_dim, element_dim=2),  # stop_lines: 5x2=20
-            PermutationInvariantEncoder(self.permutation_feature_dims[3], self.encoder_dim, element_dim=7)   # other_agents: 20x7=140
+            PermutationInvariantEncoder(self.permutation_feature_dims[0], self.encoder_dim, element_dim=self.permutation_element_dims[0]),
+            PermutationInvariantEncoder(self.permutation_feature_dims[1], self.encoder_dim, element_dim=self.permutation_element_dims[1]),
+            PermutationInvariantEncoder(self.permutation_feature_dims[2], self.encoder_dim, element_dim=self.permutation_element_dims[2]),
+            PermutationInvariantEncoder(self.permutation_feature_dims[3], self.encoder_dim, element_dim=self.permutation_element_dims[3])
         ])
         # 计算总输出维度 - 固定8个编码器
         self.total_output_dim = (len(self.simple_encoders) + len(self.permutation_encoders)) * self.encoder_dim
@@ -160,7 +161,7 @@ class FeatureEncoder(nn.Module):
         output = torch.zeros(B, M, self.total_output_dim, device=features_tensor.device, dtype=features_tensor.dtype)
         
         # 编码简单特征 - 直接使用固定索引
-        # S(t): 10维
+        # S(t)
         s_t = features_tensor[:, :, 0:self.simple_feature_dims[0]]
         output[:, :, 0:self.encoder_dim] = self.simple_encoders[0](s_t)
         
@@ -181,22 +182,22 @@ class FeatureEncoder(nn.Module):
         
         # road_boundary: 52维
         road_boundary = features_tensor[:, :, simple_end:simple_end + self.permutation_feature_dims[0]]
-        road_boundary_mask = self._flat_set_mask(road_boundary, element_dim=2)
+        road_boundary_mask = self._flat_set_mask(road_boundary, element_dim=self.permutation_element_dims[0])
         output[:, :, 4*self.encoder_dim:5*self.encoder_dim] = self.permutation_encoders[0](road_boundary, mask=road_boundary_mask)
 
-        # lane_points: 50维
+        # lane_points
         lane_points = features_tensor[:, :, simple_end + self.permutation_feature_dims[0]:simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1]]
-        lane_points_mask = self._flat_set_mask(lane_points, element_dim=2)
+        lane_points_mask = self._flat_set_mask(lane_points, element_dim=self.permutation_element_dims[1])
         output[:, :, 5*self.encoder_dim:6*self.encoder_dim] = self.permutation_encoders[1](lane_points, mask=lane_points_mask)
 
         # stop_lines: 20维
         stop_lines = features_tensor[:, :, simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1]:simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1] + self.permutation_feature_dims[2]]
-        stop_lines_mask = self._flat_set_mask(stop_lines, element_dim=2)
+        stop_lines_mask = self._flat_set_mask(stop_lines, element_dim=self.permutation_element_dims[2])
         output[:, :, 6*self.encoder_dim:7*self.encoder_dim] = self.permutation_encoders[2](stop_lines, mask=stop_lines_mask)
 
         # other_agents: 140维
         other_agents = features_tensor[:, :, simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1] + self.permutation_feature_dims[2]:self.total_input_dim]
-        other_agents_mask = self._flat_set_mask(other_agents, element_dim=7, active_channel=6)
+        other_agents_mask = self._flat_set_mask(other_agents, element_dim=self.permutation_element_dims[3], active_channel=6)
         output[:, :, 7*self.encoder_dim:8*self.encoder_dim] = self.permutation_encoders[3](other_agents, mask=other_agents_mask)
         
         return output

@@ -55,7 +55,9 @@ class WorldInitializer:
         self.vehicle_width = dynamics_config.get('vehicle_width', simulator_config.get('vehicle_width', 2.0))
         self.vehicle_parameter_sampler = VehicleParameterSampler(simulator_config, self.device)
         self.speed_range = simulator_config.get('vehicle_init_speed_range', (0.0, 5.0))
-        self.local_state_dim = simulator_config.get('observation', simulator_config).get('local_state_dim')
+        # agents_state 是仿真世界状态，固定为 [x,y,yaw,speed,length,width,active]。
+        # observation.local_state_dim 现在表示网络观测 S(t) 维度，二者不能混用。
+        self.state_dim = int(simulator_config.get('state_dim', 7))
         self.last_agents_per_env = None
 
     def _generate_states_on_quads(self, quad_indices: torch.Tensor) -> torch.Tensor:
@@ -99,7 +101,7 @@ class WorldInitializer:
         采用并行生成和迭代优化的策略，确保初始化的交通流是有效的。
         """
         # 存储每个智能体的起始quad_id
-        agents_state = torch.zeros(num_envs, self.max_agents, self.local_state_dim, device=self.device)
+        agents_state = torch.zeros(num_envs, self.max_agents, self.state_dim, device=self.device)
         agents_start_quad_ids = torch.full((num_envs, self.max_agents), -1, dtype=torch.long, device=self.device)
         start_time = time.time()
         per_env_counts = torch.randint(
@@ -490,4 +492,3 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Error during visualization: {e}")
         print("Vehicle visualization failed.")
-

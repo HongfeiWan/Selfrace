@@ -79,6 +79,9 @@ class RoadNetwork:
         self.right_boundaries = torch.stack([p3, p2], dim=1)
         # 计算道路方向向量 (从后到前)
         self.quad_directions = front_center - back_center
+        self.quad_widths = 0.5 * (
+            torch.norm(p0 - p3, dim=1) + torch.norm(p1 - p2, dim=1)
+        )
         # 归一化方向向量
         direction_norms = torch.norm(self.quad_directions, dim=1, keepdim=True)
         zero_mask = (direction_norms == 0)
@@ -91,17 +94,78 @@ class RoadNetwork:
     def _store_metadata(self, quads_data):
         """存储元数据"""
         self.quad_ids = torch.tensor([q['polyId'] for q in quads_data], dtype=torch.int64, device=self.device)
+        self.road_ids = torch.tensor([q['road_id'] for q in quads_data], dtype=torch.int32, device=self.device)
         self.lane_ids = torch.tensor([q['lane_id'] for q in quads_data], dtype=torch.int32, device=self.device)
+        self.q_values = torch.tensor([q.get('q', 0.0) for q in quads_data], dtype=torch.float32, device=self.device)
+        self.quad_curvatures = self._compute_quad_curvatures()
+        self.poly_id_to_index = {int(poly_id): i for i, poly_id in enumerate(self.quad_ids.detach().cpu().tolist())}
 
         # 加载并存储每个 quad 关联的航点 ID
         self.quad_w_lane_ids_assoc = [q.get('w_lane_ids', []) for q in quads_data]
         self.quad_w_boundary_ids_assoc = [q.get('w_boundary_ids', []) for q in quads_data]
+
+    def _compute_quad_curvatures(self) -> torch.Tensor:
+        """按 road/lane/q 顺序估算局部曲率，启动时预计算，运行时直接索引。"""
+        curvatures = torch.zeros(self.num_quads, dtype=torch.float32, device=self.device)
+        if self.num_quads < 3:
+            return curvatures
+
+        keys = {}
+        road_ids_cpu = self.road_ids.detach().cpu().tolist()
+        lane_ids_cpu = self.lane_ids.detach().cpu().tolist()
+        q_cpu = self.q_values.detach().cpu().tolist()
+        for idx, key in enumerate(zip(road_ids_cpu, lane_ids_cpu)):
+            keys.setdefault(key, []).append(idx)
+
+        for indices in keys.values():
+            if len(indices) < 3:
+                continue
+            indices.sort(key=lambda i: q_cpu[i])
+            idx_t = torch.tensor(indices, dtype=torch.long, device=self.device)
+            dirs = self.quad_directions[idx_t]
+            q_vals = self.q_values[idx_t]
+            prev_dirs = dirs[:-2]
+            next_dirs = dirs[2:]
+            dot = (prev_dirs * next_dirs).sum(dim=-1).clamp(-1.0, 1.0)
+            cross = prev_dirs[:, 0] * next_dirs[:, 1] - prev_dirs[:, 1] * next_dirs[:, 0]
+            delta_heading = torch.atan2(cross, dot)
+            delta_s = (q_vals[2:] - q_vals[:-2]).abs().clamp_min(1e-3)
+            curvatures[idx_t[1:-1]] = delta_heading / delta_s
+        return curvatures
     
     def _load_global_waypoints(self, map_data):
         """加载全局航点"""
         # 加载车道航点
         w_lane_points = map_data.get('global_w_lane_waypoints', [])
-        self.global_w_lane_waypoints = torch.tensor([[p['x'], p['y']] for p in w_lane_points], dtype=torch.float32, device=self.device) if w_lane_points else torch.empty((0, 2), device=self.device)
+        if w_lane_points:
+            self.global_w_lane_waypoints = torch.tensor(
+                [[p['x'], p['y']] for p in w_lane_points],
+                dtype=torch.float32,
+                device=self.device
+            )
+            self.global_w_lane_directions = torch.tensor(
+                [[p.get('direction', [1.0, 0.0, 0.0])[0], p.get('direction', [1.0, 0.0, 0.0])[1]] for p in w_lane_points],
+                dtype=torch.float32,
+                device=self.device
+            )
+            dir_norm = torch.norm(self.global_w_lane_directions, dim=1, keepdim=True).clamp_min(1e-6)
+            self.global_w_lane_directions = self.global_w_lane_directions / dir_norm
+            poly_indices = [
+                self.poly_id_to_index.get(int(p.get('poly_id', p.get('routing_poly_id', -1))), -1)
+                for p in w_lane_points
+            ]
+            self.global_w_lane_poly_indices = torch.tensor(poly_indices, dtype=torch.long, device=self.device)
+            safe_poly_indices = torch.clamp(self.global_w_lane_poly_indices, 0, max(self.num_quads - 1, 0))
+            self.global_w_lane_widths = torch.where(
+                self.global_w_lane_poly_indices >= 0,
+                self.quad_widths[safe_poly_indices],
+                torch.zeros_like(safe_poly_indices, dtype=torch.float32)
+            )
+        else:
+            self.global_w_lane_waypoints = torch.empty((0, 2), device=self.device)
+            self.global_w_lane_directions = torch.empty((0, 2), device=self.device)
+            self.global_w_lane_poly_indices = torch.empty((0,), dtype=torch.long, device=self.device)
+            self.global_w_lane_widths = torch.empty((0,), dtype=torch.float32, device=self.device)
         # 加载边界航点
         w_boundary_points = map_data.get('oob_points', [])
         self.global_w_boundary_points = torch.tensor([[p['x'], p['y']] for p in w_boundary_points], dtype=torch.float32, device=self.device) if w_boundary_points else torch.empty((0, 2), device=self.device)

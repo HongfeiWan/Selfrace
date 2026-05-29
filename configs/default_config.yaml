@@ -7,6 +7,7 @@ simulator:
   num_envs: 100
   verbose: false         # 热路径调试日志开关，训练时保持关闭
   sim_dt: 0.3             # 模拟时间步长
+  state_dim: 7             # 仿真世界状态 [x,y,yaw,speed,length,width,active]
   max_agents_num: 150     # 最大车辆数量,定义每个环境中最大可能的智能体数量
   # num_npc_vehicles <= max_agents_num，否则会报错
   num_npc_vehicles: 150   # NPC车辆数量,定义每个环境中实际生成的智能体数量
@@ -64,16 +65,17 @@ simulator:
   observation:
     # Observation space config
     # 定义观测空间
-    local_state_dim: 7 # (x, y, yaw, speed, length, width, active) #是全局的目前
+    local_state_dim: 13 # 原文式 S(t): c,theta,kappa,v,v_lim,phi,a_long,a_lat,Cacc,Cthrottle,Csteer,l,w
     neighbor_feature_dim: 7 # (dx, dy, vx, vy, length, width, active)
-    waypoint_feature_dim: 2 # (dx, dy) for each point
+    waypoint_feature_dim: 5 # W_lane raw: (dx, dy, heading_x, heading_y, lane_width)
     boundary_feature_dim: 2 # (dx, dy) for each point
 
     # 定义视野
     num_neighbors: 20     # 邻居数量
-    num_w_lanes: 25       # 车道数量, 25个车道
+    num_w_lanes: 80       # 原文 W_lane 取最近80个coarse lane features
     num_w_boundaries: 26  # 边界数量, 26个边界
-    horizon: 100.0        # 视野范围, 100mx100m
+    horizon: 200.0        # 原文 coarse map horizon 200m
+    speed_limit: 20.0
     
   hash:
     # Spatial hash config - 空间哈希配置
@@ -208,10 +210,11 @@ training:
     # 简单特征维度配置 - 用于SimpleFeatureEncoder
     
     # S(t), G(t), reward系数, 车辆风格参数
-    simple_feature_dims: [7, 256, 10, 4]
+    simple_feature_dims: [13, 256, 10, 4]
     # 排列不变特征维度配置 - 用于PermutationInvariantEncoder
     # road_boundary, lane_points, stop_lines, other_agents
-    permutation_feature_dims: [52, 50, 20, 140]
+    permutation_feature_dims: [52, 560, 20, 140]
+    permutation_element_dims: [2, 7, 2, 7]
     
     # 网络架构配置
     network_dim: 1024  # MLP隐藏层维度
