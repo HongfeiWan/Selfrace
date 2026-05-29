@@ -110,7 +110,7 @@ class DrivingStyleSampler:
             'a': a,
             'distribution': f"X({a}) = 0.5U({lower_bound_1:.2f}, {upper_bound_1:.2f}) + 0.5U({lower_bound_2:.2f}, {upper_bound_2:.2f})",
             'support': f"[{lower_bound_1:.2f}, {upper_bound_2:.2f}]",
-            'expected_value': 1.0  # 混合均匀分布的期望值
+            'expected_value': (lower_bound_1 + upper_bound_1 + lower_bound_2 + upper_bound_2) / 4.0
         }
 
 class RewardParameterSampler:
@@ -126,7 +126,7 @@ class RewardParameterSampler:
             device (torch.device): 计算设备。
         """
         self.device = device
-        self.reward_config = config.get('reward', {})
+        self.reward_config = config.get('reward', config)
         # 从配置中加载参数范围
         self._load_parameter_ranges()
         
@@ -321,7 +321,8 @@ class VehicleParameterSampler:
     """
     def __init__(self, config: Dict, device: torch.device):
         self.device = device
-        dynamics_config = config.get('dynamics', {})
+        sim_config = config.get('simulator', config)
+        dynamics_config = sim_config.get('dynamics', config.get('dynamics', sim_config))
         self.vehicle_length_min = dynamics_config.get('vehicle_length_min', 0.8)
         self.vehicle_length_max = dynamics_config.get('vehicle_length_max', 7.0)
         self.vehicle_width_min = dynamics_config.get('vehicle_width_min', 0.8)

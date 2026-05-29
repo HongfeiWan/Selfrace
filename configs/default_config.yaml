@@ -134,6 +134,10 @@ simulator:
     timestep_alpha: 2.5e-5      # 时间步惩罚系数
   
   traffic:
+    stop_line_width: 3.5
+    stop_line_observation_count: 5
+    stop_line_horizon: 100.0
+    red_light_probability: 0.5
 
   policy:
     # agent_feature_dim and local_state_dim are now part of simulator config

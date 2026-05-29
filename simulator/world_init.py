@@ -21,6 +21,7 @@ if simulator_dir not in sys.path:
 from road import RoadNetwork
 from offroad import OffroadChecker
 from collision import CollisionChecker
+from randomize_components import VehicleParameterSampler
 
 class WorldInitializer:
     """
@@ -45,14 +46,17 @@ class WorldInitializer:
         # 获取simulator配置，支持嵌套配置结构
         simulator_config = config.get('simulator', config)
         self.verbose = simulator_config.get('verbose', False)
-        self.max_agents = simulator_config.get('max_agents_num')
-        self.num_agents_per_env = simulator_config.get('num_npc_vehicles')
+        self.max_agents = int(simulator_config.get('max_agents_num'))
+        self.num_agents_per_env = int(simulator_config.get('num_npc_vehicles'))
         if self.num_agents_per_env > self.max_agents:
             raise ValueError("num_npc_vehicles exceeds max_agents_num")
-        self.vehicle_length = simulator_config.get('vehicle_length', 4.5)
-        self.vehicle_width = simulator_config.get('vehicle_width', 2.0)
+        dynamics_config = simulator_config.get('dynamics', {})
+        self.vehicle_length = dynamics_config.get('vehicle_length', simulator_config.get('vehicle_length', 4.5))
+        self.vehicle_width = dynamics_config.get('vehicle_width', simulator_config.get('vehicle_width', 2.0))
+        self.vehicle_parameter_sampler = VehicleParameterSampler(simulator_config, self.device)
         self.speed_range = simulator_config.get('vehicle_init_speed_range', (0.0, 5.0))
         self.local_state_dim = simulator_config.get('observation', simulator_config).get('local_state_dim')
+        self.last_agents_per_env = None
 
     def _generate_states_on_quads(self, quad_indices: torch.Tensor) -> torch.Tensor:
         """
@@ -78,12 +82,14 @@ class WorldInitializer:
         speeds = (self.speed_range[0] + 
                   (self.speed_range[1] - self.speed_range[0]) * torch.rand(num_vehicles, device=self.device))
     
+        vehicle_params = self.vehicle_parameter_sampler.sample_batch_vehicle_parameters(num_vehicles)
+
         new_states = torch.zeros(num_vehicles, 7, device=self.device)
         new_states[:, :2] = positions
         new_states[:, 2] = yaws
         new_states[:, 3] = speeds
-        new_states[:, 4] = self.vehicle_length
-        new_states[:, 5] = self.vehicle_width
+        new_states[:, 4] = vehicle_params['length']
+        new_states[:, 5] = vehicle_params['width']
         new_states[:, 6] = 1.0
         return new_states
 
@@ -96,6 +102,16 @@ class WorldInitializer:
         agents_state = torch.zeros(num_envs, self.max_agents, self.local_state_dim, device=self.device)
         agents_start_quad_ids = torch.full((num_envs, self.max_agents), -1, dtype=torch.long, device=self.device)
         start_time = time.time()
+        per_env_counts = torch.randint(
+            1,
+            self.num_agents_per_env + 1,
+            (num_envs,),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.last_agents_per_env = per_env_counts
+        slot_indices = torch.arange(self.num_agents_per_env, device=self.device).view(1, -1)
+        sampled_active_mask = slot_indices < per_env_counts.view(-1, 1)
         max_retries = 1
         for retry in range(max_retries):
             # 1. 并行生成所有环境的所有agent slot的候选状态
@@ -107,6 +123,11 @@ class WorldInitializer:
             all_candidate_states = self._generate_states_on_quads(spawn_quad_indices)
             # 重塑为 (num_envs, num_agents_per_env, 7)
             candidate_states = all_candidate_states.view(num_envs, self.num_agents_per_env, 7)
+            candidate_states[..., 6] = torch.where(
+                sampled_active_mask,
+                candidate_states[..., 6],
+                torch.zeros_like(candidate_states[..., 6])
+            )
             gen_time = time.time() - gen_start
             
             # 2. 将候选状态放入agents_state张量
@@ -132,12 +153,17 @@ class WorldInitializer:
             check_time = time.time() - check_start
             
             # 4. 确定哪些放置是无效的
-            invalid_placement_mask = ~is_on_road | collision_mask  # (num_envs, num_agents_per_env)
+            invalid_placement_mask = (~is_on_road | collision_mask) & sampled_active_mask  # (num_envs, num_agents_per_env)
             
             # 5. 如果所有放置都有效，则完成初始化
             if not invalid_placement_mask.any():
                 # 记录有效的quad_id - 使用实际生成智能体位置时使用的quad_id
-                agents_start_quad_ids[:, :self.num_agents_per_env] = spawn_quad_indices.view(num_envs, self.num_agents_per_env)
+                spawn_quad_indices_2d = spawn_quad_indices.view(num_envs, self.num_agents_per_env)
+                agents_start_quad_ids[:, :self.num_agents_per_env] = torch.where(
+                    sampled_active_mask,
+                    spawn_quad_indices_2d,
+                    torch.full_like(spawn_quad_indices_2d, -1)
+                )
 
                 if retry > 0:
                     logging.debug(f"All agents placed successfully after {retry+1} retries.")
@@ -148,7 +174,7 @@ class WorldInitializer:
             agents_state[:, :self.num_agents_per_env, 6][invalid_placement_mask] = 0.0
             
             # 7. 记录有效的quad_id（对于有效的放置）
-            valid_placement_mask = ~invalid_placement_mask
+            valid_placement_mask = sampled_active_mask & ~invalid_placement_mask
             if valid_placement_mask.any():
                 # 使用实际生成智能体位置时使用的quad_id
                 # 修复形状不匹配：将spawn_quad_indices重塑为2D，然后更新
@@ -464,5 +490,4 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Error during visualization: {e}")
         print("Vehicle visualization failed.")
-
 

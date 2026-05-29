@@ -1,5 +1,6 @@
 import torch
 import json
+import math
 from typing import Dict, Tuple, List
 
 class RoadNetwork:
@@ -45,6 +46,9 @@ class RoadNetwork:
         
         # 加载全局航点
         self._load_global_waypoints(map_data)
+
+        # 加载交通灯与停止线；这些数据用于构造 W_stop 观测和红灯越线惩罚。
+        self._load_traffic_controls(map_data)
     
     def _extract_vertices(self, quads_data):
         """提取顶点坐标"""
@@ -101,6 +105,40 @@ class RoadNetwork:
         # 加载边界航点
         w_boundary_points = map_data.get('oob_points', [])
         self.global_w_boundary_points = torch.tensor([[p['x'], p['y']] for p in w_boundary_points], dtype=torch.float32, device=self.device) if w_boundary_points else torch.empty((0, 2), device=self.device)
+
+    def _load_traffic_controls(self, map_data):
+        """加载交通灯位置和停止线中心点/朝向。"""
+        traffic_controls = map_data.get('traffic_controls', [])
+        if not traffic_controls:
+            self.traffic_light_locations = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+            self.stop_line_centers = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+            self.stop_line_yaws = torch.empty((0,), dtype=torch.float32, device=self.device)
+            self.stop_line_control_indices = torch.empty((0,), dtype=torch.long, device=self.device)
+            return
+
+        light_locations = []
+        stop_line_centers = []
+        stop_line_yaws = []
+        stop_line_control_indices = []
+        for control_idx, control in enumerate(traffic_controls):
+            loc = control.get('traffic_light_location', {})
+            light_locations.append([float(loc.get('x', 0.0)), float(loc.get('y', 0.0))])
+            for waypoint in control.get('stop_line_waypoints', []):
+                wp_loc = waypoint.get('location', {})
+                wp_rot = waypoint.get('rotation', {})
+                stop_line_centers.append([float(wp_loc.get('x', 0.0)), float(wp_loc.get('y', 0.0))])
+                stop_line_yaws.append(math.radians(float(wp_rot.get('yaw', 0.0))))
+                stop_line_control_indices.append(control_idx)
+
+        self.traffic_light_locations = torch.tensor(light_locations, dtype=torch.float32, device=self.device)
+        if stop_line_centers:
+            self.stop_line_centers = torch.tensor(stop_line_centers, dtype=torch.float32, device=self.device)
+            self.stop_line_yaws = torch.tensor(stop_line_yaws, dtype=torch.float32, device=self.device)
+            self.stop_line_control_indices = torch.tensor(stop_line_control_indices, dtype=torch.long, device=self.device)
+        else:
+            self.stop_line_centers = torch.empty((0, 2), dtype=torch.float32, device=self.device)
+            self.stop_line_yaws = torch.empty((0,), dtype=torch.float32, device=self.device)
+            self.stop_line_control_indices = torch.empty((0,), dtype=torch.long, device=self.device)
 
     def get_all_lanes_left_boundaries(self) -> torch.Tensor:
         """返回所有车道左边界线段。"""
@@ -226,10 +264,16 @@ class RoadNetwork:
         vehicle_positions_flat = vehicle_positions.view(-1, 2)  # (B*M, 2)
         distances, nearest_indices = self.find_nearest_lanes(vehicle_positions_flat, k=1, spatial_hash=spatial_hash)
         
-        # 重塑回原始形状
+        # 重塑回原始形状。空间哈希可能找不到候选车道，不能让 -1 静默索引最后一条路。
         nearest_indices = nearest_indices.view(B, M)  # (B, M)
+        valid_nearest = nearest_indices >= 0
+        safe_nearest_indices = torch.where(
+            valid_nearest,
+            nearest_indices,
+            torch.zeros_like(nearest_indices)
+        )
         # 获取最近道路段的方向向量
-        road_directions = self.quad_directions[nearest_indices]  # (B, M, 2)
+        road_directions = self.quad_directions[safe_nearest_indices]  # (B, M, 2)
         
         # 计算车辆朝向向量
         vehicle_directions = torch.stack([
@@ -238,7 +282,7 @@ class RoadNetwork:
         ], dim=-1)  # (B, M, 2)
         
         # 获取最近道路段的起点
-        nearest_centerlines = self.quad_centerlines[nearest_indices]  # (B, M, 2, 2)
+        nearest_centerlines = self.quad_centerlines[safe_nearest_indices]  # (B, M, 2, 2)
         road_starts = nearest_centerlines[:, :, 0, :]  # (B, M, 2) - 道路起点
         # 计算从道路起点到车辆位置的向量 AP = P - A
         AP = vehicle_positions - road_starts  # (B, M, 2)
@@ -257,7 +301,8 @@ class RoadNetwork:
         # cross > 0: 车辆在道路左侧
         # cross < 0: 车辆在道路右侧  
         # cross = 0: 车辆在道路中心线上
-        d = cross  # (B, M)
+        d = torch.where(valid_nearest, cross, torch.zeros_like(cross))  # (B, M)
+        theta_f = torch.where(valid_nearest, theta_f, torch.zeros_like(theta_f))
         return d, theta_f
     
 
@@ -437,5 +482,3 @@ if __name__ == '__main__':
 
         traceback.print_exc()
     
-
-

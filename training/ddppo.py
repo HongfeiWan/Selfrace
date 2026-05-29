@@ -586,6 +586,10 @@ def merge_update_stats(accum: dict, update_stats: dict):
 	accum['last_update'] = update_stats
 	return accum
 
+def clear_rollout_buffers(*buffers):
+	for buf in buffers:
+		buf.clear()
+
 # ============================== 检查是否所有世界无存活agent ==============================
 def all_worlds_no_alive_agents(simulator, cumulative_done_all=None) -> bool:
 	"""
@@ -650,7 +654,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	old_log_probs_tensor = torch.stack(old_log_probs_buffer, dim=0)
 	actions_tensor = torch.stack(actions_buffer, dim=0)
 
-	with torch.no_grad(), make_autocast_context(device, precision):
+	with torch.inference_mode(), make_autocast_context(device, precision):
 		_, last_value_pred = forward_model(model, features_tensor, mode="both")
 	if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
 		last_value_pred = last_value_pred.squeeze(-1)
@@ -660,7 +664,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	advantages, returns = gae_advantages(rewards_tensor, values_tp1, dones_accum, gamma, gae_lambda)
 
 	A_max_tensor = torch.max(torch.abs(advantages)).detach()
-	a_max_ewma = A_max_tensor if a_max_ewma is None else (beta * a_max_ewma.to(device) + (1.0 - beta) * A_max_tensor)
+	a_max_ewma = A_max_tensor if a_max_ewma is None else (beta * A_max_tensor + (1.0 - beta) * a_max_ewma.to(device))
 	eta = advantage_filter_threshold * a_max_ewma
 	keep_mask = (torch.abs(advantages) >= eta)
 
@@ -739,14 +743,12 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	last_policy_loss = None
 	last_value_loss = None
 	last_entropy = None
+	mb_old_logp = old_log_probs_batch
+	mb_adv = advantages_batch
+	mb_ret = returns_batch
+	mb_agent_idx = agent_indices_batch
+	mb_actions = actions_batch
 	for epoch in range(ppo_epochs):
-		mb_idx = torch.arange(batch_N, device=device)
-		mb_old_logp = old_log_probs_batch[mb_idx]
-		mb_adv = advantages_batch[mb_idx]
-		mb_ret = returns_batch[mb_idx]
-		mb_agent_idx = agent_indices_batch[mb_idx]
-		mb_actions = actions_batch[mb_idx]
-
 		policy_optimizer.zero_grad(set_to_none=True)
 		value_optimizer.zero_grad(set_to_none=True)
 		with make_autocast_context(device, precision):
@@ -898,19 +900,22 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		rollout_length = getattr(training_cfg, 'rollout_length', 128)  # rollout长度
 		precision = getattr(training_cfg, 'precision', '32-bit')
 		amp_scaler = make_grad_scaler(device, precision)
+		profile_on = profile_enabled(config)
 		
 		for k in range(num_iterations):
 			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")
 
 			episode_start_time = time.time()
 			# ============================== 采样（初始化） ==============================
-			reset_profile_start = profile_timer_start(device, config)
+			if profile_on:
+				reset_profile_start = profile_timer_start(device, config)
 			initial_observation = simulator.reset()
-			reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
-			feature_profile_start = profile_timer_start(device, config)
+			if profile_on:
+				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
+				feature_profile_start = profile_timer_start(device, config)
 			features_tensor = build_features_from_observation(initial_observation, simulator, config)
-			initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
-			if profile_enabled(config):
+			if profile_on:
+				initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build={initial_feature_ms:.2f}ms")
 			
 			# =========================== 步进式训练：与game.py完全一致 ==============================
@@ -945,18 +950,26 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
+						clear_rollout_buffers(
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+						)
 					else:
 						print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
 					break
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
-				policy_profile_start = profile_timer_start(device, config)
-				with torch.no_grad(), make_autocast_context(device, precision):
+				if profile_on:
+					policy_profile_start = profile_timer_start(device, config)
+				with torch.inference_mode(), make_autocast_context(device, precision):
 					action_logits, value_pred = forward_model(model, features_tensor, mode="both")
-				policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
-				action_dist = torch.distributions.Categorical(logits=action_logits)
-				actions = action_dist.sample()
+					action_dist = torch.distributions.Categorical(logits=action_logits)
+					actions = action_dist.sample()
+					old_log_probs = action_dist.log_prob(actions)
+				if profile_on:
+					policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
+				del action_dist, action_logits
 				
 				# 在推进环境前缓存当前状态
 				pre_state = simulator.agents_state.detach().clone()
@@ -966,9 +979,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				pre_stop_lines = simulator.stop_lines.detach().clone()
 				
 				# 环境步进
-				env_profile_start = profile_timer_start(device, config)
+				if profile_on:
+					env_profile_start = profile_timer_start(device, config)
 				observation, reward, done = simulator.step(actions)
-				env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
+				if profile_on:
+					env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
 				
 				# 写入训练buffer（与game.py一致）
 				states_buffer.append(pre_state)
@@ -976,11 +991,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				reward_coef_buffer.append(pre_reward_coef)
 				vehicle_style_buffer.append(pre_vehicle_style)
 				stop_lines_buffer.append(pre_stop_lines)
-				rewards_buffer.append(reward.clone())
-				dones_buffer.append(done.clone())
-				values_buffer.append(value_pred.clone())
-				old_log_probs_buffer.append(action_dist.log_prob(actions).detach().clone())
-				actions_buffer.append(actions.clone())
+				rewards_buffer.append(reward.detach().clone())
+				dones_buffer.append(done.detach().clone())
+				values_buffer.append(value_pred.detach().clone())
+				old_log_probs_buffer.append(old_log_probs.detach().clone())
+				actions_buffer.append(actions.detach().clone())
 				buffer_step_count += 1
 				
 				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
@@ -991,14 +1006,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					cumulative_done_all = cumulative_done_all | current_done_all
 				
 				# 更新观测与特征
-				feature_profile_start = profile_timer_start(device, config)
+				if profile_on:
+					feature_profile_start = profile_timer_start(device, config)
 				features_tensor = build_features_from_observation(observation, simulator, config)
-				feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
+				if profile_on:
+					feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				
 				step_count += 1
 				if step_count % log_interval == 0:
 					print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
-				if profile_enabled(config) and step_count % profile_log_interval(config) == 0:
+				if profile_on and step_count % profile_log_interval(config) == 0:
 					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
 					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
 						  + (f", {step_profile}" if step_profile else ""))
@@ -1013,6 +1030,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
+						clear_rollout_buffers(
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+						)
 						print("🔄 达到最大步数，强制开启新iteration...")
 						break
 					else:
@@ -1027,27 +1048,25 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
 						if all_worlds_no_alive_agents(simulator, cumulative_done_all):
 							print("🔄 所有世界都没有存活agents，开启新iteration...")
+							clear_rollout_buffers(
+								states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							)
 							break
 						else:
 							print("✅ 仍有世界有存活agents，继续下一个128step...")
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
-							states_buffer = []
-							path_plan_buffer = []
-							reward_coef_buffer = []
-							vehicle_style_buffer = []
-							stop_lines_buffer = []
-							rewards_buffer = []
-							dones_buffer = []
-							values_buffer = []
-							old_log_probs_buffer = []
-							actions_buffer = []
+							clear_rollout_buffers(
+								states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							)
 							buffer_step_count = 0
 							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 
 
 			# 只有真实完成 optimizer step 后才推进学习率，避免空样本或 AMP skip 时跳过首个LR。
 			scheduler_stepped = step_schedulers_if_updated(policy_scheduler, value_scheduler, iteration_update_stats)
-			if profile_enabled(config):
+			if profile_on:
 				last_update = iteration_update_stats.get('last_update', {})
 				print(f"\t⏱️ update profile: scheduler_step={scheduler_stepped}, "
 					  f"samples={iteration_update_stats.get('num_selected', 0)}, "
@@ -1120,6 +1139,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 
 		precision = getattr(training_cfg, 'precision', '32-bit')
 		amp_scaler = make_grad_scaler(device, precision)
+		profile_on = profile_enabled(config)
 
 		# 分别创建策略网络和价值网络的优化器，包含 encoder + head
 		policy_optimizer = optim.Adam(get_policy_parameters(model), lr=learning_rate)
@@ -1133,13 +1153,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			num_workers_done.set("done", b"0")
 
 			# 采样初始化
-			reset_profile_start = profile_timer_start(device, config)
+			if profile_on:
+				reset_profile_start = profile_timer_start(device, config)
 			initial_observation = simulator.reset()
-			reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
-			feature_profile_start = profile_timer_start(device, config)
+			if profile_on:
+				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
+				feature_profile_start = profile_timer_start(device, config)
 			features_tensor = build_features_from_observation(initial_observation, simulator, config)
-			initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
-			if rank == 0 and profile_enabled(config):
+			if profile_on:
+				initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
+			if rank == 0 and profile_on:
 				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build={initial_feature_ms:.2f}ms")
 
 			# =========================== 步进式训练：与game.py完全一致 ==============================
@@ -1176,6 +1199,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
+						clear_rollout_buffers(
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+						)
 					else:
 						if rank == 0:
 							print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
@@ -1183,12 +1210,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
-				policy_profile_start = profile_timer_start(device, config)
-				with torch.no_grad(), make_autocast_context(device, precision):
+				if profile_on:
+					policy_profile_start = profile_timer_start(device, config)
+				with torch.inference_mode(), make_autocast_context(device, precision):
 					action_logits, value_pred = forward_model(model, features_tensor, mode="both")
-				policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
-				action_dist = torch.distributions.Categorical(logits=action_logits)
-				actions = action_dist.sample()
+					action_dist = torch.distributions.Categorical(logits=action_logits)
+					actions = action_dist.sample()
+					old_log_probs = action_dist.log_prob(actions)
+				if profile_on:
+					policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
+				del action_dist, action_logits
 				
 				# 在推进环境前缓存当前状态
 				pre_state = simulator.agents_state.detach().clone()
@@ -1198,9 +1229,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				pre_stop_lines = simulator.stop_lines.detach().clone()
 				
 				# 环境步进
-				env_profile_start = profile_timer_start(device, config)
+				if profile_on:
+					env_profile_start = profile_timer_start(device, config)
 				observation, reward, done = simulator.step(actions)
-				env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
+				if profile_on:
+					env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
 				
 				# 写入训练buffer（与game.py一致）
 				states_buffer.append(pre_state)
@@ -1208,11 +1241,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				reward_coef_buffer.append(pre_reward_coef)
 				vehicle_style_buffer.append(pre_vehicle_style)
 				stop_lines_buffer.append(pre_stop_lines)
-				rewards_buffer.append(reward.clone())
-				dones_buffer.append(done.clone())
-				values_buffer.append(value_pred.clone())
-				old_log_probs_buffer.append(action_dist.log_prob(actions).detach().clone())
-				actions_buffer.append(actions.clone())
+				rewards_buffer.append(reward.detach().clone())
+				dones_buffer.append(done.detach().clone())
+				values_buffer.append(value_pred.detach().clone())
+				old_log_probs_buffer.append(old_log_probs.detach().clone())
+				actions_buffer.append(actions.detach().clone())
 				buffer_step_count += 1
 				
 				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
@@ -1223,14 +1256,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					cumulative_done_all = cumulative_done_all | current_done_all
 				
 				# 更新观测与特征
-				feature_profile_start = profile_timer_start(device, config)
+				if profile_on:
+					feature_profile_start = profile_timer_start(device, config)
 				features_tensor = build_features_from_observation(observation, simulator, config)
-				feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
+				if profile_on:
+					feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				
 				step_count += 1
 				if rank == 0 and step_count % log_interval == 0:
 					print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
-				if rank == 0 and profile_enabled(config) and step_count % profile_log_interval(config) == 0:
+				if rank == 0 and profile_on and step_count % profile_log_interval(config) == 0:
 					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
 					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
 						  + (f", {step_profile}" if step_profile else ""))
@@ -1246,6 +1281,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
+						clear_rollout_buffers(
+							states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+						)
 						if rank == 0:
 							print("🔄 达到最大步数，强制开启新iteration...")
 						break
@@ -1264,27 +1303,25 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						if sync_bool_across_ranks(local_no_alive, device, op=dist.ReduceOp.MIN):
 							if rank == 0:
 								print("🔄 所有世界都没有存活agents，开启新iteration...")
+							clear_rollout_buffers(
+								states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							)
 							break
 						else:
 							if rank == 0:
 								print("✅ 仍有世界有存活agents，继续下一个128step...")
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
-							states_buffer = []
-							path_plan_buffer = []
-							reward_coef_buffer = []
-							vehicle_style_buffer = []
-							stop_lines_buffer = []
-							rewards_buffer = []
-							dones_buffer = []
-							values_buffer = []
-							old_log_probs_buffer = []
-							actions_buffer = []
+							clear_rollout_buffers(
+								states_buffer, path_plan_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							)
 							buffer_step_count = 0
 							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 
 			# 7) 只有真实完成 optimizer step 后才推进学习率，避免空样本或 AMP skip 时跳过首个LR。
 			scheduler_stepped = step_schedulers_if_updated(policy_scheduler, value_scheduler, iteration_update_stats)
-			if rank == 0 and profile_enabled(config):
+			if rank == 0 and profile_on:
 				last_update = iteration_update_stats.get('last_update', {})
 				print(f"\t⏱️ update profile: scheduler_step={scheduler_stepped}, "
 					  f"samples={iteration_update_stats.get('num_selected', 0)}, "

@@ -103,6 +103,17 @@ class TeraflowSimulator:
         # PathPlanner现在会自动加载所需的数据
         self.path_planner = PathPlanner(map_path=self.map_path, device=self.device, verbose=self.verbose)
 
+        # 10. 初始化交通灯/停止线观测与奖励所需的静态几何
+        self.traffic_config = simulator_config.get('traffic') or {}
+        self.stop_line_width = float(self.traffic_config.get('stop_line_width', 3.5))
+        self.stop_line_horizon = float(self.traffic_config.get('stop_line_horizon', obs_config.get('horizon', 100.0)))
+        self.stop_line_observation_count = int(self.traffic_config.get('stop_line_observation_count', 5))
+        self.red_light_probability = float(self.traffic_config.get('red_light_probability', 0.5))
+        network_cfg = config.get('training', {}).get('network', {})
+        permutation_dims = network_cfg.get('permutation_feature_dims', [52, 50, 20, 140])
+        self.stop_line_feature_dim = int(permutation_dims[2])
+        self._prepare_traffic_controls()
+
         # 10. 初始化模拟世界的状态张量
         # 这些张量将在 reset() 中被具体填充
         self.agents_state: Optional[torch.Tensor] = None
@@ -110,6 +121,9 @@ class TeraflowSimulator:
         self.agents_path_plans: Optional[torch.Tensor] = None     # 存储所有智能体的路径规划（世界坐标）
         self.agents_path_plans_local: Optional[torch.Tensor] = None  # 存储所有智能体的路径规划（局部坐标）
         self.driving_style_params: Optional[torch.Tensor] = None
+        self.traffic_light_states: Optional[torch.Tensor] = None
+        self.stop_lines: Optional[torch.Tensor] = None
+        self.stop_line_violation: Optional[torch.Tensor] = None
 
     def _log(self, *args, **kwargs):
         if self.verbose:
@@ -126,6 +140,134 @@ class TeraflowSimulator:
         now = self._profile_now()
         profile[name] = (now - start_time) * 1000.0
         return now
+
+    def _prepare_traffic_controls(self):
+        """从地图交通控制点构造停止线线段。"""
+        centers = getattr(self.road_network, 'stop_line_centers', torch.empty((0, 2), device=self.device))
+        yaws = getattr(self.road_network, 'stop_line_yaws', torch.empty((0,), device=self.device))
+        control_indices = getattr(self.road_network, 'stop_line_control_indices', torch.empty((0,), dtype=torch.long, device=self.device))
+        if centers.numel() == 0:
+            self.stop_line_segments = torch.empty((0, 2, 2), dtype=torch.float32, device=self.device)
+            self.stop_line_control_indices = torch.empty((0,), dtype=torch.long, device=self.device)
+            self.num_traffic_controls = int(getattr(self.road_network, 'traffic_light_locations', torch.empty((0, 2))).shape[0])
+            return
+
+        perp = torch.stack([torch.sin(yaws), torch.cos(yaws)], dim=-1)
+        half_width = 0.5 * self.stop_line_width
+        p0 = centers - perp * half_width
+        p1 = centers + perp * half_width
+        self.stop_line_segments = torch.stack([p0, p1], dim=1)
+        self.stop_line_control_indices = control_indices.to(device=self.device, dtype=torch.long)
+        self.num_traffic_controls = int(max(
+            int(getattr(self.road_network, 'traffic_light_locations', torch.empty((0, 2))).shape[0]),
+            int(self.stop_line_control_indices.max().item()) + 1 if self.stop_line_control_indices.numel() > 0 else 0,
+        ))
+
+    def _reset_traffic_lights(self):
+        """每个 episode 为每个环境随机化红灯状态。"""
+        if self.num_traffic_controls <= 0:
+            self.traffic_light_states = torch.empty((self.num_envs, 0), dtype=torch.bool, device=self.device)
+            return
+        self.traffic_light_states = (
+            torch.rand((self.num_envs, self.num_traffic_controls), device=self.device) < self.red_light_probability
+        )
+
+    def _red_stop_line_mask(self, batch_size: int) -> torch.Tensor:
+        """返回每个环境中每条停止线当前是否对应红灯，形状 (B, S)。"""
+        S = self.stop_line_segments.shape[0]
+        if S == 0:
+            return torch.empty((batch_size, 0), dtype=torch.bool, device=self.device)
+        if self.traffic_light_states is None or self.traffic_light_states.numel() == 0:
+            return torch.zeros((batch_size, S), dtype=torch.bool, device=self.device)
+        control_idx = torch.clamp(self.stop_line_control_indices, 0, self.traffic_light_states.shape[1] - 1)
+        return self.traffic_light_states[:batch_size, control_idx]
+
+    def _compute_stop_line_observation(self, agents_state: torch.Tensor) -> torch.Tensor:
+        """构造局部坐标下的红灯停止线观测，形状 (B, M, stop_line_feature_dim)。"""
+        B, M, _ = agents_state.shape
+        out = torch.zeros((B, M, self.stop_line_feature_dim), dtype=agents_state.dtype, device=self.device)
+        S = self.stop_line_segments.shape[0]
+        max_lines = min(self.stop_line_observation_count, self.stop_line_feature_dim // 4)
+        if S == 0 or max_lines <= 0:
+            return out
+
+        red_mask = self._red_stop_line_mask(B)
+        centers = self.stop_line_segments.mean(dim=1)
+        ego_pos = agents_state[..., :2]
+        dist_sq = (ego_pos.unsqueeze(2) - centers.view(1, 1, S, 2)).pow(2).sum(dim=-1)
+        active_mask = agents_state[..., 6] > 0.5
+        dist_sq = dist_sq.masked_fill(~red_mask.unsqueeze(1), float('inf'))
+        dist_sq = dist_sq.masked_fill(~active_mask.unsqueeze(-1), float('inf'))
+        dist_sq = dist_sq.masked_fill(dist_sq > self.stop_line_horizon ** 2, float('inf'))
+
+        k_eff = min(max_lines, S)
+        nearest_dist_sq, nearest_idx = torch.topk(dist_sq, k=k_eff, dim=-1, largest=False)
+        valid_lines = torch.isfinite(nearest_dist_sq)
+        selected_segments = self.stop_line_segments[nearest_idx.clamp_min(0)]
+        endpoints_world = selected_segments.reshape(B, M, k_eff * 2, 2)
+
+        ego_yaw = agents_state[..., 2]
+        cos_yaw, sin_yaw = torch.cos(ego_yaw), torch.sin(ego_yaw)
+        rot_matrix = torch.stack([
+            torch.stack([cos_yaw, -sin_yaw], dim=-1),
+            torch.stack([sin_yaw, cos_yaw], dim=-1)
+        ], dim=-2)
+        rel = endpoints_world - ego_pos.unsqueeze(2)
+        endpoints_local = torch.bmm(
+            rel.reshape(B * M, k_eff * 2, 2),
+            rot_matrix.reshape(B * M, 2, 2)
+        ).reshape(B, M, k_eff * 2, 2)
+        valid_points = valid_lines.unsqueeze(-1).expand(-1, -1, -1, 2).reshape(B, M, k_eff * 2)
+        endpoints_local = torch.where(valid_points.unsqueeze(-1), endpoints_local, torch.zeros_like(endpoints_local))
+
+        flat = endpoints_local.reshape(B, M, k_eff * 4)
+        out[:, :, :flat.shape[-1]] = flat
+        return out
+
+    def _update_stop_line_observation(self, agents_state: torch.Tensor):
+        self.stop_lines = self._compute_stop_line_observation(agents_state)
+
+    @staticmethod
+    def _cross2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+    def _compute_stop_line_violation(self, states_t0: torch.Tensor, states_t1: torch.Tensor,
+                                     effective_mask: torch.Tensor) -> torch.Tensor:
+        """检测车辆一步内是否穿越红灯停止线。"""
+        B, M, _ = states_t1.shape
+        S = self.stop_line_segments.shape[0]
+        if S == 0:
+            return torch.zeros((B, M), dtype=torch.bool, device=self.device)
+
+        red_mask = self._red_stop_line_mask(B)
+        if red_mask.numel() == 0:
+            return torch.zeros((B, M), dtype=torch.bool, device=self.device)
+
+        p0 = states_t0[..., :2].unsqueeze(2)
+        p1 = states_t1[..., :2].unsqueeze(2)
+        q0 = self.stop_line_segments[:, 0, :].view(1, 1, S, 2)
+        q1 = self.stop_line_segments[:, 1, :].view(1, 1, S, 2)
+
+        ego_motion = p1 - p0
+        line_vec = q1 - q0
+        o1 = self._cross2d(ego_motion, q0 - p0)
+        o2 = self._cross2d(ego_motion, q1 - p0)
+        o3 = self._cross2d(line_vec, p0 - q0)
+        o4 = self._cross2d(line_vec, p1 - q0)
+        eps = 1e-6
+        intersects = (o1 * o2 <= eps) & (o3 * o4 <= eps)
+
+        moved = ego_motion.squeeze(2).norm(dim=-1) > 0.05
+        heading = torch.stack([torch.cos(states_t1[..., 2]), torch.sin(states_t1[..., 2])], dim=-1)
+        forward_motion = (ego_motion.squeeze(2) * heading).sum(dim=-1) > 0.0
+        violation = (
+            intersects
+            & red_mask.unsqueeze(1)
+            & effective_mask.unsqueeze(-1)
+            & moved.unsqueeze(-1)
+            & forward_motion.unsqueeze(-1)
+        )
+        return violation.any(dim=-1)
 
     def reset(self) -> torch.Tensor:
         """
@@ -161,7 +303,9 @@ class TeraflowSimulator:
 
         # 初始化路径规划器 - 为所有智能体分配目标和生成路径规划
         self._initialize_path_planning()
-        self.stop_lines = torch.zeros((self.num_envs, self.world_initializer.max_agents, 20), dtype=torch.float32, device=self.device)
+        self._reset_traffic_lights()
+        self.stop_line_violation = torch.zeros_like(active_mask, dtype=torch.bool)
+        self._update_stop_line_observation(self.agents_state)
 
         # 生成初始观测。路径规划先完成，训练首帧才能拿到同步的局部路径特征。
         self._log("Generating initial observation...")
@@ -223,10 +367,12 @@ class TeraflowSimulator:
             states_flat, actions_flat, self.dt,
             style_params=style_flat,
             active_mask=effective_flat,
+            vehicle_length=self.agents_state[..., 4].contiguous().view(Bsz * Msz),
         )  # (B*M, 4)
         new_states = new_states_flat.view(Bsz, Msz, 4)
         keep_old = ~effective_mask
         self.agents_state[..., :4] = torch.where(keep_old.unsqueeze(-1), self.agents_state[..., :4], new_states)
+        self.stop_line_violation = self._compute_stop_line_violation(states_t0, self.agents_state, effective_mask)
         profile_cursor = self._profile_record(profile, 'dynamics_ms', profile_cursor)
 
         # 2. 离路检测
@@ -280,7 +426,8 @@ class TeraflowSimulator:
             agents_state_for_obs[..., 6] = torch.where(self.last_done, 0.0, agents_state_for_obs[..., 6])
         else:
             agents_state_for_obs = self.agents_state
-        
+
+        self._update_stop_line_observation(agents_state_for_obs)
         observation = self.observation_generator.generate(agents_state_for_obs)
         profile_cursor = self._profile_record(profile, 'observation_ms', profile_cursor)
 
@@ -395,6 +542,7 @@ class TeraflowSimulator:
             dt=self.dt,
             goal_positions=goal_positions,
             waypoint_reached=waypoint_reached,
+            stop_line_violation=self.stop_line_violation,
         )
         
         # 过滤掉非active或已done车辆的奖励（与动力学一致的有效掩码）

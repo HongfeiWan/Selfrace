@@ -112,7 +112,8 @@ class KinematicBicycleModel:
         self.current_steering_angle = None  # 当前有效转向角
 
     def step(self, states: torch.Tensor, actions: torch.Tensor, dt: float,
-             style_params: torch.Tensor = None, active_mask: torch.Tensor = None) -> torch.Tensor:
+             style_params: torch.Tensor = None, active_mask: torch.Tensor = None,
+             vehicle_length: torch.Tensor = None) -> torch.Tensor:
         """
         对一批车辆状态进行一步精确更新。
         Args:
@@ -121,6 +122,7 @@ class KinematicBicycleModel:
             dt (float): 模拟时间步长 (s)。
             style_params: 可选，形状为 (N, 4)，对应 [Cthrottle, Csteer, Cacc, Cvel]。
             active_mask: 可选，形状为 (N,)，False 的车辆保留/清零控制状态。
+            vehicle_length: 可选，形状为 (N,)，用于按 l_wb=0.6*l 随机化轴距。
         Returns:
             torch.Tensor: 形状为 (N, 4) 的下一时刻状态张量。
         """
@@ -156,6 +158,11 @@ class KinematicBicycleModel:
             Cvel = torch.full((batch_size,), float(self.Cvel), device=self.device, dtype=states.dtype)
         if active_mask is not None:
             active_mask = active_mask.to(device=self.device, dtype=torch.bool)
+        if vehicle_length is not None:
+            wheelbase = 0.6 * vehicle_length.to(device=self.device, dtype=states.dtype)
+            wheelbase = torch.clamp(wheelbase, min=0.1)
+        else:
+            wheelbase = torch.full((batch_size,), float(self.L), device=self.device, dtype=states.dtype)
         
         # 更新当前加速度和转向角（jerk控制）
         along_jerk = jerk_actions[:, 0]  # 纵向jerk
@@ -203,7 +210,7 @@ class KinematicBicycleModel:
         avg_speed = (speed + new_speed) / 2.0
 
         # 根据横向加速度计算目标转向角
-        target_steering_angle = self.calculate_steering_angle(alat, avg_speed)
+        target_steering_angle = self.calculate_steering_angle(alat, avg_speed, wheelbase=wheelbase)
         
         # 初始化当前转向角（如果还没有初始化）
         if self.current_steering_angle is None or self.current_steering_angle.shape[0] != batch_size:
@@ -222,7 +229,7 @@ class KinematicBicycleModel:
         
         # 根据有效转向角更新曲率和横向加速度
         # ρ^(-1) ← tan(φ^(t)) / l_wb
-        effective_curvature = torch.tan(steering_angle) / self.L
+        effective_curvature = torch.tan(steering_angle) / wheelbase
         # a_lat(t) ← (v(t))^2 * ρ^(-1)
         effective_alat = avg_speed ** 2 * effective_curvature
         
@@ -278,13 +285,15 @@ class KinematicBicycleModel:
         if hasattr(self, 'prev_along'):
             delattr(self, 'prev_along')
 
-    def calculate_steering_angle(self, alat: torch.Tensor, speed: torch.Tensor, epsilon: float = None) -> torch.Tensor:
+    def calculate_steering_angle(self, alat: torch.Tensor, speed: torch.Tensor,
+                                 epsilon: float = None, wheelbase: torch.Tensor = None) -> torch.Tensor:
         """
         根据横向加速度和速度计算转向角
         Args:
             alat (torch.Tensor): 横向加速度
             speed (torch.Tensor): 速度
             epsilon (float): 数值稳定性参数，如果为None则使用配置中的默认值  
+            wheelbase (torch.Tensor): 每辆车的轴距；None 时使用配置默认轴距。
         Returns:
             torch.Tensor: 转向角 (弧度)
         """
@@ -307,8 +316,12 @@ class KinematicBicycleModel:
         curvature_magnitude = torch.clamp(torch.abs(curvature), min=epsilon)
         curvature = curvature_sign * curvature_magnitude
 
+        if wheelbase is None:
+            wheelbase = torch.full_like(speed, float(self.L))
+        else:
+            wheelbase = wheelbase.to(device=speed.device, dtype=speed.dtype)
         # 计算转向角：φ = arctan(ρ^(-1) * lwb)
-        steering_angle = torch.atan(curvature * self.L)
+        steering_angle = torch.atan(curvature * wheelbase)
         return steering_angle
     
     def get_discrete_action_space(self) -> DiscreteActionSpace:

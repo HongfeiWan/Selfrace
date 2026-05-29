@@ -61,10 +61,17 @@ class CollisionChecker:
         # 获取simulator配置，支持嵌套配置结构
         simulator_config = config.get('simulator', config)
         
-        max_speed = simulator_config.get('max_speed', 25) # m/s, ~126 km/h
+        dynamics_config = simulator_config.get('dynamics', {})
+        max_speed = simulator_config.get(
+            'max_speed',
+            dynamics_config.get('max_velocity', 25.0) * 1.5
+        ) # m/s, includes Cvel randomization upper bound when not explicitly configured
         sim_dt = simulator_config.get('sim_dt', 0.3) # seconds
         displacement = max_speed * sim_dt
-        vehicle_length = simulator_config.get('vehicle_length', 5.0)
+        vehicle_length = dynamics_config.get(
+            'vehicle_length_max',
+            dynamics_config.get('vehicle_length', simulator_config.get('vehicle_length', 5.0))
+        )
         
         # 扫掠体的最大维度 = 车辆自身长度 + 一个时间步内的最大位移
         max_dim = vehicle_length + displacement
