@@ -69,6 +69,47 @@ def save_checkpoint(model, policy_optimizer, value_optimizer, step: int, checkpo
 	except Exception as e:
 		print(f"⚠️ 保存检查点失败: {e}")
 
+def load_checkpoint(model, policy_optimizer, value_optimizer, checkpoint_path: str, device: torch.device) -> int:
+	"""从检查点恢复模型和优化器，返回已完成的 iteration step。"""
+	if not checkpoint_path:
+		return 0
+	if not os.path.exists(checkpoint_path):
+		raise FileNotFoundError(f"resume checkpoint not found: {checkpoint_path}")
+	state = torch.load(checkpoint_path, map_location=device)
+	load_model = model.module if hasattr(model, 'module') else model
+	if 'model_state_dict' in state:
+		load_model.load_state_dict(state['model_state_dict'], strict=True)
+	else:
+		load_model.policy_network.load_state_dict(state['policy_state_dict'], strict=True)
+		load_model.value_network.load_state_dict(state['value_state_dict'], strict=True)
+		if 'policy_feature_encoder_state_dict' in state:
+			load_model.policy_feature_encoder.load_state_dict(state['policy_feature_encoder_state_dict'], strict=True)
+		if 'value_feature_encoder_state_dict' in state:
+			load_model.value_feature_encoder.load_state_dict(state['value_feature_encoder_state_dict'], strict=True)
+	if 'policy_optim_state_dict' in state:
+		policy_optimizer.load_state_dict(state['policy_optim_state_dict'])
+	if 'value_optim_state_dict' in state:
+		value_optimizer.load_state_dict(state['value_optim_state_dict'])
+	return int(state.get('step', 0))
+
+def advance_scheduler_to_iteration(policy_scheduler, value_scheduler, completed_iterations: int):
+	"""旧 checkpoint 未保存 scheduler 状态，这里按已完成 iteration 近似推进余弦调度器。"""
+	completed_iterations = max(0, int(completed_iterations))
+	for scheduler in (policy_scheduler, value_scheduler):
+		if hasattr(scheduler, 'T_max') and hasattr(scheduler, 'eta_min'):
+			scheduler.last_epoch = completed_iterations
+			next_lrs = []
+			for base_lr, param_group in zip(scheduler.base_lrs, scheduler.optimizer.param_groups):
+				lr = scheduler.eta_min + (base_lr - scheduler.eta_min) * (
+					1 + math.cos(math.pi * completed_iterations / scheduler.T_max)
+				) / 2
+				param_group['lr'] = lr
+				next_lrs.append(lr)
+			scheduler._last_lr = next_lrs
+		else:
+			for _ in range(completed_iterations):
+				scheduler.step()
+
 # ============================== 观测数据拆解 ==============================
 def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) -> tuple:
     """
@@ -917,8 +958,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		vehicle_style=vehicle_style_mb,
 		control_state=control_state_mb,
 	)
-	mb_features = features_u_mb[inverse_mb.to(device)]
-	row_idx = torch.arange(batch_N, device=device)
+	mb_features = features_u_mb[inverse_mb.to(device), agent_indices_batch].unsqueeze(1)
 
 	policy_params = get_policy_parameters(model)
 	value_params = get_value_parameters(model)
@@ -930,14 +970,13 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	mb_old_logp = old_log_probs_batch
 	mb_adv = advantages_batch
 	mb_ret = returns_batch
-	mb_agent_idx = agent_indices_batch
 	mb_actions = actions_batch
 	for epoch in range(ppo_epochs):
 		policy_optimizer.zero_grad(set_to_none=True)
 		value_optimizer.zero_grad(set_to_none=True)
 		with make_autocast_context(device, precision):
 			action_logits, value_pred_full = forward_model(model, mb_features, mode="both")
-			logits_selected = action_logits[row_idx, mb_agent_idx]
+			logits_selected = action_logits[:, 0]
 			dist_selected = torch.distributions.Categorical(logits=logits_selected)
 			new_log_probs = dist_selected.log_prob(mb_actions)
 			ratio = torch.exp(new_log_probs - mb_old_logp)
@@ -945,7 +984,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 			surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
 			policy_loss = -torch.min(surr1, surr2).mean()
 			entropy = dist_selected.entropy().mean()
-			value_pred = value_pred_full[row_idx, mb_agent_idx]
+			value_pred = value_pred_full[:, 0]
 			value_loss = (value_pred - mb_ret).pow(2).mean()
 			total_loss = policy_loss - entropy_coef * entropy + value_loss_coef * value_loss
 
@@ -1075,6 +1114,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		# 分别创建策略网络和价值网络的调度器
 		policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(policy_optimizer, T_max=num_iterations, eta_min=0.0)
 		value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(value_optimizer, T_max=num_iterations, eta_min=0.0)
+		resume_from = getattr(training_cfg, 'resume_from', None)
+		start_iteration = 0
+		if resume_from:
+			start_iteration = load_checkpoint(model, policy_optimizer, value_optimizer, resume_from, device)
+			advance_scheduler_to_iteration(policy_scheduler, value_scheduler, start_iteration)
+			print(f"✅ 从 checkpoint 恢复: {resume_from}, start_iteration={start_iteration}")
 		
 		# 优势过滤参数
 		beta = getattr(training_cfg, 'advantage_filter_beta', 0.25)	# EWMA衰减参数
@@ -1086,7 +1131,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		amp_scaler = make_grad_scaler(device, precision)
 		profile_on = profile_enabled(config)
 		
-		for k in range(num_iterations):
+		for k in range(start_iteration, num_iterations):
 			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")
 
 			episode_start_time = time.time()
@@ -1351,9 +1396,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		value_optimizer = optim.Adam(get_value_parameters(model), lr=learning_rate)
 		policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(policy_optimizer, T_max=num_iterations, eta_min=0.0)
 		value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(value_optimizer, T_max=num_iterations, eta_min=0.0)
+		resume_from = getattr(training_cfg, 'resume_from', None)
+		start_iteration = 0
+		if resume_from:
+			start_iteration = load_checkpoint(model, policy_optimizer, value_optimizer, resume_from, device)
+			advance_scheduler_to_iteration(policy_scheduler, value_scheduler, start_iteration)
+			if rank == 0:
+				print(f"✅ 从 checkpoint 恢复: {resume_from}, start_iteration={start_iteration}")
 		
 		# 每一轮迭代（步进式训练：与game.py完全一致）
-		for k in range(num_iterations):
+		for k in range(start_iteration, num_iterations):
 			# 2) 本轮开始：重置完成计数（保持与原多卡同步逻辑一致）
 			num_workers_done.set("done", b"0")
 
