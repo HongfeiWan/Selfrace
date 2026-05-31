@@ -1,4 +1,6 @@
 {
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+    "python.terminal.activateEnvironment": true,
     "python.analysis.extraPaths": [
         "./simulator",
         "./utils",
@@ -9,5 +11,6 @@
         "./simulator",
         "./utils",
         "./training"
-    ]
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:venv"
 } 

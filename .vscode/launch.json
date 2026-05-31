@@ -1,0 +1,40 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Selfrace Game Inference",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/game/game.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+                "--device",
+                "cpu",
+                "--agents",
+                "24"
+            ]
+        },
+        {
+            "name": "Selfrace Game Headless Smoke",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/game/game.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+                "--headless",
+                "--steps",
+                "3",
+                "--device",
+                "cpu",
+                "--envs",
+                "1",
+                "--agents",
+                "8"
+            ]
+        }
+    ]
+}

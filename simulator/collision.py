@@ -35,12 +35,13 @@ class CollisionChecker:
         - 预估并存储每个智能体可能覆盖的最大网格数，这是一个用于内存预分配的优化参数。
         - 设置在宽阶段为每个智能体筛选的最大邻居数。
         """
-        self.device = torch.device(config.get('device', 'cuda'))
+        simulator_config = config.get('simulator', config)
+        configured_device = simulator_config.get('device', getattr(spatial_hash, 'device', 'cuda'))
+        self.device = torch.device(configured_device)
         self.spatial_hash = spatial_hash
 
 
         # 从配置文件读取空间哈希参数
-        simulator_config = config.get('simulator', config)
         hash_config = simulator_config.get('hash', {})
 
         # 方法1：直接使用配置的cell_size
@@ -59,8 +60,6 @@ class CollisionChecker:
         # 3. 将此物理维度转换为网格单元数 (span)，并添加安全余量。
         # 4. 计算最终的方形区域内的单元格总数。
         # 获取simulator配置，支持嵌套配置结构
-        simulator_config = config.get('simulator', config)
-        
         dynamics_config = simulator_config.get('dynamics', {})
         max_speed = simulator_config.get(
             'max_speed',

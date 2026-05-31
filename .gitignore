@@ -207,6 +207,9 @@ cython_debug/
 *.synctex.gz
 *.xdv
 
+# Local model artifacts
+training/checkpoints_remote/
+
 # PyPI configuration file
 .pypirc
 
