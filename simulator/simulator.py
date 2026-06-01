@@ -878,7 +878,7 @@ class TeraflowSimulator:
         """
         将path_plans从世界坐标转换到每个智能体的局部坐标系。
         使用observation.py中_world_to_ego_centric的原理进行坐标转换。
-        同时将-1,-1坐标转换为0，方便后续网络输入。
+        保留-1,-1无效标记，供 W_lane goal-distance 特征区分有效路径点。
         """
         if self.agents_path_plans is None or self.agents_state is None:
             return
@@ -923,8 +923,9 @@ class TeraflowSimulator:
             # 重塑回原始形状
             rotated = rotated_flat.view(B, M, L, D)
             
-            # 将无效坐标（-1,-1）设置为0
-            rotated[~valid_mask] = 0.0
+            # 保留无效坐标标记；G(t) dense path 不再作为 simple feature 输入网络，
+            # W_lane 的 goal-distance 特征需要这个标记过滤 padding。
+            rotated[~valid_mask] = -1.0
             
             return rotated
         

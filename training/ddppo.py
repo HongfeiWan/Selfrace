@@ -380,33 +380,42 @@ def build_network_features(agents_state: torch.Tensor,
     # 初始化输出张量
     features_tensor = torch.zeros(batch_size, max_agents, total_input_dim, device=agents_state.device, dtype=agents_state.dtype)
     
-    # 1. 构建简单特征 (S(t), G(t), reward系数, 车辆风格参数)
+    # 1. 构建简单特征。新配置不再包含单独的 G(t) dense path vector；
+    #    routing 信息只通过 W_lane 的 goal-distance 特征进入网络。
     simple_end = sum(simple_feature_dims)
+    has_dense_goal_vector = len(simple_feature_dims) >= 4
+    simple_offset = 0
     
     # S(t): c, theta, kappa, v, v_lim, phi, a_long, a_lat, Cacc, Cthrottle, Csteer, l, w.
-    s_t_size = simple_feature_dims[0]
-    features_tensor[:, :, :s_t_size] = normalize_s_features(
+    s_t_size = simple_feature_dims[simple_offset]
+    s_t_start = 0
+    s_t_end = s_t_start + s_t_size
+    features_tensor[:, :, s_t_start:s_t_end] = normalize_s_features(
         agents_state,
         s_t_size,
         vehicle_style=vehicle_style,
         control_state=control_state,
     )
+    simple_offset += 1
+    feature_cursor = s_t_end
     
-    # G(t): 256维 - 使用路径规划信息
-    g_t_size = simple_feature_dims[1]  # 256
-    g_t_start = s_t_size
-    g_t_end = g_t_start + g_t_size
-    if path_plan is None:
-        path_plan_stable = torch.zeros(batch_size, max_agents, g_t_size, device=agents_state.device, dtype=agents_state.dtype)
-    else:
-        path_plan_stable = path_plan.to(device=agents_state.device, dtype=agents_state.dtype).flatten(start_dim=2)
-        path_plan_stable = pad_or_truncate_flat(path_plan_stable, g_t_size, pad_value=0.0)
-    path_plan_stable = normalize_to_minus1_1(path_plan_stable, -200, 200) # 原文 coarse horizon 为 200m
-    features_tensor[:, :, g_t_start:g_t_end] = path_plan_stable
+    if has_dense_goal_vector:
+        g_t_size = simple_feature_dims[simple_offset]
+        g_t_start = feature_cursor
+        g_t_end = g_t_start + g_t_size
+        if path_plan is None:
+            path_plan_stable = torch.zeros(batch_size, max_agents, g_t_size, device=agents_state.device, dtype=agents_state.dtype)
+        else:
+            path_plan_stable = path_plan.to(device=agents_state.device, dtype=agents_state.dtype).flatten(start_dim=2)
+            path_plan_stable = pad_or_truncate_flat(path_plan_stable, g_t_size, pad_value=0.0)
+        path_plan_stable = normalize_to_minus1_1(path_plan_stable, -200, 200)
+        features_tensor[:, :, g_t_start:g_t_end] = path_plan_stable
+        simple_offset += 1
+        feature_cursor = g_t_end
 
     # reward系数: 10维 - 使用传入的采样参数
-    reward_coef_size = simple_feature_dims[2]  # 10
-    reward_coef_start = g_t_start + g_t_size
+    reward_coef_size = simple_feature_dims[simple_offset]
+    reward_coef_start = feature_cursor
     reward_coef_end = reward_coef_start + reward_coef_size
 
     reward_coef = reward_coef.to(device=agents_state.device, dtype=agents_state.dtype)
@@ -419,10 +428,12 @@ def build_network_features(agents_state: torch.Tensor,
     for i in range(copy_reward):
         reward_coef_stable[:, :, i] = normalize_to_minus1_1(reward_coef[:, :, i], *reward_bounds[i])
     features_tensor[:, :, reward_coef_start:reward_coef_end] = reward_coef_stable
+    simple_offset += 1
+    feature_cursor = reward_coef_end
 
     # 车辆风格参数: 4维 - 从agents_state中提取
-    vehicle_style_size = simple_feature_dims[3]  # 4
-    vehicle_style_start = reward_coef_start + reward_coef_size
+    vehicle_style_size = simple_feature_dims[simple_offset]
+    vehicle_style_start = feature_cursor
     vehicle_style_end = vehicle_style_start + vehicle_style_size
     if vehicle_style is None:
         vehicle_style = torch.ones(batch_size, max_agents, vehicle_style_size, device=agents_state.device, dtype=agents_state.dtype)
@@ -692,6 +703,22 @@ def step_schedulers_if_updated(policy_scheduler, value_scheduler, update_stats_a
 	return False
 
 def current_path_plan(simulator):
+	"""返回用于 W_lane routing distance 的当前目标点，形状 (B, M, 1, 2)，局部坐标。"""
+	goal_positions = getattr(simulator, 'goal_positions', None)
+	agents_state = getattr(simulator, 'agents_state', None)
+	if goal_positions is not None and agents_state is not None:
+		ego_pos = agents_state[..., :2]
+		ego_yaw = agents_state[..., 2]
+		cos_yaw, sin_yaw = torch.cos(ego_yaw), torch.sin(ego_yaw)
+		rot_matrix = torch.stack([
+			torch.stack([cos_yaw, -sin_yaw], dim=-1),
+			torch.stack([sin_yaw, cos_yaw], dim=-1)
+		], dim=-2)
+		B, M, _ = agents_state.shape
+		rel_goal = (goal_positions.to(device=agents_state.device, dtype=agents_state.dtype) - ego_pos).view(B * M, 1, 2)
+		goal_local = torch.bmm(rel_goal, rot_matrix.view(B * M, 2, 2)).view(B, M, 1, 2)
+		active = agents_state[..., 6] > 0.5
+		return torch.where(active.unsqueeze(-1).unsqueeze(-1), goal_local, torch.full_like(goal_local, -1.0))
 	return simulator.agents_path_plans_local if getattr(simulator, 'agents_path_plans_local', None) is not None else simulator.agents_path_plans
 
 def current_control_state(simulator):

@@ -219,8 +219,8 @@ training:
     encoder_dim: 64  # 每个编码器的输出维度
     # 简单特征维度配置 - 用于SimpleFeatureEncoder
     
-    # S(t), G(t), reward系数, 车辆风格参数
-    simple_feature_dims: [13, 256, 10, 4]
+    # S(t), reward系数, 车辆风格参数；routing 信息由 W_lane 的 goal-distance 特征提供
+    simple_feature_dims: [13, 10, 4]
     # 排列不变特征维度配置 - 用于PermutationInvariantEncoder
     # road_boundary, lane_points, stop_lines, other_agents
     permutation_feature_dims: [160, 560, 20, 200]
