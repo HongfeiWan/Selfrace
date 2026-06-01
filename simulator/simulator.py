@@ -422,17 +422,15 @@ class TeraflowSimulator:
         offroad_mask = (~is_on_road) & check_mask # (B, M)
         profile_cursor = self._profile_record(profile, 'offroad_ms', profile_cursor)
 
-        # 3. 动态碰撞检测（排除done的车辆）
-        # 临时将done车辆的状态设置为无效，避免它们参与碰撞检测
+        # 3. 动态碰撞检测：排除上一帧已done和本帧刚离路的车辆。
+        # 离路本身已经是终止事件，不能再让它在同一帧把其他车撞成done。
+        collision_exclude_mask = offroad_mask
         if hasattr(self, 'last_done') and self.last_done is not None:
-            # 将done车辆的状态设置为无效（active=0）
-            states_t0_for_collision = states_t0.clone()
-            states_t1_for_collision = self.agents_state.clone()
-            states_t0_for_collision[..., 6] = torch.where(self.last_done, 0.0, states_t0_for_collision[..., 6])
-            states_t1_for_collision[..., 6] = torch.where(self.last_done, 0.0, states_t1_for_collision[..., 6])
-        else:
-            states_t0_for_collision = states_t0
-            states_t1_for_collision = self.agents_state
+            collision_exclude_mask = collision_exclude_mask | self.last_done
+        states_t0_for_collision = states_t0.clone()
+        states_t1_for_collision = self.agents_state.clone()
+        states_t0_for_collision[..., 6] = torch.where(collision_exclude_mask, 0.0, states_t0_for_collision[..., 6])
+        states_t1_for_collision[..., 6] = torch.where(collision_exclude_mask, 0.0, states_t1_for_collision[..., 6])
         
         collision_check_result = self.collision_checker.check(
             states_t0_for_collision, states_t1_for_collision, debug=debug_collision, debug_env_idx=0
@@ -452,14 +450,23 @@ class TeraflowSimulator:
         )
         profile_cursor = self._profile_record(profile, 'reward_ms', profile_cursor)
 
-        # 6. 推进 route target，并把已经经过的路径前缀从后续观测中移除。
+        # 6. 检查是否结束：中间 waypoint 不终止 episode。
+        done = all_collisions | offroad_mask | final_goal_reached
+
+        # 保存done状态供本次observation和后续step使用（累积done状态，一旦done就保持done）。
+        if hasattr(self, 'last_done') and self.last_done is not None:
+            self.last_done = self.last_done | done
+        else:
+            self.last_done = done.clone()
+
+        # 7. 推进 route target，并把已经经过的路径前缀从后续观测中移除。
         self._advance_route_targets(intermediate_goal_reached)
         self._update_path_plans_local()
         profile_cursor = self._profile_record(profile, 'path_local_update_ms', profile_cursor)
         self._check_and_remove_reached_waypoints()
         profile_cursor = self._profile_record(profile, 'waypoint_update_ms', profile_cursor)
 
-        # 7. 生成新的观测（排除上一时刻已经done的车辆）。
+        # 8. 生成新的观测（排除已经done的车辆，包括当前step刚done的车辆）。
         if hasattr(self, 'last_done') and self.last_done is not None:
             agents_state_for_obs = self.agents_state.clone()
             agents_state_for_obs[..., 6] = torch.where(self.last_done, 0.0, agents_state_for_obs[..., 6])
@@ -473,15 +480,6 @@ class TeraflowSimulator:
             driving_style_params=self.driving_style_params,
         )
         profile_cursor = self._profile_record(profile, 'observation_ms', profile_cursor)
-
-        # 8. 检查是否结束：中间 waypoint 不终止 episode。
-        done = all_collisions | offroad_mask | final_goal_reached
-        
-        # 保存done状态供下次step使用（累积done状态，一旦done就保持done）
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            self.last_done = self.last_done | done
-        else:
-            self.last_done = done.clone()
 
         if profile is not None:
             profile['total_step_ms'] = (self._profile_now() - profile_start) * 1000.0
