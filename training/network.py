@@ -180,7 +180,7 @@ class FeatureEncoder(nn.Module):
         # 编码排列不变特征 - 直接使用固定索引
         simple_end = sum(self.simple_feature_dims)
         
-        # road_boundary: 52维
+        # road_boundary
         road_boundary = features_tensor[:, :, simple_end:simple_end + self.permutation_feature_dims[0]]
         road_boundary_mask = self._flat_set_mask(road_boundary, element_dim=self.permutation_element_dims[0])
         output[:, :, 4*self.encoder_dim:5*self.encoder_dim] = self.permutation_encoders[0](road_boundary, mask=road_boundary_mask)
@@ -195,9 +195,14 @@ class FeatureEncoder(nn.Module):
         stop_lines_mask = self._flat_set_mask(stop_lines, element_dim=self.permutation_element_dims[2])
         output[:, :, 6*self.encoder_dim:7*self.encoder_dim] = self.permutation_encoders[2](stop_lines, mask=stop_lines_mask)
 
-        # other_agents: 140维
+        # other_agents
         other_agents = features_tensor[:, :, simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1] + self.permutation_feature_dims[2]:self.total_input_dim]
-        other_agents_mask = self._flat_set_mask(other_agents, element_dim=self.permutation_element_dims[3], active_channel=6)
+        other_agents_active_channel = self.permutation_element_dims[3] - 1
+        other_agents_mask = self._flat_set_mask(
+            other_agents,
+            element_dim=self.permutation_element_dims[3],
+            active_channel=other_agents_active_channel,
+        )
         output[:, :, 7*self.encoder_dim:8*self.encoder_dim] = self.permutation_encoders[3](other_agents, mask=other_agents_mask)
         
         return output

@@ -31,12 +31,12 @@ class ObservationGenerator:
         self.device = device
         self.num_neighbors = config.get('num_neighbors', 1) # 邻居数量
         self.num_w_lanes = config.get('num_w_lanes', 80) # 原文 W_lane 使用 80 个 coarse map features
-        self.num_w_boundaries = config.get('num_w_boundaries', 26) # 边界数量
+        self.num_w_boundaries = config.get('num_w_boundaries', 80) # 原文 W_boundary 使用 80 个 coarse map features
         self.horizon = config.get('horizon', 200.0) # 原文 coarse map horizon 200m
         self.speed_limit = float(config.get('speed_limit', 20.0))
         # 定义观测空间维度
         self.local_state_dim = config.get('local_state_dim', 13)           # 原文式 S(t)
-        self.neighbor_feature_dim = config.get('neighbor_feature_dim', 7)  # 修改为7个特征：dx, dy, vx, vy, length, width, active 
+        self.neighbor_feature_dim = config.get('neighbor_feature_dim', 10)  # dx,dy,heading_x,heading_y,dvx,dvy,length,width,z,active
         self.waypoint_feature_dim = config.get('waypoint_feature_dim', 5)  # W_lane: dx,dy,dir_x,dir_y,width
         self.boundary_feature_dim = config.get('boundary_feature_dim', 2)  # 修改为2个特征：x,y
         # 使用来自 SelfraceSimulator 的共享哈希，仅作网格坐标与单元ID计算，不在此处重建静态索引
@@ -202,7 +202,7 @@ class ObservationGenerator:
         Returns:
             torch.Tensor: 展平后的观测向量张量 (B, M, feature_dim)。
             local_state: (B, M, 13)
-            neighbors_local: (B, M, K, 7)  # dx, dy, vx, vy, length, width, active
+            neighbors_local: (B, M, K, neighbor_feature_dim)
             w_lanes_local: (B, M, N_lanes, 5)
             w_boundaries_local: (B, M, N_boundaries, 2)
         """
@@ -336,9 +336,32 @@ class ObservationGenerator:
             v_local = torch.bmm(v_relative_world.view(B*M, K_neighbors, 2), rot_matrix.view(B*M, 2, 2)).view(B, M, K_neighbors, 2)
             length = neighbor_states[..., 4].unsqueeze(-1)
             width = neighbor_states[..., 5].unsqueeze(-1)
+            heading_world = torch.stack([torch.cos(neighbor_yaw), torch.sin(neighbor_yaw)], dim=-1)
+            heading_local = torch.bmm(
+                heading_world.view(B * M, K_neighbors, 2),
+                rot_matrix.view(B * M, 2, 2)
+            ).view(B, M, K_neighbors, 2)
+            z = torch.zeros(B, M, K_neighbors, 1, device=self.device, dtype=ego_states.dtype)
             active_flag = neighbor_states[..., 6].unsqueeze(-1)
-            neighbors_local = torch.cat([local_pos_neighbors, v_local, length, width, active_flag], dim=-1)
-            #包含七个特征：dx, dy, dvx, dvy, length, width, active
+            if self.neighbor_feature_dim <= 7:
+                neighbors_local = torch.cat([local_pos_neighbors, v_local, length, width, active_flag], dim=-1)
+            else:
+                neighbors_local = torch.cat([
+                    local_pos_neighbors,
+                    heading_local,
+                    v_local,
+                    length,
+                    width,
+                    z,
+                    active_flag,
+                ], dim=-1)
+            if neighbors_local.shape[-1] != self.neighbor_feature_dim:
+                fitted = torch.zeros(B, M, K_neighbors, self.neighbor_feature_dim, device=self.device, dtype=ego_states.dtype)
+                copy_dim = min(neighbors_local.shape[-1], self.neighbor_feature_dim)
+                fitted[..., :copy_dim] = neighbors_local[..., :copy_dim]
+                if self.neighbor_feature_dim > neighbors_local.shape[-1]:
+                    fitted[..., -1] = active_flag.squeeze(-1)
+                neighbors_local = fitted
         else:
             # 如果没有邻居，创建空的邻居特征张量
             neighbors_local = torch.zeros(B, M, 0, self.neighbor_feature_dim, device=self.device)

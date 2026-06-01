@@ -110,7 +110,7 @@ class TeraflowSimulator:
         self.stop_line_observation_count = int(self.traffic_config.get('stop_line_observation_count', 5))
         self.red_light_probability = float(self.traffic_config.get('red_light_probability', 0.5))
         network_cfg = config.get('training', {}).get('network', {})
-        permutation_dims = network_cfg.get('permutation_feature_dims', [52, 50, 20, 140])
+        permutation_dims = network_cfg.get('permutation_feature_dims', [160, 560, 20, 200])
         self.stop_line_feature_dim = int(permutation_dims[2])
         self._prepare_traffic_controls()
 
@@ -1142,13 +1142,13 @@ if __name__ == '__main__':
                         h = ax.scatter(world[:,0], world[:,1], s=4, c='k', alpha=0.5, label='w_boundaries_local')
                         overlay_artists.append(h)
 
-            # neighbors_local: (B, M, K, 7) -> [dx, dy, dvx, dvy, length, width, active]
+            # neighbors_local: [dx, dy, heading_x, heading_y, dvx, dvy, length, width, z, active]
             neigh = neighbors_local_t[0, first_agent_idx] if neighbors_local_t is not None else None
             if neigh is not None:
                 neigh_np = neigh.detach().to('cpu').numpy()
                 if neigh_np.ndim >= 2 and neigh_np.shape[-1] >= 6:
                     # 有效点：active>0.5 或者 长宽>0
-                    active_mask = neigh_np[..., 6] > 0.5 if neigh_np.shape[-1] >= 7 else np.ones(neigh_np.shape[0], dtype=bool)
+                    active_mask = neigh_np[..., -1] > 0.5 if neigh_np.shape[-1] >= 7 else np.ones(neigh_np.shape[0], dtype=bool)
                     valid = active_mask
                     dxdy = neigh_np[valid][..., :2]
                     if dxdy.size > 0:
@@ -1172,9 +1172,16 @@ if __name__ == '__main__':
                             for ii in valid_indices:
                                 row = neigh_np[ii]
                                 nx, ny = float(row[0]), float(row[1])
-                                dvx_local, dvy_local = float(row[2]), float(row[3])
-                                nlen = float(row[4])
-                                nwid = float(row[5])
+                                if row.shape[0] >= 10:
+                                    heading_x, heading_y = float(row[2]), float(row[3])
+                                    dvx_local, dvy_local = float(row[4]), float(row[5])
+                                    nlen = float(row[6])
+                                    nwid = float(row[7])
+                                else:
+                                    heading_x = heading_y = None
+                                    dvx_local, dvy_local = float(row[2]), float(row[3])
+                                    nlen = float(row[4])
+                                    nwid = float(row[5])
                                 # 局部中心 -> 世界中心
                                 cx, cy = (R @ np.array([nx, ny])).tolist(); cx += ex; cy += ey
                                 # 相对速度(局部) -> 世界相对速度
@@ -1183,7 +1190,9 @@ if __name__ == '__main__':
                                 nvx_world = vx_ego + rvx_world
                                 nvy_world = vy_ego + rvy_world
                                 speed_mag = math.hypot(nvx_world, nvy_world)
-                                if speed_mag > 1e-2:
+                                if heading_x is not None and math.hypot(heading_x, heading_y) > 1e-3:
+                                    nyaw_world = eyaw + math.atan2(heading_y, heading_x)
+                                elif speed_mag > 1e-2:
                                     nyaw_world = math.atan2(nvy_world, nvx_world)
                                 else:
                                     nyaw_world = eyaw

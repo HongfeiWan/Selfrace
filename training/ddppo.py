@@ -122,7 +122,7 @@ def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) ->
     Returns:
         tuple: (agents_state, neighbors_local, w_lanes_local, w_boundaries_local)
             - agents_state: (B, M, S_dim) - 原文式 S(t) 局部状态
-            - neighbors_local: (B, M, K, 7) - 邻居相对状态 [dx, dy, vx, vy, length, width, active]
+            - neighbors_local: (B, M, K, neighbor_dim) - 邻居相对状态，active 位于最后一维
             - w_lanes_local: (B, M, N_lanes, lane_dim) - W_lane raw features
             - w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标 [dx, dy]
     """
@@ -131,12 +131,12 @@ def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) ->
     # 从配置中获取维度信息
     simulator_config = config.simulator
     local_state_dim = simulator_config.observation.local_state_dim
-    neighbor_feature_dim = simulator_config.observation.neighbor_feature_dim  # 7
+    neighbor_feature_dim = simulator_config.observation.neighbor_feature_dim
     waypoint_feature_dim = simulator_config.observation.waypoint_feature_dim
     boundary_feature_dim = simulator_config.observation.boundary_feature_dim  # 2
     num_neighbors = simulator_config.observation.num_neighbors  # 20
     num_w_lanes = simulator_config.observation.num_w_lanes
-    num_w_boundaries = simulator_config.observation.num_w_boundaries  # 26
+    num_w_boundaries = simulator_config.observation.num_w_boundaries
     
     # 计算各部分在观测向量中的位置
     local_state_size = local_state_dim
@@ -150,8 +150,8 @@ def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) ->
     # 2. 提取neighbors_local
     neighbors_start = local_state_size
     neighbors_end = neighbors_start + neighbors_size
-    neighbors_flat = observation[:, :, neighbors_start:neighbors_end]  # (B, M, K*7)
-    neighbors_local = neighbors_flat.view(batch_size, max_agents, num_neighbors, neighbor_feature_dim)  # (B, M, K, 7)
+    neighbors_flat = observation[:, :, neighbors_start:neighbors_end]
+    neighbors_local = neighbors_flat.view(batch_size, max_agents, num_neighbors, neighbor_feature_dim)
     
     # 3. 提取w_lanes_local
     w_lanes_start = neighbors_end
@@ -356,7 +356,7 @@ def build_network_features(agents_state: torch.Tensor,
     将拆解后的观测组件构建为网络输入的特征张量
     Args:
         agents_state: (B, M, S_dim) - 原文式 S(t) 局部状态
-        neighbors_local: (B, M, K, 7) - 邻居相对状态
+        neighbors_local: (B, M, K, neighbor_dim) - 邻居相对状态，active 位于最后一维
         w_lanes_local: (B, M, N_lanes, lane_dim) - map lane raw feature
         w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标
         path_plan: (B, M, path_length, 2) - 路径规划点
@@ -438,12 +438,12 @@ def build_network_features(agents_state: torch.Tensor,
     # 2. 构建排列不变特征 (road_boundary, lane_points, stop_lines, other_agents)
     permutation_start = simple_end
     
-    # road_boundary: 52维 - 使用边界线信息
-    road_boundary_size = permutation_feature_dims[0]  # 52
+    # road_boundary: 原文使用最近80个boundary coarse features
+    road_boundary_size = permutation_feature_dims[0]
     road_boundary_start = permutation_start
     road_boundary_end = road_boundary_start + road_boundary_size
     
-    w_boundaries_flat = normalize_point_set(w_boundaries_local, road_boundary_size)
+    w_boundaries_flat = normalize_point_set(w_boundaries_local, road_boundary_size, min_val=-200.0, max_val=200.0)
     if w_boundaries_flat is not None:
         features_tensor[:, :, road_boundary_start:road_boundary_end] = w_boundaries_flat
     else:
@@ -475,23 +475,45 @@ def build_network_features(agents_state: torch.Tensor,
     else:
         features_tensor[:, :, stop_lines_start:stop_lines_end] = FEATURE_PAD_VALUE
     
-    # other_agents: 140维 - 使用邻居信息
-    other_agents_size = permutation_feature_dims[3]  # 140
+    # other_agents: 使用邻居位置、朝向、速度、尺寸、z 与 active mask
+    other_agents_size = permutation_feature_dims[3]
     other_agents_start = stop_lines_end
     other_agents_end = other_agents_start + other_agents_size
     
     # 将邻居信息按通道做归一化后再展平并填充，active=0 的 padding 不参与网络 maxpool。
     neighbors_local = neighbors_local.to(device=agents_state.device, dtype=agents_state.dtype)
-    neighbors_proc = torch.empty_like(neighbors_local)
-    neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_local[:, :, :, 0], -100, 100)
-    neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_local[:, :, :, 1], -100, 100)
-    neighbors_proc[:, :, :, 2] = normalize_to_minus1_1(neighbors_local[:, :, :, 2], -40, 40)
-    neighbors_proc[:, :, :, 3] = normalize_to_minus1_1(neighbors_local[:, :, :, 3], -40, 40)
-    neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_local[:, :, :, 4], 0.8, 7)
-    neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_local[:, :, :, 5], 0.8, 3)
-    neighbors_proc[:, :, :, 6] = neighbors_local[:, :, :, 6]
-    neighbors_flat = neighbors_proc.flatten(start_dim=2)  # (B, M, K*7)
-    features_tensor[:, :, other_agents_start:other_agents_end] = pad_or_truncate_flat(neighbors_flat, other_agents_size, pad_value=0.0)
+    neighbors_proc = torch.full_like(neighbors_local, FEATURE_PAD_VALUE)
+    neighbor_dim = neighbors_local.shape[-1]
+    if neighbor_dim >= 10:
+        neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_local[:, :, :, 0], -200, 200)
+        neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_local[:, :, :, 1], -200, 200)
+        neighbors_proc[:, :, :, 2] = torch.clamp(neighbors_local[:, :, :, 2], -1.0, 1.0)
+        neighbors_proc[:, :, :, 3] = torch.clamp(neighbors_local[:, :, :, 3], -1.0, 1.0)
+        neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_local[:, :, :, 4], -40, 40)
+        neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_local[:, :, :, 5], -40, 40)
+        neighbors_proc[:, :, :, 6] = normalize_to_minus1_1(neighbors_local[:, :, :, 6], 0.8, 7)
+        neighbors_proc[:, :, :, 7] = normalize_to_minus1_1(neighbors_local[:, :, :, 7], 0.8, 3)
+        neighbors_proc[:, :, :, 8] = normalize_to_minus1_1(neighbors_local[:, :, :, 8], -10, 10)
+        neighbors_proc[:, :, :, 9] = neighbors_local[:, :, :, 9]
+    else:
+        neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_local[:, :, :, 0], -100, 100)
+        neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_local[:, :, :, 1], -100, 100)
+        if neighbor_dim > 2:
+            neighbors_proc[:, :, :, 2] = normalize_to_minus1_1(neighbors_local[:, :, :, 2], -40, 40)
+        if neighbor_dim > 3:
+            neighbors_proc[:, :, :, 3] = normalize_to_minus1_1(neighbors_local[:, :, :, 3], -40, 40)
+        if neighbor_dim > 4:
+            neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_local[:, :, :, 4], 0.8, 7)
+        if neighbor_dim > 5:
+            neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_local[:, :, :, 5], 0.8, 3)
+        if neighbor_dim > 6:
+            neighbors_proc[:, :, :, 6] = neighbors_local[:, :, :, 6]
+    neighbors_flat = neighbors_proc.flatten(start_dim=2)
+    features_tensor[:, :, other_agents_start:other_agents_end] = pad_or_truncate_flat(
+        neighbors_flat,
+        other_agents_size,
+        pad_value=FEATURE_PAD_VALUE,
+    )
     
     return features_tensor
 
