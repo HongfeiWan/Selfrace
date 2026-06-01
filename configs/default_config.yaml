@@ -11,6 +11,9 @@ simulator:
   max_agents_num: 150     # 最大车辆数量,定义每个环境中最大可能的智能体数量
   # num_npc_vehicles <= max_agents_num，否则会报错
   num_npc_vehicles: 150   # NPC车辆数量,定义每个环境中实际生成的智能体数量
+  init_candidates_per_slot: 16  # sequential rejection 初始化时每个待填slot的候选数量
+  init_max_fill_attempts: 4     # 每个slot最多重采样次数，用于尽量填满目标车辆数
+  init_collision_clearance: 0.0 # 初始化碰撞检测额外安全间距(m)，0表示严格按车身尺寸
 
   # 地图配置  
   map_path: "./maps/processed_map_Town01_stitched.json" # 地图路径

@@ -59,6 +59,9 @@ class WorldInitializer:
         # observation.local_state_dim 现在表示网络观测 S(t) 维度，二者不能混用。
         self.state_dim = int(simulator_config.get('state_dim', 7))
         self.last_agents_per_env = None
+        self.init_candidates_per_slot = int(simulator_config.get('init_candidates_per_slot', 16))
+        self.init_max_fill_attempts = int(simulator_config.get('init_max_fill_attempts', 4))
+        self.init_collision_clearance = float(simulator_config.get('init_collision_clearance', 0.0))
 
     def _generate_states_on_quads(self, quad_indices: torch.Tensor) -> torch.Tensor:
         """
@@ -95,12 +98,151 @@ class WorldInitializer:
         new_states[:, 6] = 1.0
         return new_states
 
+    def _sample_candidate_batch(self, num_envs: int, candidates_per_env: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample a large GPU-resident candidate pool for each environment."""
+        total_candidates = num_envs * candidates_per_env
+        quad_indices = torch.randint(
+            0,
+            self.road_network.num_quads,
+            (total_candidates,),
+            device=self.device,
+        )
+        candidate_states = self._generate_states_on_quads(quad_indices).view(num_envs, candidates_per_env, 7)
+        candidate_quads = quad_indices.view(num_envs, candidates_per_env)
+        return candidate_states, candidate_quads
+
+    def _candidate_onroad_mask(self, candidate_states: torch.Tensor) -> torch.Tensor:
+        B, K, _ = candidate_states.shape
+        states_for_checker = candidate_states[..., [0, 1, 2, 4, 5]].reshape(B * K, 5)
+        return self.offroad_checker.check_on_road(states_for_checker).view(B, K)
+
+    @staticmethod
+    def _unit_axes(yaw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        axis_x = torch.stack([cos_yaw, sin_yaw], dim=-1)
+        axis_y = torch.stack([-sin_yaw, cos_yaw], dim=-1)
+        return axis_x, axis_y
+
+    def _candidate_collision_mask(
+        self,
+        candidate_states: torch.Tensor,
+        placed_states: torch.Tensor,
+        placed_active: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Return (B, K) mask for candidates overlapping any already placed vehicle.
+        Uses vectorized oriented-box SAT against the current partial initialization.
+        """
+        B, K, _ = candidate_states.shape
+        M = placed_states.shape[1]
+        if M == 0 or not bool(placed_active.any().item()):
+            return torch.zeros((B, K), dtype=torch.bool, device=self.device)
+
+        cand_center = candidate_states[..., :2]              # (B,K,2)
+        placed_center = placed_states[..., :2]               # (B,M,2)
+        cand_x, cand_y = self._unit_axes(candidate_states[..., 2])
+        placed_x, placed_y = self._unit_axes(placed_states[..., 2])
+
+        clearance = self.init_collision_clearance
+        cand_hl = 0.5 * (candidate_states[..., 4] + clearance)
+        cand_hw = 0.5 * (candidate_states[..., 5] + clearance)
+        placed_hl = 0.5 * (placed_states[..., 4] + clearance)
+        placed_hw = 0.5 * (placed_states[..., 5] + clearance)
+
+        delta = placed_center.unsqueeze(1) - cand_center.unsqueeze(2)  # (B,K,M,2)
+
+        def dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            return (a * b).sum(dim=-1)
+
+        cand_x_b = cand_x.unsqueeze(2)
+        cand_y_b = cand_y.unsqueeze(2)
+        placed_x_b = placed_x.unsqueeze(1)
+        placed_y_b = placed_y.unsqueeze(1)
+
+        abs_px_cx = dot(placed_x_b, cand_x_b).abs()
+        abs_py_cx = dot(placed_y_b, cand_x_b).abs()
+        abs_px_cy = dot(placed_x_b, cand_y_b).abs()
+        abs_py_cy = dot(placed_y_b, cand_y_b).abs()
+
+        cand_hl_b = cand_hl.unsqueeze(2)
+        cand_hw_b = cand_hw.unsqueeze(2)
+        placed_hl_b = placed_hl.unsqueeze(1)
+        placed_hw_b = placed_hw.unsqueeze(1)
+
+        sep_cx = dot(delta, cand_x_b).abs() > (
+            cand_hl_b + placed_hl_b * abs_px_cx + placed_hw_b * abs_py_cx
+        )
+        sep_cy = dot(delta, cand_y_b).abs() > (
+            cand_hw_b + placed_hl_b * abs_px_cy + placed_hw_b * abs_py_cy
+        )
+        sep_px = dot(delta, placed_x_b).abs() > (
+            placed_hl_b + cand_hl_b * abs_px_cx + cand_hw_b * abs_px_cy
+        )
+        sep_py = dot(delta, placed_y_b).abs() > (
+            placed_hw_b + cand_hl_b * abs_py_cx + cand_hw_b * abs_py_cy
+        )
+
+        overlap = ~(sep_cx | sep_cy | sep_px | sep_py)
+        overlap = overlap & placed_active.unsqueeze(1)
+        return overlap.any(dim=2)
+
+    def _sequential_collision_free_fill(
+        self,
+        agents_state: torch.Tensor,
+        agents_start_quad_ids: torch.Tensor,
+        target_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Fill each world slot-by-slot from large candidate pools.
+        For each target slot, all worlds draw K candidates in parallel and keep the
+        first candidate that is on-road and collision-free against already placed cars.
+        """
+        num_envs = agents_state.shape[0]
+        filled_counts = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        candidates_per_slot = max(1, self.init_candidates_per_slot)
+        max_attempts = max(1, self.init_max_fill_attempts)
+
+        for slot_idx in range(self.num_agents_per_env):
+            needs_slot = filled_counts < target_counts
+            if not bool(needs_slot.any().item()):
+                break
+
+            placed_active = agents_state[..., 6] > 0.5
+            slot_filled = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+            for _ in range(max_attempts):
+                still_needs = needs_slot & (~slot_filled)
+                if not bool(still_needs.any().item()):
+                    break
+
+                candidate_states, candidate_quads = self._sample_candidate_batch(num_envs, candidates_per_slot)
+                onroad = self._candidate_onroad_mask(candidate_states)
+                collides = self._candidate_collision_mask(candidate_states, agents_state, placed_active)
+                valid_candidates = onroad & (~collides) & still_needs.unsqueeze(1)
+
+                has_choice = valid_candidates.any(dim=1)
+                if not bool(has_choice.any().item()):
+                    continue
+
+                choice_idx = valid_candidates.to(torch.int32).argmax(dim=1)
+                rows = torch.where(has_choice)[0]
+                chosen_states = candidate_states[rows, choice_idx[rows]]
+                chosen_quads = candidate_quads[rows, choice_idx[rows]]
+
+                agents_state[rows, slot_idx, :7] = chosen_states
+                agents_start_quad_ids[rows, slot_idx] = chosen_quads.to(agents_start_quad_ids.dtype)
+                placed_active[rows, slot_idx] = True
+                slot_filled[rows] = True
+
+            filled_counts += slot_filled.long()
+
+        return filled_counts
+
     def initialize_world(self, num_envs: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         生成一批新的、无碰撞的世界状态。
-        采用并行生成和迭代优化的策略，确保初始化的交通流是有效的。
+        使用大候选池 + sequential rejection，尽量为每个世界填满目标车辆数。
         """
-        # 存储每个智能体的起始quad_id
         agents_state = torch.zeros(num_envs, self.max_agents, self.state_dim, device=self.device)
         agents_start_quad_ids = torch.full((num_envs, self.max_agents), -1, dtype=torch.long, device=self.device)
         start_time = time.time()
@@ -112,81 +254,21 @@ class WorldInitializer:
             device=self.device,
         )
         self.last_agents_per_env = per_env_counts
-        slot_indices = torch.arange(self.num_agents_per_env, device=self.device).view(1, -1)
-        sampled_active_mask = slot_indices < per_env_counts.view(-1, 1)
-        max_retries = 1
-        for retry in range(max_retries):
-            # 1. 并行生成所有环境的所有agent slot的候选状态
-            gen_start = time.time()
-            total_agents = num_envs * self.num_agents_per_env
-            # 为所有agent生成四边形索引
-            spawn_quad_indices = torch.randint(0, self.road_network.num_quads, (total_agents,), device=self.device)
-            # 生成所有候选状态
-            all_candidate_states = self._generate_states_on_quads(spawn_quad_indices)
-            # 重塑为 (num_envs, num_agents_per_env, 7)
-            candidate_states = all_candidate_states.view(num_envs, self.num_agents_per_env, 7)
-            candidate_states[..., 6] = torch.where(
-                sampled_active_mask,
-                candidate_states[..., 6],
-                torch.zeros_like(candidate_states[..., 6])
-            )
-            gen_time = time.time() - gen_start
-            
-            # 2. 将候选状态放入agents_state张量
-            agents_state[:, :self.num_agents_per_env] = candidate_states
-            
-            # 3. 并行检查所有agent的有效性
-            check_start = time.time()
-            # a) 离路检查 - 检查所有agent
-            offroad_start = time.time()
-            all_states_to_check = agents_state[:, :self.num_agents_per_env]  # (num_envs, num_agents_per_env, 7)
-            offroad_states_for_checker = all_states_to_check[:, :, [0, 1, 2, 4, 5]]  # (num_envs, num_agents_per_env, 5)
-            # 重塑为 (num_envs * num_agents_per_env, 5) 以便批量检查
-            offroad_states_flat = offroad_states_for_checker.view(-1, 5)
-            is_on_road_flat = self.offroad_checker.check_on_road(offroad_states_flat)
-            offroad_time = time.time() - offroad_start
-            is_on_road = is_on_road_flat.view(num_envs, self.num_agents_per_env)  # (num_envs, num_agents_per_env)
-            
-            # b) 碰撞检查 - 检查所有agent之间的碰撞
-            collision_start = time.time()
-            collisions = self.collision_checker.check(agents_state, agents_state)  # (num_envs, max_agents)
-            collision_time = time.time() - collision_start
-            collision_mask = collisions[:, :self.num_agents_per_env]  # (num_envs, num_agents_per_env)
-            check_time = time.time() - check_start
-            
-            # 4. 确定哪些放置是无效的
-            invalid_placement_mask = (~is_on_road | collision_mask) & sampled_active_mask  # (num_envs, num_agents_per_env)
-            
-            # 5. 如果所有放置都有效，则完成初始化
-            if not invalid_placement_mask.any():
-                # 记录有效的quad_id - 使用实际生成智能体位置时使用的quad_id
-                spawn_quad_indices_2d = spawn_quad_indices.view(num_envs, self.num_agents_per_env)
-                agents_start_quad_ids[:, :self.num_agents_per_env] = torch.where(
-                    sampled_active_mask,
-                    spawn_quad_indices_2d,
-                    torch.full_like(spawn_quad_indices_2d, -1)
-                )
-
-                if retry > 0:
-                    logging.debug(f"All agents placed successfully after {retry+1} retries.")
-                break
-            
-            # 6. 对于无效的放置，将对应的agent标记为不激活
-            # 直接使用切片索引来更新agents_state
-            agents_state[:, :self.num_agents_per_env, 6][invalid_placement_mask] = 0.0
-            
-            # 7. 记录有效的quad_id（对于有效的放置）
-            valid_placement_mask = sampled_active_mask & ~invalid_placement_mask
-            if valid_placement_mask.any():
-                # 使用实际生成智能体位置时使用的quad_id
-                # 修复形状不匹配：将spawn_quad_indices重塑为2D，然后更新
-                spawn_quad_indices_2d = spawn_quad_indices.view(num_envs, self.num_agents_per_env)
-                agents_start_quad_ids[:, :self.num_agents_per_env][valid_placement_mask] = spawn_quad_indices_2d[valid_placement_mask]
-            if self.verbose and retry == 0:  # 只在第一次迭代时打印性能信息
-                print(f"Retry {retry}: gen_time={gen_time:.4f}s, check_time={check_time:.4f}s, offroad_time={offroad_time:.4f}s, collision_time={collision_time:.4f}s")
+        filled_counts = self._sequential_collision_free_fill(
+            agents_state,
+            agents_start_quad_ids,
+            per_env_counts,
+        )
         end_time = time.time()
         if self.verbose:
-            print(f"World initialization time: {end_time - start_time} seconds")
+            requested = int(per_env_counts.sum().item())
+            filled = int(filled_counts.sum().item())
+            min_fill = int(filled_counts.min().item()) if filled_counts.numel() else 0
+            print(
+                f"World initialization time: {end_time - start_time:.4f}s, "
+                f"filled={filled}/{requested}, min_env_fill={min_fill}, "
+                f"candidates_per_slot={self.init_candidates_per_slot}, attempts={self.init_max_fill_attempts}"
+            )
         ego_agents_idx = torch.zeros(num_envs, dtype=torch.int64, device=self.device)
         logging.info("World initialization complete.")
         return agents_state, ego_agents_idx, agents_start_quad_ids
