@@ -389,7 +389,7 @@ class ObservationGenerator:
             local_state[..., 1] = theta
             local_state[..., 2] = self.road_network.quad_curvatures[safe_quad_indices]
             local_state[..., 3] = ego_states[..., 3]
-            local_state[..., 4] = self.speed_limit
+            local_state[..., 4] = self.speed_limit * style[..., 3]
             local_state[..., 5] = control[..., 0]  # steering angle phi
             local_state[..., 6] = control[..., 1]  # a_long
             local_state[..., 7] = control[..., 2]  # a_lat

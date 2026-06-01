@@ -242,7 +242,7 @@ def normalize_s_features(s_t: torch.Tensor, target_size: int, vehicle_style: tor
     if target_size >= 13:
         normalized = torch.empty_like(out)
         bounds = (
-            (-5.0, 5.0), (-math.pi, math.pi), (-0.2, 0.2), (-2.0, 20.0), (0.0, 30.0),
+            (-5.0, 5.0), (-math.pi, math.pi), (-0.2, 0.2), (-2.0, 30.0), (0.0, 30.0),
             (-0.7, 0.7), (-5.0, 5.0), (-4.0, 4.0),
             (1 / 1.5, 1.5), (1 / 1.25, 1.25), (1 / 1.25, 1.25),
             (0.8, 7.0), (0.8, 3.0),
@@ -401,7 +401,7 @@ def build_network_features(agents_state: torch.Tensor,
     else:
         path_plan_stable = path_plan.to(device=agents_state.device, dtype=agents_state.dtype).flatten(start_dim=2)
         path_plan_stable = pad_or_truncate_flat(path_plan_stable, g_t_size, pad_value=0.0)
-    path_plan_stable = normalize_to_minus1_1(path_plan_stable, -100, 100) #归一化
+    path_plan_stable = normalize_to_minus1_1(path_plan_stable, -200, 200) # 原文 coarse horizon 为 200m
     features_tensor[:, :, g_t_start:g_t_end] = path_plan_stable
 
     # reward系数: 10维 - 使用传入的采样参数
@@ -489,8 +489,8 @@ def build_network_features(agents_state: torch.Tensor,
         neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_local[:, :, :, 1], -200, 200)
         neighbors_proc[:, :, :, 2] = torch.clamp(neighbors_local[:, :, :, 2], -1.0, 1.0)
         neighbors_proc[:, :, :, 3] = torch.clamp(neighbors_local[:, :, :, 3], -1.0, 1.0)
-        neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_local[:, :, :, 4], -40, 40)
-        neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_local[:, :, :, 5], -40, 40)
+        neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_local[:, :, :, 4], -60, 60)
+        neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_local[:, :, :, 5], -60, 60)
         neighbors_proc[:, :, :, 6] = normalize_to_minus1_1(neighbors_local[:, :, :, 6], 0.8, 7)
         neighbors_proc[:, :, :, 7] = normalize_to_minus1_1(neighbors_local[:, :, :, 7], 0.8, 3)
         neighbors_proc[:, :, :, 8] = normalize_to_minus1_1(neighbors_local[:, :, :, 8], -10, 10)
@@ -499,9 +499,9 @@ def build_network_features(agents_state: torch.Tensor,
         neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_local[:, :, :, 0], -100, 100)
         neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_local[:, :, :, 1], -100, 100)
         if neighbor_dim > 2:
-            neighbors_proc[:, :, :, 2] = normalize_to_minus1_1(neighbors_local[:, :, :, 2], -40, 40)
+            neighbors_proc[:, :, :, 2] = normalize_to_minus1_1(neighbors_local[:, :, :, 2], -60, 60)
         if neighbor_dim > 3:
-            neighbors_proc[:, :, :, 3] = normalize_to_minus1_1(neighbors_local[:, :, :, 3], -40, 40)
+            neighbors_proc[:, :, :, 3] = normalize_to_minus1_1(neighbors_local[:, :, :, 3], -60, 60)
         if neighbor_dim > 4:
             neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_local[:, :, :, 4], 0.8, 7)
         if neighbor_dim > 5:
