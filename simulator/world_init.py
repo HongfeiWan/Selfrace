@@ -62,6 +62,18 @@ class WorldInitializer:
         self.init_candidates_per_slot = int(simulator_config.get('init_candidates_per_slot', 16))
         self.init_max_fill_attempts = int(simulator_config.get('init_max_fill_attempts', 4))
         self.init_collision_clearance = float(simulator_config.get('init_collision_clearance', 0.0))
+        self.init_candidate_pool_size = int(simulator_config.get('init_candidate_pool_size', 262144))
+        self.init_candidate_pool_refill_threshold = int(simulator_config.get('init_candidate_pool_refill_threshold', 8192))
+        self.init_candidate_pool_refill_batch = int(simulator_config.get('init_candidate_pool_refill_batch', 65536))
+        self.init_distribution_correction = bool(simulator_config.get('init_distribution_correction', True))
+        self.init_distribution_calibration_samples = int(simulator_config.get('init_distribution_calibration_samples', 65536))
+        self.init_distribution_smoothing = float(simulator_config.get('init_distribution_smoothing', 1.0))
+        self.init_distribution_max_weight = float(simulator_config.get('init_distribution_max_weight', 20.0))
+        self._spawn_quad_probs = None
+        self._candidate_pool_states = torch.empty((0, 7), dtype=torch.float32, device=self.device)
+        self._candidate_pool_quad_ids = torch.empty((0,), dtype=torch.long, device=self.device)
+        self._candidate_pool_cursor = 0
+        self._build_spawn_distribution()
 
     def _generate_states_on_quads(self, quad_indices: torch.Tensor) -> torch.Tensor:
         """
@@ -98,18 +110,111 @@ class WorldInitializer:
         new_states[:, 6] = 1.0
         return new_states
 
+    def _build_spawn_distribution(self):
+        """
+        Estimate the marginal acceptance rate of the raw initializer and bias the
+        proposal by its inverse. With uniform 1m-ish quads as the target, this
+        counteracts the tendency for rejection sampling to retain wider/easier
+        road sections more often.
+        """
+        num_quads = int(self.road_network.num_quads)
+        if num_quads <= 0:
+            raise ValueError("Road network has no quads for world initialization.")
+
+        uniform_probs = torch.full((num_quads,), 1.0 / num_quads, dtype=torch.float32, device=self.device)
+        if not self.init_distribution_correction or self.init_distribution_calibration_samples <= 0:
+            self._spawn_quad_probs = uniform_probs
+            return
+
+        sample_count = max(num_quads, self.init_distribution_calibration_samples)
+        quad_indices = torch.randint(0, num_quads, (sample_count,), dtype=torch.long, device=self.device)
+        candidate_states = self._generate_states_on_quads(quad_indices).view(1, sample_count, 7)
+        accepted = self._candidate_onroad_mask(candidate_states).view(-1)
+
+        attempts_per_quad = torch.bincount(quad_indices, minlength=num_quads).to(torch.float32)
+        accepted_per_quad = torch.bincount(quad_indices[accepted], minlength=num_quads).to(torch.float32)
+        smoothing = max(self.init_distribution_smoothing, 1e-6)
+        acceptance_rate = (accepted_per_quad + smoothing) / (attempts_per_quad + smoothing)
+        correction = torch.reciprocal(acceptance_rate.clamp_min(1e-6))
+        correction = torch.clamp(correction, max=max(self.init_distribution_max_weight, 1.0))
+
+        probs = correction / correction.sum().clamp_min(1e-12)
+        self._spawn_quad_probs = torch.where(torch.isfinite(probs), probs, uniform_probs)
+
+    def _sample_quad_indices(self, count: int) -> torch.Tensor:
+        if self._spawn_quad_probs is None:
+            self._build_spawn_distribution()
+        return torch.multinomial(self._spawn_quad_probs, count, replacement=True)
+
     def _sample_candidate_batch(self, num_envs: int, candidates_per_env: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample a large GPU-resident candidate pool for each environment."""
+        """Draw candidates from the reusable on-road candidate pool."""
         total_candidates = num_envs * candidates_per_env
-        quad_indices = torch.randint(
-            0,
-            self.road_network.num_quads,
-            (total_candidates,),
-            device=self.device,
-        )
-        candidate_states = self._generate_states_on_quads(quad_indices).view(num_envs, candidates_per_env, 7)
-        candidate_quads = quad_indices.view(num_envs, candidates_per_env)
+        candidate_states, candidate_quads = self._draw_from_candidate_pool(total_candidates)
+        candidate_states = candidate_states.view(num_envs, candidates_per_env, 7)
+        candidate_quads = candidate_quads.view(num_envs, candidates_per_env)
         return candidate_states, candidate_quads
+
+    def _generate_valid_candidate_chunk(self, count: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if count <= 0:
+            return (
+                torch.empty((0, 7), dtype=torch.float32, device=self.device),
+                torch.empty((0,), dtype=torch.long, device=self.device),
+            )
+        quad_indices = self._sample_quad_indices(count)
+        states = self._generate_states_on_quads(quad_indices)
+        valid = self._candidate_onroad_mask(states.view(1, count, 7)).view(-1)
+        return states[valid], quad_indices[valid]
+
+    def _available_pool_count(self) -> int:
+        return max(0, int(self._candidate_pool_states.shape[0]) - int(self._candidate_pool_cursor))
+
+    def _ensure_candidate_pool(self, min_available: int):
+        min_available = max(0, int(min_available))
+        if self._available_pool_count() >= min_available:
+            return
+
+        remaining_states = self._candidate_pool_states[self._candidate_pool_cursor:]
+        remaining_quads = self._candidate_pool_quad_ids[self._candidate_pool_cursor:]
+        pieces_states = [remaining_states] if remaining_states.numel() > 0 else []
+        pieces_quads = [remaining_quads] if remaining_quads.numel() > 0 else []
+        total = int(remaining_states.shape[0])
+        target = max(min_available, self.init_candidate_pool_size)
+        refill_batch = max(1, self.init_candidate_pool_refill_batch)
+
+        attempts = 0
+        max_attempts = max(8, int(math.ceil(target / refill_batch)) * 8)
+        while total < target and attempts < max_attempts:
+            states, quads = self._generate_valid_candidate_chunk(refill_batch)
+            if states.shape[0] > 0:
+                pieces_states.append(states)
+                pieces_quads.append(quads)
+                total += int(states.shape[0])
+            attempts += 1
+
+        if total < min_available:
+            raise RuntimeError(
+                f"Unable to refill initialization candidate pool: need {min_available}, got {total} "
+                f"after {attempts} refill attempts."
+            )
+
+        pool_states = torch.cat(pieces_states, dim=0) if pieces_states else torch.empty((0, 7), dtype=torch.float32, device=self.device)
+        pool_quads = torch.cat(pieces_quads, dim=0) if pieces_quads else torch.empty((0,), dtype=torch.long, device=self.device)
+        keep = min(int(pool_states.shape[0]), target)
+        self._candidate_pool_states = pool_states[:keep].contiguous()
+        self._candidate_pool_quad_ids = pool_quads[:keep].contiguous()
+        self._candidate_pool_cursor = 0
+
+    def _draw_from_candidate_pool(self, count: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        count = int(count)
+        self._ensure_candidate_pool(count)
+        start = self._candidate_pool_cursor
+        end = start + count
+        states = self._candidate_pool_states[start:end]
+        quads = self._candidate_pool_quad_ids[start:end]
+        self._candidate_pool_cursor = end
+        if self._available_pool_count() < self.init_candidate_pool_refill_threshold:
+            self._ensure_candidate_pool(max(self.init_candidate_pool_refill_threshold, 0))
+        return states, quads
 
     def _candidate_onroad_mask(self, candidate_states: torch.Tensor) -> torch.Tensor:
         B, K, _ = candidate_states.shape
@@ -216,9 +321,8 @@ class WorldInitializer:
                     break
 
                 candidate_states, candidate_quads = self._sample_candidate_batch(num_envs, candidates_per_slot)
-                onroad = self._candidate_onroad_mask(candidate_states)
                 collides = self._candidate_collision_mask(candidate_states, agents_state, placed_active)
-                valid_candidates = onroad & (~collides) & still_needs.unsqueeze(1)
+                valid_candidates = (~collides) & still_needs.unsqueeze(1)
 
                 has_choice = valid_candidates.any(dim=1)
                 if not bool(has_choice.any().item()):

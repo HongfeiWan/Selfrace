@@ -14,6 +14,13 @@ simulator:
   init_candidates_per_slot: 16  # sequential rejection 初始化时每个待填slot的候选数量
   init_max_fill_attempts: 4     # 每个slot最多重采样次数，用于尽量填满目标车辆数
   init_collision_clearance: 0.0 # 初始化碰撞检测额外安全间距(m)，0表示严格按车身尺寸
+  init_candidate_pool_size: 262144             # 跨reset复用的on-road候选池目标容量
+  init_candidate_pool_refill_threshold: 8192   # 候选池低水位，低于此值时同步补池
+  init_candidate_pool_refill_batch: 65536      # 每次补池的原始采样批量
+  init_distribution_correction: true           # 按估计接受率反向修正spawn proposal
+  init_distribution_calibration_samples: 65536 # 启动时用于估计每个quad接受率的样本数
+  init_distribution_smoothing: 1.0             # 接受率估计平滑，避免低样本quad权重发散
+  init_distribution_max_weight: 20.0           # 单个quad的最大反向修正权重
 
   # 地图配置  
   map_path: "./maps/processed_map_Town01_stitched.json" # 地图路径
