@@ -11,8 +11,9 @@ class PathPlanner:
     LANE_UTURN_THRESHOLD = 5.0
     LANE_UTURN_PENALTY = 10000.0
 
-    def __init__(self, map_path: str, device: torch.device, verbose: bool = False):
+    def __init__(self, map_path: str, device: torch.device, verbose: bool = False, enable_dense_paths: bool = False):
         self.verbose = verbose
+        self.enable_dense_paths = bool(enable_dense_paths)
         if self.verbose:
             print(f"==========PathPlanner init==========")
         start_time = time.time()
@@ -431,13 +432,19 @@ class PathPlanner:
         # ===================初始化WaypointGraphGPU===================
         self._route_distance_ready = False
         try:
-            lane_route_graph, lane_route_edge_coords = self._build_lane_route_graph(cross_data)
+            lane_route_graph, lane_route_edge_coords = self._build_lane_route_graph(
+                cross_data,
+                keep_edge_coords=self.enable_dense_paths,
+            )
             self.waypoint_graph_gpu = WaypointGraphGPU(
                 cross_data_path,
                 device=str(self.device),
                 waypoint_graph=lane_route_graph,
+                store_next=self.enable_dense_paths,
+                build_edge_lookup=self.enable_dense_paths,
             )
-            self._install_prebuilt_waypoint_graph_edge_expansions(lane_route_edge_coords)
+            if self.enable_dense_paths:
+                self._install_prebuilt_waypoint_graph_edge_expansions(lane_route_edge_coords)
             self._precompute_route_distance_tables()
         except Exception as e:
             print(f"WaypointGraphGPU初始化失败: {e}")
@@ -455,6 +462,11 @@ class PathPlanner:
         Returns:
             path: 路径(B,M,max_path_length,2)
         '''
+        if not self.enable_dense_paths:
+            raise RuntimeError(
+                "Dense path generation is disabled. Training uses explicit G(t) plus W_lane graph route distances; "
+                "instantiate PathPlanner(..., enable_dense_paths=True) only for debugging/visualization."
+            )
         plan_start_time = time.time()
         # 初始化规划的路径：
         # path = (B,M,512,2)
@@ -1370,7 +1382,11 @@ class PathPlanner:
             last_x, last_y = x, y
         return total
 
-    def _build_lane_route_graph(self, raw_cross_data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[List[Tuple[float, float]]]]:
+    def _build_lane_route_graph(
+        self,
+        raw_cross_data: Dict[str, Any],
+        keep_edge_coords: bool = False,
+    ) -> Tuple[Dict[str, Any], List[List[Tuple[float, float]]]]:
         if not self.lanes:
             return raw_cross_data.get('waypoint_graph', {'nodes': [], 'edges': []}), []
 
@@ -1428,7 +1444,8 @@ class PathPlanner:
                 coords.append(v_xy)
             weight = self._coords_path_length([node_xy(u_key)] + coords) + float(extra_weight)
             edges.append([u_node, v_node, float(weight)])
-            edge_coords.append(coords)
+            if keep_edge_coords:
+                edge_coords.append(coords)
 
         for lane_key, coords in lane_coords.items():
             expansion = coords[1:] if len(coords) > 1 else [coords[-1]]
@@ -1594,7 +1611,16 @@ class WaypointGraphGPU:
     """
     将 waypoint_graph 预处理为 GPU 常驻的稀疏入边表，并提供固定长度的批量最短路径生成功能。
     """
-    def __init__(self, json_path: Optional[str] = None, device: Optional[str] = None, waypoint_graph: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        json_path: Optional[str] = None,
+        device: Optional[str] = None,
+        waypoint_graph: Optional[Dict[str, Any]] = None,
+        store_next: bool = False,
+        build_edge_lookup: bool = False,
+    ):
+        self.store_next = bool(store_next)
+        self.build_edge_lookup = bool(build_edge_lookup)
         # 1) 读取 JSON 并解析 waypoint_graph
         if waypoint_graph is not None:
             wg = waypoint_graph
@@ -1690,12 +1716,17 @@ class WaypointGraphGPU:
         self.node_triplets = torch.from_numpy(node_triplets_np.astype(np.int64)).to(device)
         # 保存每个节点的坐标 (x,y)，用于直接索引生成坐标路径
         self.node_xy = torch.from_numpy(np.stack([x_col, y_col], axis=1).astype(np.float32)).to(device)
-        self.edge_u_idx = torch.from_numpy(u_idx.astype(np.int64)).to(device)
-        self.edge_v_idx = torch.from_numpy(v_idx.astype(np.int64)).to(device)
-        self.edge_id_lookup = torch.full((N, N), -1, dtype=torch.long, device=device)
-        if u_idx.size > 0:
-            edge_ids = torch.arange(u_idx.size, dtype=torch.long, device=device)
-            self.edge_id_lookup[self.edge_u_idx, self.edge_v_idx] = edge_ids
+        if self.build_edge_lookup:
+            self.edge_u_idx = torch.from_numpy(u_idx.astype(np.int64)).to(device)
+            self.edge_v_idx = torch.from_numpy(v_idx.astype(np.int64)).to(device)
+            self.edge_id_lookup = torch.full((N, N), -1, dtype=torch.long, device=device)
+            if u_idx.size > 0:
+                edge_ids = torch.arange(u_idx.size, dtype=torch.long, device=device)
+                self.edge_id_lookup[self.edge_u_idx, self.edge_v_idx] = edge_ids
+        else:
+            self.edge_u_idx = torch.empty(0, dtype=torch.long, device=device)
+            self.edge_v_idx = torch.empty(0, dtype=torch.long, device=device)
+            self.edge_id_lookup = None
         self.edge_expansion_points = None
         self.edge_expansion_lengths = None
 
@@ -1750,7 +1781,7 @@ class WaypointGraphGPU:
         
         # 缓存（offset位掩码、终点树）
         self._offset_masks_cache = {}
-        # 预计算所有终点组的最短路径树，使用张量存储
+        # 预计算所有终点组的图距离；dense path 的 next-hop 表按需启用。
         self._precompute_all_end_trees_tensor()
 
     def _precompute_all_end_trees_tensor(self):
@@ -1759,20 +1790,19 @@ class WaypointGraphGPU:
         U = self.triplet_unique_keys.numel()
         N = self.outgoing_tgt_idx.size(0)
 
-        # 预分配张量存储所有终点组的结果
         # dist_tensor: [U, N] - 每个终点组到所有节点的最短距离
-        # next_tensor: [U, N] - 每个终点组的最短路径下一跳
         dist_tensor = torch.full((U, N), float('inf'), dtype=torch.float32, device=device)
-        next_tensor = torch.full((U, N), -1, dtype=torch.long, device=device)
+        next_tensor = torch.full((U, N), -1, dtype=torch.long, device=device) if self.store_next else None
         # 批量构建所有终点组的最短路径树
         for g in range(U):
-            dist_g, next_g = self._build_end_tree(g)
+            dist_g, next_g = self._build_end_tree(g, return_next=self.store_next)
             dist_tensor[g] = dist_g
-            next_tensor[g] = next_g
+            if next_tensor is not None:
+                next_tensor[g] = next_g
         self.end_dist_tensor = dist_tensor  # [U, N]
-        self.end_next_tensor = next_tensor  # [U, N]
+        self.end_next_tensor = next_tensor  # [U, N] when dense path generation is enabled
 
-    def _build_end_tree(self, end_group_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _build_end_tree(self, end_group_id: int, return_next: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """为给定终点组构建最短路径树"""
         device = self.device
         N = self.outgoing_tgt_idx.size(0)
@@ -1783,7 +1813,7 @@ class WaypointGraphGPU:
         nodes = self.nodes_sorted_by_triplet[start:start + count]
         
         dist = torch.full((N,), float('inf'), dtype=torch.float32, device=device)
-        next_idx = torch.full((N,), -1, dtype=torch.long, device=device)
+        next_idx = torch.full((N,), -1, dtype=torch.long, device=device) if return_next else None
         if count > 0:
             dist.index_fill_(0, nodes, 0.0)
         
@@ -1796,8 +1826,9 @@ class WaypointGraphGPU:
             if not torch.any(improved):
                 break
             dist = torch.minimum(dist, new_d)
-            best_v = self.outgoing_tgt_idx.gather(1, min_pos.view(-1, 1)).squeeze(1)  # [N]
-            next_idx[improved] = best_v[improved]
+            if next_idx is not None:
+                best_v = self.outgoing_tgt_idx.gather(1, min_pos.view(-1, 1)).squeeze(1)  # [N]
+                next_idx[improved] = best_v[improved]
         
         return dist, next_idx
 
@@ -1820,6 +1851,8 @@ class WaypointGraphGPU:
         return use
 
     def set_edge_expansions(self, points: torch.Tensor, lengths: torch.Tensor):
+        if self.edge_id_lookup is None:
+            raise RuntimeError("edge expansion lookup is disabled; construct WaypointGraphGPU with build_edge_lookup=True")
         if points.dim() != 3 or points.size(-1) != 2:
             raise ValueError(f"edge expansion points must be [E, K, 2], got {points.shape}")
         if points.size(0) != self.edge_u_idx.numel():
@@ -1850,6 +1883,7 @@ class WaypointGraphGPU:
         if (
             self.edge_expansion_points is None
             or self.edge_expansion_lengths is None
+            or self.edge_id_lookup is None
             or L_nodes <= 1
         ):
             safe_nodes = torch.clamp(node_indices, 0, self.node_xy.shape[0] - 1)
@@ -1911,6 +1945,11 @@ class WaypointGraphGPU:
             raise ValueError(f"start_ids 与 end_ids 形状必须一致，got {start_ids.shape} vs {end_ids.shape}")
         if start_ids.dim() != 2 or start_ids.size(1) != 3:
             raise ValueError(f"start_ids 必须是 [B, 3] 形状，got {start_ids.shape}")
+        if self.end_next_tensor is None:
+            raise RuntimeError(
+                "Dense shortest-path materialization is disabled. "
+                "Construct WaypointGraphGPU(..., store_next=True) for debug path generation."
+            )
         
         device = self.device
         N = self.outgoing_tgt_idx.size(0)
@@ -2058,7 +2097,11 @@ if __name__ == "__main__":
     import numpy as np
 
     # 初始化规划器
-    path_planner = PathPlanner(map_path='maps/processed_map_Town01_stitched.json', device=torch.device('cuda'))
+    path_planner = PathPlanner(
+        map_path='maps/processed_map_Town01_stitched.json',
+        device=torch.device('cuda'),
+        enable_dense_paths=True,
+    )
 
     # 测试指定的起点和终点对
     # 测试1: [10, 67, -2] 到 [17, 65, -2]

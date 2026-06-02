@@ -122,8 +122,6 @@ class TeraflowSimulator:
         self.agents_route_target_count: Optional[torch.Tensor] = None
         self.agents_current_route_idx: Optional[torch.Tensor] = None
         self.max_route_targets: int = 4  # N_wp ~ U{0,3} plus one final goal
-        self.agents_path_plans: Optional[torch.Tensor] = None     # 存储所有智能体的路径规划（世界坐标）
-        self.agents_path_plans_local: Optional[torch.Tensor] = None  # 存储所有智能体的路径规划（局部坐标）
         self.goal_positions: Optional[torch.Tensor] = None
         self.final_goal_positions: Optional[torch.Tensor] = None
         self.route_candidate_samples: int = int(simulator_config.get('route_candidate_samples', 64))
@@ -459,12 +457,9 @@ class TeraflowSimulator:
         else:
             self.last_done = done.clone()
 
-        # 7. 推进 route target，并把已经经过的路径前缀从后续观测中移除。
+        # 7. 推进 route target。训练导航只依赖紧凑 route state，不再维护 dense path。
         self._advance_route_targets(intermediate_goal_reached)
-        self._update_path_plans_local()
-        profile_cursor = self._profile_record(profile, 'path_local_update_ms', profile_cursor)
-        self._check_and_remove_reached_waypoints()
-        profile_cursor = self._profile_record(profile, 'waypoint_update_ms', profile_cursor)
+        profile_cursor = self._profile_record(profile, 'route_update_ms', profile_cursor)
 
         # 8. 生成新的观测（排除已经done的车辆，包括当前step刚done的车辆）。
         if hasattr(self, 'last_done') and self.last_done is not None:
@@ -598,19 +593,6 @@ class TeraflowSimulator:
         self.extend_state = extended_state # 用于传入网络
         return reward, final_goal_reached, intermediate_goal_reached
     
-    def _left_align_path_tensor(self, path: torch.Tensor) -> torch.Tensor:
-        """左对齐每个 agent 的有效路径点，保持点的原始顺序。"""
-        if path is None or path.numel() == 0:
-            return path
-        B, M, L, _ = path.shape
-        valid = (path[..., 0] != -1) & (path[..., 1] != -1)
-        col_idx = torch.arange(L, device=self.device).view(1, 1, L).expand(B, M, -1)
-        order_score = (~valid).long() * L + col_idx
-        order = torch.argsort(order_score, dim=2, stable=True)
-        path_left = path.gather(2, order.unsqueeze(-1).expand(-1, -1, -1, 2))
-        path_left = torch.where(valid.gather(2, order).unsqueeze(-1), path_left, torch.full_like(path_left, -1.0))
-        return path_left
-
     def _sample_next_route_quads(
         self,
         prev_quad: torch.Tensor,
@@ -731,40 +713,45 @@ class TeraflowSimulator:
 
         return route_quads, target_count
 
-    def _build_route_path(self, start_i32: torch.Tensor, route_quads: torch.Tensor,
-                          target_count: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
-        """按 start -> waypoint(s) -> final goal 逐段规划，并拼接成一条训练路径。"""
-        B, M = start_i32.shape
-        path_segments = []
-        segment_start = start_i32
-        for leg_idx in range(self.max_route_targets):
-            segment_goal = route_quads[..., leg_idx]
-            leg_valid = active_mask & (target_count > leg_idx) & (segment_start >= 0) & (segment_goal >= 0)
-            start_valid = torch.where(leg_valid, segment_start, torch.zeros_like(segment_start))
-            goal_valid = torch.where(leg_valid, segment_goal, torch.zeros_like(segment_goal))
-            if bool(leg_valid.any().item()):
-                segment_path = self.path_planner.plan_path(start_valid.unsqueeze(-1), goal_valid.unsqueeze(-1))
-            else:
-                segment_path = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
-            segment_path = torch.where(
-                leg_valid.unsqueeze(-1).unsqueeze(-1),
-                segment_path,
-                torch.full_like(segment_path, -1.0),
-            )
-            # 后续段去掉重复的段起点，避免 waypoint 附近出现连续重复点。
-            path_segments.append(segment_path if leg_idx == 0 else segment_path[:, :, 1:, :])
-            segment_start = segment_goal
+    def get_route_state(self, clone: bool = False) -> Dict[str, torch.Tensor]:
+        """Return compact routing state used to reconstruct navigation observations on demand."""
+        if (
+            self.agents_route_quad_ids is None
+            or self.agents_route_target_count is None
+            or self.agents_current_route_idx is None
+        ):
+            return {}
+        route_state = {
+            'route_quad_ids': self.agents_route_quad_ids.to(dtype=torch.int32),
+            'target_count': self.agents_route_target_count.to(dtype=torch.int16),
+            'current_idx': self.agents_current_route_idx.to(dtype=torch.int16),
+        }
+        if clone:
+            route_state = {key: value.detach().clone() for key, value in route_state.items()}
+        return route_state
 
-        full_path = torch.cat(path_segments, dim=2)
-        full_path = self._left_align_path_tensor(full_path)
-        path = torch.full((B, M, 128, 2), -1.0, dtype=torch.float32, device=self.device)
-        use_len = min(128, full_path.shape[2])
-        path[:, :, :use_len, :] = full_path[:, :, :use_len, :]
-        return path
+    def _route_state_tensors(self, route_state: Optional[Dict[str, torch.Tensor]] = None):
+        if route_state is None:
+            return self.agents_route_quad_ids, self.agents_route_target_count, self.agents_current_route_idx
+        route_quads = route_state.get('route_quad_ids')
+        target_count = route_state.get('target_count')
+        current_idx = route_state.get('current_idx')
+        if route_quads is None or target_count is None or current_idx is None:
+            return None, None, None
+        return (
+            route_quads.to(device=self.device, dtype=torch.int32),
+            target_count.to(device=self.device, dtype=torch.long),
+            current_idx.to(device=self.device, dtype=torch.long),
+        )
 
-    def _route_quad_at(self, indices: torch.Tensor) -> torch.Tensor:
+    def _route_quad_at(self, indices: torch.Tensor, route_quad_ids: torch.Tensor = None) -> torch.Tensor:
+        if route_quad_ids is None:
+            route_quad_ids = self.agents_route_quad_ids
+        if route_quad_ids is None:
+            return torch.full(indices.shape, -1, dtype=torch.int32, device=self.device)
+        route_quad_ids = route_quad_ids.to(device=self.device, dtype=torch.int32)
         safe_indices = torch.clamp(indices, 0, self.max_route_targets - 1).long()
-        return torch.gather(self.agents_route_quad_ids, 2, safe_indices.unsqueeze(-1)).squeeze(-1)
+        return torch.gather(route_quad_ids, 2, safe_indices.unsqueeze(-1)).squeeze(-1)
 
     def _refresh_goal_positions(self):
         """刷新当前目标点和最终目标点坐标。"""
@@ -782,33 +769,35 @@ class TeraflowSimulator:
         self.final_goal_positions = torch.where(final_valid.unsqueeze(-1), final_goal_positions, current_positions)
         self.agents_goal_quad_ids = final_quad
 
-    def _current_target_is_intermediate(self) -> torch.Tensor:
-        if self.agents_route_target_count is None or self.agents_current_route_idx is None:
+    def _current_target_is_intermediate(self, route_state: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+        _, target_count, current_idx = self._route_state_tensors(route_state)
+        if target_count is None or current_idx is None:
             B, M, _ = self.agents_state.shape
             return torch.zeros((B, M), dtype=torch.bool, device=self.device)
         return (
-            (self.agents_route_target_count > 0)
-            & (self.agents_current_route_idx < (self.agents_route_target_count - 1))
+            (target_count > 0)
+            & (current_idx < (target_count - 1))
         )
 
-    def _remaining_route_goals_local(self, agents_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _remaining_route_goals_local(
+        self,
+        agents_state: torch.Tensor,
+        route_state: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return remaining route targets as explicit G(t) in ego coordinates."""
         B, M, _ = agents_state.shape
         goal_slots = self.max_route_targets
         goals_local = torch.zeros((B, M, goal_slots, 2), dtype=agents_state.dtype, device=self.device)
         goals_valid = torch.zeros((B, M, goal_slots), dtype=torch.bool, device=self.device)
-        if (
-            self.agents_route_quad_ids is None
-            or self.agents_route_target_count is None
-            or self.agents_current_route_idx is None
-        ):
+        route_quads, target_count, current_idx = self._route_state_tensors(route_state)
+        if route_quads is None or target_count is None or current_idx is None:
             return goals_local, goals_valid
 
         slot_offsets = torch.arange(goal_slots, device=self.device, dtype=torch.long).view(1, 1, goal_slots)
-        target_indices = self.agents_current_route_idx.unsqueeze(-1) + slot_offsets
-        goals_valid = target_indices < self.agents_route_target_count.unsqueeze(-1)
+        target_indices = current_idx.unsqueeze(-1) + slot_offsets
+        goals_valid = target_indices < target_count.unsqueeze(-1)
         safe_indices = torch.clamp(target_indices, 0, goal_slots - 1)
-        goal_quads = torch.gather(self.agents_route_quad_ids, 2, safe_indices)
+        goal_quads = torch.gather(route_quads, 2, safe_indices)
         goals_valid = goals_valid & (goal_quads >= 0) & (agents_state[..., 6] > 0.5).unsqueeze(-1)
 
         goal_world = self.path_planner.get_quad_centers(goal_quads.reshape(-1).to(torch.long)).view(B, M, goal_slots, 2)
@@ -827,7 +816,11 @@ class TeraflowSimulator:
         goals_local = torch.where(goals_valid.unsqueeze(-1), goals_local, torch.zeros_like(goals_local))
         return goals_local, goals_valid
 
-    def get_navigation_observation(self, agents_state: torch.Tensor = None) -> torch.Tensor:
+    def get_navigation_observation(
+        self,
+        agents_state: torch.Tensor = None,
+        route_state: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         """
         Build the paper-style navigation observation package.
 
@@ -845,15 +838,16 @@ class TeraflowSimulator:
         lane_slots = self.observation_generator.num_w_lanes
         navigation = torch.zeros((B, M, goal_slots + lane_slots, 3), dtype=agents_state.dtype, device=self.device)
 
-        goals_local, goals_valid = self._remaining_route_goals_local(agents_state)
+        goals_local, goals_valid = self._remaining_route_goals_local(agents_state, route_state=route_state)
         navigation[:, :, :goal_slots, :2] = goals_local
         navigation[:, :, :goal_slots, 2] = goals_valid.to(dtype=agents_state.dtype)
 
-        if self.agents_current_route_idx is None or self.agents_route_quad_ids is None:
+        route_quads, _, current_idx = self._route_state_tensors(route_state)
+        if route_quads is None or current_idx is None:
             return navigation
 
         w_lane_ids, _ = self.observation_generator.get_w_lane_ids_for_agents(agents_state)
-        current_goal_quad = self._route_quad_at(self.agents_current_route_idx)
+        current_goal_quad = self._route_quad_at(current_idx, route_quad_ids=route_quads)
         route_abs = self.path_planner.route_distances_from_w_lanes_to_goal_quads(w_lane_ids, current_goal_quad)
         active = agents_state[..., 6] > 0.5
         route_valid = torch.isfinite(route_abs) & (w_lane_ids >= 0) & active.unsqueeze(-1)
@@ -868,24 +862,6 @@ class TeraflowSimulator:
         lane_slice[..., 2] = route_valid.to(dtype=agents_state.dtype)
         return navigation
 
-    def _drop_path_prefix_to_targets(self, reached_mask: torch.Tensor, target_positions: torch.Tensor):
-        if self.agents_path_plans is None or not bool(reached_mask.any().item()):
-            return
-        valid_path = (self.agents_path_plans[..., 0] != -1) & (self.agents_path_plans[..., 1] != -1)
-        dist = torch.norm(self.agents_path_plans - target_positions.unsqueeze(2), dim=-1)
-        dist = dist.masked_fill(~valid_path | ~reached_mask.unsqueeze(-1), float('inf'))
-        nearest_dist, nearest_idx = torch.min(dist, dim=2)
-        has_nearest = torch.isfinite(nearest_dist)
-        L = self.agents_path_plans.shape[2]
-        prefix_mask = torch.arange(L, device=self.device).view(1, 1, L) <= nearest_idx.unsqueeze(-1)
-        drop_mask = reached_mask.unsqueeze(-1) & has_nearest.unsqueeze(-1) & prefix_mask
-        self.agents_path_plans = torch.where(
-            drop_mask.unsqueeze(-1),
-            torch.full_like(self.agents_path_plans, -1.0),
-            self.agents_path_plans,
-        )
-        self.agents_path_plans = self._left_align_path_tensor(self.agents_path_plans)
-
     def _advance_route_targets(self, intermediate_goal_reached: torch.Tensor):
         """中间 waypoint 到达后推进到下一个 route target；final goal 不在这里推进。"""
         if self.agents_current_route_idx is None or self.agents_route_target_count is None:
@@ -894,7 +870,6 @@ class TeraflowSimulator:
         if not bool(advance_mask.any().item()):
             self._refresh_goal_positions()
             return
-        self._drop_path_prefix_to_targets(advance_mask, self.goal_positions)
         max_idx = torch.clamp(self.agents_route_target_count - 1, min=0)
         next_idx = torch.minimum(self.agents_current_route_idx + advance_mask.long(), max_idx)
         self.agents_current_route_idx = next_idx
@@ -905,7 +880,7 @@ class TeraflowSimulator:
         为所有智能体初始化路径规划：
         1. 为每个激活智能体采样 final goal 与 0~3 个中间 waypoint
         2. waypoint 序列按距离与车道朝向约束顺序生成
-        3. 使用 plan_path 批量生成 start -> waypoint(s) -> final goal 的完整路径
+        3. 只保存紧凑 route state；导航观测在训练/推理时按需重建
         """
         if self.agents_state is None:
             return
@@ -920,135 +895,7 @@ class TeraflowSimulator:
         self.agents_route_quad_ids = route_quads
         self.agents_route_target_count = target_count
         self.agents_current_route_idx = torch.zeros((B, M), dtype=torch.long, device=self.device)
-        self.agents_path_plans = self._build_route_path(start_i32, route_quads, target_count, active_mask)
-        if not hasattr(self, 'path_observation_length'):
-            self.path_observation_length = 128
         self._refresh_goal_positions()
-
-        # 初始化path_plans的局部坐标版本
-        self._update_path_plans_local()
-    
-    def set_path_observation_length(self, length: int):
-        """
-        动态设置路径观察长度
-        
-        Args:
-            length (int): 新的路径观察长度，范围[2, 128]。训练路径本身始终保留完整 route。
-        """
-        length = max(2, min(128, length))  # 限制在合理范围内
-        self.path_observation_length = length
-        self._log(f"路径观察长度已更新为: {self.path_observation_length}")
-        
-        # 不再截断 agents_path_plans；完整 route 需要用于最终 goal/waypoint 奖励。
-        if hasattr(self, 'agents_path_plans') and self.agents_path_plans is not None:
-            self._apply_path_observation_length()
-    
-    def _apply_path_observation_length(self):
-        """
-        保留兼容入口：不裁剪世界坐标路径，只刷新局部路径。
-        """
-        if not hasattr(self, 'agents_path_plans') or self.agents_path_plans is None:
-            return
-        self._update_path_plans_local()
-
-    def _update_path_plans_local(self):
-        """
-        将path_plans从世界坐标转换到每个智能体的局部坐标系。
-        使用observation.py中_world_to_ego_centric的原理进行坐标转换。
-        保留-1,-1无效标记，供 W_lane goal-distance 特征区分有效路径点。
-        """
-        if self.agents_path_plans is None or self.agents_state is None:
-            return
-        
-        B, M, L, _ = self.agents_path_plans.shape
-        ego_states = self.agents_state  # (B, M, 7)
-        
-        # 获取ego车辆的位置和朝向
-        ego_pos = ego_states[..., :2]  # (B, M, 2)
-        ego_yaw = ego_states[..., 2]   # (B, M)
-        
-        # 计算旋转矩阵
-        cos_yaw, sin_yaw = torch.cos(ego_yaw), torch.sin(ego_yaw)
-        
-        # 使用标准2D旋转矩阵（车左边为正）
-        rot_matrix = torch.stack([
-            torch.stack([cos_yaw, -sin_yaw], dim=-1), 
-            torch.stack([sin_yaw, cos_yaw], dim=-1)
-        ], dim=-2)  # (B, M, 2, 2)
-        
-        # 创建path_plans_local张量
-        path_plans_local = torch.zeros_like(self.agents_path_plans)
-        
-        # 向量化bmm操作：将 (B, M) 批次展平为 (B*M)，执行bmm，然后重塑
-        def batch_rotate_path_plans(path_plans_world, ego_pos, rot_matrix):
-            # path_plans_world: (B, M, L, 2), ego_pos: (B, M, 2), rot_matrix: (B, M, 2, 2)
-            B, M, L, D = path_plans_world.shape
-            
-            # 创建有效坐标掩码（排除-1,-1坐标）
-            valid_mask = (path_plans_world[..., 0] != -1) & (path_plans_world[..., 1] != -1)  # (B, M, L)
-            
-            # 计算相对位置
-            rel_pos = path_plans_world - ego_pos.unsqueeze(2)  # (B, M, L, 2)
-            
-            # 展平为 (B*M, L, 2) 和 (B*M, 2, 2)
-            rel_pos_flat = rel_pos.view(B*M, L, D)
-            rot_matrix_flat = rot_matrix.view(B*M, D, D)
-            
-            # 执行批量矩阵乘法
-            rotated_flat = torch.bmm(rel_pos_flat, rot_matrix_flat)  # (B*M, L, 2)
-            
-            # 重塑回原始形状
-            rotated = rotated_flat.view(B, M, L, D)
-            
-            # 保留无效坐标标记；G(t) dense path 不再作为 simple feature 输入网络，
-            # W_lane 的 goal-distance 特征需要这个标记过滤 padding。
-            rotated[~valid_mask] = -1.0
-            
-            return rotated
-        
-        # 执行坐标转换
-        path_plans_local = batch_rotate_path_plans(self.agents_path_plans, ego_pos, rot_matrix)
-        
-        # 存储转换后的局部坐标
-        self.agents_path_plans_local = path_plans_local
-        
-    def _check_and_remove_reached_waypoints(self):
-        """
-        检查并移除已到达的路径点。
-        当车辆与路径规划中的某个点的距离小于1米时，将该点从路径规划中移除（设置为-1, -1）。
-        使用向量化操作提高效率。
-        """
-        if self.agents_path_plans_local is None or self.agents_state is None:
-            return
-        
-        B, M, L, _ = self.agents_path_plans_local.shape
-        
-        # 获取激活掩码
-        active_mask = self.agents_state[..., 6] > 0.5  # (B, M)
-        
-        if not active_mask.any():
-            return  # 没有激活的车辆
-        
-        # 计算所有车辆到所有路径点的距离（向量化）
-        # agents_path_plans_local: (B, M, L, 2)
-        # 计算每个路径点的模长（距离）
-        distances = torch.norm(self.agents_path_plans_local, dim=-1)  # (B, M, L)
-        
-        # 找到有效的路径点（不是-1, -1）且距离小于1米的点
-        valid_waypoints = (self.agents_path_plans[..., 0] != -1) & (self.agents_path_plans[..., 1] != -1)  # (B, M, L)
-        reached_waypoints = valid_waypoints & (distances < 1.0)  # (B, M, L)
-        
-        # 只对激活的车辆处理
-        reached_waypoints = reached_waypoints & active_mask.unsqueeze(-1)  # (B, M, L)
-        
-        if reached_waypoints.any():
-            # 将到达的路径点设置为-1, -1
-            invalid_fill = torch.full_like(self.agents_path_plans, -1.0)
-            self.agents_path_plans = torch.where(reached_waypoints.unsqueeze(-1), invalid_fill, self.agents_path_plans)
-            self.agents_path_plans_local = torch.where(reached_waypoints.unsqueeze(-1), invalid_fill, self.agents_path_plans_local)
-            
-            # 重新更新局部坐标（因为agents_path_plans可能已经改变）
-            self._update_path_plans_local()
 
 if __name__ == '__main__':
     # 这是一个简单的使用示例，用于测试模拟器的基本功能
@@ -1153,7 +1000,7 @@ if __name__ == '__main__':
     agent_artists, active_indices = build_agent_artists()
 
     # 构建策略网络与初始特征（延迟导入避免循环依赖）
-    from ddppo import decompose_observation, build_network_features, current_path_plan
+    from ddppo import decompose_observation, build_network_features, current_navigation
     from network import create_network
     import json as _json
 
@@ -1167,7 +1014,7 @@ if __name__ == '__main__':
             neighbors_local,
             w_lanes_local,
             w_boundaries_local,
-            current_path_plan(simulator),
+            current_navigation(simulator),
             simulator.stop_lines,
             simulator.reward_calculator.sampled_params,
             config_ns,
@@ -1310,38 +1157,10 @@ if __name__ == '__main__':
     except Exception:
         pass
     
-    # 绘制第一个激活agent的局部路径规划
-    if simulator.agents_path_plans_local is not None and len(active_indices) > 0:
-        first_agent_idx = int(active_indices[0])
-        # 获取第一个激活agent的局部路径规划
-        path_local = simulator.agents_path_plans_local[0, first_agent_idx].cpu().numpy()  # (L, 2)
-        
-        # 过滤有效点（非零坐标）
-        valid_mask = (path_local[:, 0] != 0) | (path_local[:, 1] != 0)
-        if valid_mask.any():
-            valid_path = path_local[valid_mask]
-            
-            # 将局部坐标转换回世界坐标进行绘制
-            ego = simulator.agents_state[0, first_agent_idx]
-            ego_x, ego_y, ego_yaw = float(ego[0].item()), float(ego[1].item()), float(ego[2].item())
-            cos_yaw = np.cos(ego_yaw)
-            sin_yaw = np.sin(ego_yaw)
-            rotation_matrix = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
-            ego_pos = np.array([ego_x, ego_y])
-            
-            # 逆变换：从局部坐标转换回世界坐标
-            world_path = (valid_path @ rotation_matrix.T) + ego_pos
-            
-            # 绘制局部路径规划（绿色实线）
-            ax.plot(world_path[:, 0], world_path[:, 1], 'g-', linewidth=3, alpha=0.8, label='Local Path Plan')
-            ax.scatter(world_path[0, 0], world_path[0, 1], c='green', marker='o', s=100, label='Path Start')
-            if len(world_path) > 1:
-                ax.scatter(world_path[-1, 0], world_path[-1, 1], c='green', marker='x', s=100, label='Path Goal')
-    
     # 统一图形样式
     ax.set_aspect('equal', adjustable='box')
     ax.grid(True, alpha=0.3)
-    ax.set_title('road graph and agent positions, first agent local path plan')
+    ax.set_title('road graph and agent positions')
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     # 绘制观测半径虚线圆（以第一个激活agent为圆心）
@@ -1471,7 +1290,7 @@ if __name__ == '__main__':
                     neighbors_local,
                     w_lanes_local,
                     w_boundaries_local,
-                    current_path_plan(simulator),
+                    current_navigation(simulator),
                     simulator.stop_lines if hasattr(simulator, 'stop_lines') else None,
                     simulator.reward_calculator.sampled_params,
                     config_ns, 

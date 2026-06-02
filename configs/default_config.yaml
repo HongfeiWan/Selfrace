@@ -4,7 +4,7 @@ simulator:
   device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
 
   # num_envs 是每个 rank/GPU 上的并行环境数；DDP 全局环境数 = num_envs * GPU 数。
-  num_envs: 100
+  num_envs: 2000
   verbose: false         # 热路径调试日志开关，训练时保持关闭
   sim_dt: 0.3             # 模拟时间步长
   state_dim: 7             # 仿真世界状态 [x,y,yaw,speed,length,width,active]
@@ -167,7 +167,7 @@ training:
   iteration: 10000
   
   # 修正其他参数
-  rollout_length: 128 # 每个rollout的步数
+  rollout_length: 32 # 论文式按需重建观测后，A5000 单卡先用32步rollout；OOM再降回16
   ppo_epochs: 3
 
   gamma: 0.999      # 改为0.999 折扣因子
@@ -186,6 +186,7 @@ training:
   value_clip_ratio: null  # Value function clipping = None
   lr_schedule: "cosine"  # 改为cosine
   precision: "16-bit"  # 添加16-bit AMP
+  network_forward_chunk_agents: 32768 # 整批 policy/value 推理按 agent 数分块，限制 set encoder 峰值显存
   
   # 修正advantage filtering
   advantage_filter_threshold: 0.01  # 阈值过滤
