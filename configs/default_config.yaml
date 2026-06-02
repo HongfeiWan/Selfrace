@@ -4,7 +4,7 @@ simulator:
   device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
 
   # num_envs 是每个 rank/GPU 上的并行环境数；DDP 全局环境数 = num_envs * GPU 数。
-  num_envs: 2000
+  num_envs: 2600
   verbose: false         # 热路径调试日志开关，训练时保持关闭
   sim_dt: 0.3             # 模拟时间步长
   state_dim: 7             # 仿真世界状态 [x,y,yaw,speed,length,width,active]
@@ -163,11 +163,11 @@ training:
 
   # batch_size 是全局目标批量；实际每卡 PPO 抽样量优先使用 batch_size_per_gpu。
   batch_size: 256000
-  batch_size_per_gpu: 2000  # 每GPU batch size
+  batch_size_per_gpu: 32000  # 每GPU batch size；测试论文 per-GPU batch
   iteration: 10000
   
   # 修正其他参数
-  rollout_length: 32 # 论文式按需重建观测后，A5000 单卡先用32步rollout；OOM再降回16
+  rollout_length: 128 # 论文式rollout长度；目标配置 2600 worlds x 150 agents x 128 rollout
   ppo_epochs: 3
 
   gamma: 0.999      # 改为0.999 折扣因子

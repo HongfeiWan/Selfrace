@@ -1546,17 +1546,15 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		return a_max_ewma.detach(), stats
 
 	N = cand_idx.shape[0]
-	K = batch_size_per_gpu if batch_size_per_gpu > 0 else N
-	if N >= K:
-		rand_pos = torch.randperm(N, device=device)[:K]
-	else:
-		rand_pos = torch.randint(0, N, (K,), device=device)
+	K_target = batch_size_per_gpu if batch_size_per_gpu > 0 else N
+	K = min(K_target, N)
+	rand_pos = torch.randperm(N, device=device)[:K]
 	selected_idx = cand_idx[rand_pos]
 	selected_t = selected_idx[:, 0]
 	selected_b = selected_idx[:, 1]
 	selected_m = selected_idx[:, 2]
 	if is_rank0:
-		print(f"🎯 随机选取 {K} 个样本用于更新（候选 {N}）")
+		print(f"🎯 随机选取 {K} 个样本用于更新（候选 {N}, 目标 {K_target}）")
 
 	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
 	advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
@@ -1648,6 +1646,11 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		'ppo_update_time_s': time.time() - update_start_time,
 	})
 	stats.update(cuda_memory_stats(device))
+	if is_rank0 and device.type == 'cuda':
+		print(
+			f"🧠 PPO峰值显存: allocated={stats['max_memory_allocated_mb']:.1f}MB, "
+			f"reserved={stats['max_memory_reserved_mb']:.1f}MB"
+		)
 	return a_max_ewma.detach(), stats
 
 def perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer,
