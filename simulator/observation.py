@@ -225,17 +225,10 @@ class ObservationGenerator:
             w_lanes_local: (B, M, N_lanes, 5)
             w_boundaries_local: (B, M, N_boundaries, 2)
         """
-        # 1. 获取世界坐标系下的特征
-        # (B, M, K, 7)
-        neighbor_states_world = self._get_nearest_neighbors(agents_state)
-        
-        # 使用预计算的数据获取w_lanes和w_boundaries
-        w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices = self._get_precomputed_waypoints(agents_state)
-
-        # 2. 将所有信息转换到每个 Agent 的局部坐标系
-        local_state, neighbors_local, w_lanes_local, w_boundaries_local = self._world_to_ego_centric(
-            agents_state, neighbor_states_world, w_lanes_world, w_lane_dirs_world,
-            w_lane_widths, w_boundaries_world, quad_indices, control_state, driving_style_params
+        local_state, neighbors_local, w_lanes_local, w_boundaries_local = self.generate_components(
+            agents_state,
+            control_state=control_state,
+            driving_style_params=driving_style_params,
         )
 
         # 3. 展平并拼接成最终的观测向量
@@ -248,6 +241,96 @@ class ObservationGenerator:
         ], dim=2)
         
         return observation
+
+    def generate_components(self, agents_state: torch.Tensor,
+                            control_state: torch.Tensor = None,
+                            driving_style_params: torch.Tensor = None):
+        """Return unpacked observation components without concatenating a full observation tensor."""
+        neighbor_states_world = self._get_nearest_neighbors(agents_state)
+        w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices = self._get_precomputed_waypoints(agents_state)
+        return self._world_to_ego_centric(
+            agents_state,
+            neighbor_states_world,
+            w_lanes_world,
+            w_lane_dirs_world,
+            w_lane_widths,
+            w_boundaries_world,
+            quad_indices,
+            control_state,
+            driving_style_params,
+        )
+
+    def _get_selected_neighbors(self, agents_state: torch.Tensor, agent_indices: torch.Tensor,
+                                ego_states: torch.Tensor) -> torch.Tensor:
+        """Nearest-neighbor states for one selected ego per batch row."""
+        batch_size, max_agents, _ = agents_state.shape
+        if self.num_neighbors == 0:
+            return torch.zeros(batch_size, 1, 0, 7, device=self.device, dtype=agents_state.dtype)
+
+        query_pos = agents_state[..., :2]
+        ego_pos = ego_states[:, 0, :2]
+        dist_sq = (query_pos - ego_pos.unsqueeze(1)).pow(2).sum(dim=-1)
+
+        agent_range = torch.arange(max_agents, device=self.device).view(1, max_agents)
+        self_mask = agent_range == agent_indices.view(batch_size, 1)
+        inactive_mask = agents_state[..., 6] < 0.5
+        dist_sq = dist_sq.masked_fill(self_mask | inactive_mask, float('inf'))
+        dist_sq = dist_sq.masked_fill(dist_sq > self.horizon ** 2, float('inf'))
+
+        k_eff = min(self.num_neighbors, max_agents)
+        _, topk_indices = torch.topk(dist_sq, k=k_eff, dim=-1, largest=False)
+        batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1)
+        neighbor_states = agents_state[batch_idx, topk_indices].unsqueeze(1)
+        valid_neighbor_dists = dist_sq[batch_idx, topk_indices].unsqueeze(1)
+        is_valid_neighbor = torch.isfinite(valid_neighbor_dists)
+
+        replacement = ego_states.unsqueeze(2).expand(-1, -1, k_eff, -1).clone()
+        replacement[..., 4] = 0.0
+        replacement[..., 5] = 0.0
+        replacement[..., 6] = 0.0
+        neighbor_states = torch.where(is_valid_neighbor.unsqueeze(-1), neighbor_states, replacement)
+        if k_eff < self.num_neighbors:
+            pad = replacement.new_zeros(batch_size, 1, self.num_neighbors - k_eff, neighbor_states.shape[-1])
+            neighbor_states = torch.cat([neighbor_states, pad], dim=2)
+        return neighbor_states
+
+    def generate_selected_components(self, agents_state: torch.Tensor, agent_indices: torch.Tensor,
+                                     control_state: torch.Tensor = None,
+                                     driving_style_params: torch.Tensor = None):
+        """Return observation components for one selected agent per batch row."""
+        batch_size, max_agents, _ = agents_state.shape
+        agent_indices = agent_indices.to(device=self.device, dtype=torch.long).view(batch_size)
+        safe_indices = torch.clamp(agent_indices, 0, max_agents - 1)
+        batch_idx = torch.arange(batch_size, device=self.device)
+
+        ego_states = agents_state[batch_idx, safe_indices].unsqueeze(1)
+        neighbor_states_world = self._get_selected_neighbors(agents_state, safe_indices, ego_states)
+        w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices = self._get_precomputed_waypoints(ego_states)
+
+        control_selected = None
+        if control_state is not None:
+            if control_state.shape[1] == 1:
+                control_selected = control_state
+            else:
+                control_selected = control_state[batch_idx, safe_indices].unsqueeze(1)
+        style_selected = None
+        if driving_style_params is not None:
+            if driving_style_params.shape[1] == 1:
+                style_selected = driving_style_params
+            else:
+                style_selected = driving_style_params[batch_idx, safe_indices].unsqueeze(1)
+
+        return self._world_to_ego_centric(
+            ego_states,
+            neighbor_states_world,
+            w_lanes_world,
+            w_lane_dirs_world,
+            w_lane_widths,
+            w_boundaries_world,
+            quad_indices,
+            control_selected,
+            style_selected,
+        )
     
     def _get_nearest_neighbors(self, agents_state: torch.Tensor) -> torch.Tensor:
         """为每个 agent 找到最近的 K 个邻居。完全向量化版本。"""

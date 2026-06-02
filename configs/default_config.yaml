@@ -188,6 +188,8 @@ training:
   precision: "16-bit"  # 添加16-bit AMP
   network_forward_chunk_agents: 32768 # 整批 policy/value 推理按 agent 数分块，限制 set encoder 峰值显存
   feature_build_chunk_agents: 16384   # observation/nav/network feature 构建按 agent 数分块，避免 W_lane 路由距离一次性过大
+  w_lane_dropout_prob: 0.5             # 原文式 W_lane element dropout；确定性重建，不占 rollout buffer
+  w_boundary_dropout_prob: 0.4         # 原文式 W_boundary element dropout；被 drop 元素不进 set encoder
   
   # 修正advantage filtering
   advantage_filter_threshold: 0.01  # 阈值过滤

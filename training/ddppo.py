@@ -368,7 +368,8 @@ def build_network_features(agents_state: torch.Tensor,
                            reward_coef: torch.Tensor,
                            config: SimpleNamespace,
                            vehicle_style: torch.Tensor = None,
-                           control_state: torch.Tensor = None) -> torch.Tensor:
+                           control_state: torch.Tensor = None,
+                           map_dropout: dict = None) -> torch.Tensor:
     """
     将拆解后的观测组件构建为网络输入的特征张量
     Args:
@@ -384,6 +385,11 @@ def build_network_features(agents_state: torch.Tensor,
         torch.Tensor: 形状为 (B, M, total_input_dim) 的网络输入特征张量
     """
     batch_size, max_agents, _ = agents_state.shape
+    w_lanes_local, w_boundaries_local = apply_map_dropout_components(
+        w_lanes_local,
+        w_boundaries_local,
+        map_dropout,
+    )
     
     # 从配置中获取网络需要的特征维度
     network_config = config.training.network
@@ -759,10 +765,15 @@ def step_schedulers_if_updated(policy_scheduler, value_scheduler, update_stats_a
 		return True
 	return False
 
-def current_navigation(simulator, agents_state: torch.Tensor = None, route_state: dict = None):
+def current_navigation(simulator, agents_state: torch.Tensor = None, route_state: dict = None,
+					   w_lane_keep_mask: torch.Tensor = None):
 	"""返回显式 G(t) + W_lane 图路由距离的导航包。"""
 	if hasattr(simulator, 'get_navigation_observation'):
-		return simulator.get_navigation_observation(agents_state=agents_state, route_state=route_state)
+		return simulator.get_navigation_observation(
+			agents_state=agents_state,
+			route_state=route_state,
+			w_lane_keep_mask=w_lane_keep_mask,
+		)
 	return None
 
 
@@ -851,23 +862,172 @@ def stop_lines_from_condition(simulator, agents_state: torch.Tensor, condition_s
 		simulator.traffic_light_states = old_traffic_light_states
 
 
-def stack_route_state_buffer(route_state_buffer: list) -> dict:
-	if not route_state_buffer:
-		return {}
-	keys = ('route_quad_ids', 'target_count', 'current_idx')
-	stacked = {}
-	for key in keys:
-		values = [state[key] for state in route_state_buffer if key in state]
-		if len(values) != len(route_state_buffer):
-			return {}
-		stacked[key] = torch.stack(values, dim=0)
-	return stacked
+class RolloutTensorBuffer:
+	"""Preallocated rollout storage. PPO reads tensor views, avoiding list + stack duplication."""
+
+	def __init__(self, capacity: int):
+		self.capacity = max(1, int(capacity))
+		self.length = 0
+		self.states = None
+		self.route_state = {}
+		self.rewards = None
+		self.dones = None
+		self.values = None
+		self.old_log_probs = None
+		self.actions = None
+		self.time_indices = None
+		self._pre_step_pending = False
+
+	def __len__(self):
+		return self.length
+
+	@property
+	def device(self):
+		if self.states is not None:
+			return self.states.device
+		for tensor in self.route_state.values():
+			return tensor.device
+		return torch.device('cpu')
+
+	def _ensure_tensor(self, name: str, value: torch.Tensor) -> torch.Tensor:
+		buffer = getattr(self, name)
+		if buffer is None:
+			buffer = torch.empty(
+				(self.capacity, *value.shape),
+				device=value.device,
+				dtype=value.dtype,
+			)
+			setattr(self, name, buffer)
+		elif buffer.shape[1:] != value.shape:
+			raise ValueError(f"{name} shape mismatch: {buffer.shape[1:]} != {value.shape}")
+		elif buffer.device != value.device:
+			raise ValueError(f"{name} device mismatch: {buffer.device} != {value.device}")
+		return buffer
+
+	def _ensure_route_tensor(self, key: str, value: torch.Tensor) -> torch.Tensor:
+		buffer = self.route_state.get(key)
+		if buffer is None:
+			buffer = torch.empty(
+				(self.capacity, *value.shape),
+				device=value.device,
+				dtype=value.dtype,
+			)
+			self.route_state[key] = buffer
+		elif buffer.shape[1:] != value.shape:
+			raise ValueError(f"route_state[{key}] shape mismatch: {buffer.shape[1:]} != {value.shape}")
+		elif buffer.device != value.device:
+			raise ValueError(f"route_state[{key}] device mismatch: {buffer.device} != {value.device}")
+		return buffer
+
+	def write_pre_step(self, state: torch.Tensor, route_state: dict, time_index: int = 0):
+		if self.length >= self.capacity:
+			raise RuntimeError(f"RolloutTensorBuffer full: length={self.length}, capacity={self.capacity}")
+		if self._pre_step_pending:
+			raise RuntimeError("write_pre_step called twice before write_post_step")
+		self._ensure_tensor('states', state)[self.length].copy_(state.detach())
+		if self.time_indices is None:
+			self.time_indices = torch.empty((self.capacity,), device=state.device, dtype=torch.long)
+		self.time_indices[self.length] = int(time_index)
+		for key, value in (route_state or {}).items():
+			if torch.is_tensor(value):
+				self._ensure_route_tensor(key, value)[self.length].copy_(value.detach())
+		self._pre_step_pending = True
+
+	def write_post_step(self, reward: torch.Tensor, done: torch.Tensor, value: torch.Tensor,
+						old_log_prob: torch.Tensor, action: torch.Tensor):
+		if not self._pre_step_pending:
+			raise RuntimeError("write_post_step called before write_pre_step")
+		done_bool = done.detach().bool()
+		self._ensure_tensor('rewards', reward)[self.length].copy_(reward.detach())
+		self._ensure_tensor('dones', done_bool)[self.length].copy_(done_bool)
+		self._ensure_tensor('values', value)[self.length].copy_(value.detach())
+		self._ensure_tensor('old_log_probs', old_log_prob)[self.length].copy_(old_log_prob.detach())
+		self._ensure_tensor('actions', action)[self.length].copy_(action.detach())
+		self.length += 1
+		self._pre_step_pending = False
+
+	def clear(self):
+		self.length = 0
+		self._pre_step_pending = False
+
+	def view(self, tensor: torch.Tensor):
+		return tensor[:self.length] if tensor is not None else None
+
+	def route_state_view(self) -> dict:
+		return {key: value[:self.length] for key, value in self.route_state.items()}
+
+	def validate(self, condition_state: dict):
+		if self.length == 0:
+			return
+		if self._pre_step_pending:
+			raise ValueError("RolloutTensorBuffer has a pending pre-step without post-step")
+		required = {
+			'states': self.states,
+			'rewards': self.rewards,
+			'dones': self.dones,
+			'values': self.values,
+			'old_log_probs': self.old_log_probs,
+			'actions': self.actions,
+			'time_indices': self.time_indices,
+		}
+		missing = [name for name, tensor in required.items() if tensor is None]
+		if missing:
+			raise ValueError(f"RolloutTensorBuffer missing tensors: {missing}")
+		base_shape = self.states.shape[1:]
+		base_device = self.states.device
+		if len(base_shape) != 3 or base_shape[-1] < 7:
+			raise ValueError(f"states expected (T,B,M,S>=7), got {(self.length, *base_shape)}")
+		B, M, _ = base_shape
+		validate_condition_state(condition_state, B, M, base_device)
+		for key in ('route_quad_ids', 'target_count', 'current_idx'):
+			if key not in self.route_state:
+				raise ValueError(f"route_state missing key: {key}")
+			tensor = self.route_state[key]
+			if tensor.device != base_device:
+				raise ValueError(f"route_state[{key}] device mismatch: {tensor.device} != {base_device}")
+			if tensor.shape[1] != B or tensor.shape[2] != M:
+				raise ValueError(f"route_state[{key}] leading shape mismatch: {tensor.shape[1:3]} != {(B, M)}")
+		for name, tensor in required.items():
+			if name == 'time_indices':
+				continue
+			if tensor.device != base_device:
+				raise ValueError(f"{name} device mismatch: {tensor.device} != {base_device}")
+			if tensor.shape[1:3] != (B, M):
+				raise ValueError(f"{name} shape mismatch: {tensor.shape[1:3]} != {(B, M)}")
 
 
 def gather_route_state(route_state_tensor: dict, t_idx: torch.Tensor, b_idx: torch.Tensor) -> dict:
 	if not route_state_tensor:
 		return {}
 	return {key: value[t_idx, b_idx] for key, value in route_state_tensor.items()}
+
+
+def gather_route_state_selected(route_state_tensor: dict, t_idx: torch.Tensor,
+								b_idx: torch.Tensor, agent_idx: torch.Tensor) -> dict:
+	if not route_state_tensor:
+		return {}
+	out = {}
+	for key, value in route_state_tensor.items():
+		selected = value[t_idx, b_idx, agent_idx]
+		out[key] = selected.unsqueeze(1)
+	return out
+
+
+def gather_condition_state_selected(condition_state: dict, env_idx: torch.Tensor,
+									agent_idx: torch.Tensor) -> dict:
+	if not condition_state:
+		return {}
+	out = {}
+	for key, value in condition_state.items():
+		if not torch.is_tensor(value) or value.dim() == 0:
+			out[key] = value
+		elif key in ('reward_coef', 'vehicle_style') and value.dim() >= 3:
+			out[key] = value[env_idx, agent_idx].unsqueeze(1)
+		elif value.shape[0] == condition_state.get('reward_coef', value).shape[0]:
+			out[key] = value[env_idx]
+		else:
+			out[key] = value
+	return out
 
 def current_control_state(simulator):
 	"""返回当前动力学控制状态 [phi, a_long, a_lat]，形状 (B, M, 3)。"""
@@ -894,12 +1054,228 @@ def control_from_buffer_state(world_state: torch.Tensor) -> torch.Tensor:
 		return world_state[..., 7:10]
 	return torch.zeros(*world_state.shape[:2], 3, device=world_state.device, dtype=world_state.dtype)
 
+def get_map_dropout_probs(config):
+	training_cfg = getattr(config, 'training', SimpleNamespace())
+	lane_p = float(getattr(training_cfg, 'w_lane_dropout_prob', 0.0))
+	boundary_p = float(getattr(training_cfg, 'w_boundary_dropout_prob', 0.0))
+	return min(max(lane_p, 0.0), 1.0), min(max(boundary_p, 0.0), 1.0)
+
+
+def _index_grid(value, B: int, M: int, device: torch.device, default_kind: str):
+	if value is None:
+		if default_kind == 'env':
+			return torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1)
+		if default_kind == 'agent':
+			return torch.arange(M, device=device, dtype=torch.long).view(1, M, 1)
+		return torch.zeros((1, 1, 1), device=device, dtype=torch.long)
+	tensor = torch.as_tensor(value, device=device, dtype=torch.long)
+	if tensor.dim() == 0:
+		return tensor.view(1, 1, 1)
+	if tensor.numel() == B * M:
+		return tensor.view(B, M, 1)
+	if tensor.numel() == B:
+		return tensor.view(B, 1, 1)
+	if tensor.numel() == M:
+		return tensor.view(1, M, 1)
+	return tensor.reshape(B, M, 1)
+
+
+def deterministic_element_keep_mask(B: int, M: int, num_elements: int, drop_prob: float,
+									device: torch.device, time_idx=None, env_idx=None,
+									agent_idx=None, salt: int = 0):
+	if num_elements <= 0:
+		return None
+	if drop_prob <= 0.0:
+		return None
+	if drop_prob >= 1.0:
+		return torch.zeros((B, M, num_elements), device=device, dtype=torch.bool)
+	keep_threshold = int(round((1.0 - drop_prob) * 10000))
+	time_grid = _index_grid(time_idx, B, M, device, 'zero')
+	env_grid = _index_grid(env_idx, B, M, device, 'env')
+	agent_grid = _index_grid(agent_idx, B, M, device, 'agent')
+	elem_grid = torch.arange(num_elements, device=device, dtype=torch.long).view(1, 1, num_elements)
+	seed = (
+		time_grid * 1000003
+		+ env_grid * 19349663
+		+ agent_grid * 83492791
+		+ elem_grid * 47899981
+		+ int(salt)
+	)
+	seed = torch.remainder(seed, 2147483647)
+	hashed = torch.remainder(seed * 48271 + 12345, 2147483647)
+	return torch.remainder(hashed, 10000) < keep_threshold
+
+
+def make_map_dropout_masks(config, B: int, M: int, lane_count: int, boundary_count: int,
+						   device: torch.device, time_idx=None, env_idx=None, agent_idx=None):
+	lane_drop, boundary_drop = get_map_dropout_probs(config)
+	return {
+		'lane_keep': deterministic_element_keep_mask(
+			B, M, lane_count, lane_drop, device,
+			time_idx=time_idx, env_idx=env_idx, agent_idx=agent_idx, salt=17,
+		),
+		'boundary_keep': deterministic_element_keep_mask(
+			B, M, boundary_count, boundary_drop, device,
+			time_idx=time_idx, env_idx=env_idx, agent_idx=agent_idx, salt=29,
+		),
+	}
+
+
+def apply_map_dropout_components(w_lanes_local: torch.Tensor, w_boundaries_local: torch.Tensor,
+								 map_dropout: dict = None):
+	if not map_dropout:
+		return w_lanes_local, w_boundaries_local
+	lane_keep = map_dropout.get('lane_keep')
+	if lane_keep is not None and w_lanes_local is not None:
+		w_lanes_local = torch.where(lane_keep.unsqueeze(-1), w_lanes_local, torch.zeros_like(w_lanes_local))
+	boundary_keep = map_dropout.get('boundary_keep')
+	if boundary_keep is not None and w_boundaries_local is not None:
+		w_boundaries_local = torch.where(boundary_keep.unsqueeze(-1), w_boundaries_local, torch.zeros_like(w_boundaries_local))
+	return w_lanes_local, w_boundaries_local
+
+
 def state_with_control_for_buffer(simulator, alive_mask: torch.Tensor) -> torch.Tensor:
 	pre_state = simulator.agents_state.detach().clone()
 	pre_state[..., 6] = alive_mask.to(dtype=pre_state.dtype)
 	pre_control_state = current_control_state(simulator).detach().clone()
 	pre_control_state = pre_control_state * alive_mask.unsqueeze(-1).to(dtype=pre_control_state.dtype)
 	return torch.cat([pre_state, pre_control_state], dim=-1)
+
+
+def _policy_observation_state_chunk(simulator, start: int, end: int, alive_mask: torch.Tensor = None):
+	obs_state = simulator.agents_state[start:end]
+	if alive_mask is not None:
+		obs_state = obs_state.clone()
+		obs_state[..., 6] = alive_mask[start:end].to(device=obs_state.device, dtype=obs_state.dtype)
+	elif getattr(simulator, 'last_done', None) is not None:
+		last_done = simulator.last_done[start:end].to(obs_state.device)
+		obs_state = obs_state.clone()
+		obs_state[..., 6] = torch.where(last_done, 0.0, obs_state[..., 6])
+	return obs_state
+
+
+def build_features_from_components(agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
+								   simulator, config, route_state, condition_state,
+								   control_state=None, map_dropout=None, world_agents_state=None):
+	world_agents_state = agents_state if world_agents_state is None else world_agents_state
+	lane_keep = map_dropout.get('lane_keep') if map_dropout else None
+	navigation = current_navigation(
+		simulator,
+		agents_state=world_agents_state,
+		route_state=route_state,
+		w_lane_keep_mask=lane_keep,
+	)
+	stop_lines = stop_lines_from_condition(simulator, world_agents_state, condition_state)
+	return build_network_features(
+		agents_state,
+		neighbors_local,
+		w_lanes_local,
+		w_boundaries_local,
+		navigation,
+		stop_lines,
+		condition_state.get('reward_coef'),
+		config,
+		vehicle_style=condition_state.get('vehicle_style'),
+		control_state=control_state,
+		map_dropout=map_dropout,
+	)
+
+
+def build_features_from_simulator_state(simulator, config, alive_mask: torch.Tensor = None,
+										condition_state: dict = None, dropout_step=0) -> torch.Tensor:
+	B, M = simulator.agents_state.shape[:2]
+	env_chunk = feature_build_env_chunk_size(config, M)
+	total_input_dim = sum(config.training.network.simple_feature_dims) + sum(config.training.network.permutation_feature_dims)
+	features = torch.empty(B, M, total_input_dim, device=simulator.agents_state.device, dtype=simulator.agents_state.dtype)
+	if env_chunk <= 0:
+		env_chunk = B
+
+	condition_state = condition_state if condition_state is not None else snapshot_condition_state(simulator)
+	route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
+	control_state_all = current_control_state(simulator)
+	lane_count = int(getattr(simulator.observation_generator, 'num_w_lanes', 0))
+	boundary_count = int(getattr(simulator.observation_generator, 'num_w_boundaries', 0))
+
+	for start in range(0, B, env_chunk):
+		end = min(start + env_chunk, B)
+		obs_state = _policy_observation_state_chunk(simulator, start, end, alive_mask=alive_mask)
+		control_chunk = slice_env_tensor(control_state_all, start, end, B)
+		condition_chunk = slice_condition_state_env(condition_state, start, end, B)
+		route_chunk = slice_route_state_env(route_state, start, end, B)
+		local_state, neighbors_local, w_lanes_local, w_boundaries_local = simulator.observation_generator.generate_components(
+			obs_state,
+			control_state=control_chunk,
+			driving_style_params=condition_chunk.get('vehicle_style'),
+		)
+		env_idx = torch.arange(start, end, device=obs_state.device, dtype=torch.long)
+		map_dropout = make_map_dropout_masks(
+			config,
+			end - start,
+			M,
+			lane_count,
+			boundary_count,
+			obs_state.device,
+			time_idx=dropout_step,
+			env_idx=env_idx,
+		)
+		features[start:end] = build_features_from_components(
+			local_state,
+			neighbors_local,
+			w_lanes_local,
+			w_boundaries_local,
+			simulator,
+			config,
+			route_chunk,
+			condition_chunk,
+			control_state=control_chunk,
+			map_dropout=map_dropout,
+			world_agents_state=obs_state,
+		)
+	return features
+
+
+def build_features_for_selected_agents(world_states: torch.Tensor, simulator, config,
+									   route_state: dict, condition_state: dict,
+									   agent_indices: torch.Tensor, time_indices: torch.Tensor = None,
+									   env_indices: torch.Tensor = None) -> torch.Tensor:
+	B, M = world_states.shape[:2]
+	obs_state = observation_state_from_buffer(world_states)
+	control_state = control_from_buffer_state(world_states)
+	agent_indices = agent_indices.to(device=world_states.device, dtype=torch.long).view(B)
+	batch_idx = torch.arange(B, device=world_states.device)
+	ego_obs_state = obs_state[batch_idx, agent_indices].unsqueeze(1)
+	local_state, neighbors_local, w_lanes_local, w_boundaries_local = simulator.observation_generator.generate_selected_components(
+		obs_state,
+		agent_indices,
+		control_state=control_state,
+		driving_style_params=condition_state.get('vehicle_style'),
+	)
+	lane_count = int(w_lanes_local.shape[2]) if w_lanes_local is not None else 0
+	boundary_count = int(w_boundaries_local.shape[2]) if w_boundaries_local is not None else 0
+	map_dropout = make_map_dropout_masks(
+		config,
+		B,
+		1,
+		lane_count,
+		boundary_count,
+		world_states.device,
+		time_idx=time_indices,
+		env_idx=env_indices,
+		agent_idx=agent_indices,
+	)
+	return build_features_from_components(
+		local_state,
+		neighbors_local,
+		w_lanes_local,
+		w_boundaries_local,
+		simulator,
+		config,
+		route_state,
+		condition_state,
+		control_state=control_state.gather(1, agent_indices.view(B, 1, 1).expand(-1, -1, control_state.shape[-1])),
+		map_dropout=map_dropout,
+		world_agents_state=ego_obs_state,
+	)
 
 def build_features_from_observation(observation, simulator, config):
 	B, M = observation.shape[:2]
@@ -956,6 +1332,8 @@ def build_features_from_world_state_batch(
 	config,
 	route_state: dict,
 	condition_state: dict,
+	time_indices: torch.Tensor = None,
+	env_indices: torch.Tensor = None,
 ) -> torch.Tensor:
 	B, M = world_states.shape[:2]
 	env_chunk = feature_build_env_chunk_size(config, M)
@@ -963,6 +1341,8 @@ def build_features_from_world_state_batch(
 	features = torch.empty(B, M, total_input_dim, device=world_states.device, dtype=world_states.dtype)
 	if env_chunk <= 0:
 		env_chunk = B
+	lane_count = int(getattr(simulator.observation_generator, 'num_w_lanes', 0))
+	boundary_count = int(getattr(simulator.observation_generator, 'num_w_boundaries', 0))
 
 	for start in range(0, B, env_chunk):
 		end = min(start + env_chunk, B)
@@ -970,30 +1350,33 @@ def build_features_from_world_state_batch(
 		obs_state = observation_state_from_buffer(world_chunk)
 		control_state = control_from_buffer_state(world_chunk)
 		condition_chunk = slice_condition_state_env(condition_state, start, end, B)
-		vehicle_style_chunk = condition_chunk.get('vehicle_style')
-		reward_coef_chunk = condition_chunk.get('reward_coef')
-		stop_lines_chunk = stop_lines_from_condition(simulator, obs_state, condition_chunk)
-		obs_chunk = simulator.observation_generator.generate(
+		local_state, neighbors_local, w_lanes_local, w_boundaries_local = simulator.observation_generator.generate_components(
 			obs_state,
 			control_state=control_state,
-			driving_style_params=vehicle_style_chunk,
+			driving_style_params=condition_chunk.get('vehicle_style'),
 		)
-		agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(obs_chunk, config)
-		features[start:end] = build_network_features(
-			agents_state,
+		map_dropout = make_map_dropout_masks(
+			config,
+			end - start,
+			M,
+			lane_count,
+			boundary_count,
+			world_states.device,
+			time_idx=slice_env_tensor(time_indices, start, end, B),
+			env_idx=slice_env_tensor(env_indices, start, end, B),
+		)
+		features[start:end] = build_features_from_components(
+			local_state,
 			neighbors_local,
 			w_lanes_local,
 			w_boundaries_local,
-			current_navigation(
-				simulator,
-				agents_state=obs_state,
-				route_state=slice_route_state_env(route_state, start, end, B),
-			),
-			stop_lines_chunk,
-			reward_coef_chunk,
+			simulator,
 			config,
-			vehicle_style=vehicle_style_chunk,
+			slice_route_state_env(route_state, start, end, B),
+			condition_chunk,
 			control_state=control_state,
+			map_dropout=map_dropout,
+			world_agents_state=obs_state,
 		)
 	return features
 
@@ -1023,51 +1406,10 @@ def validate_condition_state(condition_state: dict, B: int, M: int, device: torc
 			raise ValueError(f"condition_state[traffic_light_states] leading shape mismatch: {traffic_light_states.shape[:1]} != {(B,)}")
 
 
-def validate_rollout_buffers(states_buffer, route_state_buffer, condition_state,
-							 rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer):
-	T = len(states_buffer)
-	buffer_lengths = [
-		len(route_state_buffer), len(rewards_buffer), len(dones_buffer), len(values_buffer),
-		len(old_log_probs_buffer), len(actions_buffer)
-	]
-	if any(length != T for length in buffer_lengths):
-		raise ValueError(f"Rollout buffer length mismatch: states={T}, others={buffer_lengths}")
-	if T == 0:
-		return
-	base_shape = states_buffer[0].shape
-	base_device = states_buffer[0].device
-	if len(base_shape) != 3 or base_shape[-1] < 7:
-		raise ValueError(f"states_buffer expected (T,B,M,S>=7), got {base_shape}")
-	B, M, _ = base_shape
-	validate_condition_state(condition_state, B, M, base_device)
-	for i, tensor in enumerate(states_buffer):
-		if tensor.device != base_device:
-			raise ValueError(f"states[{i}] device mismatch: {tensor.device} != {base_device}")
-		if tensor.shape[0] != B or tensor.shape[1] != M:
-			raise ValueError(f"states[{i}] leading shape mismatch: {tensor.shape[:2]} != {(B, M)}")
-	for i, route_state in enumerate(route_state_buffer):
-		if not isinstance(route_state, dict):
-			raise ValueError(f"route_state[{i}] expected dict, got {type(route_state)}")
-		for key in ('route_quad_ids', 'target_count', 'current_idx'):
-			if key not in route_state:
-				raise ValueError(f"route_state[{i}] missing key: {key}")
-			tensor = route_state[key]
-			if tensor.device != base_device:
-				raise ValueError(f"route_state[{i}][{key}] device mismatch: {tensor.device} != {base_device}")
-			if tensor.shape[0] != B or tensor.shape[1] != M:
-				raise ValueError(f"route_state[{i}][{key}] leading shape mismatch: {tensor.shape[:2]} != {(B, M)}")
-	for name, buf in (
-		('rewards', rewards_buffer),
-		('dones', dones_buffer),
-		('values', values_buffer),
-		('old_log_probs', old_log_probs_buffer),
-		('actions', actions_buffer),
-	):
-		for i, tensor in enumerate(buf):
-			if tensor.device != base_device:
-				raise ValueError(f"{name}[{i}] device mismatch: {tensor.device} != {base_device}")
-			if tensor.shape[:2] != (B, M):
-				raise ValueError(f"{name}[{i}] shape mismatch: {tensor.shape[:2]} != {(B, M)}")
+def validate_rollout_buffer(rollout_buffer: RolloutTensorBuffer, condition_state: dict):
+	if not isinstance(rollout_buffer, RolloutTensorBuffer):
+		raise ValueError(f"rollout_buffer expected RolloutTensorBuffer, got {type(rollout_buffer)}")
+	rollout_buffer.validate(condition_state)
 
 def merge_update_stats(accum: dict, update_stats: dict):
 	if update_stats is None:
@@ -1123,19 +1465,18 @@ def sample_actions_for_alive(action_logits: torch.Tensor, alive_mask: torch.Tens
 
 # ============================== PPO更新函数 ==============================
 def perform_ppo_update(model, policy_optimizer, value_optimizer,
-					   states_buffer, route_state_buffer, condition_state,
-					   rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+					   rollout_buffer, condition_state,
 					   features_tensor, simulator, config, iteration, rank=None, a_max_ewma=None, amp_scaler=None):
 	"""执行 PPO 更新。buffer 保存世界状态/route state，条件特征在 minibatch 内重建。"""
 	is_rank0 = (rank is None or rank == 0)
 	update_start_time = time.time()
-	if len(states_buffer) == 0:
+	if len(rollout_buffer) == 0:
 		device = features_tensor.device if isinstance(features_tensor, torch.Tensor) else torch.device('cpu')
 		if is_rank0:
 			print("⚠️ Buffer为空，无法进行PPO更新")
 		return a_max_ewma, make_update_stats("empty_buffer", device)
 	if is_rank0:
-		print(f"🎯 开始经验采样训练，Buffer长度: {len(states_buffer)}")
+		print(f"🎯 开始经验采样训练，Buffer长度: {len(rollout_buffer)}")
 
 	training_cfg = getattr(config, 'training')
 	gamma = getattr(training_cfg, 'gamma', 0.999)
@@ -1150,21 +1491,19 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	beta = float(getattr(training_cfg, 'advantage_filter_beta', 0.25))
 	precision = getattr(training_cfg, 'precision', '32-bit')
 	forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
-	device = states_buffer[0].device
-	validate_rollout_buffers(
-		states_buffer, route_state_buffer, condition_state,
-		rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-	)
+	validate_rollout_buffer(rollout_buffer, condition_state)
+	device = rollout_buffer.states.device
 	if device.type == 'cuda':
 		torch.cuda.reset_peak_memory_stats(device)
 
-	states_tensor = torch.stack(states_buffer, dim=0)  # (T, B, M, 7)
-	route_state_tensor = stack_route_state_buffer(route_state_buffer)
-	rewards_tensor = torch.stack(rewards_buffer, dim=0)
-	dones_tensor = torch.stack(dones_buffer, dim=0).bool()
-	values_tensor = torch.stack(values_buffer, dim=0)
-	old_log_probs_tensor = torch.stack(old_log_probs_buffer, dim=0)
-	actions_tensor = torch.stack(actions_buffer, dim=0)
+	states_tensor = rollout_buffer.view(rollout_buffer.states)
+	route_state_tensor = rollout_buffer.route_state_view()
+	rewards_tensor = rollout_buffer.view(rollout_buffer.rewards)
+	dones_tensor = rollout_buffer.view(rollout_buffer.dones).bool()
+	values_tensor = rollout_buffer.view(rollout_buffer.values)
+	old_log_probs_tensor = rollout_buffer.view(rollout_buffer.old_log_probs)
+	actions_tensor = rollout_buffer.view(rollout_buffer.actions)
+	time_indices_tensor = rollout_buffer.view(rollout_buffer.time_indices)
 
 	if features_tensor is None:
 		last_value_pred = torch.zeros_like(values_tensor[-1])
@@ -1219,7 +1558,6 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	if is_rank0:
 		print(f"🎯 随机选取 {K} 个样本用于更新（候选 {N}）")
 
-	agent_indices_batch = selected_m.to(device)
 	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
 	advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
 	returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
@@ -1227,20 +1565,19 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std(unbiased=False) + 1e-8)
 	batch_N = old_log_probs_batch.shape[0]
 
-	uniq_tb, inverse_mb = torch.unique(torch.stack([selected_t, selected_b], dim=1), dim=0, return_inverse=True)
-	t_u_mb = uniq_tb[:, 0]
-	b_u_mb = uniq_tb[:, 1]
-	route_state_mb = gather_route_state(route_state_tensor, t_u_mb, b_u_mb)
-	condition_state_mb = gather_condition_state_env(condition_state, b_u_mb)
-	world_states_mb = states_tensor[t_u_mb, b_u_mb]
-	features_u_mb = build_features_from_world_state_batch(
+	route_state_mb = gather_route_state_selected(route_state_tensor, selected_t, selected_b, selected_m)
+	condition_state_mb = gather_condition_state_selected(condition_state, selected_b, selected_m)
+	world_states_mb = states_tensor[selected_t, selected_b]
+	mb_features = build_features_for_selected_agents(
 		world_states_mb,
 		simulator,
 		config,
 		route_state_mb,
 		condition_state_mb,
+		selected_m,
+		time_indices=time_indices_tensor[selected_t],
+		env_indices=selected_b,
 	)
-	mb_features = features_u_mb[inverse_mb.to(device), agent_indices_batch].unsqueeze(1)
 
 	policy_params = get_policy_parameters(model)
 	value_params = get_value_parameters(model)
@@ -1314,25 +1651,21 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	return a_max_ewma.detach(), stats
 
 def perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer,
-								 states_buffer, route_state_buffer, condition_state,
-								 rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+								 rollout_buffer, condition_state,
 								 features_tensor, simulator, config, iteration, a_max_ewma=None, amp_scaler=None):
 	return perform_ppo_update(
 		model, policy_optimizer, value_optimizer,
-		states_buffer, route_state_buffer, condition_state,
-		rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+		rollout_buffer, condition_state,
 		features_tensor, simulator, config, iteration,
 		rank=None, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
 	)
 
 def perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer,
-								states_buffer, route_state_buffer, condition_state,
-								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+								rollout_buffer, condition_state,
 								features_tensor, simulator, config, iteration, rank, a_max_ewma=None, amp_scaler=None):
 	return perform_ppo_update(
 		model, policy_optimizer, value_optimizer,
-		states_buffer, route_state_buffer, condition_state,
-		rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+		rollout_buffer, condition_state,
 		features_tensor, simulator, config, iteration,
 		rank=rank, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
 	)
@@ -1436,15 +1769,21 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			if profile_on:
 				reset_profile_start = profile_timer_start(device, config)
 			worker_log(f"iteration {k+1}: reset start")
-			initial_observation = simulator.reset()
+			simulator.reset(return_observation=False)
 			worker_log(f"iteration {k+1}: reset done")
 			if profile_on:
 				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
 				feature_profile_start = profile_timer_start(device, config)
-			worker_log(f"iteration {k+1}: initial feature build start")
-			features_tensor = build_features_from_observation(initial_observation, simulator, config)
-			worker_log(f"iteration {k+1}: initial feature build done")
 			condition_state = snapshot_condition_state(simulator)
+			worker_log(f"iteration {k+1}: initial feature build start")
+			features_tensor = build_features_from_simulator_state(
+				simulator,
+				config,
+				alive_mask=rollout_alive_mask(simulator, None),
+				condition_state=condition_state,
+				dropout_step=0,
+			)
+			worker_log(f"iteration {k+1}: initial feature build done")
 			if profile_on:
 				initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build={initial_feature_ms:.2f}ms")
@@ -1454,13 +1793,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			step_count = 0
 			
 			# 初始化全局buffer（与game.py一致）
-			states_buffer = []
-			route_state_buffer = []
-			rewards_buffer = []
-			dones_buffer = []
-			values_buffer = []
-			old_log_probs_buffer = []
-			actions_buffer = []
+			rollout_buffer = RolloutTensorBuffer(rollout_length)
 			buffer_step_count = 0
 			iteration_update_stats = make_update_stats("no_update", device)
 			
@@ -1474,14 +1807,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, condition_state,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							rollout_buffer, condition_state,
 							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
-						clear_rollout_buffers(
-							states_buffer, route_state_buffer,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-						)
+						clear_rollout_buffers(rollout_buffer)
 					else:
 						print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
 					break
@@ -1508,28 +1837,24 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				
 				# 在推进环境前缓存当前状态
 				pre_state = state_with_control_for_buffer(simulator, alive_mask)
-				pre_route_state = snapshot_route_state(simulator)
+				pre_route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
+				rollout_buffer.write_pre_step(pre_state, pre_route_state, time_index=step_count)
+				del pre_state
 				
 				# 环境步进
 				if profile_on:
 					env_profile_start = profile_timer_start(device, config)
 				if debug_step:
 					worker_log(f"step {step_count + 1}: env start")
-				observation, reward, done = simulator.step(actions)
+				reward, done = simulator.step(actions, return_observation=False)
 				if debug_step:
 					worker_log(f"step {step_count + 1}: env done")
 				if profile_on:
 					env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
 				
 				# 写入训练buffer（与game.py一致）
-				states_buffer.append(pre_state)
-				route_state_buffer.append(pre_route_state)
-				rewards_buffer.append(reward.detach().clone())
-				dones_buffer.append(done.detach().clone())
-				values_buffer.append(value_pred.detach().clone())
-				old_log_probs_buffer.append(old_log_probs.detach().clone())
-				actions_buffer.append(actions.detach().clone())
-				buffer_step_count += 1
+				rollout_buffer.write_post_step(reward, done, value_pred, old_log_probs, actions)
+				buffer_step_count = len(rollout_buffer)
 				
 				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
 				current_done_all = done.detach().bool()  # (B, M)
@@ -1548,7 +1873,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						feature_profile_start = profile_timer_start(device, config)
 					if debug_step:
 						worker_log(f"step {step_count + 1}: feature build start")
-					features_tensor = build_features_from_observation(observation, simulator, config)
+					next_alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
+					features_tensor = build_features_from_simulator_state(
+						simulator,
+						config,
+						alive_mask=next_alive_mask,
+						condition_state=condition_state,
+						dropout_step=step_count + 1,
+					)
 					if debug_step:
 						worker_log(f"step {step_count + 1}: feature build done")
 					if profile_on:
@@ -1566,14 +1898,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 					A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 						model, policy_optimizer, value_optimizer,
-						states_buffer, route_state_buffer, condition_state,
-						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+						rollout_buffer, condition_state,
 						features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 					merge_update_stats(iteration_update_stats, update_stats)
-					clear_rollout_buffers(
-						states_buffer, route_state_buffer,
-						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-					)
+					clear_rollout_buffers(rollout_buffer)
 					break
 				
 				# 检查是否需要PPO更新（与game.py一致）
@@ -1582,40 +1910,29 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, condition_state,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							rollout_buffer, condition_state,
 							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
-						clear_rollout_buffers(
-							states_buffer, route_state_buffer,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-						)
+						clear_rollout_buffers(rollout_buffer)
 						print("🔄 达到最大步数，强制开启新iteration...")
 						break
 					else:
 						print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, condition_state,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							rollout_buffer, condition_state,
 							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
 						
 						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
 						if all_worlds_no_alive_agents(simulator, cumulative_done_all):
 							print("🔄 所有世界都没有存活agents，开启新iteration...")
-							clear_rollout_buffers(
-								states_buffer, route_state_buffer,
-								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-							)
+							clear_rollout_buffers(rollout_buffer)
 							break
 						else:
 							print("✅ 仍有世界有存活agents，继续下一个128step...")
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
-							clear_rollout_buffers(
-								states_buffer, route_state_buffer,
-								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-							)
+							clear_rollout_buffers(rollout_buffer)
 							buffer_step_count = 0
 							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 
@@ -1725,15 +2042,21 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			if profile_on:
 				reset_profile_start = profile_timer_start(device, config)
 			worker_log(f"iteration {k+1}: reset start")
-			initial_observation = simulator.reset()
+			simulator.reset(return_observation=False)
 			worker_log(f"iteration {k+1}: reset done")
 			if profile_on:
 				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
 				feature_profile_start = profile_timer_start(device, config)
-			worker_log(f"iteration {k+1}: initial feature build start")
-			features_tensor = build_features_from_observation(initial_observation, simulator, config)
-			worker_log(f"iteration {k+1}: initial feature build done")
 			condition_state = snapshot_condition_state(simulator)
+			worker_log(f"iteration {k+1}: initial feature build start")
+			features_tensor = build_features_from_simulator_state(
+				simulator,
+				config,
+				alive_mask=rollout_alive_mask(simulator, None),
+				condition_state=condition_state,
+				dropout_step=0,
+			)
+			worker_log(f"iteration {k+1}: initial feature build done")
 			if profile_on:
 				initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
 			if rank == 0 and profile_on:
@@ -1744,13 +2067,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			step_count = 0
 			
 			# 初始化全局buffer（与game.py一致）
-			states_buffer = []
-			route_state_buffer = []
-			rewards_buffer = []
-			dones_buffer = []
-			values_buffer = []
-			old_log_probs_buffer = []
-			actions_buffer = []
+			rollout_buffer = RolloutTensorBuffer(rollout_length)
 			buffer_step_count = 0
 			iteration_update_stats = make_update_stats("no_update", device)
 			
@@ -1766,14 +2083,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, condition_state,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							rollout_buffer, condition_state,
 							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
-						clear_rollout_buffers(
-							states_buffer, route_state_buffer,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-						)
+						clear_rollout_buffers(rollout_buffer)
 					else:
 						if rank == 0:
 							print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
@@ -1801,28 +2114,24 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				
 				# 在推进环境前缓存当前状态
 				pre_state = state_with_control_for_buffer(simulator, alive_mask)
-				pre_route_state = snapshot_route_state(simulator)
+				pre_route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
+				rollout_buffer.write_pre_step(pre_state, pre_route_state, time_index=step_count)
+				del pre_state
 				
 				# 环境步进
 				if profile_on:
 					env_profile_start = profile_timer_start(device, config)
 				if debug_step:
 					worker_log(f"step {step_count + 1}: env start")
-				observation, reward, done = simulator.step(actions)
+				reward, done = simulator.step(actions, return_observation=False)
 				if debug_step:
 					worker_log(f"step {step_count + 1}: env done")
 				if profile_on:
 					env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
 				
 				# 写入训练buffer（与game.py一致）
-				states_buffer.append(pre_state)
-				route_state_buffer.append(pre_route_state)
-				rewards_buffer.append(reward.detach().clone())
-				dones_buffer.append(done.detach().clone())
-				values_buffer.append(value_pred.detach().clone())
-				old_log_probs_buffer.append(old_log_probs.detach().clone())
-				actions_buffer.append(actions.detach().clone())
-				buffer_step_count += 1
+				rollout_buffer.write_post_step(reward, done, value_pred, old_log_probs, actions)
+				buffer_step_count = len(rollout_buffer)
 				
 				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
 				current_done_all = done.detach().bool()  # (B, M)
@@ -1842,7 +2151,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						feature_profile_start = profile_timer_start(device, config)
 					if debug_step:
 						worker_log(f"step {step_count + 1}: feature build start")
-					features_tensor = build_features_from_observation(observation, simulator, config)
+					next_alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
+					features_tensor = build_features_from_simulator_state(
+						simulator,
+						config,
+						alive_mask=next_alive_mask,
+						condition_state=condition_state,
+						dropout_step=step_count + 1,
+					)
 					if debug_step:
 						worker_log(f"step {step_count + 1}: feature build done")
 					if profile_on:
@@ -1861,14 +2177,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 					A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 						model, policy_optimizer, value_optimizer,
-						states_buffer, route_state_buffer, condition_state,
-						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+						rollout_buffer, condition_state,
 						features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 					merge_update_stats(iteration_update_stats, update_stats)
-					clear_rollout_buffers(
-						states_buffer, route_state_buffer,
-						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-					)
+					clear_rollout_buffers(rollout_buffer)
 					break
 				
 				# 检查是否需要PPO更新（与game.py一致）
@@ -1878,14 +2190,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, condition_state,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							rollout_buffer, condition_state,
 							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
-						clear_rollout_buffers(
-							states_buffer, route_state_buffer,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-						)
+						clear_rollout_buffers(rollout_buffer)
 						if rank == 0:
 							print("🔄 达到最大步数，强制开启新iteration...")
 						break
@@ -1894,8 +2202,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, condition_state,
-							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
+							rollout_buffer, condition_state,
 							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
 						
@@ -1904,19 +2211,13 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						if sync_bool_across_ranks(local_no_alive, device, op=dist.ReduceOp.MIN):
 							if rank == 0:
 								print("🔄 所有世界都没有存活agents，开启新iteration...")
-							clear_rollout_buffers(
-								states_buffer, route_state_buffer,
-								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-							)
+							clear_rollout_buffers(rollout_buffer)
 							break
 						else:
 							if rank == 0:
 								print("✅ 仍有世界有存活agents，继续下一个128step...")
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
-							clear_rollout_buffers(
-								states_buffer, route_state_buffer,
-								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
-							)
+							clear_rollout_buffers(rollout_buffer)
 							buffer_step_count = 0
 							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 

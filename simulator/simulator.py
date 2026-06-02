@@ -299,7 +299,7 @@ class TeraflowSimulator:
         )
         return violation.any(dim=-1)
 
-    def reset(self) -> torch.Tensor:
+    def reset(self, return_observation: bool = True):
         """
         重置所有环境，并返回所有智能体的初始观测。
         Returns:
@@ -337,31 +337,34 @@ class TeraflowSimulator:
         self.stop_line_violation = torch.zeros_like(active_mask, dtype=torch.bool)
         self._update_stop_line_observation(self.agents_state)
 
-        # 生成初始观测。路径规划先完成，训练首帧才能拿到同步的局部路径特征。
-        self._log("Generating initial observation...")
-        initial_observation = self.observation_generator.generate(
-            self.agents_state,
-            control_state=self._current_control_state(),
-            driving_style_params=self.driving_style_params,
-        )
-        self._log(initial_observation.shape)
-        self._log("Initial observation generated")
+        initial_observation = None
+        if return_observation:
+            # 生成初始观测。路径规划先完成，训练首帧才能拿到同步的局部路径特征。
+            self._log("Generating initial observation...")
+            initial_observation = self.observation_generator.generate(
+                self.agents_state,
+                control_state=self._current_control_state(),
+                driving_style_params=self.driving_style_params,
+            )
+            self._log(initial_observation.shape)
+            self._log("Initial observation generated")
         self._log("Path planning initialized")
         self._log(f"Reset complete. World state shape: {self.agents_state.shape}")
         
         return initial_observation
     
-    def step(self, actions: torch.Tensor, debug_collision: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def step(self, actions: torch.Tensor, debug_collision: bool = False,
+             return_observation: bool = True):
         """
         让所有环境向前步进一个时间步。所有智能体都根据actions更新。
         Args:
             actions (torch.Tensor): 形状为 (B, M, action) 的动作张量。
             debug_collision (bool): 是否为碰撞检测器开启调试模式。
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - observation (torch.Tensor): 新的观测 (B, M, obs_dim)。
-                - reward (torch.Tensor): 奖励 (B, M)。
-                - done (torch.Tensor): 是否结束的标志 (B, M)。
+            return_observation=True:
+                (observation, reward, done)
+            return_observation=False:
+                (reward, done)
         """
         if self.agents_state is None:
             raise RuntimeError("Must call reset() before calling step().")
@@ -461,26 +464,30 @@ class TeraflowSimulator:
         self._advance_route_targets(intermediate_goal_reached)
         profile_cursor = self._profile_record(profile, 'route_update_ms', profile_cursor)
 
-        # 8. 生成新的观测（排除已经done的车辆，包括当前step刚done的车辆）。
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            agents_state_for_obs = self.agents_state.clone()
-            agents_state_for_obs[..., 6] = torch.where(self.last_done, 0.0, agents_state_for_obs[..., 6])
-        else:
-            agents_state_for_obs = self.agents_state
+        observation = None
+        if return_observation:
+            # 8. 生成新的观测（排除已经done的车辆，包括当前step刚done的车辆）。
+            if hasattr(self, 'last_done') and self.last_done is not None:
+                agents_state_for_obs = self.agents_state.clone()
+                agents_state_for_obs[..., 6] = torch.where(self.last_done, 0.0, agents_state_for_obs[..., 6])
+            else:
+                agents_state_for_obs = self.agents_state
 
-        self._update_stop_line_observation(agents_state_for_obs)
-        observation = self.observation_generator.generate(
-            agents_state_for_obs,
-            control_state=self._current_control_state(),
-            driving_style_params=self.driving_style_params,
-        )
-        profile_cursor = self._profile_record(profile, 'observation_ms', profile_cursor)
+            self._update_stop_line_observation(agents_state_for_obs)
+            observation = self.observation_generator.generate(
+                agents_state_for_obs,
+                control_state=self._current_control_state(),
+                driving_style_params=self.driving_style_params,
+            )
+            profile_cursor = self._profile_record(profile, 'observation_ms', profile_cursor)
 
         if profile is not None:
             profile['total_step_ms'] = (self._profile_now() - profile_start) * 1000.0
             self.last_step_profile = profile
 
-        return observation, reward, done
+        if return_observation:
+            return observation, reward, done
+        return reward, done
     
     def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -820,6 +827,7 @@ class TeraflowSimulator:
         self,
         agents_state: torch.Tensor = None,
         route_state: Optional[Dict[str, torch.Tensor]] = None,
+        w_lane_keep_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Build the paper-style navigation observation package.
@@ -847,6 +855,9 @@ class TeraflowSimulator:
             return navigation
 
         w_lane_ids, _ = self.observation_generator.get_w_lane_ids_for_agents(agents_state)
+        if w_lane_keep_mask is not None:
+            keep_mask = w_lane_keep_mask.to(device=self.device, dtype=torch.bool)
+            w_lane_ids = torch.where(keep_mask, w_lane_ids, torch.full_like(w_lane_ids, -1))
         current_goal_quad = self._route_quad_at(current_idx, route_quad_ids=route_quads)
         route_abs = self.path_planner.route_distances_from_w_lanes_to_goal_quads(w_lane_ids, current_goal_quad)
         active = agents_state[..., 6] > 0.5

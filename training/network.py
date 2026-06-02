@@ -91,18 +91,34 @@ class PermutationInvariantEncoder(nn.Module):
             raise ValueError(f"x 期望为 3D 或 4D 张量，得到 {x.dim()}D")
 
         B, M, K, d = x.shape
+        if mask is not None:
+            flat_mask = mask.reshape(-1)
+            flat_x = x.reshape(-1, d)
+            neg_inf = torch.finfo(x.dtype).min
+            encoded_flat = torch.full(
+                (B * M, self.output_dim),
+                neg_inf,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            if bool(flat_mask.any().item()):
+                valid_x = flat_x[flat_mask]
+                encoded_valid = self.element_encoder(valid_x)
+                group_ids = torch.arange(B * M, device=x.device, dtype=torch.long).repeat_interleave(K)[flat_mask]
+                scatter_index = group_ids.unsqueeze(-1).expand(-1, self.output_dim)
+                if hasattr(encoded_flat, 'scatter_reduce_'):
+                    encoded_flat.scatter_reduce_(0, scatter_index, encoded_valid, reduce='amax', include_self=True)
+                else:
+                    encoded_elements = self.element_encoder(flat_x).reshape(B, M, K, self.output_dim)
+                    encoded_elements = encoded_elements.masked_fill(~mask.unsqueeze(-1), neg_inf)
+                    encoded_flat = torch.max(encoded_elements, dim=2)[0].reshape(B * M, self.output_dim)
+            encoded = encoded_flat.view(B, M, self.output_dim)
+            all_invalid = ~mask.any(dim=2)
+            return torch.where(all_invalid.unsqueeze(-1), torch.zeros_like(encoded), encoded)
+
         encoded_elements = self.element_encoder(x.reshape(-1, d))  # [(B*M*K), output_dim]
         encoded_elements = encoded_elements.reshape(B, M, K, self.output_dim)
-
-        if mask is not None:
-            neg_inf = torch.finfo(encoded_elements.dtype).min
-            encoded_elements = encoded_elements.masked_fill(~mask.unsqueeze(-1), neg_inf)
-
-        encoded = torch.max(encoded_elements, dim=2)[0]  # [B, M, output_dim]
-        if mask is not None:
-            all_invalid = ~mask.any(dim=2)
-            encoded = torch.where(all_invalid.unsqueeze(-1), torch.zeros_like(encoded), encoded)
-        return encoded
+        return torch.max(encoded_elements, dim=2)[0]  # [B, M, output_dim]
 
 class FeatureEncoder(nn.Module):
     """
