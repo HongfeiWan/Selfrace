@@ -143,6 +143,25 @@ class ObservationGenerator:
         
         return w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices
 
+    def get_w_lane_ids_for_agents(self, agents_state: torch.Tensor) -> tuple:
+        """
+        Return the precomputed W_lane ids in the same order used by generate().
+
+        This lets downstream navigation features attach route-level quantities to
+        each lane observation without duplicating nearest-neighbor map lookup.
+        """
+        batch_size, max_agents, _ = agents_state.shape
+        agent_positions_flat = agents_state[..., :2].view(-1, 2)
+        _, quad_indices = self.road_network.find_nearest_lanes(
+            agent_positions_flat, k=1, spatial_hash=self.spatial_hash
+        )
+        quad_indices = quad_indices.squeeze(-1)
+        valid_quad = quad_indices >= 0
+        safe_quad_indices = torch.where(valid_quad, quad_indices, torch.zeros_like(quad_indices))
+        w_lanes_ids = self.quad_to_w_lanes_ids[safe_quad_indices]
+        w_lanes_ids = torch.where(valid_quad.unsqueeze(-1), w_lanes_ids, torch.full_like(w_lanes_ids, -1))
+        return w_lanes_ids.view(batch_size, max_agents, self.num_w_lanes), quad_indices.view(batch_size, max_agents)
+
     def _get_waypoints_by_ids(self, waypoint_ids: torch.Tensor, waypoints: torch.Tensor) -> torch.Tensor:
         """
         根据ID列表获取waypoint坐标。

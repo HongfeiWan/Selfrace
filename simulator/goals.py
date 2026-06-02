@@ -429,6 +429,7 @@ class PathPlanner:
             self.all_start_cids = torch.empty(0, dtype=torch.int32, device=self.device)
         
         # ===================初始化WaypointGraphGPU===================
+        self._route_distance_ready = False
         try:
             lane_route_graph, lane_route_edge_coords = self._build_lane_route_graph(cross_data)
             self.waypoint_graph_gpu = WaypointGraphGPU(
@@ -437,6 +438,7 @@ class PathPlanner:
                 waypoint_graph=lane_route_graph,
             )
             self._install_prebuilt_waypoint_graph_edge_expansions(lane_route_edge_coords)
+            self._precompute_route_distance_tables()
         except Exception as e:
             print(f"WaypointGraphGPU初始化失败: {e}")
             self.waypoint_graph_gpu = None
@@ -922,6 +924,193 @@ class PathPlanner:
             return centers_flat.view(original_shape[0], original_shape[1], 2)
         else:
             return centers_flat
+
+    def _map_graph_triplets_to_groups(self, triplets: torch.Tensor) -> torch.Tensor:
+        """Map [cross, road, lane] triplets to WaypointGraphGPU group ids."""
+        if self.waypoint_graph_gpu is None or triplets.numel() == 0:
+            return torch.full(triplets.shape[:-1], -1, dtype=torch.long, device=self.device)
+        wg = self.waypoint_graph_gpu
+        if wg.triplet_unique_keys.numel() == 0:
+            return torch.full(triplets.shape[:-1], -1, dtype=torch.long, device=self.device)
+
+        original_shape = triplets.shape[:-1]
+        flat = triplets.to(device=self.device, dtype=torch.long).reshape(-1, 3)
+        off = flat - wg._triplet_mins.view(1, 3)
+        keys = off[:, 0] * wg._triplet_mul_cross + off[:, 1] * wg._triplet_mul_road + off[:, 2]
+        pos = torch.searchsorted(wg.triplet_unique_keys, keys)
+        pos = torch.clamp(pos, 0, wg.triplet_unique_keys.numel() - 1)
+        matched = wg.triplet_unique_keys[pos] == keys
+        groups = torch.full((flat.shape[0],), -1, dtype=torch.long, device=self.device)
+        groups[matched] = pos[matched]
+        return groups.view(original_shape)
+
+    def _graph_node_for_groups(self, groups: torch.Tensor) -> torch.Tensor:
+        """Return the first concrete graph node for each triplet group."""
+        if self.waypoint_graph_gpu is None or groups.numel() == 0:
+            return torch.full_like(groups, -1, dtype=torch.long)
+        wg = self.waypoint_graph_gpu
+        out = torch.full(groups.shape, -1, dtype=torch.long, device=self.device)
+        valid = (groups >= 0) & (groups < wg.triplet_group_starts.numel())
+        if valid.any():
+            safe_groups = groups[valid].to(torch.long)
+            starts = wg.triplet_group_starts[safe_groups]
+            counts = wg.triplet_group_counts[safe_groups]
+            has_node = counts > 0
+            valid_positions = torch.where(valid)[0]
+            if has_node.any():
+                out[valid_positions[has_node]] = wg.nodes_sorted_by_triplet[starts[has_node]]
+        return out
+
+    def _build_quad_to_waypoint_lookup(self, map_quad_ids: torch.Tensor, waypoint_values: torch.Tensor) -> torch.Tensor:
+        """Build a dense quad-index -> W_lane waypoint lookup from map polyId keys."""
+        num_quads = int(self.quads_info['center_x'].shape[0])
+        lookup = torch.full((num_quads,), -1, dtype=torch.long, device=self.device)
+        if map_quad_ids.numel() == 0 or waypoint_values.numel() == 0:
+            return lookup
+
+        poly_ids = self.quads_info.get('polyId', torch.arange(num_quads, device=self.device, dtype=torch.int32))
+        for qid, wp_id in zip(map_quad_ids.detach().cpu().tolist(), waypoint_values.detach().cpu().tolist()):
+            qid_int = int(qid)
+            wp_int = int(wp_id)
+            match = torch.where(poly_ids == qid_int)[0]
+            if match.numel() > 0:
+                lookup[match[0].long()] = wp_int
+            elif 0 <= qid_int < num_quads:
+                lookup[qid_int] = wp_int
+        return lookup
+
+    def _precompute_route_distance_tables(self):
+        """Precompute lane waypoint metadata used for W_lane graph-route distances."""
+        self._route_distance_ready = False
+        if self.waypoint_graph_gpu is None or not hasattr(self, 'global_w_lane_waypoints'):
+            return
+        num_waypoints = int(self.global_w_lane_waypoints['x'].shape[0])
+        if num_waypoints == 0:
+            return
+
+        road_ids = self.global_w_lane_waypoints['carla_waypoint_info']['road_id'].to(device=self.device, dtype=torch.long)
+        lane_ids = self.global_w_lane_waypoints['carla_waypoint_info']['lane_id'].to(device=self.device, dtype=torch.long)
+        start_triplets = torch.stack([
+            torch.full_like(road_ids, self.LANE_START_NODE),
+            road_ids,
+            lane_ids,
+        ], dim=1)
+        end_triplets = torch.stack([
+            torch.full_like(road_ids, self.LANE_END_NODE),
+            road_ids,
+            lane_ids,
+        ], dim=1)
+        self.w_lane_start_group = self._map_graph_triplets_to_groups(start_triplets)
+        self.w_lane_end_group = self._map_graph_triplets_to_groups(end_triplets)
+        self.w_lane_end_node_idx = self._graph_node_for_groups(self.w_lane_end_group)
+        self.w_lane_road_ids = road_ids
+        self.w_lane_lane_ids = lane_ids
+        self.w_lane_progress = torch.zeros(num_waypoints, dtype=torch.float32, device=self.device)
+        self.w_lane_remaining_to_end = torch.zeros(num_waypoints, dtype=torch.float32, device=self.device)
+
+        for lane_indices in self.lanes.values():
+            if lane_indices.numel() == 0:
+                continue
+            lane_indices = lane_indices.to(device=self.device, dtype=torch.long)
+            coords = self.get_waypoint_coords(lane_indices)
+            if coords.shape[0] <= 1:
+                progress = torch.zeros((coords.shape[0],), dtype=torch.float32, device=self.device)
+            else:
+                step = torch.norm(coords[1:] - coords[:-1], dim=1)
+                progress = torch.cat([
+                    torch.zeros((1,), dtype=torch.float32, device=self.device),
+                    torch.cumsum(step, dim=0),
+                ], dim=0)
+            total = progress[-1] if progress.numel() > 0 else torch.tensor(0.0, device=self.device)
+            self.w_lane_progress[lane_indices] = progress
+            self.w_lane_remaining_to_end[lane_indices] = total - progress
+
+        prev_lookup = self._build_quad_to_waypoint_lookup(
+            getattr(self, 'quad_to_prev_waypoint_quad_ids', torch.empty(0, device=self.device, dtype=torch.int32)),
+            getattr(self, 'quad_to_prev_waypoint_values', torch.empty(0, device=self.device, dtype=torch.int32)),
+        )
+        next_lookup = self._build_quad_to_waypoint_lookup(
+            getattr(self, 'quad_to_next_waypoint_quad_ids', torch.empty(0, device=self.device, dtype=torch.int32)),
+            getattr(self, 'quad_to_next_waypoint_values', torch.empty(0, device=self.device, dtype=torch.int32)),
+        )
+
+        quad_centers = torch.stack([self.quads_info['center_x'], self.quads_info['center_y']], dim=1)
+        prev_valid = (prev_lookup >= 0) & (prev_lookup < num_waypoints)
+        next_valid = (next_lookup >= 0) & (next_lookup < num_waypoints)
+        safe_prev = torch.clamp(prev_lookup, 0, max(num_waypoints - 1, 0))
+        safe_next = torch.clamp(next_lookup, 0, max(num_waypoints - 1, 0))
+        waypoint_xy = self.get_waypoint_coords(torch.arange(num_waypoints, device=self.device, dtype=torch.long))
+        prev_dist = torch.norm(waypoint_xy[safe_prev] - quad_centers, dim=1)
+        next_dist = torch.norm(waypoint_xy[safe_next] - quad_centers, dim=1)
+        prev_dist = prev_dist.masked_fill(~prev_valid, float('inf'))
+        next_dist = next_dist.masked_fill(~next_valid, float('inf'))
+        use_next = next_dist < prev_dist
+        self.quad_goal_waypoint = torch.where(use_next, next_lookup, prev_lookup).to(torch.long)
+        self.quad_goal_waypoint = torch.where(
+            torch.isfinite(torch.minimum(prev_dist, next_dist)),
+            self.quad_goal_waypoint,
+            torch.full_like(self.quad_goal_waypoint, -1),
+        )
+        self._route_distance_ready = True
+
+    def route_distances_from_w_lanes_to_goal_quads(self, w_lane_ids: torch.Tensor, goal_quad_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Compute graph-route distance from each observed W_lane waypoint to the current goal quad.
+
+        The distance follows lane direction, uses the waypoint graph between lane
+        endpoints, and falls back to inf when either endpoint is not routable.
+        """
+        route_dist = torch.full(w_lane_ids.shape, float('inf'), dtype=torch.float32, device=self.device)
+        if not self._route_distance_ready or self.waypoint_graph_gpu is None:
+            return route_dist
+
+        num_waypoints = int(self.w_lane_progress.shape[0])
+        num_quads = int(self.quad_goal_waypoint.shape[0])
+        if num_waypoints == 0 or num_quads == 0:
+            return route_dist
+
+        w_lane_ids = w_lane_ids.to(device=self.device, dtype=torch.long)
+        goal_quad_ids = goal_quad_ids.to(device=self.device, dtype=torch.long)
+        source_valid = (w_lane_ids >= 0) & (w_lane_ids < num_waypoints)
+        goal_valid = (goal_quad_ids >= 0) & (goal_quad_ids < num_quads)
+        safe_w = torch.clamp(w_lane_ids, 0, num_waypoints - 1)
+        safe_goal_quad = torch.clamp(goal_quad_ids, 0, num_quads - 1)
+
+        goal_wp = self.quad_goal_waypoint[safe_goal_quad]
+        goal_valid = goal_valid & (goal_wp >= 0) & (goal_wp < num_waypoints)
+        safe_goal_wp = torch.clamp(goal_wp, 0, num_waypoints - 1)
+
+        target_start_group = self.w_lane_start_group[safe_goal_wp].unsqueeze(-1)
+        source_end_node = self.w_lane_end_node_idx[safe_w]
+        graph_valid = (
+            source_valid
+            & goal_valid.unsqueeze(-1)
+            & (target_start_group >= 0)
+            & (source_end_node >= 0)
+        )
+        if graph_valid.any():
+            expanded_target_group = target_start_group.expand_as(source_end_node)
+            graph_values = self.waypoint_graph_gpu.end_dist_tensor[
+                expanded_target_group[graph_valid].to(torch.long),
+                source_end_node[graph_valid].to(torch.long),
+            ]
+            route_dist[graph_valid] = graph_values
+
+        source_progress = self.w_lane_progress[safe_w]
+        source_remaining = self.w_lane_remaining_to_end[safe_w]
+        goal_progress = self.w_lane_progress[safe_goal_wp].unsqueeze(-1)
+        route_dist = source_remaining + route_dist + goal_progress
+
+        same_lane = (
+            source_valid
+            & goal_valid.unsqueeze(-1)
+            & (self.w_lane_road_ids[safe_w] == self.w_lane_road_ids[safe_goal_wp].unsqueeze(-1))
+            & (self.w_lane_lane_ids[safe_w] == self.w_lane_lane_ids[safe_goal_wp].unsqueeze(-1))
+        )
+        direct_forward = goal_progress - source_progress
+        use_direct = same_lane & (direct_forward >= 0.0)
+        route_dist = torch.where(use_direct, direct_forward, route_dist)
+        return torch.where(source_valid & goal_valid.unsqueeze(-1), route_dist, torch.full_like(route_dist, float('inf')))
     
     def get_nearest_neighbor_info_batch(self, quad_ids: torch.Tensor) -> dict:
         """

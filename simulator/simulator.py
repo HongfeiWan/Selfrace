@@ -791,6 +791,83 @@ class TeraflowSimulator:
             & (self.agents_current_route_idx < (self.agents_route_target_count - 1))
         )
 
+    def _remaining_route_goals_local(self, agents_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return remaining route targets as explicit G(t) in ego coordinates."""
+        B, M, _ = agents_state.shape
+        goal_slots = self.max_route_targets
+        goals_local = torch.zeros((B, M, goal_slots, 2), dtype=agents_state.dtype, device=self.device)
+        goals_valid = torch.zeros((B, M, goal_slots), dtype=torch.bool, device=self.device)
+        if (
+            self.agents_route_quad_ids is None
+            or self.agents_route_target_count is None
+            or self.agents_current_route_idx is None
+        ):
+            return goals_local, goals_valid
+
+        slot_offsets = torch.arange(goal_slots, device=self.device, dtype=torch.long).view(1, 1, goal_slots)
+        target_indices = self.agents_current_route_idx.unsqueeze(-1) + slot_offsets
+        goals_valid = target_indices < self.agents_route_target_count.unsqueeze(-1)
+        safe_indices = torch.clamp(target_indices, 0, goal_slots - 1)
+        goal_quads = torch.gather(self.agents_route_quad_ids, 2, safe_indices)
+        goals_valid = goals_valid & (goal_quads >= 0) & (agents_state[..., 6] > 0.5).unsqueeze(-1)
+
+        goal_world = self.path_planner.get_quad_centers(goal_quads.reshape(-1).to(torch.long)).view(B, M, goal_slots, 2)
+        ego_pos = agents_state[..., :2]
+        ego_yaw = agents_state[..., 2]
+        cos_yaw, sin_yaw = torch.cos(ego_yaw), torch.sin(ego_yaw)
+        rot_matrix = torch.stack([
+            torch.stack([cos_yaw, -sin_yaw], dim=-1),
+            torch.stack([sin_yaw, cos_yaw], dim=-1)
+        ], dim=-2)
+        rel = goal_world - ego_pos.unsqueeze(2)
+        goals_local = torch.bmm(
+            rel.reshape(B * M, goal_slots, 2),
+            rot_matrix.reshape(B * M, 2, 2),
+        ).reshape(B, M, goal_slots, 2)
+        goals_local = torch.where(goals_valid.unsqueeze(-1), goals_local, torch.zeros_like(goals_local))
+        return goals_local, goals_valid
+
+    def get_navigation_observation(self, agents_state: torch.Tensor = None) -> torch.Tensor:
+        """
+        Build the paper-style navigation observation package.
+
+        Rows [0:max_route_targets) encode explicit remaining G(t): dx, dy, valid.
+        Rows after that align with W_lane observations and encode graph route
+        distance to the current target: absolute distance, relative distance, valid.
+        """
+        if agents_state is None:
+            agents_state = self.agents_state
+        if agents_state is None:
+            return torch.empty((0, 0, 0, 3), dtype=torch.float32, device=self.device)
+
+        B, M, _ = agents_state.shape
+        goal_slots = self.max_route_targets
+        lane_slots = self.observation_generator.num_w_lanes
+        navigation = torch.zeros((B, M, goal_slots + lane_slots, 3), dtype=agents_state.dtype, device=self.device)
+
+        goals_local, goals_valid = self._remaining_route_goals_local(agents_state)
+        navigation[:, :, :goal_slots, :2] = goals_local
+        navigation[:, :, :goal_slots, 2] = goals_valid.to(dtype=agents_state.dtype)
+
+        if self.agents_current_route_idx is None or self.agents_route_quad_ids is None:
+            return navigation
+
+        w_lane_ids, _ = self.observation_generator.get_w_lane_ids_for_agents(agents_state)
+        current_goal_quad = self._route_quad_at(self.agents_current_route_idx)
+        route_abs = self.path_planner.route_distances_from_w_lanes_to_goal_quads(w_lane_ids, current_goal_quad)
+        active = agents_state[..., 6] > 0.5
+        route_valid = torch.isfinite(route_abs) & (w_lane_ids >= 0) & active.unsqueeze(-1)
+        masked_route = route_abs.masked_fill(~route_valid, float('inf'))
+        min_route = masked_route.amin(dim=-1, keepdim=True)
+        min_route = torch.where(torch.isfinite(min_route), min_route, torch.zeros_like(min_route))
+        route_rel = route_abs - min_route
+
+        lane_slice = navigation[:, :, goal_slots:goal_slots + lane_slots]
+        lane_slice[..., 0] = torch.where(route_valid, route_abs, torch.zeros_like(route_abs))
+        lane_slice[..., 1] = torch.where(route_valid, route_rel, torch.zeros_like(route_rel))
+        lane_slice[..., 2] = route_valid.to(dtype=agents_state.dtype)
+        return navigation
+
     def _drop_path_prefix_to_targets(self, reached_mask: torch.Tensor, target_positions: torch.Tensor):
         if self.agents_path_plans is None or not bool(reached_mask.any().item()):
             return
@@ -1076,7 +1153,7 @@ if __name__ == '__main__':
     agent_artists, active_indices = build_agent_artists()
 
     # 构建策略网络与初始特征（延迟导入避免循环依赖）
-    from ddppo import decompose_observation, build_network_features
+    from ddppo import decompose_observation, build_network_features, current_path_plan
     from network import create_network
     import json as _json
 
@@ -1090,7 +1167,7 @@ if __name__ == '__main__':
             neighbors_local,
             w_lanes_local,
             w_boundaries_local,
-            simulator.agents_path_plans,
+            current_path_plan(simulator),
             simulator.stop_lines,
             simulator.reward_calculator.sampled_params,
             config_ns,
@@ -1394,7 +1471,7 @@ if __name__ == '__main__':
                     neighbors_local,
                     w_lanes_local,
                     w_boundaries_local,
-                    simulator.agents_path_plans_local,
+                    current_path_plan(simulator),
                     simulator.stop_lines if hasattr(simulator, 'stop_lines') else None,
                     simulator.reward_calculator.sampled_params,
                     config_ns, 

@@ -272,8 +272,13 @@ def normalize_s_features(s_t: torch.Tensor, target_size: int, vehicle_style: tor
         normalized[:, :, 6] = out[:, :, 6]
     return normalized
 
+def _is_navigation_packet(path_plan: torch.Tensor) -> bool:
+    return path_plan is not None and path_plan.dim() == 4 and path_plan.shape[-1] >= 3
+
+
 def build_lane_map_features(w_lanes_local: torch.Tensor, path_plan: torch.Tensor,
-                            target_size: int, element_dim: int = 7) -> torch.Tensor:
+                            target_size: int, element_dim: int = 7,
+                            goal_slots: int = 0) -> torch.Tensor:
     """构造原文式 W_lane: 位置、车道方向、车道宽度、到下一目标的绝对/相对距离。"""
     if w_lanes_local is None or w_lanes_local.numel() == 0:
         return None
@@ -303,7 +308,22 @@ def build_lane_map_features(w_lanes_local: torch.Tensor, path_plan: torch.Tensor
         lane_width = torch.zeros(B, M, K, device=lanes.device, dtype=lanes.dtype)
         valid = valid & (lane_xy.abs().sum(dim=-1) > 1e-6)
 
-    if path_plan is not None and path_plan.numel() > 0:
+    nav_packet = _is_navigation_packet(path_plan)
+    route_abs = route_rel = route_valid = None
+    if nav_packet and goal_slots <= 0 and path_plan.shape[2] >= K:
+        goal_slots = max(0, path_plan.shape[2] - K)
+    if nav_packet and path_plan.shape[2] >= goal_slots + K:
+        nav = path_plan.to(device=lanes.device, dtype=lanes.dtype)
+        route_rows = nav[:, :, goal_slots:goal_slots + K, :]
+        route_abs = route_rows[..., 0]
+        route_rel = route_rows[..., 1]
+        route_valid = (route_rows[..., 2] > 0.5) & torch.isfinite(route_abs) & torch.isfinite(route_rel)
+
+    if nav_packet and goal_slots > 0 and path_plan.shape[2] >= goal_slots:
+        nav = path_plan.to(device=lanes.device, dtype=lanes.dtype)
+        goal_local = nav[:, :, 0, :2]
+        has_goal = nav[:, :, 0, 2] > 0.5
+    elif path_plan is not None and path_plan.numel() > 0:
         path = path_plan.to(device=lanes.device, dtype=lanes.dtype)
         path_valid = torch.isfinite(path).all(dim=-1) & ~((path[..., 0] == -1.0) & (path[..., 1] == -1.0))
         L = path.shape[2]
@@ -318,12 +338,20 @@ def build_lane_map_features(w_lanes_local: torch.Tensor, path_plan: torch.Tensor
         goal_local = torch.zeros(B, M, 2, device=lanes.device, dtype=lanes.dtype)
         has_goal = torch.zeros(B, M, dtype=torch.bool, device=lanes.device)
 
-    goal_dist = torch.norm(lane_xy - goal_local.unsqueeze(2), dim=-1)
-    goal_dist = torch.where(valid & has_goal.unsqueeze(-1), goal_dist, torch.zeros_like(goal_dist))
-    masked_goal_dist = goal_dist.masked_fill(~(valid & has_goal.unsqueeze(-1)), float('inf'))
+    euclidean_goal_dist = torch.norm(lane_xy - goal_local.unsqueeze(2), dim=-1)
+    if route_abs is not None:
+        distance_valid = valid & (route_valid | has_goal.unsqueeze(-1))
+        goal_dist = torch.where(route_valid, route_abs, euclidean_goal_dist)
+    else:
+        distance_valid = valid & has_goal.unsqueeze(-1)
+        goal_dist = euclidean_goal_dist
+    goal_dist = torch.where(distance_valid, goal_dist, torch.zeros_like(goal_dist))
+    masked_goal_dist = goal_dist.masked_fill(~distance_valid, float('inf'))
     min_goal_dist = masked_goal_dist.amin(dim=2)
     min_goal_dist = torch.where(torch.isfinite(min_goal_dist), min_goal_dist, torch.zeros_like(min_goal_dist))
     rel_goal_dist = goal_dist - min_goal_dist.unsqueeze(-1)
+    if route_rel is not None:
+        rel_goal_dist = torch.where(route_valid, route_rel, rel_goal_dist)
 
     out = torch.full((B, M, K, element_dim), FEATURE_PAD_VALUE, device=lanes.device, dtype=lanes.dtype)
     if element_dim > 0:
@@ -380,10 +408,10 @@ def build_network_features(agents_state: torch.Tensor,
     # 初始化输出张量
     features_tensor = torch.zeros(batch_size, max_agents, total_input_dim, device=agents_state.device, dtype=agents_state.dtype)
     
-    # 1. 构建简单特征。新配置不再包含单独的 G(t) dense path vector；
-    #    routing 信息只通过 W_lane 的 goal-distance 特征进入网络。
+    # 1. 构建简单特征：S(t), 显式 G(t), reward 参数和车辆风格参数。
     simple_end = sum(simple_feature_dims)
     has_dense_goal_vector = len(simple_feature_dims) >= 4
+    goal_slots = 0
     simple_offset = 0
     
     # S(t): c, theta, kappa, v, v_lim, phi, a_long, a_lat, Cacc, Cthrottle, Csteer, l, w.
@@ -405,6 +433,13 @@ def build_network_features(agents_state: torch.Tensor,
         g_t_end = g_t_start + g_t_size
         if path_plan is None:
             path_plan_stable = torch.zeros(batch_size, max_agents, g_t_size, device=agents_state.device, dtype=agents_state.dtype)
+        elif _is_navigation_packet(path_plan):
+            nav = path_plan.to(device=agents_state.device, dtype=agents_state.dtype)
+            goal_slots = max(1, g_t_size // 2)
+            goal_rows = nav[:, :, :goal_slots, :]
+            goal_valid = goal_rows[..., 2] > 0.5
+            goal_xy = torch.where(goal_valid.unsqueeze(-1), goal_rows[..., :2], torch.zeros_like(goal_rows[..., :2]))
+            path_plan_stable = pad_or_truncate_flat(goal_xy.flatten(start_dim=2), g_t_size, pad_value=0.0)
         else:
             path_plan_stable = path_plan.to(device=agents_state.device, dtype=agents_state.dtype).flatten(start_dim=2)
             path_plan_stable = pad_or_truncate_flat(path_plan_stable, g_t_size, pad_value=0.0)
@@ -466,7 +501,7 @@ def build_network_features(agents_state: torch.Tensor,
     lane_points_end = lane_points_start + lane_points_size
     
     lane_element_dim = permutation_element_dims[1] if len(permutation_element_dims) > 1 else 7
-    w_lanes_flat = build_lane_map_features(w_lanes_local, path_plan, lane_points_size, lane_element_dim)
+    w_lanes_flat = build_lane_map_features(w_lanes_local, path_plan, lane_points_size, lane_element_dim, goal_slots=goal_slots)
     if w_lanes_flat is not None:
         features_tensor[:, :, lane_points_start:lane_points_end] = w_lanes_flat
     else:
@@ -703,7 +738,9 @@ def step_schedulers_if_updated(policy_scheduler, value_scheduler, update_stats_a
 	return False
 
 def current_path_plan(simulator):
-	"""返回用于 W_lane routing distance 的当前目标点，形状 (B, M, 1, 2)，局部坐标。"""
+	"""返回显式 G(t) + W_lane 图路由距离的导航包。"""
+	if hasattr(simulator, 'get_navigation_observation'):
+		return simulator.get_navigation_observation()
 	goal_positions = getattr(simulator, 'goal_positions', None)
 	agents_state = getattr(simulator, 'agents_state', None)
 	if goal_positions is not None and agents_state is not None:
