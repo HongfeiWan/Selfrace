@@ -766,13 +766,14 @@ def step_schedulers_if_updated(policy_scheduler, value_scheduler, update_stats_a
 	return False
 
 def current_navigation(simulator, agents_state: torch.Tensor = None, route_state: dict = None,
-					   w_lane_keep_mask: torch.Tensor = None):
+					   w_lane_keep_mask: torch.Tensor = None, w_lane_ids: torch.Tensor = None):
 	"""返回显式 G(t) + W_lane 图路由距离的导航包。"""
 	if hasattr(simulator, 'get_navigation_observation'):
 		return simulator.get_navigation_observation(
 			agents_state=agents_state,
 			route_state=route_state,
 			w_lane_keep_mask=w_lane_keep_mask,
+			w_lane_ids=w_lane_ids,
 		)
 	return None
 
@@ -1013,6 +1014,17 @@ def gather_route_state_selected(route_state_tensor: dict, t_idx: torch.Tensor,
 	return out
 
 
+def gather_current_route_state_selected(route_state_tensor: dict, env_idx: torch.Tensor,
+										agent_idx: torch.Tensor) -> dict:
+	if not route_state_tensor:
+		return {}
+	out = {}
+	for key, value in route_state_tensor.items():
+		selected = value[env_idx, agent_idx]
+		out[key] = selected.unsqueeze(1)
+	return out
+
+
 def gather_condition_state_selected(condition_state: dict, env_idx: torch.Tensor,
 									agent_idx: torch.Tensor) -> dict:
 	if not condition_state:
@@ -1156,14 +1168,17 @@ def _policy_observation_state_chunk(simulator, start: int, end: int, alive_mask:
 
 def build_features_from_components(agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
 								   simulator, config, route_state, condition_state,
-								   control_state=None, map_dropout=None, world_agents_state=None):
+								   control_state=None, map_dropout=None, world_agents_state=None,
+								   map_metadata: dict = None):
 	world_agents_state = agents_state if world_agents_state is None else world_agents_state
 	lane_keep = map_dropout.get('lane_keep') if map_dropout else None
+	w_lane_ids = map_metadata.get('w_lane_ids') if map_metadata else None
 	navigation = current_navigation(
 		simulator,
 		agents_state=world_agents_state,
 		route_state=route_state,
 		w_lane_keep_mask=lane_keep,
+		w_lane_ids=w_lane_ids,
 	)
 	stop_lines = stop_lines_from_condition(simulator, world_agents_state, condition_state)
 	return build_network_features(
@@ -1202,10 +1217,11 @@ def build_features_from_simulator_state(simulator, config, alive_mask: torch.Ten
 		control_chunk = slice_env_tensor(control_state_all, start, end, B)
 		condition_chunk = slice_condition_state_env(condition_state, start, end, B)
 		route_chunk = slice_route_state_env(route_state, start, end, B)
-		local_state, neighbors_local, w_lanes_local, w_boundaries_local = simulator.observation_generator.generate_components(
+		local_state, neighbors_local, w_lanes_local, w_boundaries_local, map_metadata = simulator.observation_generator.generate_components(
 			obs_state,
 			control_state=control_chunk,
 			driving_style_params=condition_chunk.get('vehicle_style'),
+			return_map_ids=True,
 		)
 		env_idx = torch.arange(start, end, device=obs_state.device, dtype=torch.long)
 		map_dropout = make_map_dropout_masks(
@@ -1230,6 +1246,7 @@ def build_features_from_simulator_state(simulator, config, alive_mask: torch.Ten
 			control_state=control_chunk,
 			map_dropout=map_dropout,
 			world_agents_state=obs_state,
+			map_metadata=map_metadata,
 		)
 	return features
 
@@ -1244,11 +1261,12 @@ def build_features_for_selected_agents(world_states: torch.Tensor, simulator, co
 	agent_indices = agent_indices.to(device=world_states.device, dtype=torch.long).view(B)
 	batch_idx = torch.arange(B, device=world_states.device)
 	ego_obs_state = obs_state[batch_idx, agent_indices].unsqueeze(1)
-	local_state, neighbors_local, w_lanes_local, w_boundaries_local = simulator.observation_generator.generate_selected_components(
+	local_state, neighbors_local, w_lanes_local, w_boundaries_local, map_metadata = simulator.observation_generator.generate_selected_components(
 		obs_state,
 		agent_indices,
 		control_state=control_state,
 		driving_style_params=condition_state.get('vehicle_style'),
+		return_map_ids=True,
 	)
 	lane_count = int(w_lanes_local.shape[2]) if w_lanes_local is not None else 0
 	boundary_count = int(w_boundaries_local.shape[2]) if w_boundaries_local is not None else 0
@@ -1275,6 +1293,7 @@ def build_features_for_selected_agents(world_states: torch.Tensor, simulator, co
 		control_state=control_state.gather(1, agent_indices.view(B, 1, 1).expand(-1, -1, control_state.shape[-1])),
 		map_dropout=map_dropout,
 		world_agents_state=ego_obs_state,
+		map_metadata=map_metadata,
 	)
 
 def build_features_from_observation(observation, simulator, config):
@@ -1350,10 +1369,11 @@ def build_features_from_world_state_batch(
 		obs_state = observation_state_from_buffer(world_chunk)
 		control_state = control_from_buffer_state(world_chunk)
 		condition_chunk = slice_condition_state_env(condition_state, start, end, B)
-		local_state, neighbors_local, w_lanes_local, w_boundaries_local = simulator.observation_generator.generate_components(
+		local_state, neighbors_local, w_lanes_local, w_boundaries_local, map_metadata = simulator.observation_generator.generate_components(
 			obs_state,
 			control_state=control_state,
 			driving_style_params=condition_chunk.get('vehicle_style'),
+			return_map_ids=True,
 		)
 		map_dropout = make_map_dropout_masks(
 			config,
@@ -1374,10 +1394,11 @@ def build_features_from_world_state_batch(
 			config,
 			slice_route_state_env(route_state, start, end, B),
 			condition_chunk,
-			control_state=control_state,
-			map_dropout=map_dropout,
-			world_agents_state=obs_state,
-		)
+				control_state=control_state,
+				map_dropout=map_dropout,
+				world_agents_state=obs_state,
+				map_metadata=map_metadata,
+			)
 	return features
 
 def sync_bool_across_ranks(value: bool, device: torch.device, op=dist.ReduceOp.MIN) -> bool:
@@ -1463,10 +1484,143 @@ def sample_actions_for_alive(action_logits: torch.Tensor, alive_mask: torch.Tens
 		old_log_probs[alive_mask] = dist_alive.log_prob(actions_alive).to(old_log_probs.dtype)
 	return actions, old_log_probs
 
+
+def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Tensor,
+								 condition_state: dict, dropout_step: int,
+								 precision: str, forward_chunk_agents: int,
+								 sample_actions: bool = True):
+	"""
+	Online rollout forward for active agents only.
+
+	The returned action/logp/value tensors keep the full (B,M) shape required by
+	the simulator and rollout buffer, but feature construction and network
+	forward only run on alive selected agents.
+	"""
+	states = simulator.agents_state
+	B, M = states.shape[:2]
+	device = states.device
+	actions = torch.zeros((B, M), dtype=torch.long, device=device)
+	old_log_probs = torch.zeros((B, M), dtype=states.dtype, device=device)
+	value_pred = torch.zeros((B, M), dtype=states.dtype, device=device)
+	profile = {'feature_ms': 0.0, 'policy_ms': 0.0, 'num_selected': 0}
+
+	alive_mask = alive_mask.to(device=device, dtype=torch.bool)
+	if not bool(alive_mask.any().item()):
+		return actions, old_log_probs, value_pred, profile
+
+	env_idx, agent_idx = alive_mask.nonzero(as_tuple=True)
+	total_selected = int(env_idx.numel())
+	profile['num_selected'] = total_selected
+	selected_chunk = feature_build_chunk_agents(config, M)
+	if selected_chunk <= 0:
+		selected_chunk = total_selected
+
+	route_state_all = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
+	control_state_all = current_control_state(simulator)
+	profile_on = profile_enabled(config)
+
+	for start in range(0, total_selected, selected_chunk):
+		end = min(start + selected_chunk, total_selected)
+		env_chunk = env_idx[start:end]
+		agent_chunk = agent_idx[start:end]
+
+		if profile_on:
+			feature_start = profile_timer_start(device, config)
+		obs_state_chunk = states[env_chunk].clone()
+		obs_state_chunk[..., 6] = alive_mask[env_chunk].to(dtype=obs_state_chunk.dtype)
+		control_chunk = control_state_all[env_chunk]
+		world_state_chunk = torch.cat([obs_state_chunk, control_chunk], dim=-1)
+		route_chunk = gather_current_route_state_selected(route_state_all, env_chunk, agent_chunk)
+		condition_chunk = gather_condition_state_selected(condition_state, env_chunk, agent_chunk)
+		features_chunk = build_features_for_selected_agents(
+			world_state_chunk,
+			simulator,
+			config,
+			route_chunk,
+			condition_chunk,
+			agent_chunk,
+			time_indices=torch.as_tensor(dropout_step, device=device, dtype=torch.long),
+			env_indices=env_chunk,
+		)
+		if profile_on:
+			profile['feature_ms'] += profile_elapsed_ms(feature_start, device, config)
+
+		if profile_on:
+			policy_start = profile_timer_start(device, config)
+		with torch.inference_mode(), make_autocast_context(device, precision):
+			if sample_actions:
+				action_logits, values_chunk = forward_model(
+					model,
+					features_chunk,
+					mode="both",
+					chunk_agents=forward_chunk_agents,
+				)
+				logits_selected = action_logits[:, 0]
+				dist_selected = torch.distributions.Categorical(logits=logits_selected)
+				actions_chunk = dist_selected.sample()
+				actions[env_chunk, agent_chunk] = actions_chunk
+				old_log_probs[env_chunk, agent_chunk] = dist_selected.log_prob(actions_chunk).to(old_log_probs.dtype)
+			else:
+				values_chunk = forward_model(
+					model,
+					features_chunk,
+					mode="value",
+					chunk_agents=forward_chunk_agents,
+				)
+		if values_chunk.dim() == 3 and values_chunk.shape[-1] == 1:
+			values_chunk = values_chunk.squeeze(-1)
+		if values_chunk.dim() == 2:
+			values_selected = values_chunk[:, 0]
+		else:
+			values_selected = values_chunk.reshape(-1)
+		value_pred[env_chunk, agent_chunk] = values_selected.to(value_pred.dtype)
+		if profile_on:
+			profile['policy_ms'] += profile_elapsed_ms(policy_start, device, config)
+
+		del features_chunk, world_state_chunk, obs_state_chunk
+
+	return actions, old_log_probs, value_pred, profile
+
+
+def bootstrap_values_for_alive_agents(model, simulator, config, alive_mask: torch.Tensor,
+									  condition_state: dict, dropout_step: int,
+									  precision: str, forward_chunk_agents: int):
+	_, _, value_pred, _ = rollout_forward_alive_agents(
+		model,
+		simulator,
+		config,
+		alive_mask,
+		condition_state,
+		dropout_step,
+		precision,
+		forward_chunk_agents,
+		sample_actions=False,
+	)
+	return value_pred
+
+
+def current_rollout_bootstrap_value(model, simulator, config, cumulative_done_all,
+									condition_state: dict, dropout_step: int,
+									precision: str, forward_chunk_agents: int):
+	alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
+	if not bool(alive_mask.any().item()):
+		return None
+	return bootstrap_values_for_alive_agents(
+		model,
+		simulator,
+		config,
+		alive_mask,
+		condition_state,
+		dropout_step,
+		precision,
+		forward_chunk_agents,
+	)
+
 # ============================== PPO更新函数 ==============================
 def perform_ppo_update(model, policy_optimizer, value_optimizer,
 					   rollout_buffer, condition_state,
-					   features_tensor, simulator, config, iteration, rank=None, a_max_ewma=None, amp_scaler=None):
+					   features_tensor, simulator, config, iteration, rank=None,
+					   a_max_ewma=None, amp_scaler=None, bootstrap_value=None):
 	"""执行 PPO 更新。buffer 保存世界状态/route state，条件特征在 minibatch 内重建。"""
 	is_rank0 = (rank is None or rank == 0)
 	update_start_time = time.time()
@@ -1505,7 +1659,11 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	actions_tensor = rollout_buffer.view(rollout_buffer.actions)
 	time_indices_tensor = rollout_buffer.view(rollout_buffer.time_indices)
 
-	if features_tensor is None:
+	if bootstrap_value is not None:
+		last_value_pred = bootstrap_value.to(device=device, dtype=values_tensor.dtype)
+		if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
+			last_value_pred = last_value_pred.squeeze(-1)
+	elif features_tensor is None:
 		last_value_pred = torch.zeros_like(values_tensor[-1])
 	else:
 		with torch.inference_mode(), make_autocast_context(device, precision):
@@ -1655,22 +1813,26 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 
 def perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer,
 								 rollout_buffer, condition_state,
-								 features_tensor, simulator, config, iteration, a_max_ewma=None, amp_scaler=None):
+								 features_tensor, simulator, config, iteration, a_max_ewma=None,
+								 amp_scaler=None, bootstrap_value=None):
 	return perform_ppo_update(
 		model, policy_optimizer, value_optimizer,
 		rollout_buffer, condition_state,
 		features_tensor, simulator, config, iteration,
 		rank=None, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
+		bootstrap_value=bootstrap_value,
 	)
 
 def perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer,
 								rollout_buffer, condition_state,
-								features_tensor, simulator, config, iteration, rank, a_max_ewma=None, amp_scaler=None):
+								features_tensor, simulator, config, iteration, rank, a_max_ewma=None,
+								amp_scaler=None, bootstrap_value=None):
 	return perform_ppo_update(
 		model, policy_optimizer, value_optimizer,
 		rollout_buffer, condition_state,
 		features_tensor, simulator, config, iteration,
 		rank=rank, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
+		bootstrap_value=bootstrap_value,
 	)
 		
 # ============================== 寻找空闲端口 ==============================
@@ -1776,20 +1938,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			worker_log(f"iteration {k+1}: reset done")
 			if profile_on:
 				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
-				feature_profile_start = profile_timer_start(device, config)
 			condition_state = snapshot_condition_state(simulator)
-			worker_log(f"iteration {k+1}: initial feature build start")
-			features_tensor = build_features_from_simulator_state(
-				simulator,
-				config,
-				alive_mask=rollout_alive_mask(simulator, None),
-				condition_state=condition_state,
-				dropout_step=0,
-			)
-			worker_log(f"iteration {k+1}: initial feature build done")
+			features_tensor = None
+			worker_log(f"iteration {k+1}: rollout feature build deferred to alive-agent chunks")
 			if profile_on:
-				initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
-				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build={initial_feature_ms:.2f}ms")
+				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build=0.00ms")
 			
 			# =========================== 步进式训练：与game.py完全一致 ==============================
 			B, M, S = simulator.agents_state.shape
@@ -1811,7 +1964,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
-							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
+							None, simulator, config, k+1, A_max_ewma, amp_scaler,
+							bootstrap_value=None)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
 					else:
@@ -1824,17 +1978,19 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				debug_step = step_count < 3
 				if debug_step:
 					worker_log(f"step {step_count + 1}: policy start")
-				if profile_on:
-					policy_profile_start = profile_timer_start(device, config)
-				with torch.inference_mode(), make_autocast_context(device, precision):
-					action_logits, value_pred = forward_model(model, features_tensor, mode="both", chunk_agents=forward_chunk_agents)
-				if value_pred.dim() == 3 and value_pred.shape[-1] == 1:
-					value_pred = value_pred.squeeze(-1)
-				value_pred = torch.where(alive_mask, value_pred, torch.zeros_like(value_pred))
-				actions, old_log_probs = sample_actions_for_alive(action_logits, alive_mask)
-				if profile_on:
-					policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
-				del action_logits
+				actions, old_log_probs, value_pred, rollout_profile = rollout_forward_alive_agents(
+					model,
+					simulator,
+					config,
+					alive_mask,
+					condition_state,
+					dropout_step=step_count,
+					precision=precision,
+					forward_chunk_agents=forward_chunk_agents,
+					sample_actions=True,
+				)
+				policy_forward_ms = rollout_profile['policy_ms']
+				feature_build_ms = rollout_profile['feature_ms']
 				if debug_step:
 					worker_log(f"step {step_count + 1}: policy done")
 				
@@ -1867,27 +2023,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					cumulative_done_all = cumulative_done_all | current_done_all
 				no_alive_after_step = all_worlds_no_alive_agents(simulator, cumulative_done_all)
 				
-				# 更新观测与特征
-				if no_alive_after_step:
-					features_tensor = None
-					feature_build_ms = 0.0
-				else:
-					if profile_on:
-						feature_profile_start = profile_timer_start(device, config)
-					if debug_step:
-						worker_log(f"step {step_count + 1}: feature build start")
-					next_alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
-					features_tensor = build_features_from_simulator_state(
-						simulator,
-						config,
-						alive_mask=next_alive_mask,
-						condition_state=condition_state,
-						dropout_step=step_count + 1,
-					)
-					if debug_step:
-						worker_log(f"step {step_count + 1}: feature build done")
-					if profile_on:
-						feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
+				# 下一步 feature 不再整批预构造；下个循环会按 alive agent chunk 即时生成。
+				features_tensor = None
 				
 				step_count += 1
 				if step_count % log_interval == 0:
@@ -1902,7 +2039,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 						model, policy_optimizer, value_optimizer,
 						rollout_buffer, condition_state,
-						features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
+						None, simulator, config, k+1, A_max_ewma, amp_scaler,
+						bootstrap_value=None)
 					merge_update_stats(iteration_update_stats, update_stats)
 					clear_rollout_buffers(rollout_buffer)
 					break
@@ -1911,22 +2049,30 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				if buffer_step_count >= rollout_length or step_count >= max_episode_length:
 					if step_count >= max_episode_length:
 						print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
+						bootstrap_value = current_rollout_bootstrap_value(
+							model, simulator, config, cumulative_done_all,
+							condition_state, step_count, precision, forward_chunk_agents)
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
-							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
+							None, simulator, config, k+1, A_max_ewma, amp_scaler,
+							bootstrap_value=bootstrap_value)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
 						print("🔄 达到最大步数，强制开启新iteration...")
 						break
 					else:
 						print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
+						bootstrap_value = current_rollout_bootstrap_value(
+							model, simulator, config, cumulative_done_all,
+							condition_state, step_count, precision, forward_chunk_agents)
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
-							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
+							None, simulator, config, k+1, A_max_ewma, amp_scaler,
+							bootstrap_value=bootstrap_value)
 						merge_update_stats(iteration_update_stats, update_stats)
-						
+
 						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
 						if all_worlds_no_alive_agents(simulator, cumulative_done_all):
 							print("🔄 所有世界都没有存活agents，开启新iteration...")
@@ -2049,21 +2195,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			worker_log(f"iteration {k+1}: reset done")
 			if profile_on:
 				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
-				feature_profile_start = profile_timer_start(device, config)
 			condition_state = snapshot_condition_state(simulator)
-			worker_log(f"iteration {k+1}: initial feature build start")
-			features_tensor = build_features_from_simulator_state(
-				simulator,
-				config,
-				alive_mask=rollout_alive_mask(simulator, None),
-				condition_state=condition_state,
-				dropout_step=0,
-			)
-			worker_log(f"iteration {k+1}: initial feature build done")
-			if profile_on:
-				initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
+			features_tensor = None
+			worker_log(f"iteration {k+1}: rollout feature build deferred to alive-agent chunks")
 			if rank == 0 and profile_on:
-				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build={initial_feature_ms:.2f}ms")
+				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build=0.00ms")
 
 			# =========================== 步进式训练：与game.py完全一致 ==============================
 			B, M, S = simulator.agents_state.shape
@@ -2086,8 +2222,9 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
-							rollout_buffer, condition_state,
-							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
+								rollout_buffer, condition_state,
+								None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
+								bootstrap_value=None)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
 					else:
@@ -2101,17 +2238,19 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				debug_step = step_count < 3
 				if debug_step:
 					worker_log(f"step {step_count + 1}: policy start")
-				if profile_on:
-					policy_profile_start = profile_timer_start(device, config)
-				with torch.inference_mode(), make_autocast_context(device, precision):
-					action_logits, value_pred = forward_model(model, features_tensor, mode="both", chunk_agents=forward_chunk_agents)
-				if value_pred.dim() == 3 and value_pred.shape[-1] == 1:
-					value_pred = value_pred.squeeze(-1)
-				value_pred = torch.where(alive_mask, value_pred, torch.zeros_like(value_pred))
-				actions, old_log_probs = sample_actions_for_alive(action_logits, alive_mask)
-				if profile_on:
-					policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
-				del action_logits
+				actions, old_log_probs, value_pred, rollout_profile = rollout_forward_alive_agents(
+					model,
+					simulator,
+					config,
+					alive_mask,
+					condition_state,
+					dropout_step=step_count,
+					precision=precision,
+					forward_chunk_agents=forward_chunk_agents,
+					sample_actions=True,
+				)
+				policy_forward_ms = rollout_profile['policy_ms']
+				feature_build_ms = rollout_profile['feature_ms']
 				if debug_step:
 					worker_log(f"step {step_count + 1}: policy done")
 				
@@ -2145,27 +2284,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				local_no_alive_after_step = all_worlds_no_alive_agents(simulator, cumulative_done_all)
 				no_alive_after_step = sync_bool_across_ranks(local_no_alive_after_step, device, op=dist.ReduceOp.MIN)
 				
-				# 更新观测与特征
-				if no_alive_after_step:
-					features_tensor = None
-					feature_build_ms = 0.0
-				else:
-					if profile_on:
-						feature_profile_start = profile_timer_start(device, config)
-					if debug_step:
-						worker_log(f"step {step_count + 1}: feature build start")
-					next_alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
-					features_tensor = build_features_from_simulator_state(
-						simulator,
-						config,
-						alive_mask=next_alive_mask,
-						condition_state=condition_state,
-						dropout_step=step_count + 1,
-					)
-					if debug_step:
-						worker_log(f"step {step_count + 1}: feature build done")
-					if profile_on:
-						feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
+				# 下一步 feature 不再整批预构造；下个循环会按 alive agent chunk 即时生成。
+				features_tensor = None
 				
 				step_count += 1
 				if rank == 0 and step_count % log_interval == 0:
@@ -2181,7 +2301,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 						model, policy_optimizer, value_optimizer,
 						rollout_buffer, condition_state,
-						features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
+						None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
+						bootstrap_value=None)
 					merge_update_stats(iteration_update_stats, update_stats)
 					clear_rollout_buffers(rollout_buffer)
 					break
@@ -2191,10 +2312,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					if step_count >= max_episode_length:
 						if rank == 0:
 							print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
+						bootstrap_value = current_rollout_bootstrap_value(
+							model, simulator, config, cumulative_done_all,
+							condition_state, step_count, precision, forward_chunk_agents)
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
-							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
+							None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
+							bootstrap_value=bootstrap_value)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
 						if rank == 0:
@@ -2203,12 +2328,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					else:
 						if rank == 0:
 							print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
+						bootstrap_value = current_rollout_bootstrap_value(
+							model, simulator, config, cumulative_done_all,
+							condition_state, step_count, precision, forward_chunk_agents)
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
-							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
+							None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
+							bootstrap_value=bootstrap_value)
 						merge_update_stats(iteration_update_stats, update_stats)
-						
+
 						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
 						local_no_alive = all_worlds_no_alive_agents(simulator, cumulative_done_all)
 						if sync_bool_across_ranks(local_no_alive, device, op=dist.ReduceOp.MIN):

@@ -828,6 +828,7 @@ class TeraflowSimulator:
         agents_state: torch.Tensor = None,
         route_state: Optional[Dict[str, torch.Tensor]] = None,
         w_lane_keep_mask: torch.Tensor = None,
+        w_lane_ids: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Build the paper-style navigation observation package.
@@ -854,7 +855,10 @@ class TeraflowSimulator:
         if route_quads is None or current_idx is None:
             return navigation
 
-        w_lane_ids, _ = self.observation_generator.get_w_lane_ids_for_agents(agents_state)
+        if w_lane_ids is None:
+            w_lane_ids, _ = self.observation_generator.get_w_lane_ids_for_agents(agents_state)
+        else:
+            w_lane_ids = w_lane_ids.to(device=self.device, dtype=torch.long)
         if w_lane_keep_mask is not None:
             keep_mask = w_lane_keep_mask.to(device=self.device, dtype=torch.bool)
             w_lane_ids = torch.where(keep_mask, w_lane_ids, torch.full_like(w_lane_ids, -1))

@@ -76,6 +76,27 @@ class ObservationGenerator:
         else:
             self.quad_to_w_boundaries_ids = torch.full((num_quads, self.num_w_boundaries), -1, dtype=torch.long, device=self.device)
 
+        self._cache_quad_waypoint_static_tensors()
+
+    def _cache_quad_waypoint_static_tensors(self):
+        """Cache per-quad static W_lane/W_boundary tensors; per-step code only transforms them."""
+        self.quad_to_w_lanes_world = self._get_waypoints_by_ids(
+            self.quad_to_w_lanes_ids,
+            self.road_network.global_w_lane_waypoints,
+        )
+        self.quad_to_w_lane_dirs_world = self._get_waypoints_by_ids(
+            self.quad_to_w_lanes_ids,
+            self.road_network.global_w_lane_directions,
+        )
+        self.quad_to_w_lane_widths = self._get_scalar_by_ids(
+            self.quad_to_w_lanes_ids,
+            self.road_network.global_w_lane_widths,
+        )
+        self.quad_to_w_boundaries_world = self._get_waypoints_by_ids(
+            self.quad_to_w_boundaries_ids,
+            self.road_network.global_w_boundary_points,
+        )
+
     def _compute_nearest_waypoint_ids(self, query_points: torch.Tensor, waypoints: torch.Tensor, num_nearest: int) -> torch.Tensor:
         """
         计算每个查询点到waypoints的最近num_nearest个点的ID。
@@ -102,7 +123,7 @@ class ObservationGenerator:
         
         return nearest_indices
 
-    def _get_precomputed_waypoints(self, agents_state: torch.Tensor) -> tuple:
+    def _get_precomputed_waypoints(self, agents_state: torch.Tensor, return_ids: bool = False) -> tuple:
         """
         使用预计算的数据获取w_lanes和w_boundaries。
         Args:
@@ -128,11 +149,15 @@ class ObservationGenerator:
         w_lanes_ids = torch.where(valid_quad.unsqueeze(-1), w_lanes_ids, torch.full_like(w_lanes_ids, -1))
         w_boundaries_ids = torch.where(valid_quad.unsqueeze(-1), w_boundaries_ids, torch.full_like(w_boundaries_ids, -1))
         
-        # 通过ID获取waypoint坐标
-        w_lanes_world = self._get_waypoints_by_ids(w_lanes_ids, self.road_network.global_w_lane_waypoints)
-        w_lane_dirs_world = self._get_waypoints_by_ids(w_lanes_ids, self.road_network.global_w_lane_directions)
-        w_lane_widths = self._get_scalar_by_ids(w_lanes_ids, self.road_network.global_w_lane_widths)
-        w_boundaries_world = self._get_waypoints_by_ids(w_boundaries_ids, self.road_network.global_w_boundary_points)
+        # 静态坐标/方向/宽度已按 quad 缓存；这里仅按当前 quad gather。
+        w_lanes_world = self.quad_to_w_lanes_world[safe_quad_indices]
+        w_lane_dirs_world = self.quad_to_w_lane_dirs_world[safe_quad_indices]
+        w_lane_widths = self.quad_to_w_lane_widths[safe_quad_indices]
+        w_boundaries_world = self.quad_to_w_boundaries_world[safe_quad_indices]
+        w_lanes_world = torch.where(valid_quad.view(-1, 1, 1), w_lanes_world, torch.zeros_like(w_lanes_world))
+        w_lane_dirs_world = torch.where(valid_quad.view(-1, 1, 1), w_lane_dirs_world, torch.zeros_like(w_lane_dirs_world))
+        w_lane_widths = torch.where(valid_quad.view(-1, 1), w_lane_widths, torch.zeros_like(w_lane_widths))
+        w_boundaries_world = torch.where(valid_quad.view(-1, 1, 1), w_boundaries_world, torch.zeros_like(w_boundaries_world))
         
         # 恢复原始形状
         w_lanes_world = w_lanes_world.view(batch_size, max_agents, self.num_w_lanes, 2)
@@ -141,7 +166,20 @@ class ObservationGenerator:
         w_boundaries_world = w_boundaries_world.view(batch_size, max_agents, self.num_w_boundaries, 2)
         quad_indices = quad_indices.view(batch_size, max_agents)
         
-        return w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices
+        if not return_ids:
+            return w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices
+
+        w_lanes_ids = w_lanes_ids.view(batch_size, max_agents, self.num_w_lanes)
+        w_boundaries_ids = w_boundaries_ids.view(batch_size, max_agents, self.num_w_boundaries)
+        return (
+            w_lanes_world,
+            w_lane_dirs_world,
+            w_lane_widths,
+            w_boundaries_world,
+            quad_indices,
+            w_lanes_ids,
+            w_boundaries_ids,
+        )
 
     def get_w_lane_ids_for_agents(self, agents_state: torch.Tensor) -> tuple:
         """
@@ -244,11 +282,13 @@ class ObservationGenerator:
 
     def generate_components(self, agents_state: torch.Tensor,
                             control_state: torch.Tensor = None,
-                            driving_style_params: torch.Tensor = None):
+                            driving_style_params: torch.Tensor = None,
+                            return_map_ids: bool = False):
         """Return unpacked observation components without concatenating a full observation tensor."""
         neighbor_states_world = self._get_nearest_neighbors(agents_state)
-        w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices = self._get_precomputed_waypoints(agents_state)
-        return self._world_to_ego_centric(
+        waypoint_data = self._get_precomputed_waypoints(agents_state, return_ids=return_map_ids)
+        w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices = waypoint_data[:5]
+        components = self._world_to_ego_centric(
             agents_state,
             neighbor_states_world,
             w_lanes_world,
@@ -259,6 +299,13 @@ class ObservationGenerator:
             control_state,
             driving_style_params,
         )
+        if not return_map_ids:
+            return components
+        return (*components, {
+            'quad_indices': quad_indices,
+            'w_lane_ids': waypoint_data[5],
+            'w_boundary_ids': waypoint_data[6],
+        })
 
     def _get_selected_neighbors(self, agents_state: torch.Tensor, agent_indices: torch.Tensor,
                                 ego_states: torch.Tensor) -> torch.Tensor:
@@ -296,7 +343,8 @@ class ObservationGenerator:
 
     def generate_selected_components(self, agents_state: torch.Tensor, agent_indices: torch.Tensor,
                                      control_state: torch.Tensor = None,
-                                     driving_style_params: torch.Tensor = None):
+                                     driving_style_params: torch.Tensor = None,
+                                     return_map_ids: bool = False):
         """Return observation components for one selected agent per batch row."""
         batch_size, max_agents, _ = agents_state.shape
         agent_indices = agent_indices.to(device=self.device, dtype=torch.long).view(batch_size)
@@ -305,7 +353,8 @@ class ObservationGenerator:
 
         ego_states = agents_state[batch_idx, safe_indices].unsqueeze(1)
         neighbor_states_world = self._get_selected_neighbors(agents_state, safe_indices, ego_states)
-        w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices = self._get_precomputed_waypoints(ego_states)
+        waypoint_data = self._get_precomputed_waypoints(ego_states, return_ids=return_map_ids)
+        w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices = waypoint_data[:5]
 
         control_selected = None
         if control_state is not None:
@@ -320,7 +369,7 @@ class ObservationGenerator:
             else:
                 style_selected = driving_style_params[batch_idx, safe_indices].unsqueeze(1)
 
-        return self._world_to_ego_centric(
+        components = self._world_to_ego_centric(
             ego_states,
             neighbor_states_world,
             w_lanes_world,
@@ -331,6 +380,13 @@ class ObservationGenerator:
             control_selected,
             style_selected,
         )
+        if not return_map_ids:
+            return components
+        return (*components, {
+            'quad_indices': quad_indices,
+            'w_lane_ids': waypoint_data[5],
+            'w_boundary_ids': waypoint_data[6],
+        })
     
     def _get_nearest_neighbors(self, agents_state: torch.Tensor) -> torch.Tensor:
         """为每个 agent 找到最近的 K 个邻居。完全向量化版本。"""
