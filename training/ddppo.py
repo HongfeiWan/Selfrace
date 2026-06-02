@@ -766,11 +766,89 @@ def current_navigation(simulator, agents_state: torch.Tensor = None, route_state
 	return None
 
 
+def feature_build_chunk_agents(config, max_agents: int) -> int:
+	training_cfg = getattr(config, 'training', SimpleNamespace())
+	chunk_agents = int(getattr(
+		training_cfg,
+		'feature_build_chunk_agents',
+		getattr(training_cfg, 'network_forward_chunk_agents', 32768),
+	))
+	if chunk_agents <= 0:
+		return 0
+	return max(int(max_agents), chunk_agents)
+
+
+def feature_build_env_chunk_size(config, max_agents: int) -> int:
+	chunk_agents = feature_build_chunk_agents(config, max_agents)
+	if chunk_agents <= 0:
+		return 0
+	return max(1, chunk_agents // max(1, int(max_agents)))
+
+
+def slice_env_tensor(value, start: int, end: int, total_envs: int):
+	if value is None:
+		return None
+	if torch.is_tensor(value) and value.dim() > 0 and int(value.shape[0]) == int(total_envs):
+		return value[start:end]
+	return value
+
+
+def slice_route_state_env(route_state: dict, start: int, end: int, total_envs: int) -> dict:
+	if not route_state:
+		return {}
+	out = {}
+	for key, value in route_state.items():
+		out[key] = slice_env_tensor(value, start, end, total_envs)
+	return out
+
+
 def snapshot_route_state(simulator) -> dict:
 	"""Clone compact route tensors for the rollout buffer."""
 	if not hasattr(simulator, 'get_route_state'):
 		return {}
 	return simulator.get_route_state(clone=True)
+
+
+def snapshot_condition_state(simulator) -> dict:
+	"""Clone rollout-level condition tensors; expanded stop-line features are rebuilt on demand."""
+	reward_coef = getattr(getattr(simulator, 'reward_calculator', None), 'sampled_params', None)
+	vehicle_style = getattr(simulator, 'driving_style_params', None)
+	traffic_light_states = getattr(simulator, 'traffic_light_states', None)
+	return {
+		'reward_coef': reward_coef.detach().clone() if torch.is_tensor(reward_coef) else None,
+		'vehicle_style': vehicle_style.detach().clone() if torch.is_tensor(vehicle_style) else None,
+		'traffic_light_states': traffic_light_states.detach().clone() if torch.is_tensor(traffic_light_states) else None,
+	}
+
+
+def slice_condition_state_env(condition_state: dict, start: int, end: int, total_envs: int) -> dict:
+	if not condition_state:
+		return {}
+	return {
+		key: slice_env_tensor(value, start, end, total_envs)
+		for key, value in condition_state.items()
+	}
+
+
+def gather_condition_state_env(condition_state: dict, env_idx: torch.Tensor) -> dict:
+	if not condition_state:
+		return {}
+	out = {}
+	for key, value in condition_state.items():
+		out[key] = value[env_idx] if torch.is_tensor(value) and value.dim() > 0 else value
+	return out
+
+
+def stop_lines_from_condition(simulator, agents_state: torch.Tensor, condition_state: dict) -> torch.Tensor:
+	if not hasattr(simulator, '_compute_stop_line_observation'):
+		return None
+	traffic_light_states = condition_state.get('traffic_light_states') if condition_state else None
+	old_traffic_light_states = getattr(simulator, 'traffic_light_states', None)
+	try:
+		simulator.traffic_light_states = traffic_light_states
+		return simulator._compute_stop_line_observation(agents_state)
+	finally:
+		simulator.traffic_light_states = old_traffic_light_states
 
 
 def stack_route_state_buffer(route_state_buffer: list) -> dict:
@@ -824,19 +902,100 @@ def state_with_control_for_buffer(simulator, alive_mask: torch.Tensor) -> torch.
 	return torch.cat([pre_state, pre_control_state], dim=-1)
 
 def build_features_from_observation(observation, simulator, config):
-	agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
-	return build_network_features(
-		agents_state,
-		neighbors_local,
-		w_lanes_local,
-		w_boundaries_local,
-		current_navigation(simulator),
-		getattr(simulator, 'stop_lines', None),
-		simulator.reward_calculator.sampled_params,
-		config,
-		vehicle_style=getattr(simulator, 'driving_style_params', None),
-		control_state=current_control_state(simulator),
-	)
+	B, M = observation.shape[:2]
+	env_chunk = feature_build_env_chunk_size(config, M)
+	total_input_dim = sum(config.training.network.simple_feature_dims) + sum(config.training.network.permutation_feature_dims)
+
+	if env_chunk <= 0 or B <= env_chunk:
+		agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
+		return build_network_features(
+			agents_state,
+			neighbors_local,
+			w_lanes_local,
+			w_boundaries_local,
+			current_navigation(simulator),
+			getattr(simulator, 'stop_lines', None),
+			simulator.reward_calculator.sampled_params,
+			config,
+			vehicle_style=getattr(simulator, 'driving_style_params', None),
+			control_state=current_control_state(simulator),
+		)
+
+	features = torch.empty(B, M, total_input_dim, device=observation.device, dtype=observation.dtype)
+	world_state = getattr(simulator, 'agents_state', None)
+	route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
+	reward_coef = simulator.reward_calculator.sampled_params
+	vehicle_style = getattr(simulator, 'driving_style_params', None)
+	stop_lines = getattr(simulator, 'stop_lines', None)
+	control_state = current_control_state(simulator)
+
+	for start in range(0, B, env_chunk):
+		end = min(start + env_chunk, B)
+		obs_chunk = observation[start:end]
+		agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(obs_chunk, config)
+		world_chunk = slice_env_tensor(world_state, start, end, B)
+		route_chunk = slice_route_state_env(route_state, start, end, B)
+		features[start:end] = build_network_features(
+			agents_state,
+			neighbors_local,
+			w_lanes_local,
+			w_boundaries_local,
+			current_navigation(simulator, agents_state=world_chunk, route_state=route_chunk),
+			slice_env_tensor(stop_lines, start, end, B),
+			slice_env_tensor(reward_coef, start, end, B),
+			config,
+			vehicle_style=slice_env_tensor(vehicle_style, start, end, B),
+			control_state=slice_env_tensor(control_state, start, end, B),
+		)
+	return features
+
+
+def build_features_from_world_state_batch(
+	world_states: torch.Tensor,
+	simulator,
+	config,
+	route_state: dict,
+	condition_state: dict,
+) -> torch.Tensor:
+	B, M = world_states.shape[:2]
+	env_chunk = feature_build_env_chunk_size(config, M)
+	total_input_dim = sum(config.training.network.simple_feature_dims) + sum(config.training.network.permutation_feature_dims)
+	features = torch.empty(B, M, total_input_dim, device=world_states.device, dtype=world_states.dtype)
+	if env_chunk <= 0:
+		env_chunk = B
+
+	for start in range(0, B, env_chunk):
+		end = min(start + env_chunk, B)
+		world_chunk = world_states[start:end]
+		obs_state = observation_state_from_buffer(world_chunk)
+		control_state = control_from_buffer_state(world_chunk)
+		condition_chunk = slice_condition_state_env(condition_state, start, end, B)
+		vehicle_style_chunk = condition_chunk.get('vehicle_style')
+		reward_coef_chunk = condition_chunk.get('reward_coef')
+		stop_lines_chunk = stop_lines_from_condition(simulator, obs_state, condition_chunk)
+		obs_chunk = simulator.observation_generator.generate(
+			obs_state,
+			control_state=control_state,
+			driving_style_params=vehicle_style_chunk,
+		)
+		agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(obs_chunk, config)
+		features[start:end] = build_network_features(
+			agents_state,
+			neighbors_local,
+			w_lanes_local,
+			w_boundaries_local,
+			current_navigation(
+				simulator,
+				agents_state=obs_state,
+				route_state=slice_route_state_env(route_state, start, end, B),
+			),
+			stop_lines_chunk,
+			reward_coef_chunk,
+			config,
+			vehicle_style=vehicle_style_chunk,
+			control_state=control_state,
+		)
+	return features
 
 def sync_bool_across_ranks(value: bool, device: torch.device, op=dist.ReduceOp.MIN) -> bool:
 	if not dist.is_available() or not dist.is_initialized():
@@ -845,12 +1004,31 @@ def sync_bool_across_ranks(value: bool, device: torch.device, op=dist.ReduceOp.M
 	dist.all_reduce(t, op=op)
 	return bool(t.item())
 
-def validate_rollout_buffers(states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+def validate_condition_state(condition_state: dict, B: int, M: int, device: torch.device):
+	if not isinstance(condition_state, dict):
+		raise ValueError(f"condition_state expected dict, got {type(condition_state)}")
+	for key in ('reward_coef', 'vehicle_style'):
+		tensor = condition_state.get(key)
+		if tensor is None:
+			raise ValueError(f"condition_state missing {key}")
+		if tensor.device != device:
+			raise ValueError(f"condition_state[{key}] device mismatch: {tensor.device} != {device}")
+		if tensor.shape[0] != B or tensor.shape[1] != M:
+			raise ValueError(f"condition_state[{key}] leading shape mismatch: {tensor.shape[:2]} != {(B, M)}")
+	traffic_light_states = condition_state.get('traffic_light_states')
+	if traffic_light_states is not None:
+		if traffic_light_states.device != device:
+			raise ValueError(f"condition_state[traffic_light_states] device mismatch: {traffic_light_states.device} != {device}")
+		if traffic_light_states.dim() > 0 and traffic_light_states.shape[0] != B:
+			raise ValueError(f"condition_state[traffic_light_states] leading shape mismatch: {traffic_light_states.shape[:1]} != {(B,)}")
+
+
+def validate_rollout_buffers(states_buffer, route_state_buffer, condition_state,
 							 rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer):
 	T = len(states_buffer)
 	buffer_lengths = [
-		len(route_state_buffer), len(reward_coef_buffer), len(vehicle_style_buffer), len(stop_lines_buffer),
-		len(rewards_buffer), len(dones_buffer), len(values_buffer), len(old_log_probs_buffer), len(actions_buffer)
+		len(route_state_buffer), len(rewards_buffer), len(dones_buffer), len(values_buffer),
+		len(old_log_probs_buffer), len(actions_buffer)
 	]
 	if any(length != T for length in buffer_lengths):
 		raise ValueError(f"Rollout buffer length mismatch: states={T}, others={buffer_lengths}")
@@ -861,17 +1039,12 @@ def validate_rollout_buffers(states_buffer, route_state_buffer, reward_coef_buff
 	if len(base_shape) != 3 or base_shape[-1] < 7:
 		raise ValueError(f"states_buffer expected (T,B,M,S>=7), got {base_shape}")
 	B, M, _ = base_shape
-	for name, buf in (
-		('states', states_buffer),
-		('reward_coef', reward_coef_buffer),
-		('vehicle_style', vehicle_style_buffer),
-		('stop_lines', stop_lines_buffer),
-	):
-		for i, tensor in enumerate(buf):
-			if tensor.device != base_device:
-				raise ValueError(f"{name}[{i}] device mismatch: {tensor.device} != {base_device}")
-			if tensor.shape[0] != B or tensor.shape[1] != M:
-				raise ValueError(f"{name}[{i}] leading shape mismatch: {tensor.shape[:2]} != {(B, M)}")
+	validate_condition_state(condition_state, B, M, base_device)
+	for i, tensor in enumerate(states_buffer):
+		if tensor.device != base_device:
+			raise ValueError(f"states[{i}] device mismatch: {tensor.device} != {base_device}")
+		if tensor.shape[0] != B or tensor.shape[1] != M:
+			raise ValueError(f"states[{i}] leading shape mismatch: {tensor.shape[:2]} != {(B, M)}")
 	for i, route_state in enumerate(route_state_buffer):
 		if not isinstance(route_state, dict):
 			raise ValueError(f"route_state[{i}] expected dict, got {type(route_state)}")
@@ -950,10 +1123,10 @@ def sample_actions_for_alive(action_logits: torch.Tensor, alive_mask: torch.Tens
 
 # ============================== PPO更新函数 ==============================
 def perform_ppo_update(model, policy_optimizer, value_optimizer,
-					   states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+					   states_buffer, route_state_buffer, condition_state,
 					   rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 					   features_tensor, simulator, config, iteration, rank=None, a_max_ewma=None, amp_scaler=None):
-	"""执行 PPO 更新。buffer 中保存真实世界状态和对应时刻的条件特征。"""
+	"""执行 PPO 更新。buffer 保存世界状态/route state，条件特征在 minibatch 内重建。"""
 	is_rank0 = (rank is None or rank == 0)
 	update_start_time = time.time()
 	if len(states_buffer) == 0:
@@ -979,7 +1152,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
 	device = states_buffer[0].device
 	validate_rollout_buffers(
-		states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+		states_buffer, route_state_buffer, condition_state,
 		rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 	)
 	if device.type == 'cuda':
@@ -987,9 +1160,6 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 
 	states_tensor = torch.stack(states_buffer, dim=0)  # (T, B, M, 7)
 	route_state_tensor = stack_route_state_buffer(route_state_buffer)
-	reward_coef_tensor = torch.stack(reward_coef_buffer, dim=0) if reward_coef_buffer else None
-	vehicle_style_tensor = torch.stack(vehicle_style_buffer, dim=0) if vehicle_style_buffer else None
-	stop_lines_tensor = torch.stack(stop_lines_buffer, dim=0) if stop_lines_buffer else None
 	rewards_tensor = torch.stack(rewards_buffer, dim=0)
 	dones_tensor = torch.stack(dones_buffer, dim=0).bool()
 	values_tensor = torch.stack(values_buffer, dim=0)
@@ -1061,37 +1231,14 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	t_u_mb = uniq_tb[:, 0]
 	b_u_mb = uniq_tb[:, 1]
 	route_state_mb = gather_route_state(route_state_tensor, t_u_mb, b_u_mb)
-	stop_lines_mb = stop_lines_tensor[t_u_mb, b_u_mb] if stop_lines_tensor is not None else None
-	reward_coef_mb = reward_coef_tensor[t_u_mb, b_u_mb] if reward_coef_tensor is not None else simulator.reward_calculator.sampled_params[b_u_mb]
-	if vehicle_style_tensor is not None:
-		vehicle_style_mb = vehicle_style_tensor[t_u_mb, b_u_mb]
-	else:
-		current_style = getattr(simulator, 'driving_style_params', None)
-		vehicle_style_mb = current_style[b_u_mb] if current_style is not None else None
+	condition_state_mb = gather_condition_state_env(condition_state, b_u_mb)
 	world_states_mb = states_tensor[t_u_mb, b_u_mb]
-	control_state_mb = control_from_buffer_state(world_states_mb)
-	obs_mb = simulator.observation_generator.generate(
-		observation_state_from_buffer(world_states_mb),
-		control_state=control_state_mb,
-		driving_style_params=vehicle_style_mb,
-	)
-	agents_state_dec_mb, neighbors_local_mb, w_lanes_local_mb, w_boundaries_local_mb = decompose_observation(obs_mb, config)
-	navigation_mb = current_navigation(
+	features_u_mb = build_features_from_world_state_batch(
+		world_states_mb,
 		simulator,
-		agents_state=observation_state_from_buffer(world_states_mb),
-		route_state=route_state_mb,
-	)
-	features_u_mb = build_network_features(
-		agents_state_dec_mb,
-		neighbors_local_mb,
-		w_lanes_local_mb,
-		w_boundaries_local_mb,
-		navigation_mb,
-		stop_lines_mb,
-		reward_coef_mb,
 		config,
-		vehicle_style=vehicle_style_mb,
-		control_state=control_state_mb,
+		route_state_mb,
+		condition_state_mb,
 	)
 	mb_features = features_u_mb[inverse_mb.to(device), agent_indices_batch].unsqueeze(1)
 
@@ -1167,24 +1314,24 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	return a_max_ewma.detach(), stats
 
 def perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer,
-								 states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								 states_buffer, route_state_buffer, condition_state,
 								 rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 								 features_tensor, simulator, config, iteration, a_max_ewma=None, amp_scaler=None):
 	return perform_ppo_update(
 		model, policy_optimizer, value_optimizer,
-		states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+		states_buffer, route_state_buffer, condition_state,
 		rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 		features_tensor, simulator, config, iteration,
 		rank=None, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
 	)
 
 def perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer,
-								states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								states_buffer, route_state_buffer, condition_state,
 								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 								features_tensor, simulator, config, iteration, rank, a_max_ewma=None, amp_scaler=None):
 	return perform_ppo_update(
 		model, policy_optimizer, value_optimizer,
-		states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+		states_buffer, route_state_buffer, condition_state,
 		rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 		features_tensor, simulator, config, iteration,
 		rank=rank, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
@@ -1217,14 +1364,28 @@ def cleanup_ddp():
 
 # ============================== DDPPO训练 ==============================
 def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str, master_port: int, store_port: int):
+	for stream in (sys.stdout, sys.stderr):
+		try:
+			stream.reconfigure(line_buffering=True, write_through=True)
+		except Exception:
+			pass
+
+	def worker_log(message: str):
+		print(f"[Rank {rank}] {message}", flush=True)
+
 	if gpu_count == 1:
 		#TODO:这里写单卡训练代码，用于调试
+		worker_log("worker start: single-gpu path")
 		device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
 		torch.cuda.set_device(device) if device.type == 'cuda' else None
 		config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
+		worker_log("creating network")
 		model = create_network(config=config, network_type="independent")
 		model = model.to(device)
+		worker_log("network ready")
+		worker_log("creating simulator")
 		simulator = TeraflowSimulator(config=config_dict, device=device)
+		worker_log("simulator ready")
 
 		sim_cfg = getattr(config, 'simulator')
 		training_cfg = getattr(config, 'training')
@@ -1274,11 +1435,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			# ============================== 采样（初始化） ==============================
 			if profile_on:
 				reset_profile_start = profile_timer_start(device, config)
+			worker_log(f"iteration {k+1}: reset start")
 			initial_observation = simulator.reset()
+			worker_log(f"iteration {k+1}: reset done")
 			if profile_on:
 				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
 				feature_profile_start = profile_timer_start(device, config)
+			worker_log(f"iteration {k+1}: initial feature build start")
 			features_tensor = build_features_from_observation(initial_observation, simulator, config)
+			worker_log(f"iteration {k+1}: initial feature build done")
+			condition_state = snapshot_condition_state(simulator)
 			if profile_on:
 				initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build={initial_feature_ms:.2f}ms")
@@ -1290,9 +1456,6 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			# 初始化全局buffer（与game.py一致）
 			states_buffer = []
 			route_state_buffer = []
-			reward_coef_buffer = []
-			vehicle_style_buffer = []
-			stop_lines_buffer = []
 			rewards_buffer = []
 			dones_buffer = []
 			values_buffer = []
@@ -1311,12 +1474,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer, condition_state,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 						)
 					else:
@@ -1326,6 +1489,9 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
+				debug_step = step_count < 3
+				if debug_step:
+					worker_log(f"step {step_count + 1}: policy start")
 				if profile_on:
 					policy_profile_start = profile_timer_start(device, config)
 				with torch.inference_mode(), make_autocast_context(device, precision):
@@ -1337,27 +1503,27 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				if profile_on:
 					policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
 				del action_logits
+				if debug_step:
+					worker_log(f"step {step_count + 1}: policy done")
 				
 				# 在推进环境前缓存当前状态
 				pre_state = state_with_control_for_buffer(simulator, alive_mask)
 				pre_route_state = snapshot_route_state(simulator)
-				pre_reward_coef = simulator.reward_calculator.sampled_params.detach().clone()
-				pre_vehicle_style = simulator.driving_style_params.detach().clone()
-				pre_stop_lines = simulator.stop_lines.detach().clone()
 				
 				# 环境步进
 				if profile_on:
 					env_profile_start = profile_timer_start(device, config)
+				if debug_step:
+					worker_log(f"step {step_count + 1}: env start")
 				observation, reward, done = simulator.step(actions)
+				if debug_step:
+					worker_log(f"step {step_count + 1}: env done")
 				if profile_on:
 					env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
 				
 				# 写入训练buffer（与game.py一致）
 				states_buffer.append(pre_state)
 				route_state_buffer.append(pre_route_state)
-				reward_coef_buffer.append(pre_reward_coef)
-				vehicle_style_buffer.append(pre_vehicle_style)
-				stop_lines_buffer.append(pre_stop_lines)
 				rewards_buffer.append(reward.detach().clone())
 				dones_buffer.append(done.detach().clone())
 				values_buffer.append(value_pred.detach().clone())
@@ -1380,7 +1546,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				else:
 					if profile_on:
 						feature_profile_start = profile_timer_start(device, config)
+					if debug_step:
+						worker_log(f"step {step_count + 1}: feature build start")
 					features_tensor = build_features_from_observation(observation, simulator, config)
+					if debug_step:
+						worker_log(f"step {step_count + 1}: feature build done")
 					if profile_on:
 						feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				
@@ -1396,12 +1566,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 					A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 						model, policy_optimizer, value_optimizer,
-						states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+						states_buffer, route_state_buffer, condition_state,
 						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 						features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 					merge_update_stats(iteration_update_stats, update_stats)
 					clear_rollout_buffers(
-						states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+						states_buffer, route_state_buffer,
 						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 					)
 					break
@@ -1412,12 +1582,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer, condition_state,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 						)
 						print("🔄 达到最大步数，强制开启新iteration...")
@@ -1426,7 +1596,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer, condition_state,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
@@ -1435,7 +1605,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						if all_worlds_no_alive_agents(simulator, cumulative_done_all):
 							print("🔄 所有世界都没有存活agents，开启新iteration...")
 							clear_rollout_buffers(
-								states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								states_buffer, route_state_buffer,
 								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							)
 							break
@@ -1443,7 +1613,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print("✅ 仍有世界有存活agents，继续下一个128step...")
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
 							clear_rollout_buffers(
-								states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								states_buffer, route_state_buffer,
 								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							)
 							buffer_step_count = 0
@@ -1468,6 +1638,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		return 0
 	
 	try:
+		worker_log("worker start: ddp path")
 		device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
 		torch.cuda.set_device(device) if device.type == 'cuda' else None
 		# 调试打印：确认设备映射
@@ -1490,8 +1661,10 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 
 		# 载入配置并建模
 		config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
+		worker_log("creating network")
 		model = create_network(config=config, network_type="independent")
 		model = model.to(device)
+		worker_log("network ready")
 		
 		# 按原文示例的DDP签名（等价于传入本地rank）
 		if device.type == 'cuda':
@@ -1500,7 +1673,9 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			model = DDP(model)
 
 		# ==== 与单卡保持一致的模拟器与超参数初始化 ====
+		worker_log("creating simulator")
 		simulator = TeraflowSimulator(config=config_dict, device=device)
+		worker_log("simulator ready")
 		sim_cfg = getattr(config, 'simulator', SimpleNamespace())
 		training_cfg = getattr(config, 'training', SimpleNamespace())
 		learning_rate = getattr(training_cfg, 'learning_rate', 3e-4)
@@ -1549,11 +1724,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			# 采样初始化
 			if profile_on:
 				reset_profile_start = profile_timer_start(device, config)
+			worker_log(f"iteration {k+1}: reset start")
 			initial_observation = simulator.reset()
+			worker_log(f"iteration {k+1}: reset done")
 			if profile_on:
 				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
 				feature_profile_start = profile_timer_start(device, config)
+			worker_log(f"iteration {k+1}: initial feature build start")
 			features_tensor = build_features_from_observation(initial_observation, simulator, config)
+			worker_log(f"iteration {k+1}: initial feature build done")
+			condition_state = snapshot_condition_state(simulator)
 			if profile_on:
 				initial_feature_ms = profile_elapsed_ms(feature_profile_start, device, config)
 			if rank == 0 and profile_on:
@@ -1566,9 +1746,6 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			# 初始化全局buffer（与game.py一致）
 			states_buffer = []
 			route_state_buffer = []
-			reward_coef_buffer = []
-			vehicle_style_buffer = []
-			stop_lines_buffer = []
 			rewards_buffer = []
 			dones_buffer = []
 			values_buffer = []
@@ -1589,12 +1766,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer, condition_state,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 						)
 					else:
@@ -1605,6 +1782,9 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
+				debug_step = step_count < 3
+				if debug_step:
+					worker_log(f"step {step_count + 1}: policy start")
 				if profile_on:
 					policy_profile_start = profile_timer_start(device, config)
 				with torch.inference_mode(), make_autocast_context(device, precision):
@@ -1616,27 +1796,27 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				if profile_on:
 					policy_forward_ms = profile_elapsed_ms(policy_profile_start, device, config)
 				del action_logits
+				if debug_step:
+					worker_log(f"step {step_count + 1}: policy done")
 				
 				# 在推进环境前缓存当前状态
 				pre_state = state_with_control_for_buffer(simulator, alive_mask)
 				pre_route_state = snapshot_route_state(simulator)
-				pre_reward_coef = simulator.reward_calculator.sampled_params.detach().clone()
-				pre_vehicle_style = simulator.driving_style_params.detach().clone()
-				pre_stop_lines = simulator.stop_lines.detach().clone()
 				
 				# 环境步进
 				if profile_on:
 					env_profile_start = profile_timer_start(device, config)
+				if debug_step:
+					worker_log(f"step {step_count + 1}: env start")
 				observation, reward, done = simulator.step(actions)
+				if debug_step:
+					worker_log(f"step {step_count + 1}: env done")
 				if profile_on:
 					env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
 				
 				# 写入训练buffer（与game.py一致）
 				states_buffer.append(pre_state)
 				route_state_buffer.append(pre_route_state)
-				reward_coef_buffer.append(pre_reward_coef)
-				vehicle_style_buffer.append(pre_vehicle_style)
-				stop_lines_buffer.append(pre_stop_lines)
 				rewards_buffer.append(reward.detach().clone())
 				dones_buffer.append(done.detach().clone())
 				values_buffer.append(value_pred.detach().clone())
@@ -1660,7 +1840,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				else:
 					if profile_on:
 						feature_profile_start = profile_timer_start(device, config)
+					if debug_step:
+						worker_log(f"step {step_count + 1}: feature build start")
 					features_tensor = build_features_from_observation(observation, simulator, config)
+					if debug_step:
+						worker_log(f"step {step_count + 1}: feature build done")
 					if profile_on:
 						feature_build_ms = profile_elapsed_ms(feature_profile_start, device, config)
 				
@@ -1677,12 +1861,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 					A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 						model, policy_optimizer, value_optimizer,
-						states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+						states_buffer, route_state_buffer, condition_state,
 						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 						features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 					merge_update_stats(iteration_update_stats, update_stats)
 					clear_rollout_buffers(
-						states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+						states_buffer, route_state_buffer,
 						rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 					)
 					break
@@ -1694,12 +1878,12 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer, condition_state,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 						)
 						if rank == 0:
@@ -1710,7 +1894,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
-							states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+							states_buffer, route_state_buffer, condition_state,
 							rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							features_tensor, simulator, config, k+1, rank, A_max_ewma, amp_scaler)
 						merge_update_stats(iteration_update_stats, update_stats)
@@ -1721,7 +1905,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							if rank == 0:
 								print("🔄 所有世界都没有存活agents，开启新iteration...")
 							clear_rollout_buffers(
-								states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								states_buffer, route_state_buffer,
 								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							)
 							break
@@ -1730,7 +1914,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 								print("✅ 仍有世界有存活agents，继续下一个128step...")
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
 							clear_rollout_buffers(
-								states_buffer, route_state_buffer, reward_coef_buffer, vehicle_style_buffer, stop_lines_buffer,
+								states_buffer, route_state_buffer,
 								rewards_buffer, dones_buffer, values_buffer, old_log_probs_buffer, actions_buffer,
 							)
 							buffer_step_count = 0
