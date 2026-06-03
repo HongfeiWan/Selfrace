@@ -20,7 +20,7 @@ if str(TRAINING_DIR) not in sys.path:
     sys.path.insert(0, str(TRAINING_DIR))
 
 from simulator import TeraflowSimulator
-from ddppo import build_features_from_observation
+from ddppo import build_features_from_simulator_state
 from network import create_network
 
 
@@ -56,6 +56,8 @@ def load_config(config_path: Path, device: torch.device, num_envs: int, num_agen
         simulator_cfg["map_path"] = str((PROJECT_ROOT / map_path).resolve())
 
     training_cfg = config.setdefault("training", {})
+    training_cfg["w_lane_dropout_prob"] = 0.0
+    training_cfg["w_boundary_dropout_prob"] = 0.0
     profile_cfg = training_cfg.setdefault("profile", {})
     profile_cfg["enabled"] = False
     profile_cfg["cuda_sync"] = False
@@ -104,6 +106,7 @@ class InferenceGame:
         self.last_probs = None
         self.current_observation = None
         self.features_tensor = None
+        self.show_all_waypoints = True
         self._visible_boundary_cache = None
         self._visible_boundary_key = None
 
@@ -150,8 +153,8 @@ class InferenceGame:
         self.small_font = pygame.font.Font(None, 22)
 
     def reset_episode(self):
-        self.current_observation = self.simulator.reset()
-        self.features_tensor = build_features_from_observation(self.current_observation, self.simulator, self.config_ns)
+        self.simulator.reset(return_observation=False)
+        self.current_observation = None
         self.step_count = 0
         self.episode_count += 1
         B, M, _ = self.simulator.agents_state.shape
@@ -165,6 +168,15 @@ class InferenceGame:
         self.selected_agent = self._first_alive_agent(self.current_world)
         self._visible_boundary_cache = None
         self._visible_boundary_key = None
+        self.features_tensor = self._build_features()
+
+    def _build_features(self):
+        return build_features_from_simulator_state(
+            self.simulator,
+            self.config_ns,
+            alive_mask=self._alive_mask(),
+            dropout_step=self.step_count,
+        )
 
     def _alive_mask(self) -> torch.Tensor:
         active = self.simulator.agents_state[..., 6] > 0.5
@@ -209,7 +221,7 @@ class InferenceGame:
 
             alive = self._alive_mask()
             actions = torch.where(alive, actions, torch.zeros_like(actions))
-            observation, reward, done = self.simulator.step(actions)
+            reward, done = self.simulator.step(actions, return_observation=False)
 
             self.last_actions = actions.detach()
             self.last_values = values.detach()
@@ -220,10 +232,11 @@ class InferenceGame:
             self.step_count += 1
 
             if self._alive_mask().sum().item() == 0:
-                self.current_observation = observation
+                self.current_observation = None
+                self.features_tensor = None
                 return
-            self.current_observation = observation
-            self.features_tensor = build_features_from_observation(observation, self.simulator, self.config_ns)
+            self.current_observation = None
+            self.features_tensor = self._build_features()
 
     def run_headless(self):
         for _ in range(int(self.args.steps)):
@@ -257,6 +270,8 @@ class InferenceGame:
                 self.reset_episode()
             elif event.key == pygame.K_m:
                 self.deterministic = not self.deterministic
+            elif event.key == pygame.K_w:
+                self.show_all_waypoints = not self.show_all_waypoints
             elif event.key == pygame.K_LEFTBRACKET:
                 self._switch_world(-1)
             elif event.key == pygame.K_RIGHTBRACKET:
@@ -307,7 +322,7 @@ class InferenceGame:
         self.screen.fill((245, 247, 250))
         camera_xy = self._camera_pose()[:2]
         self._draw_road(camera_xy)
-        self._draw_path(camera_xy)
+        self._draw_navigation_targets(camera_xy)
         self._draw_agents(camera_xy)
         self._draw_action_probs()
         self._draw_ui()
@@ -339,26 +354,69 @@ class InferenceGame:
         self._visible_boundary_key = key
         return self._visible_boundary_cache
 
-    def _draw_path(self, camera_xy):
+    def _draw_navigation_targets(self, camera_xy):
         pygame = self.pygame
-        if not hasattr(self.simulator, "agents_path_plans") or self.simulator.agents_path_plans is None:
-            return
         b = self.current_world
-        m = self.selected_agent
-        path = self.simulator.agents_path_plans[b, m].detach().cpu()
-        valid = (path[:, 0] != -1) & (path[:, 1] != -1)
-        pts_world = path[valid][:80]
-        if pts_world.shape[0] >= 2:
-            pts = [self._world_to_screen(float(x), float(y), camera_xy) for x, y in pts_world.tolist()]
-            pygame.draw.lines(self.screen, (28, 150, 80), False, pts, 2)
-            for pt in pts[::8]:
-                pygame.draw.circle(self.screen, (28, 150, 80), pt, 3)
+        if self.show_all_waypoints:
+            active = (self.simulator.agents_state[b, :, 6] > 0.5).detach().cpu()
+            done = self.cumulative_done[b].detach().cpu()
+            for agent_idx in torch.nonzero(active & (~done), as_tuple=False).flatten().tolist():
+                if agent_idx != self.selected_agent:
+                    self._draw_agent_route_targets(camera_xy, b, int(agent_idx), selected=False)
+        self._draw_agent_route_targets(camera_xy, b, self.selected_agent, selected=True)
+
         if hasattr(self.simulator, "goal_positions") and self.simulator.goal_positions is not None:
-            gx, gy = self.simulator.goal_positions[b, m].detach().cpu().tolist()
+            gx, gy = self.simulator.goal_positions[b, self.selected_agent].detach().cpu().tolist()
             pygame.draw.circle(self.screen, (250, 188, 40), self._world_to_screen(float(gx), float(gy), camera_xy), 6)
         if hasattr(self.simulator, "final_goal_positions") and self.simulator.final_goal_positions is not None:
-            gx, gy = self.simulator.final_goal_positions[b, m].detach().cpu().tolist()
+            gx, gy = self.simulator.final_goal_positions[b, self.selected_agent].detach().cpu().tolist()
             pygame.draw.circle(self.screen, (230, 90, 60), self._world_to_screen(float(gx), float(gy), camera_xy), 7, width=2)
+
+    def _draw_agent_route_targets(self, camera_xy, world_idx: int, agent_idx: int, selected: bool):
+        pygame = self.pygame
+        route_points = self._remaining_route_points(world_idx, agent_idx)
+        if not route_points:
+            return
+        for idx, (x, y) in enumerate(route_points):
+            sx, sy = self._world_to_screen(x, y, camera_xy)
+            if sx < -20 or sx > self.width + 20 or sy < -20 or sy > self.height + 20:
+                continue
+            is_current = idx == 0
+            is_final = idx == len(route_points) - 1
+            if selected:
+                fill = (35, 115, 210) if not is_final else (230, 90, 60)
+                radius = 6 if is_current else 5
+                border = (245, 247, 250)
+            else:
+                fill = (100, 135, 170) if not is_final else (175, 110, 95)
+                radius = 3 if is_current else 2
+                border = (225, 230, 236)
+            pygame.draw.circle(self.screen, fill, (sx, sy), radius)
+            pygame.draw.circle(self.screen, border, (sx, sy), radius, width=1)
+            if selected:
+                label = self.small_font.render(str(idx + 1), True, (20, 45, 70))
+                self.screen.blit(label, (sx + 6, sy - 6))
+
+    def _remaining_route_points(self, world_idx: int, agent_idx: int):
+        route_quads = getattr(self.simulator, "agents_route_quad_ids", None)
+        target_count = getattr(self.simulator, "agents_route_target_count", None)
+        current_idx = getattr(self.simulator, "agents_current_route_idx", None)
+        if route_quads is None or target_count is None or current_idx is None:
+            return []
+
+        b = min(max(world_idx, 0), route_quads.shape[0] - 1)
+        m = min(max(agent_idx, 0), route_quads.shape[1] - 1)
+        start = int(current_idx[b, m].item())
+        count = int(target_count[b, m].item())
+        if count <= start:
+            return []
+
+        quads = route_quads[b, m, start:count].to(device=self.device, dtype=torch.long)
+        quads = quads[quads >= 0]
+        if quads.numel() == 0:
+            return []
+        centers = self.simulator.path_planner.get_quad_centers(quads).detach().cpu()
+        return [(float(x), float(y)) for x, y in centers.tolist()]
 
     def _draw_agents(self, camera_xy):
         pygame = self.pygame
@@ -426,7 +484,7 @@ class InferenceGame:
             f"world {b}: alive {int(alive.sum().item())} / active {int(active.sum().item())} / done {int(done.sum().item())}",
             f"selected car: {m}  action: {action}  speed: {speed:.2f} m/s",
             f"reward: {reward:.4f}  value: {value:.4f}  entropy: {entropy:.3f}",
-            f"zoom: {self.zoom_m:.0f} m",
+            f"waypoints: {'all' if self.show_all_waypoints else 'selected'}  zoom: {self.zoom_m:.0f} m",
         ]
         x, y = 14, 14
         for line in lines:

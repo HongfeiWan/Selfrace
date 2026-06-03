@@ -327,20 +327,20 @@ def build_lane_map_features(w_lanes_local: torch.Tensor, navigation: torch.Tenso
         goal_local = torch.zeros(B, M, 2, device=lanes.device, dtype=lanes.dtype)
         has_goal = torch.zeros(B, M, dtype=torch.bool, device=lanes.device)
 
-    euclidean_goal_dist = torch.norm(lane_xy - goal_local.unsqueeze(2), dim=-1)
     if route_abs is not None:
-        distance_valid = valid & (route_valid | has_goal.unsqueeze(-1))
-        goal_dist = torch.where(route_valid, route_abs, euclidean_goal_dist)
+        distance_valid = valid & route_valid
+        goal_dist = torch.where(distance_valid, route_abs, torch.zeros_like(route_abs))
+        rel_goal_dist = torch.where(distance_valid, route_rel, torch.zeros_like(route_rel))
     else:
+        # 兼容旧输入：没有 W_lane 图距离 packet 时才退回到显式目标的欧氏距离。
+        euclidean_goal_dist = torch.norm(lane_xy - goal_local.unsqueeze(2), dim=-1)
         distance_valid = valid & has_goal.unsqueeze(-1)
         goal_dist = euclidean_goal_dist
-    goal_dist = torch.where(distance_valid, goal_dist, torch.zeros_like(goal_dist))
-    masked_goal_dist = goal_dist.masked_fill(~distance_valid, float('inf'))
-    min_goal_dist = masked_goal_dist.amin(dim=2)
-    min_goal_dist = torch.where(torch.isfinite(min_goal_dist), min_goal_dist, torch.zeros_like(min_goal_dist))
-    rel_goal_dist = goal_dist - min_goal_dist.unsqueeze(-1)
-    if route_rel is not None:
-        rel_goal_dist = torch.where(route_valid, route_rel, rel_goal_dist)
+        goal_dist = torch.where(distance_valid, goal_dist, torch.zeros_like(goal_dist))
+        masked_goal_dist = goal_dist.masked_fill(~distance_valid, float('inf'))
+        min_goal_dist = masked_goal_dist.amin(dim=2)
+        min_goal_dist = torch.where(torch.isfinite(min_goal_dist), min_goal_dist, torch.zeros_like(min_goal_dist))
+        rel_goal_dist = goal_dist - min_goal_dist.unsqueeze(-1)
 
     out = torch.full((B, M, K, element_dim), FEATURE_PAD_VALUE, device=lanes.device, dtype=lanes.dtype)
     if element_dim > 0:
@@ -353,9 +353,11 @@ def build_lane_map_features(w_lanes_local: torch.Tensor, navigation: torch.Tenso
     if element_dim > 4:
         out[..., 4] = normalize_to_minus1_1(lane_width, 0.0, 8.0)
     if element_dim > 5:
-        out[..., 5] = normalize_to_minus1_1(goal_dist, 0.0, 400.0)
+        goal_dist_norm = normalize_to_minus1_1(goal_dist, 0.0, 400.0)
+        out[..., 5] = torch.where(distance_valid, goal_dist_norm, torch.full_like(goal_dist_norm, FEATURE_PAD_VALUE))
     if element_dim > 6:
-        out[..., 6] = normalize_to_minus1_1(rel_goal_dist, 0.0, 200.0)
+        rel_goal_dist_norm = normalize_to_minus1_1(rel_goal_dist, 0.0, 200.0)
+        out[..., 6] = torch.where(distance_valid, rel_goal_dist_norm, torch.full_like(rel_goal_dist_norm, FEATURE_PAD_VALUE))
     out = torch.where(valid.unsqueeze(-1), out, torch.full_like(out, FEATURE_PAD_VALUE))
     return pad_or_truncate_flat(out.flatten(start_dim=2), target_size, FEATURE_PAD_VALUE)
 
