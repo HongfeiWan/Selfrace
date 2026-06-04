@@ -74,6 +74,7 @@ class RoadNetwork:
         back_center = (p0 + p3) / 2.0   # 后中心点
         # 计算车道中心线 (从后中心点到前中心点)
         self.quad_centerlines = torch.stack([back_center, front_center], dim=1)
+        self.quad_centers = self.quad_centerlines.mean(dim=1)
         # 计算车道边界
         self.left_boundaries = torch.stack([p0, p1], dim=1)
         self.right_boundaries = torch.stack([p3, p2], dim=1)
@@ -236,68 +237,33 @@ class RoadNetwork:
             points = points.unsqueeze(0)
         N = points.shape[0]
         if spatial_hash is not None:
-            # 使用空间哈希加速查询
-            candidate_pairs = spatial_hash.query_points(points)  # (num_candidates, 2) -> (point_idx, quad_idx)
-            if candidate_pairs.numel() == 0:
-                # 如果没有候选quad，返回默认值
-                distances = torch.full((N, k), float('inf'), device=self.device)
-                indices = torch.full((N, k), -1, dtype=torch.long, device=self.device)
-                return distances, indices
-            # 计算候选quad到对应点的距离
-            point_indices = candidate_pairs[:, 0]  # (num_candidates,)
-            quad_indices = candidate_pairs[:, 1]   # (num_candidates,)
-            # 获取候选点的坐标和quad中心点
-            candidate_points = points[point_indices]  # (num_candidates, 2)
-            quad_centers = self.quad_centerlines.mean(dim=1)  # (num_quads, 2)
-            candidate_quad_centers = quad_centers[quad_indices]  # (num_candidates, 2)
-            # 计算距离
-            diff = candidate_points - candidate_quad_centers  # (num_candidates, 2)
-            candidate_distances = torch.sum(diff ** 2, dim=-1)  # (num_candidates,)
-            
-            # 为每个点找到最近的k个quad
+            candidate_ids, valid_mask = spatial_hash.query_points_padded(points)
+            max_candidates = candidate_ids.shape[1]
             distances = torch.full((N, k), float('inf'), device=self.device)
             indices = torch.full((N, k), -1, dtype=torch.long, device=self.device)
-            
-            # 使用GPU向量化操作处理所有点（无循环版本）
-            if point_indices.numel() > 0:
-                # 计算每个点的候选数量
-                point_counts = torch.bincount(point_indices, minlength=N)  # (N,) - 每个点的候选数量
-                max_candidates_per_point = int(getattr(spatial_hash, 'static_max_candidates_per_cell', 0))
-                
-                if max_candidates_per_point > 0:
-                    # 创建排序索引以便按点分组
-                    sorted_indices = torch.argsort(point_indices)  # 将候选按点ID排序
-                    sorted_point_indices = point_indices[sorted_indices]
-                    sorted_candidate_distances = candidate_distances[sorted_indices]
-                    sorted_quad_indices = quad_indices[sorted_indices]
-                    
-                    # 计算每个点的起始位置
-                    point_starts = torch.cumsum(torch.nn.functional.pad(point_counts, (1, 0)), dim=0)[:-1]  # (N,)
-                    
-                    # 创建候选数据张量
-                    point_candidate_distances = torch.full((N, max_candidates_per_point), float('inf'), device=self.device)
-                    point_candidate_indices = torch.full((N, max_candidates_per_point), -1, dtype=torch.long, device=self.device)
-                    
-                    # 使用高级索引进行向量化填充
-                    # 为每个候选创建(点索引, 候选位置)的坐标
-                    candidate_positions = torch.arange(len(sorted_indices), device=self.device) - point_starts[sorted_point_indices]
-                    
-                    # 填充候选数据（GPU向量化操作）
-                    point_candidate_distances[sorted_point_indices, candidate_positions] = sorted_candidate_distances
-                    point_candidate_indices[sorted_point_indices, candidate_positions] = sorted_quad_indices
-                    
-                    # 找到每个点的最近k个quad
-                    topk_distances, topk_indices = torch.topk(point_candidate_distances, k=min(k, max_candidates_per_point), dim=1, largest=False)
-                    
-                    # 填充结果
-                    valid_k = min(k, max_candidates_per_point)
-                    distances[:, :valid_k] = torch.sqrt(topk_distances)
-                    indices[:, :valid_k] = torch.gather(point_candidate_indices, 1, topk_indices)
-            
+            if max_candidates <= 0 or self.num_quads == 0:
+                return distances, indices
+
+            safe_candidate_ids = torch.clamp(candidate_ids, 0, self.num_quads - 1)
+            candidate_centers = self.quad_centers[safe_candidate_ids]
+            diff = points.unsqueeze(1) - candidate_centers
+            candidate_dist_sq = torch.sum(diff ** 2, dim=-1).masked_fill(~valid_mask, float('inf'))
+
+            k_eff = min(k, max_candidates)
+            topk_dist_sq, topk_pos = torch.topk(candidate_dist_sq, k=k_eff, dim=1, largest=False)
+            topk_indices = torch.gather(candidate_ids, 1, topk_pos)
+            valid_topk = torch.isfinite(topk_dist_sq)
+
+            distances[:, :k_eff] = torch.sqrt(topk_dist_sq)
+            indices[:, :k_eff] = torch.where(
+                valid_topk,
+                topk_indices,
+                torch.full_like(topk_indices, -1)
+            )
             return distances, indices
         else:
             # 使用原始暴力搜索方法
-            quad_centers = self.quad_centerlines.mean(dim=1) # (num_quads, 2)
+            quad_centers = self.quad_centers # (num_quads, 2)
             # 使用广播计算欧氏距离的平方
             # (N, 1, 2) - (1, num_quads, 2) -> (N, num_quads, 2)
             diff = points.unsqueeze(1) - quad_centers.unsqueeze(0)

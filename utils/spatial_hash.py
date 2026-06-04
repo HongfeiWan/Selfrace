@@ -29,6 +29,8 @@ class SpatialHash:
         self.static_sorted_items = torch.empty((0,), dtype=torch.long, device=self.device)
         self.static_cell_starts = torch.empty((0,), dtype=torch.long, device=self.device)
         self.static_max_candidates_per_cell = 0
+        self.static_cell_items = torch.empty((0, 0), dtype=torch.long, device=self.device)
+        self.static_cell_counts = torch.empty((0,), dtype=torch.long, device=self.device)
         #print(f"SpatialHash initialized with grid {self.grid_size.cpu().numpy()} and cell size {self.cell_size:.2f}m.")
 
     def get_cell_idx(self, points: torch.Tensor) -> torch.Tensor:
@@ -45,9 +47,13 @@ class SpatialHash:
             static_items_bounds (torch.Tensor): 静态物体的AABB，形状 (num_items, 2, 2) for (min, max).
         """
         num_items = static_items_bounds.shape[0]
+        grid_total_cells = int(self.grid_total_cells.item())
         if num_items == 0:
-            self.static_cell_starts = torch.zeros(self.grid_total_cells + 1, dtype=torch.long, device=self.device)
+            self.static_cell_starts = torch.zeros(grid_total_cells + 1, dtype=torch.long, device=self.device)
             self.static_max_candidates_per_cell = 0
+            self.static_sorted_items = torch.empty(0, dtype=torch.long, device=self.device)
+            self.static_cell_counts = torch.zeros(grid_total_cells, dtype=torch.long, device=self.device)
+            self.static_cell_items = torch.empty((grid_total_cells, 0), dtype=torch.long, device=self.device)
             return
 
         item_min_bounds = static_items_bounds[:, 0]
@@ -72,57 +78,70 @@ class SpatialHash:
 
         if item_cell_pairs.numel() == 0:
             self.static_sorted_items = torch.empty(0, dtype=torch.long, device=self.device)
-            self.static_cell_starts = torch.zeros(self.grid_total_cells + 1, dtype=torch.long, device=self.device)
+            self.static_cell_starts = torch.zeros(grid_total_cells + 1, dtype=torch.long, device=self.device)
             self.static_max_candidates_per_cell = 0
+            self.static_cell_counts = torch.zeros(grid_total_cells, dtype=torch.long, device=self.device)
+            self.static_cell_items = torch.empty((grid_total_cells, 0), dtype=torch.long, device=self.device)
             return
 
         sorted_pairs = item_cell_pairs[item_cell_pairs[:, 1].argsort()]
         self.static_sorted_items = sorted_pairs[:, 0].contiguous()
-        self.static_cell_starts = torch.zeros(self.grid_total_cells + 1, dtype=torch.long, device=self.device)
+        self.static_cell_starts = torch.zeros(grid_total_cells + 1, dtype=torch.long, device=self.device)
         unique_cells, counts = torch.unique_consecutive(sorted_pairs[:, 1], return_counts=True)
         self.static_cell_starts[unique_cells + 1] = counts
         self.static_cell_starts = self.static_cell_starts.cumsum_(0)
         self.static_max_candidates_per_cell = int(counts.max().item()) if counts.numel() > 0 else 0
+        self.static_cell_counts = torch.zeros(grid_total_cells, dtype=torch.long, device=self.device)
+        self.static_cell_counts[unique_cells] = counts
+
+        self.static_cell_items = torch.full(
+            (grid_total_cells, self.static_max_candidates_per_cell),
+            -1,
+            dtype=torch.long,
+            device=self.device
+        )
+        if self.static_max_candidates_per_cell > 0:
+            sorted_cells = sorted_pairs[:, 1]
+            starts = self.static_cell_starts[sorted_cells]
+            positions = torch.arange(sorted_pairs.shape[0], device=self.device) - starts
+            self.static_cell_items[sorted_cells, positions] = sorted_pairs[:, 0]
         #print(f"Built static index for {num_items} items.")
 
-    def query_points(self, points: torch.Tensor) -> torch.Tensor:
+    def query_points_padded(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        批量查询点，返回每个点对应的候选静态物体ID。
+        批量查询点，返回每个点所在 cell 的 padded 静态候选表。
+
+        Returns:
+            candidate_item_ids: [N, C]，无效位置为 -1。
+            valid_mask: [N, C]，候选是否有效。
         """
-        if self.static_sorted_items.numel() == 0:
-            return torch.empty((0, 2), dtype=torch.long, device=self.device)
+        N = points.shape[0]
+        max_candidates = int(self.static_max_candidates_per_cell)
+        if N == 0 or max_candidates <= 0 or self.static_cell_items.numel() == 0:
+            empty_items = torch.empty((N, 0), dtype=torch.long, device=self.device)
+            empty_mask = torch.empty((N, 0), dtype=torch.bool, device=self.device)
+            return empty_items, empty_mask
+
         cell_indices_2d = self.get_cell_idx(points)
         cell_indices_flat = cell_indices_2d[:, 0] * self.grid_size[1] + cell_indices_2d[:, 1]
-        starts = self.static_cell_starts[cell_indices_flat]
-        ends = self.static_cell_starts[cell_indices_flat + 1]
-        num_candidates_per_point = ends - starts
-        max_candidates = self.static_max_candidates_per_cell
-        if max_candidates <= 0:
-            return torch.empty((0, 2), dtype=torch.long, device=self.device)
-        point_indices_out = torch.arange(len(points), device=self.device).repeat_interleave(num_candidates_per_point)
-        # GPU加速版本：避免for循环
-        # 使用高级索引操作替代torch.cat和for循环
-        # 创建索引偏移矩阵
-        offsets = torch.arange(max_candidates, device=self.device).unsqueeze(0)  # (1, max_candidates)
-        # 扩展starts以匹配最大候选数
-        starts_expanded = starts.unsqueeze(1) + offsets  # (num_points, max_candidates)
-        # 创建有效掩码
-        valid_mask = offsets < num_candidates_per_point.unsqueeze(1)  # (num_points, max_candidates)
-        # 应用掩码并展平
-        valid_starts = starts_expanded[valid_mask]
-        # 使用高级索引获取item_indices
-        item_indices_out = self.static_sorted_items[valid_starts]
+        candidate_item_ids = self.static_cell_items[cell_indices_flat]
+        candidate_counts = self.static_cell_counts[cell_indices_flat]
+        candidate_positions = torch.arange(max_candidates, device=self.device).unsqueeze(0)
+        valid_mask = (candidate_positions < candidate_counts.unsqueeze(1)) & (candidate_item_ids >= 0)
+        return candidate_item_ids, valid_mask
 
-        return torch.stack([point_indices_out, item_indices_out], dim=1)
+    def query_dynamic_pair_list(self, B: int, M: int, active_mask: torch.Tensor,
+                                verts_t0: torch.Tensor, verts_t1: torch.Tensor,
+                                debug: bool = False, debug_env_idx: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict]]:
+        """
+        返回动态物体的 sparse unordered pair list: (batch, agent_i, agent_j)。
+        agent_i < agent_j，且不会按 max_neighbors 截断。
+        """
+        empty = torch.empty((0,), dtype=torch.long, device=self.device)
+        if B == 0 or M <= 1:
+            debug_info = {'occupied_cell_ids': empty} if debug else None
+            return empty, empty, empty, debug_info
 
-    def query_dynamic_pairs(self, B: int, M: int, active_mask: torch.Tensor,
-                            verts_t0: torch.Tensor, verts_t1: torch.Tensor,
-                            max_neighbors: int, debug: bool = False, debug_env_idx: int = 0) -> Tuple[torch.Tensor, Optional[Dict]]:
-        """
-        为一批动态物体执行高效的临近对查询。
-        此方法使用稀疏矩阵乘法，非常适合于智能体间的碰撞检测宽阶段。
-        优化版本：使用批处理稀疏矩阵操作减少循环。
-        """
         all_verts = torch.cat([verts_t0, verts_t1], dim=-2)
         min_coords, _ = torch.min(all_verts, dim=-2)
         max_coords, _ = torch.max(all_verts, dim=-2)
@@ -157,10 +176,6 @@ class SpatialHash:
             debug_info = {'occupied_cell_ids': torch.unique(occupied_cell_indices)}
 
         # 向量化分组与配对：避免 per-batch 循环和巨大矩阵
-        num_neighbors = min(max_neighbors, M - 1)
-        if num_neighbors <= 0:
-            return torch.full((B, M, 0), -1, dtype=torch.long, device=self.device), debug_info
-
         # 1) 将占用条目按 (batch, cell) 分组
         group_keys = batch_indices.long() * self.grid_total_cells + cell_indices.long()
         sort_idx = torch.argsort(group_keys)
@@ -169,12 +184,12 @@ class SpatialHash:
         sorted_agents = agent_indices[sort_idx]
 
         if sorted_keys.numel() == 0:
-            return torch.full((B, M, num_neighbors), -1, dtype=torch.long, device=self.device), debug_info
+            return empty, empty, empty, debug_info
 
         all_keys, all_counts = torch.unique_consecutive(sorted_keys, return_counts=True)
         valid_groups_mask = all_counts >= 2
         if not valid_groups_mask.any():
-            return torch.full((B, M, num_neighbors), -1, dtype=torch.long, device=self.device), debug_info
+            return empty, empty, empty, debug_info
 
         group_counts = all_counts[valid_groups_mask]
         group_starts_all = torch.cumsum(torch.nn.functional.pad(all_counts, (1, 0)), dim=0)[:-1]
@@ -186,7 +201,7 @@ class SpatialHash:
         tri_i, tri_j = tri[0], tri[1]
         valid_pair_mask = (tri_i.unsqueeze(0) < group_counts.unsqueeze(1)) & (tri_j.unsqueeze(0) < group_counts.unsqueeze(1))
         if not valid_pair_mask.any():
-            return torch.full((B, M, num_neighbors), -1, dtype=torch.long, device=self.device), debug_info
+            return empty, empty, empty, debug_info
 
         pos_i = group_starts.unsqueeze(1) + tri_i.unsqueeze(0)
         pos_j = group_starts.unsqueeze(1) + tri_j.unsqueeze(0)
@@ -212,32 +227,5 @@ class SpatialHash:
         a_min = a_min[unique_idx_sorted]
         a_max = a_max[unique_idx_sorted]
 
-        # 4) 生成有向邻接 (src->dst 和 dst->src)
-        neigh_batches = torch.cat([pair_batches, pair_batches], dim=0)
-        src_agents = torch.cat([a_min, a_max], dim=0)
-        dst_agents = torch.cat([a_max, a_min], dim=0)
-
-        # 5) 对每个 (batch, src) 选择前K个（按 dst 升序保证确定性）
-        group_id = neigh_batches.long() * M + src_agents.long()
-        lex_key = group_id * M + dst_agents.long()
-        perm = torch.argsort(lex_key)
-        gid_sorted = group_id[perm]
-        dst_sorted = dst_agents[perm]
-
-        uniq_gid, gid_counts = torch.unique_consecutive(gid_sorted, return_counts=True)
-        gid_starts = torch.cumsum(torch.nn.functional.pad(gid_counts, (1, 0)), dim=0)[:-1]
-        repeated_starts = gid_starts.repeat_interleave(gid_counts)
-        positions = torch.arange(dst_sorted.numel(), device=self.device) - repeated_starts
-        keep = positions < num_neighbors
-
-        sel_gid = gid_sorted[keep]
-        sel_pos = positions[keep].long()
-        sel_dst = dst_sorted[keep]
-
-        candidate_pairs = torch.full((B, M, num_neighbors), -1, dtype=torch.long, device=self.device)
-        sel_batch = sel_gid // M
-        sel_src = sel_gid % M
-        candidate_pairs[sel_batch, sel_src, sel_pos] = sel_dst
-
-        return candidate_pairs, debug_info
+        return pair_batches, a_min, a_max, debug_info
     

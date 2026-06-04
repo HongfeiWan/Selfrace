@@ -136,16 +136,17 @@ class CollisionChecker:
 
     def _broad_phase_vectorized(self, active_mask: torch.Tensor,
                                 verts_t0: torch.Tensor, verts_t1: torch.Tensor,
-                                debug: bool = False, debug_env_idx: int = 0) -> Tuple[torch.Tensor, Optional[Dict]]:
+                                debug: bool = False, debug_env_idx: int = 0) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Optional[Dict]]:
         """
         目的: 调用共享的空间哈希对象来高效地找出所有可能发生碰撞的智能体对。
         """
         B, M, _, _ = verts_t0.shape
-        return self.spatial_hash.query_dynamic_pairs(
-            B, M, active_mask, verts_t0, verts_t1, self.max_neighbors, debug, debug_env_idx
+        pair_batches, agent_i, agent_j, debug_info = self.spatial_hash.query_dynamic_pair_list(
+            B, M, active_mask, verts_t0, verts_t1, debug=debug, debug_env_idx=debug_env_idx
         )
+        return (pair_batches, agent_i, agent_j), debug_info
 
-    def _narrow_phase_vectorized(self, candidate_pairs: torch.Tensor,
+    def _narrow_phase_vectorized(self, sparse_pairs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
                                  active_mask: torch.Tensor, states_t0: torch.Tensor, states_t1: torch.Tensor,
                                  verts_t0: torch.Tensor, verts_t1: torch.Tensor) -> torch.Tensor:
         """
@@ -163,24 +164,20 @@ class CollisionChecker:
             - 创建一个全零的最终结果张量。
             - 将计算出的碰撞结果（一个布尔列表）并行地写回到结果张量中对应的智能体位置。
         """
-        B, M, K = candidate_pairs.shape
-        if K == 0:
-            return torch.zeros((B, M), dtype=torch.bool, device=self.device)
+        B, M = active_mask.shape
 
         # 确保所有输入张量都在正确的设备上
-        candidate_pairs = candidate_pairs.to(self.device)
         active_mask = active_mask.to(self.device)
-        
-        agent_j_indices = torch.arange(M, device=self.device).view(1, M, 1).expand(B, M, K)
-        agent_k_indices = candidate_pairs
 
-        valid_mask = (agent_k_indices != -1) & active_mask.unsqueeze(-1)
-        unique_mask = agent_j_indices < agent_k_indices
-        final_mask = valid_mask & unique_mask
-
-        batch_idx_flat = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, M, K)[final_mask]
-        j_idx_flat = agent_j_indices[final_mask]
-        k_idx_flat = agent_k_indices[final_mask]
+        batch_idx_flat, j_idx_flat, k_idx_flat = sparse_pairs[:3]
+        batch_idx_flat = batch_idx_flat.to(self.device)
+        j_idx_flat = j_idx_flat.to(self.device)
+        k_idx_flat = k_idx_flat.to(self.device)
+        if j_idx_flat.numel() > 0:
+            valid_mask = active_mask[batch_idx_flat, j_idx_flat] & active_mask[batch_idx_flat, k_idx_flat]
+            batch_idx_flat = batch_idx_flat[valid_mask]
+            j_idx_flat = j_idx_flat[valid_mask]
+            k_idx_flat = k_idx_flat[valid_mask]
 
         if j_idx_flat.numel() == 0:
             return torch.zeros((B, M), dtype=torch.bool, device=self.device)

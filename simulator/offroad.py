@@ -19,18 +19,28 @@ class OffroadChecker:
     一个基于 GPU 加速的批量化离路检测器。
     它使用一个共享的、预初始化的 SpatialHash 对象来执行查询。
     """
-    def __init__(self, map_data: RoadNetwork, spatial_hash: SpatialHash, points_per_vehicle_edge: int = 3):
+    DEFAULT_POINT_CHUNK_SIZE = 524288
+
+    def __init__(
+        self,
+        map_data: RoadNetwork,
+        spatial_hash: SpatialHash,
+        points_per_vehicle_edge: int = 3,
+        offroad_point_chunk_size: int = DEFAULT_POINT_CHUNK_SIZE,
+    ):
         """
         初始化离路检测器。
         Args:
             map_data (RoadNetwork): 包含路面几何信息的 RoadNetwork 对象。
             spatial_hash (SpatialHash): 预初始化的空间哈希对象。
             points_per_vehicle_edge (int): 沿着车辆边界框每条边采样的点数。
+            offroad_point_chunk_size (int): padded point-in-polygon 每个 chunk 的点数。
         """
         self.device = map_data.device
         if points_per_vehicle_edge < 2:
             raise ValueError("points_per_vehicle_edge must be at least 2.")
         self.points_per_vehicle_edge = points_per_vehicle_edge
+        self.offroad_point_chunk_size = max(1, int(offroad_point_chunk_size))
         self.road_polygons = map_data.quads_vertices.to(self.device)
 
         self.spatial_hash = spatial_hash
@@ -101,36 +111,41 @@ class OffroadChecker:
     def _batch_point_in_polygon_test(self, points: Tensor) -> Tensor:
         """
         基于矢量叉乘（半平面）的方法：
-        1) 用空间哈希取候选 (point, quad)；
-        2) 对每个候选，计算四条边的 cross(e, p - v)；
+        1) 用 padded 空间哈希取每个 point 的候选 quad；
+        2) 对每个 chunk 的候选，计算四条边的 cross(e, p - v)；
         3) 若多边形为顺时针，则 cross <= 0，全为右侧；若为逆时针则 cross >= 0；
            统一写作 (sign * cross) >= -eps，sign=+1(CCW), -1(CW)。
-        4) 命中的点按原索引 scatter 回去。
         """
-
         M = points.shape[0]
         if M == 0:
             return torch.empty(0, dtype=torch.bool, device=self.device)
-        candidate_pairs = self.spatial_hash.query_points(points)
-        if candidate_pairs.shape[0] == 0:
-            return torch.zeros(M, dtype=torch.bool, device=self.device)
-        point_indices = candidate_pairs[:, 0]
-        polygon_indices = candidate_pairs[:, 1]
 
-        pts = points[point_indices]
-        verts = self.poly_verts[polygon_indices]
-        edges = self.poly_edges[polygon_indices]
-        sign = self.poly_sign[polygon_indices]
-        pv = pts.unsqueeze(1) - verts
-        cross = edges[..., 0] * pv[..., 1] - edges[..., 1] * pv[..., 0]
-        inside = (sign.unsqueeze(-1) * cross >= -1e-10).all(dim=-1)
+        return self._batch_point_in_polygon_test_padded(points)
 
-        # 修复版本：使用scatter_add_来正确处理一个点被多个多边形包含的情况
-        # 一个点只要被任何一个多边形包含，就应该被认为是"在道路上"
-        flat_on_road_mask = torch.zeros(M, dtype=torch.int32, device=self.device)
-        flat_on_road_mask.scatter_add_(0, point_indices, inside.to(torch.int32))
-        flat_on_road_mask = flat_on_road_mask.gt_(0)  # 只要有一个多边形包含该点，就为True
-        
+    def _batch_point_in_polygon_test_padded(self, points: Tensor) -> Tensor:
+        M = points.shape[0]
+        flat_on_road_mask = torch.zeros(M, dtype=torch.bool, device=self.device)
+        if self.poly_verts.shape[0] == 0:
+            return flat_on_road_mask
+
+        chunk_size = self.offroad_point_chunk_size
+        for start in range(0, M, chunk_size):
+            end = min(start + chunk_size, M)
+            chunk_points = points[start:end]
+            candidate_ids, valid_mask = self.spatial_hash.query_points_padded(chunk_points)
+            if candidate_ids.shape[1] == 0:
+                continue
+
+            safe_candidate_ids = torch.clamp(candidate_ids, 0, self.poly_verts.shape[0] - 1)
+            verts = self.poly_verts[safe_candidate_ids]
+            edges = self.poly_edges[safe_candidate_ids]
+            sign = self.poly_sign[safe_candidate_ids]
+
+            pv = chunk_points[:, None, None, :] - verts
+            cross = edges[..., 0] * pv[..., 1] - edges[..., 1] * pv[..., 0]
+            inside = (sign.unsqueeze(-1) * cross >= -1e-10).all(dim=-1) & valid_mask
+            flat_on_road_mask[start:end] = inside.any(dim=1)
+
         return flat_on_road_mask
 
     def check_on_road(self, states: Tensor) -> Tensor:
@@ -367,6 +382,3 @@ if __name__ == "__main__":
         print(f"测试过程中发生错误: {e}")
         import traceback
         traceback.print_exc()
-
-    
-   

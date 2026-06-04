@@ -114,11 +114,11 @@ def find_nearest_quad_for_waypoint(waypoint, quad_centers_3d, spatial_hash=None,
         wp_tensor = torch.tensor([wp_pos], dtype=torch.float32, device=spatial_hash.device)
         
         # 查询候选quad
-        candidate_pairs = spatial_hash.query_points(wp_tensor)
-        
-        if candidate_pairs.numel() > 0:
+        candidate_ids, valid_mask = spatial_hash.query_points_padded(wp_tensor)
+
+        if valid_mask.any():
             # 获取候选quad的ID
-            candidate_quad_ids = candidate_pairs[:, 1].cpu().numpy()
+            candidate_quad_ids = candidate_ids[valid_mask].cpu().numpy()
             
             # 在候选quad中寻找最近的
             min_distance = float('inf')
@@ -821,4 +821,4 @@ def main():
     visualize_lane_paths(map_path_full)
 
 if __name__ == "__main__":
-    main() 
+    main()
