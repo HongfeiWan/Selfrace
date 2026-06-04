@@ -69,6 +69,27 @@ def save_checkpoint(model, policy_optimizer, value_optimizer, step: int, checkpo
 	except Exception as e:
 		print(f"⚠️ 保存检查点失败: {e}")
 
+def adapt_state_dict_for_expanded_inputs(module, loaded_state: dict) -> tuple[dict, bool]:
+	"""Pad old Linear input weights when feature dimensions are expanded."""
+	current_state = module.state_dict()
+	adapted = dict(loaded_state)
+	adapted_keys = []
+	for key, value in list(adapted.items()):
+		if key not in current_state or not torch.is_tensor(value):
+			continue
+		target = current_state[key]
+		if value.shape == target.shape:
+			continue
+		if value.dim() == 2 and target.dim() == 2 and value.shape[0] == target.shape[0] and value.shape[1] < target.shape[1]:
+			padded = torch.zeros_like(target)
+			padded[:, :value.shape[1]].copy_(value.to(device=target.device, dtype=target.dtype))
+			adapted[key] = padded
+			adapted_keys.append((key, tuple(value.shape), tuple(target.shape)))
+	if adapted_keys:
+		for key, old_shape, new_shape in adapted_keys:
+			print(f"ℹ️ checkpoint input weight padded: {key} {old_shape} -> {new_shape}")
+	return adapted, bool(adapted_keys)
+
 def load_checkpoint(model, policy_optimizer, value_optimizer, checkpoint_path: str, device: torch.device) -> int:
 	"""从检查点恢复模型和优化器，返回已完成的 iteration step。"""
 	if not checkpoint_path:
@@ -77,18 +98,33 @@ def load_checkpoint(model, policy_optimizer, value_optimizer, checkpoint_path: s
 		raise FileNotFoundError(f"resume checkpoint not found: {checkpoint_path}")
 	state = torch.load(checkpoint_path, map_location=device)
 	load_model = model.module if hasattr(model, 'module') else model
+	checkpoint_migrated = False
 	if 'model_state_dict' in state:
-		load_model.load_state_dict(state['model_state_dict'], strict=True)
+		model_state, migrated = adapt_state_dict_for_expanded_inputs(load_model, state['model_state_dict'])
+		checkpoint_migrated = checkpoint_migrated or migrated
+		load_model.load_state_dict(model_state, strict=True)
 	else:
+		if 'policy_feature_encoder_state_dict' in state:
+			policy_encoder_state, migrated = adapt_state_dict_for_expanded_inputs(
+				load_model.policy_feature_encoder,
+				state['policy_feature_encoder_state_dict'],
+			)
+			checkpoint_migrated = checkpoint_migrated or migrated
+			load_model.policy_feature_encoder.load_state_dict(policy_encoder_state, strict=True)
+		if 'value_feature_encoder_state_dict' in state:
+			value_encoder_state, migrated = adapt_state_dict_for_expanded_inputs(
+				load_model.value_feature_encoder,
+				state['value_feature_encoder_state_dict'],
+			)
+			checkpoint_migrated = checkpoint_migrated or migrated
+			load_model.value_feature_encoder.load_state_dict(value_encoder_state, strict=True)
 		load_model.policy_network.load_state_dict(state['policy_state_dict'], strict=True)
 		load_model.value_network.load_state_dict(state['value_state_dict'], strict=True)
-		if 'policy_feature_encoder_state_dict' in state:
-			load_model.policy_feature_encoder.load_state_dict(state['policy_feature_encoder_state_dict'], strict=True)
-		if 'value_feature_encoder_state_dict' in state:
-			load_model.value_feature_encoder.load_state_dict(state['value_feature_encoder_state_dict'], strict=True)
-	if 'policy_optim_state_dict' in state:
+	if checkpoint_migrated:
+		print("ℹ️ checkpoint model was migrated for expanded C_reward; optimizer state skipped to avoid stale Adam tensors.")
+	elif 'policy_optim_state_dict' in state:
 		policy_optimizer.load_state_dict(state['policy_optim_state_dict'])
-	if 'value_optim_state_dict' in state:
+	if not checkpoint_migrated and 'value_optim_state_dict' in state:
 		value_optimizer.load_state_dict(state['value_optim_state_dict'])
 	return int(state.get('step', 0))
 
@@ -240,7 +276,8 @@ class FeatureBuildWorkspace:
         elif name == 'reward':
             bounds = (
                 (2, 12), (0, 3), (0, 3), (0, 0.1), (0.00025, 0.025),
-                (0, 1), (0.00025, 0.0075), (-0.5, 0.5), (0.00025, 0.0075), (0, 1),
+                (0, 1), (0.00025, 0.0075), (-0.5, 0.5), (0.0025, 0.0025),
+                (0.00025, 0.0075), (0, 1), (0.000025, 0.000025),
             )
         elif name == 'style':
             bounds = ((1 / 1.25, 1.25), (1 / 1.25, 1.25), (1 / 1.5, 1.5), (1 / 1.5, 1.5))
@@ -497,7 +534,7 @@ def build_network_features(agents_state: torch.Tensor,
         w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标
         navigation: (B, M, goal_slots + lane_slots, 3) - 显式 G(t) 与 W_lane 图路由距离
         stop_lines: (B, M, num_stop_lines, 20) - 停止线点
-        reward_coef: (B, M, 10) - 奖励系数
+        reward_coef: (B, M, 12) - 原文式 reward conditioning
         config: 配置对象
     Returns:
         torch.Tensor: 形状为 (B, M, total_input_dim) 的网络输入特征张量
@@ -583,7 +620,7 @@ def build_network_features(agents_state: torch.Tensor,
         simple_offset += 1
         feature_cursor = g_t_end
 
-    # reward系数: 10维 - 使用传入的采样参数
+    # reward系数: 原文式12维 C_reward，顺序对应 RewardParameterSampler.sample_all_parameters。
     reward_coef_size = simple_feature_dims[simple_offset]
     reward_coef_start = feature_cursor
     reward_coef_end = reward_coef_start + reward_coef_size

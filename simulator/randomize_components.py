@@ -160,6 +160,13 @@ class RewardParameterSampler:
         # 停止线相关参数
         self.stop_line_alpha_min = self.reward_config.get('stop_line_alpha_min', 0.0)
         self.stop_line_alpha_max = self.reward_config.get('stop_line_alpha_max', 1.0)
+        # 原文 C_reward 也包含固定的 velocity/timestep reward 系数；默认 min=max。
+        velocity_alpha = self.reward_config.get('velocity_alpha', 2.5e-3)
+        timestep_alpha = self.reward_config.get('timestep_alpha', 2.5e-5)
+        self.velocity_alpha_min = self.reward_config.get('velocity_alpha_min', velocity_alpha)
+        self.velocity_alpha_max = self.reward_config.get('velocity_alpha_max', velocity_alpha)
+        self.timestep_alpha_min = self.reward_config.get('timestep_alpha_min', timestep_alpha)
+        self.timestep_alpha_max = self.reward_config.get('timestep_alpha_max', timestep_alpha)
     
     def sample_delta_goal(self) -> torch.Tensor:
         """
@@ -278,7 +285,7 @@ class RewardParameterSampler:
             B: 批量大小 B (默认1)
             M: 智能体数 M (默认1)
         Returns:
-            torch.Tensor: 形状为 (B, M, 10) 的reward系数张量
+            torch.Tensor: 形状为 (B, M, 12) 的reward系数张量
         """
         device = self.device
         def uniform(min_v, max_v):
@@ -294,11 +301,13 @@ class RewardParameterSampler:
             'vel_align_alpha': uniform(self.vel_align_alpha_min, self.vel_align_alpha_max),
             'l_center_alpha': uniform(self.l_center_alpha_min, self.l_center_alpha_max),
             'center_bias_alpha': uniform(self.center_bias_alpha_min, self.center_bias_alpha_max),
+            'velocity_alpha': uniform(self.velocity_alpha_min, self.velocity_alpha_max),
             'reverse_alpha': uniform(self.reverse_alpha_min, self.reverse_alpha_max),
             'stop_line_alpha': uniform(self.stop_line_alpha_min, self.stop_line_alpha_max),
+            'timestep_alpha': uniform(self.timestep_alpha_min, self.timestep_alpha_max),
         }
-        
-        # 将参数堆叠成 (B, M, 10) 的张量
+
+        # 将参数堆叠成 (B, M, 12) 的张量；顺序对应原文 reward table。
         reward_coef_list = [
             params['delta_goal'],
             params['collision_alpha'],
@@ -308,11 +317,13 @@ class RewardParameterSampler:
             params['vel_align_alpha'],
             params['l_center_alpha'],
             params['center_bias_alpha'],
+            params['velocity_alpha'],
             params['reverse_alpha'],
-            params['stop_line_alpha']
+            params['stop_line_alpha'],
+            params['timestep_alpha'],
         ]
-        
-        return torch.stack(reward_coef_list, dim=-1)  # (B, M, 10)
+
+        return torch.stack(reward_coef_list, dim=-1)  # (B, M, 12)
 
 class VehicleParameterSampler:
     """
@@ -411,10 +422,10 @@ if __name__ == "__main__":
             # 采样所有参数
             sampled_params = sampler.sample_all_parameters()
             
-            # 存储每个参数的值 (sampled_params 是形状为 (1, 1, 10) 的张量)
-            param_names = ['delta_goal', 'collision_alpha', 'boundary_alpha', 'comfort_alpha', 
-                          'l_align_alpha', 'vel_align_alpha', 'l_center_alpha', 'center_bias_alpha', 
-                          'reverse_alpha', 'stop_line_alpha']
+            # 存储每个参数的值 (sampled_params 是形状为 (1, 1, 12) 的张量)
+            param_names = ['delta_goal', 'collision_alpha', 'boundary_alpha', 'comfort_alpha',
+                          'l_align_alpha', 'vel_align_alpha', 'l_center_alpha', 'center_bias_alpha',
+                          'velocity_alpha', 'reverse_alpha', 'stop_line_alpha', 'timestep_alpha']
             for j, param_name in enumerate(param_names):
                 all_samples[param_name].append(sampled_params[0, 0, j].item())
         

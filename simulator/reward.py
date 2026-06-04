@@ -77,8 +77,10 @@ class RewardCalculator:
             'vel_align_alpha': 5,
             'l_center_alpha': 6,
             'center_bias_alpha': 7,
-            'reverse_alpha': 8,
-            'stop_line_alpha': 9,
+            'velocity_alpha': 8,
+            'reverse_alpha': 9,
+            'stop_line_alpha': 10,
+            'timestep_alpha': 11,
         }
         
     def reset_episode(self):
@@ -318,8 +320,9 @@ class RewardCalculator:
         # 计算速度条件: 1_{|v| > 2.5}
         speed_condition = (torch.abs(speeds) > 2.5).float()
         
-        # 计算速度奖励
-        velocity_reward = self.velocity_alpha * dt * max_cos_theta * speed_condition
+        # 计算速度奖励（逐元素 alpha_velocity，与 C_reward conditioning 一致）
+        alpha_velocity = self.sampled_params[..., self._param_name_to_idx['velocity_alpha']]
+        velocity_reward = alpha_velocity * dt * max_cos_theta * speed_condition
         
         return velocity_reward
 
@@ -398,8 +401,9 @@ class RewardCalculator:
         # 综合条件: |v| > 0 ∨ |a| > 0
         timestep_condition = torch.max(speed_condition, acceleration_condition)
         
-        # 计算时间步惩罚
-        timestep_penalty = -(self.timestep_alpha * dt) * timestep_condition 
+        # 计算时间步惩罚（逐元素 alpha_timestep，与 C_reward conditioning 一致）
+        alpha_timestep = self.sampled_params[..., self._param_name_to_idx['timestep_alpha']]
+        timestep_penalty = -(alpha_timestep * dt) * timestep_condition
         
         return timestep_penalty
 
