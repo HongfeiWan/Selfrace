@@ -1513,6 +1513,52 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 	env_idx, agent_idx = alive_mask.nonzero(as_tuple=True)
 	total_selected = int(env_idx.numel())
 	profile['num_selected'] = total_selected
+	training_cfg = getattr(config, 'training')
+	dense_alive_fraction = float(getattr(training_cfg, 'rollout_dense_alive_fraction', 0.0))
+	if dense_alive_fraction > 0.0 and (total_selected / max(1, B * M)) >= dense_alive_fraction:
+		profile_on = profile_enabled(config)
+		if profile_on:
+			feature_start = profile_timer_start(device, config)
+		features_all = build_features_from_simulator_state(
+			simulator,
+			config,
+			alive_mask=alive_mask,
+			condition_state=condition_state,
+			dropout_step=dropout_step,
+		)
+		if profile_on:
+			profile['feature_ms'] += profile_elapsed_ms(feature_start, device, config)
+
+		if profile_on:
+			policy_start = profile_timer_start(device, config)
+		with torch.inference_mode(), make_autocast_context(device, precision):
+			if sample_actions:
+				action_logits, values_all = forward_model(
+					model,
+					features_all,
+					mode="both",
+					chunk_agents=forward_chunk_agents,
+				)
+				dist_all = torch.distributions.Categorical(logits=action_logits)
+				actions_all = dist_all.sample()
+				log_probs_all = dist_all.log_prob(actions_all).to(old_log_probs.dtype)
+				actions = torch.where(alive_mask, actions_all, actions)
+				old_log_probs = torch.where(alive_mask, log_probs_all, old_log_probs)
+			else:
+				values_all = forward_model(
+					model,
+					features_all,
+					mode="value",
+					chunk_agents=forward_chunk_agents,
+				)
+		if values_all.dim() == 3 and values_all.shape[-1] == 1:
+			values_all = values_all.squeeze(-1)
+		value_pred = torch.where(alive_mask, values_all.to(value_pred.dtype), value_pred)
+		if profile_on:
+			profile['policy_ms'] += profile_elapsed_ms(policy_start, device, config)
+		del features_all
+		return actions, old_log_probs, value_pred, profile
+
 	selected_chunk = feature_build_chunk_agents(config, M)
 	if selected_chunk <= 0:
 		selected_chunk = total_selected

@@ -186,8 +186,9 @@ training:
   value_clip_ratio: null  # Value function clipping = None
   lr_schedule: "cosine"  # 改为cosine
   precision: "16-bit"  # 添加16-bit AMP
-  network_forward_chunk_agents: 32768 # 整批 policy/value 推理按 agent 数分块，限制 set encoder 峰值显存
-  feature_build_chunk_agents: 16384   # observation/nav/network feature 构建按 agent 数分块，避免 W_lane 路由距离一次性过大
+  network_forward_chunk_agents: 65536 # 用更多显存减少 policy/value forward 分块，提高2600-world训练吞吐
+  feature_build_chunk_agents: 65536   # 用更多显存减少 selected-agent feature build 分块；2600 worlds下仍保留安全余量
+  rollout_dense_alive_fraction: 0.55   # 存活agent比例高时改用dense env-batch rollout，用显存换速度
   w_lane_dropout_prob: 0.5             # 原文式 W_lane element dropout；确定性重建，不占 rollout buffer
   w_boundary_dropout_prob: 0.4         # 原文式 W_boundary element dropout；被 drop 元素不进 set encoder
   
