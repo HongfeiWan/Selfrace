@@ -21,6 +21,8 @@ simulator:
   init_distribution_calibration_samples: 65536 # 启动时用于估计每个quad接受率的样本数
   init_distribution_smoothing: 1.0             # 接受率估计平滑，避免低样本quad权重发散
   init_distribution_max_weight: 20.0           # 单个quad的最大反向修正权重
+  collision_narrow_chunk_pairs: 524288         # 动态碰撞窄阶段pair分块上限，限制极端拥堵显存峰值
+  collision_pair_gen_chunk_pairs: 1048576      # 动态碰撞宽阶段每块生成的候选pair目标上限
 
   # 地图配置  
   map_path: "./maps/processed_map_Town01_stitched.json" # 地图路径

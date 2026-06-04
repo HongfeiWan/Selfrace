@@ -25,6 +25,8 @@ class SpatialHash:
         grid_dim = torch.ceil((self.max_bounds - self.min_bounds) / self.cell_size).long()
         self.grid_size = torch.max(grid_dim, torch.tensor([1, 1], device=device, dtype=torch.long))
         self.grid_total_cells = self.grid_size[0] * self.grid_size[1]
+        self.grid_total_cells_int = int(self.grid_total_cells.item())
+        self._arange_cache: Dict[int, torch.Tensor] = {}
         # 用于静态几何体索引的属性
         self.static_sorted_items = torch.empty((0,), dtype=torch.long, device=self.device)
         self.static_cell_starts = torch.empty((0,), dtype=torch.long, device=self.device)
@@ -32,6 +34,40 @@ class SpatialHash:
         self.static_cell_items = torch.empty((0, 0), dtype=torch.long, device=self.device)
         self.static_cell_counts = torch.empty((0,), dtype=torch.long, device=self.device)
         #print(f"SpatialHash initialized with grid {self.grid_size.cpu().numpy()} and cell size {self.cell_size:.2f}m.")
+
+    def _cached_arange(self, size: int) -> torch.Tensor:
+        size = int(size)
+        cached = self._arange_cache.get(size)
+        if cached is None:
+            cached = torch.arange(size, device=self.device)
+            self._arange_cache[size] = cached
+        return cached
+
+    def _profile_now(self, cuda_sync: bool = False) -> float:
+        if cuda_sync and self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+        return time.time()
+
+    def _profile_record(self, profile: Optional[Dict], name: str, start_time: float,
+                        cuda_sync: bool = False) -> float:
+        if profile is None:
+            return start_time
+        now = self._profile_now(cuda_sync)
+        profile[name] = (now - start_time) * 1000.0
+        return now
+
+    def _profile_set_default_counts(self, profile: Optional[Dict]):
+        if profile is None:
+            return
+        profile.setdefault('cell_build_ms', 0.0)
+        profile.setdefault('sort_group_ms', 0.0)
+        profile.setdefault('pair_gen_ms', 0.0)
+        profile.setdefault('dedup_ms', 0.0)
+        profile.setdefault('occupancy_entries', 0)
+        profile.setdefault('num_cell_groups', 0)
+        profile.setdefault('max_group_size', 0)
+        profile.setdefault('pairs_before_dedup', 0)
+        profile.setdefault('unique_pairs', 0)
 
     def get_cell_idx(self, points: torch.Tensor) -> torch.Tensor:
         """将世界坐标批量转换为网格单元索引。"""
@@ -47,7 +83,7 @@ class SpatialHash:
             static_items_bounds (torch.Tensor): 静态物体的AABB，形状 (num_items, 2, 2) for (min, max).
         """
         num_items = static_items_bounds.shape[0]
-        grid_total_cells = int(self.grid_total_cells.item())
+        grid_total_cells = self.grid_total_cells_int
         if num_items == 0:
             self.static_cell_starts = torch.zeros(grid_total_cells + 1, dtype=torch.long, device=self.device)
             self.static_max_candidates_per_cell = 0
@@ -132,16 +168,21 @@ class SpatialHash:
 
     def query_dynamic_pair_list(self, B: int, M: int, active_mask: torch.Tensor,
                                 verts_t0: torch.Tensor, verts_t1: torch.Tensor,
-                                debug: bool = False, debug_env_idx: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict]]:
+                                debug: bool = False, debug_env_idx: int = 0,
+                                profile: Optional[Dict] = None,
+                                profile_cuda_sync: bool = False,
+                                pair_gen_chunk_pairs: int = 1048576) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict]]:
         """
         返回动态物体的 sparse unordered pair list: (batch, agent_i, agent_j)。
         agent_i < agent_j，且不会按 max_neighbors 截断。
         """
+        self._profile_set_default_counts(profile)
         empty = torch.empty((0,), dtype=torch.long, device=self.device)
         if B == 0 or M <= 1:
             debug_info = {'occupied_cell_ids': empty} if debug else None
             return empty, empty, empty, debug_info
 
+        cell_build_start = self._profile_now(profile_cuda_sync) if profile is not None else 0.0
         all_verts = torch.cat([verts_t0, verts_t1], dim=-2)
         min_coords, _ = torch.min(all_verts, dim=-2)
         max_coords, _ = torch.max(all_verts, dim=-2)
@@ -153,8 +194,9 @@ class SpatialHash:
         span_y = (max_grid_idx[..., 1] - min_grid_idx[..., 1] + 1).clamp(min=1)
         max_cells_per_agent = (span_x * span_y).max().item()
 
-        ix_x = torch.arange(max_cells_per_agent, device=self.device) % span_x.view(-1, 1)
-        ix_y = torch.arange(max_cells_per_agent, device=self.device) // span_x.view(-1, 1)
+        cell_offsets = self._cached_arange(max_cells_per_agent).view(1, -1)
+        ix_x = cell_offsets % span_x.view(-1, 1)
+        ix_y = cell_offsets // span_x.view(-1, 1)
 
         agent_grid_x = min_grid_idx[..., 0].view(-1, 1) + ix_x
         agent_grid_y = min_grid_idx[..., 1].view(-1, 1) + ix_y
@@ -163,11 +205,14 @@ class SpatialHash:
         
         cell_ids = agent_grid_x * self.grid_size[1] + agent_grid_y
 
-        valid_flat_mask = valid_cell_mask.flatten()
-        
-        batch_indices = torch.arange(B, device=self.device).view(B, 1).expand(-1, M).flatten().unsqueeze(-1).expand(-1, max_cells_per_agent).flatten()[valid_flat_mask]
-        agent_indices = torch.arange(M, device=self.device).view(1, M).expand(B, -1).flatten().unsqueeze(-1).expand(-1, max_cells_per_agent).flatten()[valid_flat_mask]
-        cell_indices = cell_ids.flatten()[valid_flat_mask]
+        valid_flat_indices = valid_cell_mask.flatten().nonzero(as_tuple=False).squeeze(-1)
+        flat_agent_positions = torch.div(valid_flat_indices, max_cells_per_agent, rounding_mode='floor')
+        batch_indices = torch.div(flat_agent_positions, M, rounding_mode='floor')
+        agent_indices = flat_agent_positions - batch_indices * M
+        cell_indices = cell_ids.flatten()[valid_flat_indices]
+        self._profile_record(profile, 'cell_build_ms', cell_build_start, profile_cuda_sync)
+        if profile is not None:
+            profile['occupancy_entries'] = int(cell_indices.numel())
 
         debug_info = None
         if debug:
@@ -177,43 +222,84 @@ class SpatialHash:
 
         # 向量化分组与配对：避免 per-batch 循环和巨大矩阵
         # 1) 将占用条目按 (batch, cell) 分组
-        group_keys = batch_indices.long() * self.grid_total_cells + cell_indices.long()
+        sort_group_start = self._profile_now(profile_cuda_sync) if profile is not None else 0.0
+        group_keys = batch_indices.long() * self.grid_total_cells_int + cell_indices.long()
         sort_idx = torch.argsort(group_keys)
         sorted_keys = group_keys[sort_idx]
         sorted_batches = batch_indices[sort_idx]
         sorted_agents = agent_indices[sort_idx]
 
         if sorted_keys.numel() == 0:
+            self._profile_record(profile, 'sort_group_ms', sort_group_start, profile_cuda_sync)
             return empty, empty, empty, debug_info
 
         all_keys, all_counts = torch.unique_consecutive(sorted_keys, return_counts=True)
-        valid_groups_mask = all_counts >= 2
-        if not valid_groups_mask.any():
+        if profile is not None:
+            profile['num_cell_groups'] = int(all_counts.numel())
+        valid_group_indices = (all_counts >= 2).nonzero(as_tuple=False).squeeze(-1)
+        if valid_group_indices.numel() == 0:
+            self._profile_record(profile, 'sort_group_ms', sort_group_start, profile_cuda_sync)
             return empty, empty, empty, debug_info
 
-        group_counts = all_counts[valid_groups_mask]
+        group_counts = all_counts[valid_group_indices]
         group_starts_all = torch.cumsum(torch.nn.functional.pad(all_counts, (1, 0)), dim=0)[:-1]
-        group_starts = group_starts_all[valid_groups_mask]
+        group_starts = group_starts_all[valid_group_indices]
 
         # 2) 为每个分组生成无序对 (i<j)，完全向量化
         max_group_size = int(group_counts.max().item())
+        if profile is not None:
+            profile['max_group_size'] = max_group_size
+        self._profile_record(profile, 'sort_group_ms', sort_group_start, profile_cuda_sync)
+
+        pair_gen_start = self._profile_now(profile_cuda_sync) if profile is not None else 0.0
         tri = torch.triu_indices(max_group_size, max_group_size, offset=1, device=self.device)
         tri_i, tri_j = tri[0], tri[1]
-        valid_pair_mask = (tri_i.unsqueeze(0) < group_counts.unsqueeze(1)) & (tri_j.unsqueeze(0) < group_counts.unsqueeze(1))
-        if not valid_pair_mask.any():
+        tri_pair_count = int(tri_i.numel())
+        if tri_pair_count == 0:
+            self._profile_record(profile, 'pair_gen_ms', pair_gen_start, profile_cuda_sync)
             return empty, empty, empty, debug_info
 
-        pos_i = group_starts.unsqueeze(1) + tri_i.unsqueeze(0)
-        pos_j = group_starts.unsqueeze(1) + tri_j.unsqueeze(0)
-        flat_mask = valid_pair_mask.flatten()
-        flat_i = pos_i.flatten()[flat_mask]
-        flat_j = pos_j.flatten()[flat_mask]
+        target_pairs_per_chunk = max(1, int(pair_gen_chunk_pairs))
+        groups_per_chunk = max(1, target_pairs_per_chunk // max(1, tri_pair_count))
+        pair_batches_chunks = []
+        agents_i_chunks = []
+        agents_j_chunks = []
+        num_valid_groups = int(group_counts.numel())
 
-        pair_batches = sorted_batches[flat_i]
-        agents_i = sorted_agents[flat_i]
-        agents_j = sorted_agents[flat_j]
+        for group_start_idx in range(0, num_valid_groups, groups_per_chunk):
+            group_end_idx = min(group_start_idx + groups_per_chunk, num_valid_groups)
+            counts_chunk = group_counts[group_start_idx:group_end_idx]
+            starts_chunk = group_starts[group_start_idx:group_end_idx]
+            valid_pair_mask = (
+                (tri_i.unsqueeze(0) < counts_chunk.unsqueeze(1))
+                & (tri_j.unsqueeze(0) < counts_chunk.unsqueeze(1))
+            )
+            valid_pair_positions = valid_pair_mask.flatten().nonzero(as_tuple=False).squeeze(-1)
+            if valid_pair_positions.numel() == 0:
+                continue
+
+            local_group_idx = torch.div(valid_pair_positions, tri_pair_count, rounding_mode='floor')
+            local_pair_idx = valid_pair_positions - local_group_idx * tri_pair_count
+            flat_i = starts_chunk[local_group_idx] + tri_i[local_pair_idx]
+            flat_j = starts_chunk[local_group_idx] + tri_j[local_pair_idx]
+
+            pair_batches_chunks.append(sorted_batches[flat_i])
+            agents_i_chunks.append(sorted_agents[flat_i])
+            agents_j_chunks.append(sorted_agents[flat_j])
+
+        if not pair_batches_chunks:
+            self._profile_record(profile, 'pair_gen_ms', pair_gen_start, profile_cuda_sync)
+            return empty, empty, empty, debug_info
+
+        pair_batches = torch.cat(pair_batches_chunks, dim=0)
+        agents_i = torch.cat(agents_i_chunks, dim=0)
+        agents_j = torch.cat(agents_j_chunks, dim=0)
+        if profile is not None:
+            profile['pairs_before_dedup'] = int(pair_batches.numel())
+        self._profile_record(profile, 'pair_gen_ms', pair_gen_start, profile_cuda_sync)
 
         # 3) 对对儿进行归一化并去重（同一对可出现在多个cell）
+        dedup_start = self._profile_now(profile_cuda_sync) if profile is not None else 0.0
         a_min = torch.minimum(agents_i, agents_j)
         a_max = torch.maximum(agents_i, agents_j)
         pair_key = pair_batches.long() * (M * M) + a_min.long() * M + a_max.long()
@@ -226,6 +312,9 @@ class SpatialHash:
         pair_batches = pair_batches[unique_idx_sorted]
         a_min = a_min[unique_idx_sorted]
         a_max = a_max[unique_idx_sorted]
+        if profile is not None:
+            profile['unique_pairs'] = int(pair_batches.numel())
+        self._profile_record(profile, 'dedup_ms', dedup_start, profile_cuda_sync)
 
         return pair_batches, a_min, a_max, debug_info
     

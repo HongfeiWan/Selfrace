@@ -439,15 +439,13 @@ class TeraflowSimulator:
         collision_exclude_mask = offroad_mask
         if hasattr(self, 'last_done') and self.last_done is not None:
             collision_exclude_mask = collision_exclude_mask | self.last_done
-        states_t0_for_collision = states_t0.clone()
-        states_t1_for_collision = self.agents_state.clone()
-        states_t0_for_collision[..., 6] = torch.where(collision_exclude_mask, 0.0, states_t0_for_collision[..., 6])
-        states_t1_for_collision[..., 6] = torch.where(collision_exclude_mask, 0.0, states_t1_for_collision[..., 6])
+        collision_active_mask = active_mask & (~collision_exclude_mask)
         
         collision_check_result = self.collision_checker.check(
-            states_t0_for_collision, states_t1_for_collision, debug=debug_collision, debug_env_idx=0
+            states_t0, self.agents_state, debug=debug_collision, debug_env_idx=0,
+            active_mask_override=collision_active_mask, profile=profile
         )
-        all_collisions = collision_check_result
+        all_collisions = collision_check_result[0] if isinstance(collision_check_result, tuple) else collision_check_result
         profile_cursor = self._profile_record(profile, 'collision_ms', profile_cursor)
 
         # 4. 计算Frenet坐标信息

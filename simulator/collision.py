@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from typing import Dict, Tuple, Optional, List
 import logging
+import time
 import os
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -79,17 +80,35 @@ class CollisionChecker:
         max_span = int(max_dim_safety / self.cell_size) + 2 # +2 确保覆盖边界情况
         self.max_cells_per_agent = max_span * max_span
         self.max_neighbors = config.get('max_neighbors', 30)
+        self.narrow_chunk_pairs = int(simulator_config.get('collision_narrow_chunk_pairs', 524288))
+        self.pair_gen_chunk_pairs = int(simulator_config.get('collision_pair_gen_chunk_pairs', 1048576))
+        profile_config = config.get('training', {}).get('profile', {})
+        self.profile_cuda_sync = bool(profile_config.get('cuda_sync', False))
         
         #print(f"Collision checker initialized.")
         print(f"Grid dimensions: {self.grid_width}x{self.grid_height}, Calculated cell size: {self.cell_size:.2f}m")
         print(f"Max cells per agent conservatively estimated to: {self.max_cells_per_agent}")
+
+    def _profile_now(self) -> float:
+        if self.profile_cuda_sync and self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+        return time.time()
+
+    def _profile_record(self, profile: Optional[Dict], name: str, start_time: float) -> float:
+        if profile is None:
+            return start_time
+        now = self._profile_now()
+        profile[name] = (now - start_time) * 1000.0
+        return now
 
     def check(self,
               states_t0: torch.Tensor,
               states_t1: torch.Tensor,
               static_obstacles: Optional[torch.Tensor] = None,
               debug: bool = False,
-              debug_env_idx: int = 0) -> torch.Tensor:
+              debug_env_idx: int = 0,
+              active_mask_override: Optional[torch.Tensor] = None,
+              profile: Optional[Dict] = None) -> torch.Tensor:
         """
         目的: 作为主入口函数，对一批智能体的状态进行完整的碰撞检测。
 
@@ -106,16 +125,25 @@ class CollisionChecker:
         states_t0 = states_t0.to(self.device)
         states_t1 = states_t1.to(self.device)
         
-        active_mask = states_t1[..., 6] > 0.5
+        if active_mask_override is None:
+            active_mask = states_t1[..., 6] > 0.5
+        else:
+            active_mask = active_mask_override.to(self.device, dtype=torch.bool)
+        if profile is not None:
+            profile['active_agents'] = int(active_mask.sum().item())
+        vertex_start = self._profile_now() if profile is not None else 0.0
         verts_t0 = self._get_world_vertices(states_t0)
         verts_t1 = self._get_world_vertices(states_t1)
+        self._profile_record(profile, 'vertex_ms', vertex_start)
 
         candidate_pairs, broad_phase_debug_info = self._broad_phase_vectorized(
-            active_mask, verts_t0, verts_t1, debug=debug, debug_env_idx=debug_env_idx
+            active_mask, verts_t0, verts_t1, debug=debug, debug_env_idx=debug_env_idx,
+            profile=profile
         )
         
         dynamic_collisions = self._narrow_phase_vectorized(
-            candidate_pairs, active_mask, states_t0, states_t1, verts_t0, verts_t1
+            candidate_pairs, active_mask, states_t0, states_t1, verts_t0, verts_t1,
+            profile=profile
         )
 
         final_collisions = dynamic_collisions
@@ -136,19 +164,23 @@ class CollisionChecker:
 
     def _broad_phase_vectorized(self, active_mask: torch.Tensor,
                                 verts_t0: torch.Tensor, verts_t1: torch.Tensor,
-                                debug: bool = False, debug_env_idx: int = 0) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Optional[Dict]]:
+                                debug: bool = False, debug_env_idx: int = 0,
+                                profile: Optional[Dict] = None) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Optional[Dict]]:
         """
         目的: 调用共享的空间哈希对象来高效地找出所有可能发生碰撞的智能体对。
         """
         B, M, _, _ = verts_t0.shape
         pair_batches, agent_i, agent_j, debug_info = self.spatial_hash.query_dynamic_pair_list(
-            B, M, active_mask, verts_t0, verts_t1, debug=debug, debug_env_idx=debug_env_idx
+            B, M, active_mask, verts_t0, verts_t1, debug=debug, debug_env_idx=debug_env_idx,
+            profile=profile, profile_cuda_sync=self.profile_cuda_sync,
+            pair_gen_chunk_pairs=self.pair_gen_chunk_pairs
         )
         return (pair_batches, agent_i, agent_j), debug_info
 
     def _narrow_phase_vectorized(self, sparse_pairs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
                                  active_mask: torch.Tensor, states_t0: torch.Tensor, states_t1: torch.Tensor,
-                                 verts_t0: torch.Tensor, verts_t1: torch.Tensor) -> torch.Tensor:
+                                 verts_t0: torch.Tensor, verts_t1: torch.Tensor,
+                                 profile: Optional[Dict] = None) -> torch.Tensor:
         """
         目的: 对宽阶段筛选出的候选对进行精确的连续碰撞检测。
 
@@ -165,6 +197,10 @@ class CollisionChecker:
             - 将计算出的碰撞结果（一个布尔列表）并行地写回到结果张量中对应的智能体位置。
         """
         B, M = active_mask.shape
+        narrow_start = self._profile_now() if profile is not None else 0.0
+        if profile is not None:
+            profile.setdefault('scatter_ms', 0.0)
+            profile.setdefault('colliding_pairs', 0)
 
         # 确保所有输入张量都在正确的设备上
         active_mask = active_mask.to(self.device)
@@ -180,24 +216,50 @@ class CollisionChecker:
             k_idx_flat = k_idx_flat[valid_mask]
 
         if j_idx_flat.numel() == 0:
+            self._profile_record(profile, 'narrow_ms', narrow_start)
             return torch.zeros((B, M), dtype=torch.bool, device=self.device)
 
-        j_states_t0, j_states_t1 = states_t0[batch_idx_flat, j_idx_flat], states_t1[batch_idx_flat, j_idx_flat]
-        j_verts_t0, j_verts_t1 = verts_t0[batch_idx_flat, j_idx_flat], verts_t1[batch_idx_flat, j_idx_flat]
-        k_states_t0, k_states_t1 = states_t0[batch_idx_flat, k_idx_flat], states_t1[batch_idx_flat, k_idx_flat]
-        k_verts_t0, k_verts_t1 = verts_t0[batch_idx_flat, k_idx_flat], verts_t1[batch_idx_flat, k_idx_flat]
-
-        coll_1 = self._check_one_way_collision(j_states_t0, j_states_t1, k_verts_t0, k_verts_t1)
-        coll_2 = self._check_one_way_collision(k_states_t0, k_states_t1, j_verts_t0, j_verts_t1)
-        pair_collisions = torch.logical_or(coll_1, coll_2)
-
         collisions = torch.zeros((B, M), dtype=torch.bool, device=self.device)
-        colliding_batch_idx = batch_idx_flat[pair_collisions]
-        colliding_j_idx = j_idx_flat[pair_collisions]
-        colliding_k_idx = k_idx_flat[pair_collisions]
+        num_pairs = int(j_idx_flat.numel())
+        chunk_size = num_pairs if self.narrow_chunk_pairs <= 0 else min(self.narrow_chunk_pairs, num_pairs)
+        colliding_pairs = 0
+        scatter_ms = 0.0
 
-        collisions.index_put_((colliding_batch_idx, colliding_j_idx), torch.tensor(True, device=self.device))
-        collisions.index_put_((colliding_batch_idx, colliding_k_idx), torch.tensor(True, device=self.device))
+        for start in range(0, num_pairs, chunk_size):
+            end = min(start + chunk_size, num_pairs)
+            batch_chunk = batch_idx_flat[start:end]
+            j_chunk = j_idx_flat[start:end]
+            k_chunk = k_idx_flat[start:end]
+
+            j_states_t0 = states_t0[batch_chunk, j_chunk]
+            j_states_t1 = states_t1[batch_chunk, j_chunk]
+            j_verts_t0 = verts_t0[batch_chunk, j_chunk]
+            j_verts_t1 = verts_t1[batch_chunk, j_chunk]
+            k_states_t0 = states_t0[batch_chunk, k_chunk]
+            k_states_t1 = states_t1[batch_chunk, k_chunk]
+            k_verts_t0 = verts_t0[batch_chunk, k_chunk]
+            k_verts_t1 = verts_t1[batch_chunk, k_chunk]
+
+            coll_1 = self._check_one_way_collision(j_states_t0, j_states_t1, k_verts_t0, k_verts_t1)
+            coll_2 = self._check_one_way_collision(k_states_t0, k_states_t1, j_verts_t0, j_verts_t1)
+            pair_collisions = torch.logical_or(coll_1, coll_2)
+            if profile is not None:
+                colliding_pairs += int(pair_collisions.sum().item())
+
+            colliding_batch_idx = batch_chunk[pair_collisions]
+            colliding_j_idx = j_chunk[pair_collisions]
+            colliding_k_idx = k_chunk[pair_collisions]
+
+            scatter_start = self._profile_now() if profile is not None else 0.0
+            collisions[colliding_batch_idx, colliding_j_idx] = True
+            collisions[colliding_batch_idx, colliding_k_idx] = True
+            if profile is not None:
+                scatter_ms += (self._profile_now() - scatter_start) * 1000.0
+
+        if profile is not None:
+            profile['scatter_ms'] = scatter_ms
+            profile['colliding_pairs'] = colliding_pairs
+        self._profile_record(profile, 'narrow_ms', narrow_start)
         
         return collisions
     
