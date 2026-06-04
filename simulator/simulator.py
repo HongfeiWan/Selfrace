@@ -202,26 +202,37 @@ class TeraflowSimulator:
             torch.rand((self.num_envs, self.num_traffic_controls), device=self.device) < self.red_light_probability
         )
 
-    def _red_stop_line_mask(self, batch_size: int) -> torch.Tensor:
+    def _red_stop_line_mask(self, batch_size: int, traffic_light_states: torch.Tensor = None) -> torch.Tensor:
         """返回每个环境中每条停止线当前是否对应红灯，形状 (B, S)。"""
         S = self.stop_line_segments.shape[0]
         if S == 0:
             return torch.empty((batch_size, 0), dtype=torch.bool, device=self.device)
-        if self.traffic_light_states is None or self.traffic_light_states.numel() == 0:
+        traffic_light_states = self.traffic_light_states if traffic_light_states is None else traffic_light_states
+        if traffic_light_states is None or traffic_light_states.numel() == 0:
             return torch.zeros((batch_size, S), dtype=torch.bool, device=self.device)
-        control_idx = torch.clamp(self.stop_line_control_indices, 0, self.traffic_light_states.shape[1] - 1)
-        return self.traffic_light_states[:batch_size, control_idx]
+        traffic_light_states = traffic_light_states.to(device=self.device, dtype=torch.bool)
+        control_idx = torch.clamp(self.stop_line_control_indices, 0, traffic_light_states.shape[1] - 1)
+        return traffic_light_states[:batch_size, control_idx]
 
-    def _compute_stop_line_observation(self, agents_state: torch.Tensor) -> torch.Tensor:
+    def _compute_stop_line_observation(
+        self,
+        agents_state: torch.Tensor,
+        traffic_light_states: torch.Tensor = None,
+        out: torch.Tensor = None,
+    ) -> torch.Tensor:
         """构造局部坐标下的红灯停止线观测，形状 (B, M, stop_line_feature_dim)。"""
         B, M, _ = agents_state.shape
-        out = torch.zeros((B, M, self.stop_line_feature_dim), dtype=agents_state.dtype, device=self.device)
+        expected_shape = (B, M, self.stop_line_feature_dim)
+        if out is None or out.shape != expected_shape or out.device != agents_state.device or out.dtype != agents_state.dtype:
+            out = torch.zeros(expected_shape, dtype=agents_state.dtype, device=agents_state.device)
+        else:
+            out.zero_()
         S = self.stop_line_segments.shape[0]
         max_lines = min(self.stop_line_observation_count, self.stop_line_feature_dim // 4)
         if S == 0 or max_lines <= 0:
             return out
 
-        red_mask = self._red_stop_line_mask(B)
+        red_mask = self._red_stop_line_mask(B, traffic_light_states=traffic_light_states)
         centers = self.stop_line_segments.mean(dim=1)
         ego_pos = agents_state[..., :2]
         dist_sq = (ego_pos.unsqueeze(2) - centers.view(1, 1, S, 2)).pow(2).sum(dim=-1)
@@ -829,6 +840,7 @@ class TeraflowSimulator:
         route_state: Optional[Dict[str, torch.Tensor]] = None,
         w_lane_keep_mask: torch.Tensor = None,
         w_lane_ids: torch.Tensor = None,
+        out: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Build the paper-style navigation observation package.
@@ -845,7 +857,12 @@ class TeraflowSimulator:
         B, M, _ = agents_state.shape
         goal_slots = self.max_route_targets
         lane_slots = self.observation_generator.num_w_lanes
-        navigation = torch.zeros((B, M, goal_slots + lane_slots, 3), dtype=agents_state.dtype, device=self.device)
+        expected_shape = (B, M, goal_slots + lane_slots, 3)
+        if out is None or out.shape != expected_shape or out.device != agents_state.device or out.dtype != agents_state.dtype:
+            navigation = torch.zeros(expected_shape, dtype=agents_state.dtype, device=agents_state.device)
+        else:
+            navigation = out
+            navigation.zero_()
 
         goals_local, goals_valid = self._remaining_route_goals_local(agents_state, route_state=route_state)
         navigation[:, :, :goal_slots, :2] = goals_local

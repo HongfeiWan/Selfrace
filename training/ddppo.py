@@ -200,33 +200,137 @@ def normalize_to_minus1_1(x: torch.Tensor, min_val, max_val) -> torch.Tensor:
 
 FEATURE_PAD_VALUE = -2.0
 
-def pad_or_truncate_flat(flat: torch.Tensor, target_size: int, pad_value: float = 0.0) -> torch.Tensor:
+class FeatureBuildWorkspace:
+    """Long-lived scratch/cache for feature construction hot paths."""
+
+    def __init__(self, config: SimpleNamespace = None):
+        self._bounds_cache = {}
+        self._arange_cache = {}
+        self._scratch = {}
+        self.feature_chunks = 0
+        if config is not None:
+            self.configure(config)
+
+    def configure(self, config: SimpleNamespace):
+        network_config = config.training.network
+        self.simple_feature_dims = list(network_config.simple_feature_dims)
+        self.permutation_feature_dims = list(network_config.permutation_feature_dims)
+        self.permutation_element_dims = list(getattr(network_config, 'permutation_element_dims', [2, 7, 2, 7]))
+        self.simple_end = sum(self.simple_feature_dims)
+        self.total_input_dim = self.simple_end + sum(self.permutation_feature_dims)
+
+    def reset_counters(self):
+        self.feature_chunks = 0
+
+    def mark_feature_chunk(self):
+        self.feature_chunks += 1
+
+    def bounds(self, name: str, dtype: torch.dtype, device: torch.device):
+        key = (name, dtype, device)
+        cached = self._bounds_cache.get(key)
+        if cached is not None:
+            return cached
+        if name == 's13':
+            bounds = (
+                (-5.0, 5.0), (-math.pi, math.pi), (-0.2, 0.2), (-2.0, 30.0), (0.0, 30.0),
+                (-0.7, 0.7), (-5.0, 5.0), (-4.0, 4.0),
+                (1 / 1.5, 1.5), (1 / 1.25, 1.25), (1 / 1.25, 1.25),
+                (0.8, 7.0), (0.8, 3.0),
+            )
+        elif name == 'reward':
+            bounds = (
+                (2, 12), (0, 3), (0, 3), (0, 0.1), (0.00025, 0.025),
+                (0, 1), (0.00025, 0.0075), (-0.5, 0.5), (0.00025, 0.0075), (0, 1),
+            )
+        elif name == 'style':
+            bounds = ((1 / 1.25, 1.25), (1 / 1.25, 1.25), (1 / 1.5, 1.5), (1 / 1.5, 1.5))
+        else:
+            raise KeyError(f"unknown feature bounds: {name}")
+        min_t = torch.tensor([lo for lo, _ in bounds], device=device, dtype=dtype)
+        max_t = torch.tensor([hi for _, hi in bounds], device=device, dtype=dtype)
+        self._bounds_cache[key] = (min_t, max_t)
+        return min_t, max_t
+
+    def arange(self, n: int, device: torch.device, dtype: torch.dtype = torch.long):
+        key = (int(n), device, dtype)
+        cached = self._arange_cache.get(key)
+        if cached is None:
+            cached = torch.arange(int(n), device=device, dtype=dtype)
+            self._arange_cache[key] = cached
+        return cached
+
+    def scratch(self, name: str, shape, device: torch.device, dtype: torch.dtype, fill_value=None) -> torch.Tensor:
+        shape = tuple(int(dim) for dim in shape)
+        cached = self._scratch.get(name)
+        reuse = (
+            cached is not None
+            and cached.device == device
+            and cached.dtype == dtype
+            and cached.dim() == len(shape)
+            and all(int(cached.shape[i]) >= shape[i] for i in range(len(shape)))
+        )
+        if not reuse:
+            cached = torch.empty(shape, device=device, dtype=dtype)
+            self._scratch[name] = cached
+        view = cached[tuple(slice(0, dim) for dim in shape)]
+        if fill_value is not None:
+            view.fill_(fill_value)
+        return view
+
+
+def _default_workspace(config: SimpleNamespace = None) -> FeatureBuildWorkspace:
+    workspace = FeatureBuildWorkspace(config) if config is not None else FeatureBuildWorkspace()
+    return workspace
+
+
+def pad_or_truncate_flat(flat: torch.Tensor, target_size: int, pad_value: float = 0.0,
+                         out: torch.Tensor = None) -> torch.Tensor:
     B, M, D = flat.shape
-    out = torch.full((B, M, target_size), pad_value, device=flat.device, dtype=flat.dtype)
+    if out is None:
+        out = torch.full((B, M, target_size), pad_value, device=flat.device, dtype=flat.dtype)
+    else:
+        out.fill_(pad_value)
     copy_size = min(D, target_size)
     if copy_size > 0:
         out[:, :, :copy_size] = flat[:, :, :copy_size]
     return out
 
 def normalize_point_set(points: torch.Tensor, target_size: int, element_dim: int = 2,
-                        min_val: float = -100.0, max_val: float = 100.0) -> torch.Tensor:
+                        min_val: float = -100.0, max_val: float = 100.0,
+                        out: torch.Tensor = None) -> torch.Tensor:
     if points is None or points.numel() == 0:
+        if out is not None:
+            out.fill_(FEATURE_PAD_VALUE)
+            return out
         return None
     if points.dim() == 3:
         B, M, N = points.shape
         elements = points.view(B, M, N // element_dim, element_dim)
     else:
         elements = points
+    B, M, num_elements, _ = elements.shape
+    if out is None:
+        out = torch.empty((B, M, target_size), device=elements.device, dtype=elements.dtype)
+    out.fill_(FEATURE_PAD_VALUE)
+    max_elements = min(num_elements, target_size // max(1, element_dim))
+    if max_elements <= 0:
+        return out
+    elements = elements[:, :, :max_elements]
     valid = torch.isfinite(elements).all(dim=-1) & (elements.abs().sum(dim=-1) > 1e-6)
     normalized = normalize_to_minus1_1(torch.nan_to_num(elements, nan=0.0, posinf=max_val, neginf=min_val), min_val, max_val)
-    normalized = torch.where(valid.unsqueeze(-1), normalized, torch.full_like(normalized, FEATURE_PAD_VALUE))
-    return pad_or_truncate_flat(normalized.flatten(start_dim=2), target_size, FEATURE_PAD_VALUE)
+    target = out[:, :, :max_elements * element_dim].view(B, M, max_elements, element_dim)
+    target.copy_(torch.where(valid.unsqueeze(-1), normalized, torch.full_like(normalized, FEATURE_PAD_VALUE)))
+    return out
 
 def normalize_s_features(s_t: torch.Tensor, target_size: int, vehicle_style: torch.Tensor = None,
-                         control_state: torch.Tensor = None) -> torch.Tensor:
+                         control_state: torch.Tensor = None, workspace: FeatureBuildWorkspace = None,
+                         out: torch.Tensor = None) -> torch.Tensor:
     """原文式 S(t): c,theta,kappa,v,v_lim,phi,a_long,a_lat,Cacc,Cthrottle,Csteer,l,w。"""
     B, M, _ = s_t.shape
-    out = torch.zeros(B, M, target_size, device=s_t.device, dtype=s_t.dtype)
+    if out is None:
+        out = torch.zeros(B, M, target_size, device=s_t.device, dtype=s_t.dtype)
+    else:
+        out.zero_()
     copy = min(s_t.shape[-1], target_size)
     if copy > 0:
         out[:, :, :copy] = s_t[:, :, :copy]
@@ -240,18 +344,17 @@ def normalize_s_features(s_t: torch.Tensor, target_size: int, vehicle_style: tor
         out[:, :, 10] = vehicle_style[:, :, 1]  # Csteer
 
     if target_size >= 13:
-        normalized = torch.empty_like(out)
-        bounds = (
-            (-5.0, 5.0), (-math.pi, math.pi), (-0.2, 0.2), (-2.0, 30.0), (0.0, 30.0),
-            (-0.7, 0.7), (-5.0, 5.0), (-4.0, 4.0),
-            (1 / 1.5, 1.5), (1 / 1.25, 1.25), (1 / 1.25, 1.25),
-            (0.8, 7.0), (0.8, 3.0),
+        normalized = out.clone() if out is not None else torch.empty_like(out)
+        workspace = workspace or _default_workspace()
+        bounds_min, bounds_max = workspace.bounds('s13', out.dtype, out.device)
+        copy_bounds = min(target_size, bounds_min.numel())
+        normalized[:, :, :copy_bounds] = normalize_to_minus1_1(
+            out[:, :, :copy_bounds],
+            bounds_min[:copy_bounds],
+            bounds_max[:copy_bounds],
         )
-        for i in range(target_size):
-            if i < len(bounds):
-                normalized[:, :, i] = normalize_to_minus1_1(out[:, :, i], *bounds[i])
-            else:
-                normalized[:, :, i] = out[:, :, i]
+        if target_size > copy_bounds:
+            normalized[:, :, copy_bounds:] = out[:, :, copy_bounds:]
         return normalized
 
     # 兼容旧7维 local state。
@@ -278,9 +381,12 @@ def _is_navigation_packet(navigation: torch.Tensor) -> bool:
 
 def build_lane_map_features(w_lanes_local: torch.Tensor, navigation: torch.Tensor,
                             target_size: int, element_dim: int = 7,
-                            goal_slots: int = 0) -> torch.Tensor:
+                            goal_slots: int = 0, out: torch.Tensor = None) -> torch.Tensor:
     """构造原文式 W_lane: 位置、车道方向、车道宽度、到下一目标的绝对/相对距离。"""
     if w_lanes_local is None or w_lanes_local.numel() == 0:
+        if out is not None:
+            out.fill_(FEATURE_PAD_VALUE)
+            return out
         return None
     lanes = w_lanes_local
     if lanes.dim() == 3:
@@ -293,6 +399,14 @@ def build_lane_map_features(w_lanes_local: torch.Tensor, navigation: torch.Tenso
             raw_dim = lanes.shape[-1]
         lanes = lanes.view(B, M, N // raw_dim, raw_dim)
     B, M, K, raw_dim = lanes.shape
+    if out is None:
+        out = torch.empty((B, M, target_size), device=lanes.device, dtype=lanes.dtype)
+    out.fill_(FEATURE_PAD_VALUE)
+    K_eff = min(K, target_size // max(1, element_dim))
+    if K_eff <= 0:
+        return out
+    lanes = lanes[:, :, :K_eff]
+    K = K_eff
     lane_xy = lanes[..., :2]
     valid = torch.isfinite(lane_xy).all(dim=-1)
 
@@ -342,24 +456,24 @@ def build_lane_map_features(w_lanes_local: torch.Tensor, navigation: torch.Tenso
         min_goal_dist = torch.where(torch.isfinite(min_goal_dist), min_goal_dist, torch.zeros_like(min_goal_dist))
         rel_goal_dist = goal_dist - min_goal_dist.unsqueeze(-1)
 
-    out = torch.full((B, M, K, element_dim), FEATURE_PAD_VALUE, device=lanes.device, dtype=lanes.dtype)
+    lane_out = out[:, :, :K * element_dim].view(B, M, K, element_dim)
     if element_dim > 0:
-        out[..., 0] = normalize_to_minus1_1(lane_xy[..., 0], -200, 200)
+        lane_out[..., 0] = normalize_to_minus1_1(lane_xy[..., 0], -200, 200)
     if element_dim > 1:
-        out[..., 1] = normalize_to_minus1_1(lane_xy[..., 1], -200, 200)
+        lane_out[..., 1] = normalize_to_minus1_1(lane_xy[..., 1], -200, 200)
     if element_dim > 2:
         dir_end = min(element_dim, 4)
-        out[..., 2:dir_end] = lane_dir[..., :dir_end - 2]
+        lane_out[..., 2:dir_end] = lane_dir[..., :dir_end - 2]
     if element_dim > 4:
-        out[..., 4] = normalize_to_minus1_1(lane_width, 0.0, 8.0)
+        lane_out[..., 4] = normalize_to_minus1_1(lane_width, 0.0, 8.0)
     if element_dim > 5:
         goal_dist_norm = normalize_to_minus1_1(goal_dist, 0.0, 400.0)
-        out[..., 5] = torch.where(distance_valid, goal_dist_norm, torch.full_like(goal_dist_norm, FEATURE_PAD_VALUE))
+        lane_out[..., 5] = torch.where(distance_valid, goal_dist_norm, torch.full_like(goal_dist_norm, FEATURE_PAD_VALUE))
     if element_dim > 6:
         rel_goal_dist_norm = normalize_to_minus1_1(rel_goal_dist, 0.0, 200.0)
-        out[..., 6] = torch.where(distance_valid, rel_goal_dist_norm, torch.full_like(rel_goal_dist_norm, FEATURE_PAD_VALUE))
-    out = torch.where(valid.unsqueeze(-1), out, torch.full_like(out, FEATURE_PAD_VALUE))
-    return pad_or_truncate_flat(out.flatten(start_dim=2), target_size, FEATURE_PAD_VALUE)
+        lane_out[..., 6] = torch.where(distance_valid, rel_goal_dist_norm, torch.full_like(rel_goal_dist_norm, FEATURE_PAD_VALUE))
+    lane_out.masked_fill_(~valid.unsqueeze(-1), FEATURE_PAD_VALUE)
+    return out
 
 def build_network_features(agents_state: torch.Tensor, 
                            neighbors_local: torch.Tensor, 
@@ -371,7 +485,9 @@ def build_network_features(agents_state: torch.Tensor,
                            config: SimpleNamespace,
                            vehicle_style: torch.Tensor = None,
                            control_state: torch.Tensor = None,
-                           map_dropout: dict = None) -> torch.Tensor:
+                           map_dropout: dict = None,
+                           workspace: FeatureBuildWorkspace = None,
+                           out: torch.Tensor = None) -> torch.Tensor:
     """
     将拆解后的观测组件构建为网络输入的特征张量
     Args:
@@ -387,23 +503,37 @@ def build_network_features(agents_state: torch.Tensor,
         torch.Tensor: 形状为 (B, M, total_input_dim) 的网络输入特征张量
     """
     batch_size, max_agents, _ = agents_state.shape
+    if workspace is None:
+        workspace = _default_workspace(config)
+    elif not hasattr(workspace, 'total_input_dim'):
+        workspace.configure(config)
     w_lanes_local, w_boundaries_local = apply_map_dropout_components(
         w_lanes_local,
         w_boundaries_local,
         map_dropout,
+        inplace=True,
     )
     
     # 从配置中获取网络需要的特征维度
-    network_config = config.training.network
-    simple_feature_dims = network_config.simple_feature_dims
-    permutation_feature_dims = network_config.permutation_feature_dims
-    permutation_element_dims = getattr(network_config, 'permutation_element_dims', [2, 7, 2, 7])
+    simple_feature_dims = workspace.simple_feature_dims
+    permutation_feature_dims = workspace.permutation_feature_dims
+    permutation_element_dims = workspace.permutation_element_dims
     
     # 计算总输入维度
-    total_input_dim = sum(simple_feature_dims) + sum(permutation_feature_dims)
+    total_input_dim = workspace.total_input_dim
     
     # 初始化输出张量
-    features_tensor = torch.zeros(batch_size, max_agents, total_input_dim, device=agents_state.device, dtype=agents_state.dtype)
+    if out is None:
+        features_tensor = workspace.scratch(
+            'network_features',
+            (batch_size, max_agents, total_input_dim),
+            agents_state.device,
+            agents_state.dtype,
+            fill_value=0.0,
+        )
+    else:
+        features_tensor = out
+        features_tensor.zero_()
     
     # 1. 构建简单特征：S(t), 显式 G(t), reward 参数和车辆风格参数。
     simple_end = sum(simple_feature_dims)
@@ -420,6 +550,8 @@ def build_network_features(agents_state: torch.Tensor,
         s_t_size,
         vehicle_style=vehicle_style,
         control_state=control_state,
+        workspace=workspace,
+        out=features_tensor[:, :, s_t_start:s_t_end],
     )
     simple_offset += 1
     feature_cursor = s_t_end
@@ -429,16 +561,23 @@ def build_network_features(agents_state: torch.Tensor,
         g_t_start = feature_cursor
         g_t_end = g_t_start + g_t_size
         if navigation is None:
-            goal_vector = torch.zeros(batch_size, max_agents, g_t_size, device=agents_state.device, dtype=agents_state.dtype)
+            goal_vector = features_tensor[:, :, g_t_start:g_t_end]
+            goal_vector.zero_()
         elif _is_navigation_packet(navigation):
             nav = navigation.to(device=agents_state.device, dtype=agents_state.dtype)
             goal_slots = max(1, g_t_size // 2)
             goal_rows = nav[:, :, :goal_slots, :]
             goal_valid = goal_rows[..., 2] > 0.5
             goal_xy = torch.where(goal_valid.unsqueeze(-1), goal_rows[..., :2], torch.zeros_like(goal_rows[..., :2]))
-            goal_vector = pad_or_truncate_flat(goal_xy.flatten(start_dim=2), g_t_size, pad_value=0.0)
+            goal_vector = pad_or_truncate_flat(
+                goal_xy.flatten(start_dim=2),
+                g_t_size,
+                pad_value=0.0,
+                out=features_tensor[:, :, g_t_start:g_t_end],
+            )
         else:
-            goal_vector = torch.zeros(batch_size, max_agents, g_t_size, device=agents_state.device, dtype=agents_state.dtype)
+            goal_vector = features_tensor[:, :, g_t_start:g_t_end]
+            goal_vector.zero_()
         goal_vector = normalize_to_minus1_1(goal_vector, -200, 200)
         features_tensor[:, :, g_t_start:g_t_end] = goal_vector
         simple_offset += 1
@@ -450,15 +589,16 @@ def build_network_features(agents_state: torch.Tensor,
     reward_coef_end = reward_coef_start + reward_coef_size
 
     reward_coef = reward_coef.to(device=agents_state.device, dtype=agents_state.dtype)
-    reward_coef_stable = torch.zeros(batch_size, max_agents, reward_coef_size, device=agents_state.device, dtype=agents_state.dtype)
-    reward_bounds = (
-        (2, 12), (0, 3), (0, 3), (0, 0.1), (0.00025, 0.025),
-        (0, 1), (0.00025, 0.0075), (-0.5, 0.5), (0.00025, 0.0075), (0, 1),
-    )
-    copy_reward = min(reward_coef.shape[-1], reward_coef_size, len(reward_bounds))
-    for i in range(copy_reward):
-        reward_coef_stable[:, :, i] = normalize_to_minus1_1(reward_coef[:, :, i], *reward_bounds[i])
-    features_tensor[:, :, reward_coef_start:reward_coef_end] = reward_coef_stable
+    reward_out = features_tensor[:, :, reward_coef_start:reward_coef_end]
+    reward_out.zero_()
+    reward_min, reward_max = workspace.bounds('reward', agents_state.dtype, agents_state.device)
+    copy_reward = min(reward_coef.shape[-1], reward_coef_size, reward_min.numel())
+    if copy_reward > 0:
+        reward_out[:, :, :copy_reward] = normalize_to_minus1_1(
+            reward_coef[:, :, :copy_reward],
+            reward_min[:copy_reward],
+            reward_max[:copy_reward],
+        )
     simple_offset += 1
     feature_cursor = reward_coef_end
 
@@ -470,12 +610,16 @@ def build_network_features(agents_state: torch.Tensor,
         vehicle_style = torch.ones(batch_size, max_agents, vehicle_style_size, device=agents_state.device, dtype=agents_state.dtype)
     else:
         vehicle_style = vehicle_style.to(device=agents_state.device, dtype=agents_state.dtype)
-    vehicle_style_stable = torch.zeros(batch_size, max_agents, vehicle_style_size, device=agents_state.device, dtype=agents_state.dtype)
-    style_bounds = ((1 / 1.25, 1.25), (1 / 1.25, 1.25), (1 / 1.5, 1.5), (1 / 1.5, 1.5))
-    copy_style = min(vehicle_style.shape[-1], vehicle_style_size, len(style_bounds))
-    for i in range(copy_style):
-        vehicle_style_stable[:, :, i] = normalize_to_minus1_1(vehicle_style[:, :, i], *style_bounds[i])
-    features_tensor[:, :, vehicle_style_start:vehicle_style_end] = vehicle_style_stable
+    style_out = features_tensor[:, :, vehicle_style_start:vehicle_style_end]
+    style_out.zero_()
+    style_min, style_max = workspace.bounds('style', agents_state.dtype, agents_state.device)
+    copy_style = min(vehicle_style.shape[-1], vehicle_style_size, style_min.numel())
+    if copy_style > 0:
+        style_out[:, :, :copy_style] = normalize_to_minus1_1(
+            vehicle_style[:, :, :copy_style],
+            style_min[:copy_style],
+            style_max[:copy_style],
+        )
     
     # 2. 构建排列不变特征 (road_boundary, lane_points, stop_lines, other_agents)
     permutation_start = simple_end
@@ -485,11 +629,16 @@ def build_network_features(agents_state: torch.Tensor,
     road_boundary_start = permutation_start
     road_boundary_end = road_boundary_start + road_boundary_size
     
-    w_boundaries_flat = normalize_point_set(w_boundaries_local, road_boundary_size, min_val=-200.0, max_val=200.0)
-    if w_boundaries_flat is not None:
-        features_tensor[:, :, road_boundary_start:road_boundary_end] = w_boundaries_flat
-    else:
-        features_tensor[:, :, road_boundary_start:road_boundary_end] = FEATURE_PAD_VALUE
+    boundary_out = features_tensor[:, :, road_boundary_start:road_boundary_end]
+    w_boundaries_flat = normalize_point_set(
+        w_boundaries_local,
+        road_boundary_size,
+        min_val=-200.0,
+        max_val=200.0,
+        out=boundary_out,
+    )
+    if w_boundaries_flat is None:
+        boundary_out.fill_(FEATURE_PAD_VALUE)
     
     # lane_points: 原文式 map lane feature，每个元素包含位置、方向、宽度、目标距离。
     lane_points_size = permutation_feature_dims[1]
@@ -497,25 +646,34 @@ def build_network_features(agents_state: torch.Tensor,
     lane_points_end = lane_points_start + lane_points_size
     
     lane_element_dim = permutation_element_dims[1] if len(permutation_element_dims) > 1 else 7
-    w_lanes_flat = build_lane_map_features(w_lanes_local, navigation, lane_points_size, lane_element_dim, goal_slots=goal_slots)
-    if w_lanes_flat is not None:
-        features_tensor[:, :, lane_points_start:lane_points_end] = w_lanes_flat
-    else:
-        features_tensor[:, :, lane_points_start:lane_points_end] = FEATURE_PAD_VALUE
+    lane_out = features_tensor[:, :, lane_points_start:lane_points_end]
+    w_lanes_flat = build_lane_map_features(
+        w_lanes_local,
+        navigation,
+        lane_points_size,
+        lane_element_dim,
+        goal_slots=goal_slots,
+        out=lane_out,
+    )
+    if w_lanes_flat is None:
+        lane_out.fill_(FEATURE_PAD_VALUE)
     
     # stop_lines: 20维 - 使用停止线信息
     stop_lines_size = permutation_feature_dims[2]  # 20
     stop_lines_start = lane_points_end
     stop_lines_end = stop_lines_start + stop_lines_size
     
+    stop_out = features_tensor[:, :, stop_lines_start:stop_lines_end]
     if stop_lines is not None and stop_lines.numel() > 0:
-        stop_lines_flat = normalize_point_set(stop_lines.to(device=agents_state.device, dtype=agents_state.dtype), stop_lines_size)
-        if stop_lines_flat is not None:
-            features_tensor[:, :, stop_lines_start:stop_lines_end] = stop_lines_flat
-        else:
-            features_tensor[:, :, stop_lines_start:stop_lines_end] = FEATURE_PAD_VALUE
+        stop_lines_flat = normalize_point_set(
+            stop_lines.to(device=agents_state.device, dtype=agents_state.dtype),
+            stop_lines_size,
+            out=stop_out,
+        )
+        if stop_lines_flat is None:
+            stop_out.fill_(FEATURE_PAD_VALUE)
     else:
-        features_tensor[:, :, stop_lines_start:stop_lines_end] = FEATURE_PAD_VALUE
+        stop_out.fill_(FEATURE_PAD_VALUE)
     
     # other_agents: 使用邻居位置、朝向、速度、尺寸、z 与 active mask
     other_agents_size = permutation_feature_dims[3]
@@ -524,38 +682,36 @@ def build_network_features(agents_state: torch.Tensor,
     
     # 将邻居信息按通道做归一化后再展平并填充，active=0 的 padding 不参与网络 maxpool。
     neighbors_local = neighbors_local.to(device=agents_state.device, dtype=agents_state.dtype)
-    neighbors_proc = torch.full_like(neighbors_local, FEATURE_PAD_VALUE)
     neighbor_dim = neighbors_local.shape[-1]
+    other_out = features_tensor[:, :, other_agents_start:other_agents_end]
+    other_out.fill_(FEATURE_PAD_VALUE)
+    neighbor_slots = min(neighbors_local.shape[2], other_agents_size // max(1, neighbor_dim))
+    neighbors_proc = other_out[:, :, :neighbor_slots * neighbor_dim].view(batch_size, max_agents, neighbor_slots, neighbor_dim)
+    neighbors_src = neighbors_local[:, :, :neighbor_slots]
     if neighbor_dim >= 10:
-        neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_local[:, :, :, 0], -200, 200)
-        neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_local[:, :, :, 1], -200, 200)
-        neighbors_proc[:, :, :, 2] = torch.clamp(neighbors_local[:, :, :, 2], -1.0, 1.0)
-        neighbors_proc[:, :, :, 3] = torch.clamp(neighbors_local[:, :, :, 3], -1.0, 1.0)
-        neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_local[:, :, :, 4], -60, 60)
-        neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_local[:, :, :, 5], -60, 60)
-        neighbors_proc[:, :, :, 6] = normalize_to_minus1_1(neighbors_local[:, :, :, 6], 0.8, 7)
-        neighbors_proc[:, :, :, 7] = normalize_to_minus1_1(neighbors_local[:, :, :, 7], 0.8, 3)
-        neighbors_proc[:, :, :, 8] = normalize_to_minus1_1(neighbors_local[:, :, :, 8], -10, 10)
-        neighbors_proc[:, :, :, 9] = neighbors_local[:, :, :, 9]
+        neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_src[:, :, :, 0], -200, 200)
+        neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_src[:, :, :, 1], -200, 200)
+        neighbors_proc[:, :, :, 2] = torch.clamp(neighbors_src[:, :, :, 2], -1.0, 1.0)
+        neighbors_proc[:, :, :, 3] = torch.clamp(neighbors_src[:, :, :, 3], -1.0, 1.0)
+        neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_src[:, :, :, 4], -60, 60)
+        neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_src[:, :, :, 5], -60, 60)
+        neighbors_proc[:, :, :, 6] = normalize_to_minus1_1(neighbors_src[:, :, :, 6], 0.8, 7)
+        neighbors_proc[:, :, :, 7] = normalize_to_minus1_1(neighbors_src[:, :, :, 7], 0.8, 3)
+        neighbors_proc[:, :, :, 8] = normalize_to_minus1_1(neighbors_src[:, :, :, 8], -10, 10)
+        neighbors_proc[:, :, :, 9] = neighbors_src[:, :, :, 9]
     else:
-        neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_local[:, :, :, 0], -100, 100)
-        neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_local[:, :, :, 1], -100, 100)
+        neighbors_proc[:, :, :, 0] = normalize_to_minus1_1(neighbors_src[:, :, :, 0], -100, 100)
+        neighbors_proc[:, :, :, 1] = normalize_to_minus1_1(neighbors_src[:, :, :, 1], -100, 100)
         if neighbor_dim > 2:
-            neighbors_proc[:, :, :, 2] = normalize_to_minus1_1(neighbors_local[:, :, :, 2], -60, 60)
+            neighbors_proc[:, :, :, 2] = normalize_to_minus1_1(neighbors_src[:, :, :, 2], -60, 60)
         if neighbor_dim > 3:
-            neighbors_proc[:, :, :, 3] = normalize_to_minus1_1(neighbors_local[:, :, :, 3], -60, 60)
+            neighbors_proc[:, :, :, 3] = normalize_to_minus1_1(neighbors_src[:, :, :, 3], -60, 60)
         if neighbor_dim > 4:
-            neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_local[:, :, :, 4], 0.8, 7)
+            neighbors_proc[:, :, :, 4] = normalize_to_minus1_1(neighbors_src[:, :, :, 4], 0.8, 7)
         if neighbor_dim > 5:
-            neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_local[:, :, :, 5], 0.8, 3)
+            neighbors_proc[:, :, :, 5] = normalize_to_minus1_1(neighbors_src[:, :, :, 5], 0.8, 3)
         if neighbor_dim > 6:
-            neighbors_proc[:, :, :, 6] = neighbors_local[:, :, :, 6]
-    neighbors_flat = neighbors_proc.flatten(start_dim=2)
-    features_tensor[:, :, other_agents_start:other_agents_end] = pad_or_truncate_flat(
-        neighbors_flat,
-        other_agents_size,
-        pad_value=FEATURE_PAD_VALUE,
-    )
+            neighbors_proc[:, :, :, 6] = neighbors_src[:, :, :, 6]
     
     return features_tensor
 
@@ -722,6 +878,7 @@ def make_update_stats(reason: str = "", device: torch.device = None) -> dict:
 		'value_loss': None,
 		'entropy': None,
 		'ppo_update_time_s': 0.0,
+		'ppo_feature_rebuild_ms': 0.0,
 		'max_memory_allocated_mb': 0.0,
 		'max_memory_reserved_mb': 0.0,
 	}
@@ -768,7 +925,8 @@ def step_schedulers_if_updated(policy_scheduler, value_scheduler, update_stats_a
 	return False
 
 def current_navigation(simulator, agents_state: torch.Tensor = None, route_state: dict = None,
-					   w_lane_keep_mask: torch.Tensor = None, w_lane_ids: torch.Tensor = None):
+					   w_lane_keep_mask: torch.Tensor = None, w_lane_ids: torch.Tensor = None,
+					   out: torch.Tensor = None):
 	"""返回显式 G(t) + W_lane 图路由距离的导航包。"""
 	if hasattr(simulator, 'get_navigation_observation'):
 		return simulator.get_navigation_observation(
@@ -776,6 +934,7 @@ def current_navigation(simulator, agents_state: torch.Tensor = None, route_state
 			route_state=route_state,
 			w_lane_keep_mask=w_lane_keep_mask,
 			w_lane_ids=w_lane_ids,
+			out=out,
 		)
 	return None
 
@@ -853,16 +1012,16 @@ def gather_condition_state_env(condition_state: dict, env_idx: torch.Tensor) -> 
 	return out
 
 
-def stop_lines_from_condition(simulator, agents_state: torch.Tensor, condition_state: dict) -> torch.Tensor:
+def stop_lines_from_condition(simulator, agents_state: torch.Tensor, condition_state: dict,
+							  out: torch.Tensor = None) -> torch.Tensor:
 	if not hasattr(simulator, '_compute_stop_line_observation'):
 		return None
 	traffic_light_states = condition_state.get('traffic_light_states') if condition_state else None
-	old_traffic_light_states = getattr(simulator, 'traffic_light_states', None)
-	try:
-		simulator.traffic_light_states = traffic_light_states
-		return simulator._compute_stop_line_observation(agents_state)
-	finally:
-		simulator.traffic_light_states = old_traffic_light_states
+	return simulator._compute_stop_line_observation(
+		agents_state,
+		traffic_light_states=traffic_light_states,
+		out=out,
+	)
 
 
 class RolloutTensorBuffer:
@@ -895,10 +1054,11 @@ class RolloutTensorBuffer:
 	def _ensure_tensor(self, name: str, value: torch.Tensor) -> torch.Tensor:
 		buffer = getattr(self, name)
 		if buffer is None:
+			dtype = self._storage_dtype(name, value)
 			buffer = torch.empty(
 				(self.capacity, *value.shape),
 				device=value.device,
-				dtype=value.dtype,
+				dtype=dtype,
 			)
 			setattr(self, name, buffer)
 		elif buffer.shape[1:] != value.shape:
@@ -907,13 +1067,53 @@ class RolloutTensorBuffer:
 			raise ValueError(f"{name} device mismatch: {buffer.device} != {value.device}")
 		return buffer
 
+	def _ensure_tensor_shape(self, name: str, shape, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+		buffer = getattr(self, name)
+		shape = tuple(int(dim) for dim in shape)
+		if buffer is None:
+			buffer = torch.empty((self.capacity, *shape), device=device, dtype=dtype)
+			setattr(self, name, buffer)
+		elif buffer.shape[1:] != shape:
+			raise ValueError(f"{name} shape mismatch: {buffer.shape[1:]} != {shape}")
+		elif buffer.device != device:
+			raise ValueError(f"{name} device mismatch: {buffer.device} != {device}")
+		elif buffer.dtype != dtype:
+			raise ValueError(f"{name} dtype mismatch: {buffer.dtype} != {dtype}")
+		return buffer
+
+	def _storage_dtype(self, name: str, value: torch.Tensor) -> torch.dtype:
+		if name == 'actions' and value.dtype in (
+			torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.long,
+		):
+			if value.numel() == 0:
+				return torch.uint8
+			min_action = int(value.min().item())
+			max_action = int(value.max().item())
+			if 0 <= min_action and max_action <= 255:
+				return torch.uint8
+		return value.dtype
+
+	def _route_storage_dtype(self, key: str, value: torch.Tensor) -> torch.dtype:
+		if key == 'route_quad_ids':
+			if value.numel() == 0:
+				return torch.int16
+			min_id = int(value.min().item())
+			max_id = int(value.max().item())
+			if -32768 <= min_id and max_id <= 32767:
+				return torch.int16
+			return torch.int32
+		if key in ('target_count', 'current_idx'):
+			return torch.int16
+		return value.dtype
+
 	def _ensure_route_tensor(self, key: str, value: torch.Tensor) -> torch.Tensor:
 		buffer = self.route_state.get(key)
 		if buffer is None:
+			dtype = self._route_storage_dtype(key, value)
 			buffer = torch.empty(
 				(self.capacity, *value.shape),
 				device=value.device,
-				dtype=value.dtype,
+				dtype=dtype,
 			)
 			self.route_state[key] = buffer
 		elif buffer.shape[1:] != value.shape:
@@ -933,7 +1133,32 @@ class RolloutTensorBuffer:
 		self.time_indices[self.length] = int(time_index)
 		for key, value in (route_state or {}).items():
 			if torch.is_tensor(value):
-				self._ensure_route_tensor(key, value)[self.length].copy_(value.detach())
+				dst = self._ensure_route_tensor(key, value)[self.length]
+				dst.copy_(value.detach().to(dtype=dst.dtype))
+		self._pre_step_pending = True
+
+	def write_pre_step_from_simulator(self, simulator, alive_mask: torch.Tensor, route_state: dict, time_index: int = 0):
+		if self.length >= self.capacity:
+			raise RuntimeError(f"RolloutTensorBuffer full: length={self.length}, capacity={self.capacity}")
+		if self._pre_step_pending:
+			raise RuntimeError("write_pre_step_from_simulator called twice before write_post_step")
+		state = simulator.agents_state.detach()
+		B, M = state.shape[:2]
+		dst = self._ensure_tensor_shape('states', (B, M, 10), state.device, state.dtype)[self.length]
+		dst.zero_()
+		copy_state = min(7, state.shape[-1])
+		if copy_state > 0:
+			dst[..., :copy_state].copy_(state[..., :copy_state])
+		dst[..., 6] = alive_mask.to(device=state.device, dtype=state.dtype)
+		control = current_control_state(simulator).detach()
+		dst[..., 7:10].copy_(control.to(device=state.device, dtype=state.dtype) * dst[..., 6:7])
+		if self.time_indices is None:
+			self.time_indices = torch.empty((self.capacity,), device=state.device, dtype=torch.long)
+		self.time_indices[self.length] = int(time_index)
+		for key, value in (route_state or {}).items():
+			if torch.is_tensor(value):
+				route_dst = self._ensure_route_tensor(key, value)[self.length]
+				route_dst.copy_(value.detach().to(dtype=route_dst.dtype))
 		self._pre_step_pending = True
 
 	def write_post_step(self, reward: torch.Tensor, done: torch.Tensor, value: torch.Tensor,
@@ -945,7 +1170,8 @@ class RolloutTensorBuffer:
 		self._ensure_tensor('dones', done_bool)[self.length].copy_(done_bool)
 		self._ensure_tensor('values', value)[self.length].copy_(value.detach())
 		self._ensure_tensor('old_log_probs', old_log_prob)[self.length].copy_(old_log_prob.detach())
-		self._ensure_tensor('actions', action)[self.length].copy_(action.detach())
+		action_dst = self._ensure_tensor('actions', action)[self.length]
+		action_dst.copy_(action.detach().to(dtype=action_dst.dtype))
 		self.length += 1
 		self._pre_step_pending = False
 
@@ -997,12 +1223,6 @@ class RolloutTensorBuffer:
 				raise ValueError(f"{name} device mismatch: {tensor.device} != {base_device}")
 			if tensor.shape[1:3] != (B, M):
 				raise ValueError(f"{name} shape mismatch: {tensor.shape[1:3]} != {(B, M)}")
-
-
-def gather_route_state(route_state_tensor: dict, t_idx: torch.Tensor, b_idx: torch.Tensor) -> dict:
-	if not route_state_tensor:
-		return {}
-	return {key: value[t_idx, b_idx] for key, value in route_state_tensor.items()}
 
 
 def gather_route_state_selected(route_state_tensor: dict, t_idx: torch.Tensor,
@@ -1075,12 +1295,15 @@ def get_map_dropout_probs(config):
 	return min(max(lane_p, 0.0), 1.0), min(max(boundary_p, 0.0), 1.0)
 
 
-def _index_grid(value, B: int, M: int, device: torch.device, default_kind: str):
+def _index_grid(value, B: int, M: int, device: torch.device, default_kind: str,
+                workspace: FeatureBuildWorkspace = None):
 	if value is None:
 		if default_kind == 'env':
-			return torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1)
+			arange = workspace.arange(B, device) if workspace is not None else torch.arange(B, device=device, dtype=torch.long)
+			return arange.view(B, 1, 1)
 		if default_kind == 'agent':
-			return torch.arange(M, device=device, dtype=torch.long).view(1, M, 1)
+			arange = workspace.arange(M, device) if workspace is not None else torch.arange(M, device=device, dtype=torch.long)
+			return arange.view(1, M, 1)
 		return torch.zeros((1, 1, 1), device=device, dtype=torch.long)
 	tensor = torch.as_tensor(value, device=device, dtype=torch.long)
 	if tensor.dim() == 0:
@@ -1096,7 +1319,8 @@ def _index_grid(value, B: int, M: int, device: torch.device, default_kind: str):
 
 def deterministic_element_keep_mask(B: int, M: int, num_elements: int, drop_prob: float,
 									device: torch.device, time_idx=None, env_idx=None,
-									agent_idx=None, salt: int = 0):
+									agent_idx=None, salt: int = 0,
+									workspace: FeatureBuildWorkspace = None):
 	if num_elements <= 0:
 		return None
 	if drop_prob <= 0.0:
@@ -1104,10 +1328,11 @@ def deterministic_element_keep_mask(B: int, M: int, num_elements: int, drop_prob
 	if drop_prob >= 1.0:
 		return torch.zeros((B, M, num_elements), device=device, dtype=torch.bool)
 	keep_threshold = int(round((1.0 - drop_prob) * 10000))
-	time_grid = _index_grid(time_idx, B, M, device, 'zero')
-	env_grid = _index_grid(env_idx, B, M, device, 'env')
-	agent_grid = _index_grid(agent_idx, B, M, device, 'agent')
-	elem_grid = torch.arange(num_elements, device=device, dtype=torch.long).view(1, 1, num_elements)
+	time_grid = _index_grid(time_idx, B, M, device, 'zero', workspace=workspace)
+	env_grid = _index_grid(env_idx, B, M, device, 'env', workspace=workspace)
+	agent_grid = _index_grid(agent_idx, B, M, device, 'agent', workspace=workspace)
+	elem_arange = workspace.arange(num_elements, device) if workspace is not None else torch.arange(num_elements, device=device, dtype=torch.long)
+	elem_grid = elem_arange.view(1, 1, num_elements)
 	seed = (
 		time_grid * 1000003
 		+ env_grid * 19349663
@@ -1121,39 +1346,40 @@ def deterministic_element_keep_mask(B: int, M: int, num_elements: int, drop_prob
 
 
 def make_map_dropout_masks(config, B: int, M: int, lane_count: int, boundary_count: int,
-						   device: torch.device, time_idx=None, env_idx=None, agent_idx=None):
+						   device: torch.device, time_idx=None, env_idx=None, agent_idx=None,
+						   workspace: FeatureBuildWorkspace = None):
 	lane_drop, boundary_drop = get_map_dropout_probs(config)
 	return {
 		'lane_keep': deterministic_element_keep_mask(
 			B, M, lane_count, lane_drop, device,
 			time_idx=time_idx, env_idx=env_idx, agent_idx=agent_idx, salt=17,
+			workspace=workspace,
 		),
 		'boundary_keep': deterministic_element_keep_mask(
 			B, M, boundary_count, boundary_drop, device,
 			time_idx=time_idx, env_idx=env_idx, agent_idx=agent_idx, salt=29,
+			workspace=workspace,
 		),
 	}
 
 
 def apply_map_dropout_components(w_lanes_local: torch.Tensor, w_boundaries_local: torch.Tensor,
-								 map_dropout: dict = None):
+								 map_dropout: dict = None, inplace: bool = False):
 	if not map_dropout:
 		return w_lanes_local, w_boundaries_local
 	lane_keep = map_dropout.get('lane_keep')
 	if lane_keep is not None and w_lanes_local is not None:
-		w_lanes_local = torch.where(lane_keep.unsqueeze(-1), w_lanes_local, torch.zeros_like(w_lanes_local))
+		if inplace:
+			w_lanes_local.masked_fill_(~lane_keep.unsqueeze(-1), 0.0)
+		else:
+			w_lanes_local = torch.where(lane_keep.unsqueeze(-1), w_lanes_local, torch.zeros_like(w_lanes_local))
 	boundary_keep = map_dropout.get('boundary_keep')
 	if boundary_keep is not None and w_boundaries_local is not None:
-		w_boundaries_local = torch.where(boundary_keep.unsqueeze(-1), w_boundaries_local, torch.zeros_like(w_boundaries_local))
+		if inplace:
+			w_boundaries_local.masked_fill_(~boundary_keep.unsqueeze(-1), 0.0)
+		else:
+			w_boundaries_local = torch.where(boundary_keep.unsqueeze(-1), w_boundaries_local, torch.zeros_like(w_boundaries_local))
 	return w_lanes_local, w_boundaries_local
-
-
-def state_with_control_for_buffer(simulator, alive_mask: torch.Tensor) -> torch.Tensor:
-	pre_state = simulator.agents_state.detach().clone()
-	pre_state[..., 6] = alive_mask.to(dtype=pre_state.dtype)
-	pre_control_state = current_control_state(simulator).detach().clone()
-	pre_control_state = pre_control_state * alive_mask.unsqueeze(-1).to(dtype=pre_control_state.dtype)
-	return torch.cat([pre_state, pre_control_state], dim=-1)
 
 
 def _policy_observation_state_chunk(simulator, start: int, end: int, alive_mask: torch.Tensor = None):
@@ -1171,18 +1397,37 @@ def _policy_observation_state_chunk(simulator, start: int, end: int, alive_mask:
 def build_features_from_components(agents_state, neighbors_local, w_lanes_local, w_boundaries_local,
 								   simulator, config, route_state, condition_state,
 								   control_state=None, map_dropout=None, world_agents_state=None,
-								   map_metadata: dict = None):
+								   map_metadata: dict = None, workspace: FeatureBuildWorkspace = None,
+								   out: torch.Tensor = None):
 	world_agents_state = agents_state if world_agents_state is None else world_agents_state
 	lane_keep = map_dropout.get('lane_keep') if map_dropout else None
 	w_lane_ids = map_metadata.get('w_lane_ids') if map_metadata else None
+	workspace = workspace or _default_workspace(config)
+	goal_slots = int(getattr(simulator, 'max_route_targets', 0))
+	lane_slots = int(getattr(simulator.observation_generator, 'num_w_lanes', 0))
+	nav_out = workspace.scratch(
+		'navigation',
+		(world_agents_state.shape[0], world_agents_state.shape[1], goal_slots + lane_slots, 3),
+		world_agents_state.device,
+		world_agents_state.dtype,
+	)
 	navigation = current_navigation(
 		simulator,
 		agents_state=world_agents_state,
 		route_state=route_state,
 		w_lane_keep_mask=lane_keep,
 		w_lane_ids=w_lane_ids,
+		out=nav_out,
 	)
-	stop_lines = stop_lines_from_condition(simulator, world_agents_state, condition_state)
+	stop_dim = int(getattr(simulator, 'stop_line_feature_dim', 0))
+	stop_out = workspace.scratch(
+		'stop_lines',
+		(world_agents_state.shape[0], world_agents_state.shape[1], stop_dim),
+		world_agents_state.device,
+		world_agents_state.dtype,
+	)
+	stop_lines = stop_lines_from_condition(simulator, world_agents_state, condition_state, out=stop_out)
+	workspace.mark_feature_chunk()
 	return build_network_features(
 		agents_state,
 		neighbors_local,
@@ -1195,14 +1440,18 @@ def build_features_from_components(agents_state, neighbors_local, w_lanes_local,
 		vehicle_style=condition_state.get('vehicle_style'),
 		control_state=control_state,
 		map_dropout=map_dropout,
+		workspace=workspace,
+		out=out,
 	)
 
 
 def build_features_from_simulator_state(simulator, config, alive_mask: torch.Tensor = None,
-										condition_state: dict = None, dropout_step=0) -> torch.Tensor:
+										condition_state: dict = None, dropout_step=0,
+										workspace: FeatureBuildWorkspace = None) -> torch.Tensor:
 	B, M = simulator.agents_state.shape[:2]
+	workspace = workspace or _default_workspace(config)
 	env_chunk = feature_build_env_chunk_size(config, M)
-	total_input_dim = sum(config.training.network.simple_feature_dims) + sum(config.training.network.permutation_feature_dims)
+	total_input_dim = workspace.total_input_dim
 	features = torch.empty(B, M, total_input_dim, device=simulator.agents_state.device, dtype=simulator.agents_state.dtype)
 	if env_chunk <= 0:
 		env_chunk = B
@@ -1225,7 +1474,7 @@ def build_features_from_simulator_state(simulator, config, alive_mask: torch.Ten
 			driving_style_params=condition_chunk.get('vehicle_style'),
 			return_map_ids=True,
 		)
-		env_idx = torch.arange(start, end, device=obs_state.device, dtype=torch.long)
+		env_idx = workspace.arange(B, obs_state.device)[start:end]
 		map_dropout = make_map_dropout_masks(
 			config,
 			end - start,
@@ -1235,8 +1484,9 @@ def build_features_from_simulator_state(simulator, config, alive_mask: torch.Ten
 			obs_state.device,
 			time_idx=dropout_step,
 			env_idx=env_idx,
+			workspace=workspace,
 		)
-		features[start:end] = build_features_from_components(
+		build_features_from_components(
 			local_state,
 			neighbors_local,
 			w_lanes_local,
@@ -1249,6 +1499,8 @@ def build_features_from_simulator_state(simulator, config, alive_mask: torch.Ten
 			map_dropout=map_dropout,
 			world_agents_state=obs_state,
 			map_metadata=map_metadata,
+			workspace=workspace,
+			out=features[start:end],
 		)
 	return features
 
@@ -1256,12 +1508,15 @@ def build_features_from_simulator_state(simulator, config, alive_mask: torch.Ten
 def build_features_for_selected_agents(world_states: torch.Tensor, simulator, config,
 									   route_state: dict, condition_state: dict,
 									   agent_indices: torch.Tensor, time_indices: torch.Tensor = None,
-									   env_indices: torch.Tensor = None) -> torch.Tensor:
+									   env_indices: torch.Tensor = None,
+									   workspace: FeatureBuildWorkspace = None,
+									   out: torch.Tensor = None) -> torch.Tensor:
 	B, M = world_states.shape[:2]
+	workspace = workspace or _default_workspace(config)
 	obs_state = observation_state_from_buffer(world_states)
 	control_state = control_from_buffer_state(world_states)
 	agent_indices = agent_indices.to(device=world_states.device, dtype=torch.long).view(B)
-	batch_idx = torch.arange(B, device=world_states.device)
+	batch_idx = workspace.arange(B, world_states.device)
 	ego_obs_state = obs_state[batch_idx, agent_indices].unsqueeze(1)
 	local_state, neighbors_local, w_lanes_local, w_boundaries_local, map_metadata = simulator.observation_generator.generate_selected_components(
 		obs_state,
@@ -1282,6 +1537,7 @@ def build_features_for_selected_agents(world_states: torch.Tensor, simulator, co
 		time_idx=time_indices,
 		env_idx=env_indices,
 		agent_idx=agent_indices,
+		workspace=workspace,
 	)
 	return build_features_from_components(
 		local_state,
@@ -1296,112 +1552,9 @@ def build_features_for_selected_agents(world_states: torch.Tensor, simulator, co
 		map_dropout=map_dropout,
 		world_agents_state=ego_obs_state,
 		map_metadata=map_metadata,
+		workspace=workspace,
+		out=out,
 	)
-
-def build_features_from_observation(observation, simulator, config):
-	B, M = observation.shape[:2]
-	env_chunk = feature_build_env_chunk_size(config, M)
-	total_input_dim = sum(config.training.network.simple_feature_dims) + sum(config.training.network.permutation_feature_dims)
-
-	if env_chunk <= 0 or B <= env_chunk:
-		agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config)
-		return build_network_features(
-			agents_state,
-			neighbors_local,
-			w_lanes_local,
-			w_boundaries_local,
-			current_navigation(simulator),
-			getattr(simulator, 'stop_lines', None),
-			simulator.reward_calculator.sampled_params,
-			config,
-			vehicle_style=getattr(simulator, 'driving_style_params', None),
-			control_state=current_control_state(simulator),
-		)
-
-	features = torch.empty(B, M, total_input_dim, device=observation.device, dtype=observation.dtype)
-	world_state = getattr(simulator, 'agents_state', None)
-	route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
-	reward_coef = simulator.reward_calculator.sampled_params
-	vehicle_style = getattr(simulator, 'driving_style_params', None)
-	stop_lines = getattr(simulator, 'stop_lines', None)
-	control_state = current_control_state(simulator)
-
-	for start in range(0, B, env_chunk):
-		end = min(start + env_chunk, B)
-		obs_chunk = observation[start:end]
-		agents_state, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(obs_chunk, config)
-		world_chunk = slice_env_tensor(world_state, start, end, B)
-		route_chunk = slice_route_state_env(route_state, start, end, B)
-		features[start:end] = build_network_features(
-			agents_state,
-			neighbors_local,
-			w_lanes_local,
-			w_boundaries_local,
-			current_navigation(simulator, agents_state=world_chunk, route_state=route_chunk),
-			slice_env_tensor(stop_lines, start, end, B),
-			slice_env_tensor(reward_coef, start, end, B),
-			config,
-			vehicle_style=slice_env_tensor(vehicle_style, start, end, B),
-			control_state=slice_env_tensor(control_state, start, end, B),
-		)
-	return features
-
-
-def build_features_from_world_state_batch(
-	world_states: torch.Tensor,
-	simulator,
-	config,
-	route_state: dict,
-	condition_state: dict,
-	time_indices: torch.Tensor = None,
-	env_indices: torch.Tensor = None,
-) -> torch.Tensor:
-	B, M = world_states.shape[:2]
-	env_chunk = feature_build_env_chunk_size(config, M)
-	total_input_dim = sum(config.training.network.simple_feature_dims) + sum(config.training.network.permutation_feature_dims)
-	features = torch.empty(B, M, total_input_dim, device=world_states.device, dtype=world_states.dtype)
-	if env_chunk <= 0:
-		env_chunk = B
-	lane_count = int(getattr(simulator.observation_generator, 'num_w_lanes', 0))
-	boundary_count = int(getattr(simulator.observation_generator, 'num_w_boundaries', 0))
-
-	for start in range(0, B, env_chunk):
-		end = min(start + env_chunk, B)
-		world_chunk = world_states[start:end]
-		obs_state = observation_state_from_buffer(world_chunk)
-		control_state = control_from_buffer_state(world_chunk)
-		condition_chunk = slice_condition_state_env(condition_state, start, end, B)
-		local_state, neighbors_local, w_lanes_local, w_boundaries_local, map_metadata = simulator.observation_generator.generate_components(
-			obs_state,
-			control_state=control_state,
-			driving_style_params=condition_chunk.get('vehicle_style'),
-			return_map_ids=True,
-		)
-		map_dropout = make_map_dropout_masks(
-			config,
-			end - start,
-			M,
-			lane_count,
-			boundary_count,
-			world_states.device,
-			time_idx=slice_env_tensor(time_indices, start, end, B),
-			env_idx=slice_env_tensor(env_indices, start, end, B),
-		)
-		features[start:end] = build_features_from_components(
-			local_state,
-			neighbors_local,
-			w_lanes_local,
-			w_boundaries_local,
-			simulator,
-			config,
-			slice_route_state_env(route_state, start, end, B),
-			condition_chunk,
-				control_state=control_state,
-				map_dropout=map_dropout,
-				world_agents_state=obs_state,
-				map_metadata=map_metadata,
-			)
-	return features
 
 def sync_bool_across_ranks(value: bool, device: torch.device, op=dist.ReduceOp.MIN) -> bool:
 	if not dist.is_available() or not dist.is_initialized():
@@ -1441,6 +1594,7 @@ def merge_update_stats(accum: dict, update_stats: dict):
 	accum['num_candidates'] = accum.get('num_candidates', 0) + int(update_stats.get('num_candidates', 0) or 0)
 	accum['num_selected'] = accum.get('num_selected', 0) + int(update_stats.get('num_selected', 0) or 0)
 	accum['ppo_update_time_s'] = accum.get('ppo_update_time_s', 0.0) + float(update_stats.get('ppo_update_time_s', 0.0) or 0.0)
+	accum['ppo_feature_rebuild_ms'] = accum.get('ppo_feature_rebuild_ms', 0.0) + float(update_stats.get('ppo_feature_rebuild_ms', 0.0) or 0.0)
 	for key in ('max_memory_allocated_mb', 'max_memory_reserved_mb'):
 		accum[key] = max(float(accum.get(key, 0.0) or 0.0), float(update_stats.get(key, 0.0) or 0.0))
 	accum['last_update'] = update_stats
@@ -1475,22 +1629,11 @@ def rollout_alive_mask(simulator, cumulative_done_all=None) -> torch.Tensor:
 		return active_mask
 	return active_mask & (~cumulative_done_all.to(active_mask.device))
 
-def sample_actions_for_alive(action_logits: torch.Tensor, alive_mask: torch.Tensor):
-	"""只为仍存活的 agent 采样动作，已 done 的 slot 填 dummy 动作与零 logprob。"""
-	actions = torch.zeros(action_logits.shape[:2], dtype=torch.long, device=action_logits.device)
-	old_log_probs = torch.zeros(action_logits.shape[:2], dtype=action_logits.dtype, device=action_logits.device)
-	if bool(alive_mask.any().item()):
-		dist_alive = torch.distributions.Categorical(logits=action_logits[alive_mask])
-		actions_alive = dist_alive.sample()
-		actions[alive_mask] = actions_alive
-		old_log_probs[alive_mask] = dist_alive.log_prob(actions_alive).to(old_log_probs.dtype)
-	return actions, old_log_probs
-
-
 def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Tensor,
 								 condition_state: dict, dropout_step: int,
 								 precision: str, forward_chunk_agents: int,
-								 sample_actions: bool = True):
+								 sample_actions: bool = True,
+								 feature_workspace: FeatureBuildWorkspace = None):
 	"""
 	Online rollout forward for active agents only.
 
@@ -1504,18 +1647,20 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 	actions = torch.zeros((B, M), dtype=torch.long, device=device)
 	old_log_probs = torch.zeros((B, M), dtype=states.dtype, device=device)
 	value_pred = torch.zeros((B, M), dtype=states.dtype, device=device)
-	profile = {'feature_ms': 0.0, 'policy_ms': 0.0, 'num_selected': 0}
+	profile = {'feature_ms': 0.0, 'policy_ms': 0.0, 'num_selected': 0, 'feature_chunks': 0, 'path': 'none'}
+	feature_workspace = feature_workspace or _default_workspace(config)
+	feature_workspace.reset_counters()
 
 	alive_mask = alive_mask.to(device=device, dtype=torch.bool)
-	if not bool(alive_mask.any().item()):
-		return actions, old_log_probs, value_pred, profile
-
 	env_idx, agent_idx = alive_mask.nonzero(as_tuple=True)
 	total_selected = int(env_idx.numel())
+	if total_selected <= 0:
+		return actions, old_log_probs, value_pred, profile
 	profile['num_selected'] = total_selected
 	training_cfg = getattr(config, 'training')
 	dense_alive_fraction = float(getattr(training_cfg, 'rollout_dense_alive_fraction', 0.0))
 	if dense_alive_fraction > 0.0 and (total_selected / max(1, B * M)) >= dense_alive_fraction:
+		profile['path'] = 'dense'
 		profile_on = profile_enabled(config)
 		if profile_on:
 			feature_start = profile_timer_start(device, config)
@@ -1525,9 +1670,11 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 			alive_mask=alive_mask,
 			condition_state=condition_state,
 			dropout_step=dropout_step,
+			workspace=feature_workspace,
 		)
 		if profile_on:
 			profile['feature_ms'] += profile_elapsed_ms(feature_start, device, config)
+		profile['feature_chunks'] = feature_workspace.feature_chunks
 
 		if profile_on:
 			policy_start = profile_timer_start(device, config)
@@ -1562,6 +1709,7 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 	selected_chunk = feature_build_chunk_agents(config, M)
 	if selected_chunk <= 0:
 		selected_chunk = total_selected
+	profile['path'] = 'selected'
 
 	route_state_all = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
 	control_state_all = current_control_state(simulator)
@@ -1589,9 +1737,11 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 			agent_chunk,
 			time_indices=torch.as_tensor(dropout_step, device=device, dtype=torch.long),
 			env_indices=env_chunk,
+			workspace=feature_workspace,
 		)
 		if profile_on:
 			profile['feature_ms'] += profile_elapsed_ms(feature_start, device, config)
+		profile['feature_chunks'] = feature_workspace.feature_chunks
 
 		if profile_on:
 			policy_start = profile_timer_start(device, config)
@@ -1632,7 +1782,8 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 
 def bootstrap_values_for_alive_agents(model, simulator, config, alive_mask: torch.Tensor,
 									  condition_state: dict, dropout_step: int,
-									  precision: str, forward_chunk_agents: int):
+									  precision: str, forward_chunk_agents: int,
+									  feature_workspace: FeatureBuildWorkspace = None):
 	_, _, value_pred, _ = rollout_forward_alive_agents(
 		model,
 		simulator,
@@ -1643,13 +1794,15 @@ def bootstrap_values_for_alive_agents(model, simulator, config, alive_mask: torc
 		precision,
 		forward_chunk_agents,
 		sample_actions=False,
+		feature_workspace=feature_workspace,
 	)
 	return value_pred
 
 
 def current_rollout_bootstrap_value(model, simulator, config, cumulative_done_all,
 									condition_state: dict, dropout_step: int,
-									precision: str, forward_chunk_agents: int):
+									precision: str, forward_chunk_agents: int,
+									feature_workspace: FeatureBuildWorkspace = None):
 	alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
 	if not bool(alive_mask.any().item()):
 		return None
@@ -1662,13 +1815,15 @@ def current_rollout_bootstrap_value(model, simulator, config, cumulative_done_al
 		dropout_step,
 		precision,
 		forward_chunk_agents,
+		feature_workspace=feature_workspace,
 	)
 
 # ============================== PPO更新函数 ==============================
 def perform_ppo_update(model, policy_optimizer, value_optimizer,
 					   rollout_buffer, condition_state,
 					   features_tensor, simulator, config, iteration, rank=None,
-					   a_max_ewma=None, amp_scaler=None, bootstrap_value=None):
+					   a_max_ewma=None, amp_scaler=None, bootstrap_value=None,
+					   feature_workspace: FeatureBuildWorkspace = None):
 	"""执行 PPO 更新。buffer 保存世界状态/route state，条件特征在 minibatch 内重建。"""
 	is_rank0 = (rank is None or rank == 0)
 	update_start_time = time.time()
@@ -1693,6 +1848,8 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	beta = float(getattr(training_cfg, 'advantage_filter_beta', 0.25))
 	precision = getattr(training_cfg, 'precision', '32-bit')
 	forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
+	feature_workspace = feature_workspace or _default_workspace(config)
+	feature_workspace.reset_counters()
 	validate_rollout_buffer(rollout_buffer, condition_state)
 	device = rollout_buffer.states.device
 	if device.type == 'cuda':
@@ -1765,13 +1922,17 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
 	advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
 	returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
-	actions_batch = actions_tensor[selected_t, selected_b, selected_m].view(-1)
+	actions_batch = actions_tensor[selected_t, selected_b, selected_m].view(-1).to(torch.long)
 	advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std(unbiased=False) + 1e-8)
 	batch_N = old_log_probs_batch.shape[0]
 
 	route_state_mb = gather_route_state_selected(route_state_tensor, selected_t, selected_b, selected_m)
 	condition_state_mb = gather_condition_state_selected(condition_state, selected_b, selected_m)
 	world_states_mb = states_tensor[selected_t, selected_b]
+	ppo_feature_rebuild_ms = 0.0
+	profile_on = profile_enabled(config)
+	if profile_on:
+		feature_rebuild_start = profile_timer_start(device, config)
 	mb_features = build_features_for_selected_agents(
 		world_states_mb,
 		simulator,
@@ -1781,7 +1942,10 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		selected_m,
 		time_indices=time_indices_tensor[selected_t],
 		env_indices=selected_b,
+		workspace=feature_workspace,
 	)
+	if profile_on:
+		ppo_feature_rebuild_ms = profile_elapsed_ms(feature_rebuild_start, device, config)
 
 	policy_params = get_policy_parameters(model)
 	value_params = get_value_parameters(model)
@@ -1850,6 +2014,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		'value_loss': last_value_loss,
 		'entropy': last_entropy,
 		'ppo_update_time_s': time.time() - update_start_time,
+		'ppo_feature_rebuild_ms': ppo_feature_rebuild_ms,
 	})
 	stats.update(cuda_memory_stats(device))
 	if is_rank0 and device.type == 'cuda':
@@ -1862,25 +2027,29 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 def perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer,
 								 rollout_buffer, condition_state,
 								 features_tensor, simulator, config, iteration, a_max_ewma=None,
-								 amp_scaler=None, bootstrap_value=None):
+								 amp_scaler=None, bootstrap_value=None,
+								 feature_workspace: FeatureBuildWorkspace = None):
 	return perform_ppo_update(
 		model, policy_optimizer, value_optimizer,
 		rollout_buffer, condition_state,
 		features_tensor, simulator, config, iteration,
 		rank=None, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
 		bootstrap_value=bootstrap_value,
+		feature_workspace=feature_workspace,
 	)
 
 def perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer,
 								rollout_buffer, condition_state,
 								features_tensor, simulator, config, iteration, rank, a_max_ewma=None,
-								amp_scaler=None, bootstrap_value=None):
+								amp_scaler=None, bootstrap_value=None,
+								feature_workspace: FeatureBuildWorkspace = None):
 	return perform_ppo_update(
 		model, policy_optimizer, value_optimizer,
 		rollout_buffer, condition_state,
 		features_tensor, simulator, config, iteration,
 		rank=rank, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
 		bootstrap_value=bootstrap_value,
+		feature_workspace=feature_workspace,
 	)
 		
 # ============================== 寻找空闲端口 ==============================
@@ -1973,6 +2142,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
 		amp_scaler = make_grad_scaler(device, precision)
 		profile_on = profile_enabled(config)
+		feature_workspace = FeatureBuildWorkspace(config)
 		
 		for k in range(start_iteration, num_iterations):
 			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")
@@ -2006,20 +2176,21 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 
 			while step_count < max_episode_length:
 				# 全局死亡检测：如果所有世界都没有存活agents，执行PPO更新后开始新iteration
-				if all_worlds_no_alive_agents(simulator, cumulative_done_all):
+				alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
+				if not bool(alive_mask.any().item()):
 					if buffer_step_count > 0:
 						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
 							None, simulator, config, k+1, A_max_ewma, amp_scaler,
-							bootstrap_value=None)
+							bootstrap_value=None,
+							feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
 					else:
 						print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
 					break
-				alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
@@ -2036,6 +2207,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					precision=precision,
 					forward_chunk_agents=forward_chunk_agents,
 					sample_actions=True,
+					feature_workspace=feature_workspace,
 				)
 				policy_forward_ms = rollout_profile['policy_ms']
 				feature_build_ms = rollout_profile['feature_ms']
@@ -2043,10 +2215,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					worker_log(f"step {step_count + 1}: policy done")
 				
 				# 在推进环境前缓存当前状态
-				pre_state = state_with_control_for_buffer(simulator, alive_mask)
 				pre_route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
-				rollout_buffer.write_pre_step(pre_state, pre_route_state, time_index=step_count)
-				del pre_state
+				rollout_buffer.write_pre_step_from_simulator(simulator, alive_mask, pre_route_state, time_index=step_count)
 				
 				# 环境步进
 				if profile_on:
@@ -2069,7 +2239,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					cumulative_done_all = current_done_all.clone()
 				else:
 					cumulative_done_all = cumulative_done_all | current_done_all
-				no_alive_after_step = all_worlds_no_alive_agents(simulator, cumulative_done_all)
+				no_alive_after_step = not bool(rollout_alive_mask(simulator, cumulative_done_all).any().item())
 				
 				# 下一步 feature 不再整批预构造；下个循环会按 alive agent chunk 即时生成。
 				features_tensor = None
@@ -2079,7 +2249,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
 				if profile_on and step_count % profile_log_interval(config) == 0:
 					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
+					rollout_path = rollout_profile.get('path', 'none')
+					rollout_selected = int(rollout_profile.get('num_selected', 0) or 0)
+					rollout_chunks = int(rollout_profile.get('feature_chunks', 0) or 0)
 					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
+						  + f", path={rollout_path}, selected={rollout_selected}, feature_chunks={rollout_chunks}"
 						  + (f", {step_profile}" if step_profile else ""))
 
 				if no_alive_after_step:
@@ -2088,7 +2262,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						model, policy_optimizer, value_optimizer,
 						rollout_buffer, condition_state,
 						None, simulator, config, k+1, A_max_ewma, amp_scaler,
-						bootstrap_value=None)
+						bootstrap_value=None,
+						feature_workspace=feature_workspace)
 					merge_update_stats(iteration_update_stats, update_stats)
 					clear_rollout_buffers(rollout_buffer)
 					break
@@ -2099,12 +2274,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
 						bootstrap_value = current_rollout_bootstrap_value(
 							model, simulator, config, cumulative_done_all,
-							condition_state, step_count, precision, forward_chunk_agents)
+							condition_state, step_count, precision, forward_chunk_agents,
+							feature_workspace=feature_workspace)
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
 							None, simulator, config, k+1, A_max_ewma, amp_scaler,
-							bootstrap_value=bootstrap_value)
+							bootstrap_value=bootstrap_value,
+							feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
 						print("🔄 达到最大步数，强制开启新iteration...")
@@ -2113,12 +2290,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
 						bootstrap_value = current_rollout_bootstrap_value(
 							model, simulator, config, cumulative_done_all,
-							condition_state, step_count, precision, forward_chunk_agents)
+							condition_state, step_count, precision, forward_chunk_agents,
+							feature_workspace=feature_workspace)
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
 							None, simulator, config, k+1, A_max_ewma, amp_scaler,
-							bootstrap_value=bootstrap_value)
+							bootstrap_value=bootstrap_value,
+							feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 
 						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
@@ -2141,6 +2320,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				print(f"\t⏱️ update profile: scheduler_step={scheduler_stepped}, "
 					  f"samples={iteration_update_stats.get('num_selected', 0)}, "
 					  f"ppo={iteration_update_stats.get('ppo_update_time_s', 0.0):.3f}s, "
+					  f"ppo_feature_rebuild={iteration_update_stats.get('ppo_feature_rebuild_ms', 0.0):.2f}ms, "
 					  f"mem_alloc={iteration_update_stats.get('max_memory_allocated_mb', 0.0):.1f}MB, "
 					  f"skip={last_update.get('skip_reason', '')}")
 			# 保存检查点
@@ -2216,6 +2396,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 		forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
 		amp_scaler = make_grad_scaler(device, precision)
 		profile_on = profile_enabled(config)
+		feature_workspace = FeatureBuildWorkspace(config)
 
 		# 分别创建策略网络和价值网络的优化器，包含 encoder + head
 		policy_optimizer = optim.Adam(get_policy_parameters(model), lr=learning_rate)
@@ -2263,7 +2444,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 
 			while step_count < max_episode_length:
 				# 全局死亡检测：如果所有世界都没有存活agents，执行PPO更新后开始新iteration
-				local_no_alive = all_worlds_no_alive_agents(simulator, cumulative_done_all)
+				alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
+				local_no_alive = not bool(alive_mask.any().item())
 				if sync_bool_across_ranks(local_no_alive, device, op=dist.ReduceOp.MIN):
 					if buffer_step_count > 0:
 						if rank == 0:
@@ -2272,14 +2454,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							model, policy_optimizer, value_optimizer,
 								rollout_buffer, condition_state,
 								None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
-								bootstrap_value=None)
+								bootstrap_value=None,
+								feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
 					else:
 						if rank == 0:
 							print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
 					break
-				alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
 				
 				# 单步训练（与game.py的update_game_state一致）
 				step_start_time = time.time()
@@ -2296,6 +2478,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					precision=precision,
 					forward_chunk_agents=forward_chunk_agents,
 					sample_actions=True,
+					feature_workspace=feature_workspace,
 				)
 				policy_forward_ms = rollout_profile['policy_ms']
 				feature_build_ms = rollout_profile['feature_ms']
@@ -2303,10 +2486,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					worker_log(f"step {step_count + 1}: policy done")
 				
 				# 在推进环境前缓存当前状态
-				pre_state = state_with_control_for_buffer(simulator, alive_mask)
 				pre_route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
-				rollout_buffer.write_pre_step(pre_state, pre_route_state, time_index=step_count)
-				del pre_state
+				rollout_buffer.write_pre_step_from_simulator(simulator, alive_mask, pre_route_state, time_index=step_count)
 				
 				# 环境步进
 				if profile_on:
@@ -2329,7 +2510,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					cumulative_done_all = current_done_all.clone()
 				else:
 					cumulative_done_all = cumulative_done_all | current_done_all
-				local_no_alive_after_step = all_worlds_no_alive_agents(simulator, cumulative_done_all)
+				local_no_alive_after_step = not bool(rollout_alive_mask(simulator, cumulative_done_all).any().item())
 				no_alive_after_step = sync_bool_across_ranks(local_no_alive_after_step, device, op=dist.ReduceOp.MIN)
 				
 				# 下一步 feature 不再整批预构造；下个循环会按 alive agent chunk 即时生成。
@@ -2340,7 +2521,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
 				if rank == 0 and profile_on and step_count % profile_log_interval(config) == 0:
 					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
+					rollout_path = rollout_profile.get('path', 'none')
+					rollout_selected = int(rollout_profile.get('num_selected', 0) or 0)
+					rollout_chunks = int(rollout_profile.get('feature_chunks', 0) or 0)
 					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
+						  + f", path={rollout_path}, selected={rollout_selected}, feature_chunks={rollout_chunks}"
 						  + (f", {step_profile}" if step_profile else ""))
 
 				if no_alive_after_step:
@@ -2350,7 +2535,8 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						model, policy_optimizer, value_optimizer,
 						rollout_buffer, condition_state,
 						None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
-						bootstrap_value=None)
+						bootstrap_value=None,
+						feature_workspace=feature_workspace)
 					merge_update_stats(iteration_update_stats, update_stats)
 					clear_rollout_buffers(rollout_buffer)
 					break
@@ -2362,12 +2548,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
 						bootstrap_value = current_rollout_bootstrap_value(
 							model, simulator, config, cumulative_done_all,
-							condition_state, step_count, precision, forward_chunk_agents)
+							condition_state, step_count, precision, forward_chunk_agents,
+							feature_workspace=feature_workspace)
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
 							None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
-							bootstrap_value=bootstrap_value)
+							bootstrap_value=bootstrap_value,
+							feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
 						if rank == 0:
@@ -2378,12 +2566,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
 						bootstrap_value = current_rollout_bootstrap_value(
 							model, simulator, config, cumulative_done_all,
-							condition_state, step_count, precision, forward_chunk_agents)
+							condition_state, step_count, precision, forward_chunk_agents,
+							feature_workspace=feature_workspace)
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
 							None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
-							bootstrap_value=bootstrap_value)
+							bootstrap_value=bootstrap_value,
+							feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 
 						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
@@ -2408,6 +2598,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				print(f"\t⏱️ update profile: scheduler_step={scheduler_stepped}, "
 					  f"samples={iteration_update_stats.get('num_selected', 0)}, "
 					  f"ppo={iteration_update_stats.get('ppo_update_time_s', 0.0):.3f}s, "
+					  f"ppo_feature_rebuild={iteration_update_stats.get('ppo_feature_rebuild_ms', 0.0):.2f}ms, "
 					  f"mem_alloc={iteration_update_stats.get('max_memory_allocated_mb', 0.0):.1f}MB, "
 					  f"skip={last_update.get('skip_reason', '')}")
 
