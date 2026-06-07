@@ -622,17 +622,19 @@ class TeraflowSimulator:
         这对应原文中 waypoint 序列的采样方式，避免目标序列在地图上随机跳跃。
         """
         B, M = prev_quad.shape
-        if self.road_network.num_quads <= 0:
+        routable_quad_ids = self._routable_quad_ids()
+        if routable_quad_ids.numel() == 0:
             return torch.full_like(prev_quad, -1, dtype=torch.int32)
 
         K = max(1, self.route_candidate_samples)
-        sampled = torch.randint(
+        sampled_pos = torch.randint(
             0,
-            self.road_network.num_quads,
+            int(routable_quad_ids.numel()),
             (B, M, K),
             dtype=torch.long,
             device=self.device,
         )
+        sampled = routable_quad_ids[sampled_pos]
         safe_prev = torch.clamp(prev_quad.long(), 0, self.road_network.num_quads - 1)
         quad_centers = self.road_network.quad_centerlines.mean(dim=1)
         quad_dirs = self.road_network.quad_directions
@@ -678,6 +680,21 @@ class TeraflowSimulator:
         chosen = torch.where(has_strict | has_relaxed, chosen, fallback_choice)
         return torch.where(valid_mask & (has_strict | has_relaxed | has_fallback), chosen, torch.full_like(chosen, -1))
 
+    def _routable_quad_ids(self) -> torch.Tensor:
+        routable = getattr(self.path_planner, 'routable_quad_ids', None)
+        if torch.is_tensor(routable) and routable.numel() > 0:
+            routable = routable.to(device=self.device, dtype=torch.long)
+            routable = routable[(routable >= 0) & (routable < self.road_network.num_quads)]
+            if routable.numel() > 0:
+                return routable
+        return torch.arange(self.road_network.num_quads, device=self.device, dtype=torch.long)
+
+    def _project_to_routable_quads(self, quad_ids: torch.Tensor) -> torch.Tensor:
+        project_fn = getattr(self.path_planner, 'project_quads_to_routable', None)
+        if callable(project_fn):
+            return project_fn(quad_ids).to(device=self.device, dtype=torch.int32)
+        return quad_ids.to(device=self.device, dtype=torch.int32)
+
     def _sample_route_quad_ids(self, active_mask: torch.Tensor, start_i32: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """采样 final goal 与 N_wp ~ U{0,3} 个中间 waypoint，并构造受距离/朝向约束的目标序列。"""
         B, M = active_mask.shape
@@ -694,20 +711,33 @@ class TeraflowSimulator:
         route_mask = route_slots < target_count.unsqueeze(-1)
         route_quads = torch.full((B, M, self.max_route_targets), -1, dtype=torch.int32, device=self.device)
 
-        first_target = torch.randint(
+        routable_quad_ids = self._routable_quad_ids()
+        if routable_quad_ids.numel() == 0:
+            return route_quads, torch.zeros_like(target_count)
+        first_pos = torch.randint(
             0,
-            self.road_network.num_quads,
+            int(routable_quad_ids.numel()),
             (B, M),
-            dtype=torch.int32,
+            dtype=torch.long,
             device=self.device,
         )
-        if self.road_network.num_quads > 1:
-            same_as_start = valid_start & (first_target == start_i32)
+        first_target = routable_quad_ids[first_pos]
+        if routable_quad_ids.numel() > 1:
+            same_as_start = valid_start & (first_target == start_i32.long())
+            offset = torch.randint(
+                1,
+                int(routable_quad_ids.numel()),
+                (B, M),
+                dtype=torch.long,
+                device=self.device,
+            )
+            alternate_target = routable_quad_ids[(first_pos + offset) % int(routable_quad_ids.numel())]
             first_target = torch.where(
                 same_as_start,
-                ((first_target.long() + 1) % self.road_network.num_quads).to(torch.int32),
+                alternate_target,
                 first_target,
             )
+        first_target = self._project_to_routable_quads(first_target)
         route_quads[..., 0] = torch.where(valid_start & route_mask[..., 0], first_target, route_quads[..., 0])
 
         for route_idx in range(1, self.max_route_targets):
@@ -727,6 +757,11 @@ class TeraflowSimulator:
             )
             route_mask = route_slots < target_count.unsqueeze(-1)
 
+        route_quads = torch.where(
+            (valid_start.unsqueeze(-1) & route_mask),
+            self._project_to_routable_quads(route_quads),
+            route_quads,
+        )
         return route_quads, target_count
 
     def get_route_state(self, clone: bool = False) -> Dict[str, torch.Tensor]:

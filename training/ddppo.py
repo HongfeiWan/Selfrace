@@ -236,6 +236,26 @@ def normalize_to_minus1_1(x: torch.Tensor, min_val, max_val) -> torch.Tensor:
 
 FEATURE_PAD_VALUE = -2.0
 
+
+def config_get(container, name: str, default=None):
+    if isinstance(container, dict):
+        return container.get(name, default)
+    return getattr(container, name, default)
+
+
+def normalize_route_distance(distance: torch.Tensor, max_distance: float, mode: str = "log") -> torch.Tensor:
+    """Normalize non-negative route distances while preserving long-range ordering."""
+    max_distance = max(float(max_distance), 1e-6)
+    distance = torch.clamp(distance, min=0.0)
+    mode = str(mode or "log").lower()
+    if mode == "linear":
+        return normalize_to_minus1_1(distance, 0.0, max_distance)
+    if mode == "sqrt":
+        scaled = torch.sqrt(distance) / math.sqrt(max_distance)
+    else:
+        scaled = torch.log1p(distance) / math.log1p(max_distance)
+    return torch.clamp(scaled * 2.0 - 1.0, -1.0, 1.0)
+
 class FeatureBuildWorkspace:
     """Long-lived scratch/cache for feature construction hot paths."""
 
@@ -418,7 +438,10 @@ def _is_navigation_packet(navigation: torch.Tensor) -> bool:
 
 def build_lane_map_features(w_lanes_local: torch.Tensor, navigation: torch.Tensor,
                             target_size: int, element_dim: int = 7,
-                            goal_slots: int = 0, out: torch.Tensor = None) -> torch.Tensor:
+                            goal_slots: int = 0, out: torch.Tensor = None,
+                            route_distance_norm: str = "log",
+                            route_abs_distance_max: float = 12000.0,
+                            route_rel_distance_max: float = 12000.0) -> torch.Tensor:
     """构造原文式 W_lane: 位置、车道方向、车道宽度、到下一目标的绝对/相对距离。"""
     if w_lanes_local is None or w_lanes_local.numel() == 0:
         if out is not None:
@@ -504,10 +527,18 @@ def build_lane_map_features(w_lanes_local: torch.Tensor, navigation: torch.Tenso
     if element_dim > 4:
         lane_out[..., 4] = normalize_to_minus1_1(lane_width, 0.0, 8.0)
     if element_dim > 5:
-        goal_dist_norm = normalize_to_minus1_1(goal_dist, 0.0, 400.0)
+        goal_dist_norm = normalize_route_distance(
+            goal_dist,
+            route_abs_distance_max,
+            mode=route_distance_norm,
+        )
         lane_out[..., 5] = torch.where(distance_valid, goal_dist_norm, torch.full_like(goal_dist_norm, FEATURE_PAD_VALUE))
     if element_dim > 6:
-        rel_goal_dist_norm = normalize_to_minus1_1(rel_goal_dist, 0.0, 200.0)
+        rel_goal_dist_norm = normalize_route_distance(
+            rel_goal_dist,
+            route_rel_distance_max,
+            mode=route_distance_norm,
+        )
         lane_out[..., 6] = torch.where(distance_valid, rel_goal_dist_norm, torch.full_like(rel_goal_dist_norm, FEATURE_PAD_VALUE))
     lane_out.masked_fill_(~valid.unsqueeze(-1), FEATURE_PAD_VALUE)
     return out
@@ -683,6 +714,11 @@ def build_network_features(agents_state: torch.Tensor,
     lane_points_end = lane_points_start + lane_points_size
     
     lane_element_dim = permutation_element_dims[1] if len(permutation_element_dims) > 1 else 7
+    training_cfg = config_get(config, 'training', SimpleNamespace())
+    navigation_cfg = config_get(training_cfg, 'navigation', SimpleNamespace())
+    route_distance_norm = config_get(navigation_cfg, 'route_distance_norm', 'log')
+    route_abs_distance_max = float(config_get(navigation_cfg, 'route_abs_distance_max', 12000.0))
+    route_rel_distance_max = float(config_get(navigation_cfg, 'route_rel_distance_max', 12000.0))
     lane_out = features_tensor[:, :, lane_points_start:lane_points_end]
     w_lanes_flat = build_lane_map_features(
         w_lanes_local,
@@ -690,6 +726,9 @@ def build_network_features(agents_state: torch.Tensor,
         lane_points_size,
         lane_element_dim,
         goal_slots=goal_slots,
+        route_distance_norm=route_distance_norm,
+        route_abs_distance_max=route_abs_distance_max,
+        route_rel_distance_max=route_rel_distance_max,
         out=lane_out,
     )
     if w_lanes_flat is None:

@@ -431,6 +431,12 @@ class PathPlanner:
         
         # ===================初始化WaypointGraphGPU===================
         self._route_distance_ready = False
+        self.routable_quad_mask = torch.zeros(
+            self.quads_info['center_x'].shape[0],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self.routable_quad_ids = torch.empty(0, dtype=torch.int32, device=self.device)
         try:
             lane_route_graph, lane_route_edge_coords = self._build_lane_route_graph(
                 cross_data,
@@ -1063,7 +1069,48 @@ class PathPlanner:
             self.quad_goal_waypoint,
             torch.full_like(self.quad_goal_waypoint, -1),
         )
+        goal_wp_safe = torch.clamp(self.quad_goal_waypoint, 0, max(num_waypoints - 1, 0))
+        self.routable_quad_mask = (
+            (self.quad_goal_waypoint >= 0)
+            & (self.quad_goal_waypoint < num_waypoints)
+            & (self.w_lane_start_group[goal_wp_safe] >= 0)
+        )
+        self.routable_quad_ids = torch.nonzero(self.routable_quad_mask, as_tuple=False).squeeze(1).to(torch.int32)
         self._route_distance_ready = True
+
+    def project_quads_to_routable(self, quad_ids: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
+        """Project invalid or unroutable road quads to the nearest routable quad."""
+        routable_ids = getattr(self, 'routable_quad_ids', None)
+        routable_mask = getattr(self, 'routable_quad_mask', None)
+        if routable_ids is None or routable_ids.numel() == 0 or routable_mask is None:
+            return quad_ids.to(device=self.device, dtype=torch.int32)
+
+        quad_ids_long = quad_ids.to(device=self.device, dtype=torch.long)
+        out = quad_ids_long.clone()
+        num_quads = int(routable_mask.shape[0])
+        in_range = (quad_ids_long >= 0) & (quad_ids_long < num_quads)
+        safe_quad = torch.clamp(quad_ids_long, 0, max(num_quads - 1, 0))
+        already_routable = in_range & routable_mask[safe_quad]
+        needs_projection = in_range & (~already_routable)
+        out = torch.where(in_range, out, torch.full_like(out, -1))
+
+        if not bool(needs_projection.any().item()):
+            return out.to(torch.int32)
+
+        quad_centers = torch.stack([self.quads_info['center_x'], self.quads_info['center_y']], dim=1)
+        routable_long = routable_ids.to(device=self.device, dtype=torch.long)
+        routable_centers = quad_centers[routable_long]
+        flat_out = out.reshape(-1)
+        flat_safe = safe_quad.reshape(-1)
+        flat_needs = torch.nonzero(needs_projection.reshape(-1), as_tuple=False).squeeze(1)
+
+        for start in range(0, int(flat_needs.numel()), int(chunk_size)):
+            idx = flat_needs[start:start + int(chunk_size)]
+            query = quad_centers[flat_safe[idx]]
+            nearest = torch.cdist(query, routable_centers).argmin(dim=1)
+            flat_out[idx] = routable_long[nearest]
+
+        return out.to(torch.int32)
 
     def route_distances_from_w_lanes_to_goal_quads(self, w_lane_ids: torch.Tensor, goal_quad_ids: torch.Tensor) -> torch.Tensor:
         """
