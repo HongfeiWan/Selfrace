@@ -1922,6 +1922,9 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	batch_size_per_gpu = int(getattr(training_cfg, 'batch_size_per_gpu', 2000))
 	advantage_filter_threshold = float(getattr(training_cfg, 'advantage_filter_threshold', 0.01))
 	beta = float(getattr(training_cfg, 'advantage_filter_beta', 0.25))
+	advantage_filter_max_drop_fraction = float(getattr(training_cfg, 'advantage_filter_max_drop_fraction', 1.0))
+	advantage_filter_max_drop_fraction = min(max(advantage_filter_max_drop_fraction, 0.0), 1.0)
+	min_ppo_samples = max(0, int(getattr(training_cfg, 'min_ppo_samples', 0)))
 	precision = getattr(training_cfg, 'precision', '32-bit')
 	forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
 	feature_workspace = feature_workspace or _default_workspace(config)
@@ -1959,41 +1962,144 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	A_max_tensor = torch.max(torch.abs(advantages)).detach()
 	a_max_ewma = A_max_tensor if a_max_ewma is None else (beta * A_max_tensor + (1.0 - beta) * a_max_ewma.to(device))
 	eta = advantage_filter_threshold * a_max_ewma
-	keep_mask = (torch.abs(advantages) >= eta)
+	abs_advantages = torch.abs(advantages)
 
 	seen_done_inclusive = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
 	seen_done_prev = torch.roll(seen_done_inclusive, shifts=1, dims=0)
 	seen_done_prev[0] = False
 	first_done_step = dones_tensor & (~seen_done_prev)
 	post_done_mask = seen_done_inclusive & (~first_done_step)
-	keep_mask = keep_mask & (~post_done_mask)
 	active_sample_mask = states_tensor[..., 6] > 0.5
-	keep_mask = keep_mask & active_sample_mask
-	cand_idx = keep_mask.nonzero(as_tuple=False)
+	eligible_mask = active_sample_mask & (~post_done_mask)
+	threshold_keep_mask = eligible_mask & (abs_advantages >= eta)
+	eligible_count = int(eligible_mask.sum().item())
+	threshold_count = int(threshold_keep_mask.sum().item())
+	min_keep_by_drop_cap = math.ceil(eligible_count * (1.0 - advantage_filter_max_drop_fraction)) if eligible_count > 0 else 0
+	min_keep = min(eligible_count, max(min_keep_by_drop_cap, min_ppo_samples))
+	protection_applied = threshold_count < min_keep
+	effective_candidate_count = max(threshold_count, min_keep)
 
 	if is_rank0:
 		print(f"🎯 第 {iteration} 个iteration - 最大|A|: {A_max_tensor.item():.4f}, 阈值: {eta.item():.4f}")
-		print(f"📊 过滤前: {keep_mask.numel()}, 过滤后: {keep_mask.sum().item()}")
+		print(
+			f"📊 eligible: {eligible_count}, threshold后: {threshold_count}, "
+			f"保护后候选池: {effective_candidate_count}, min_keep: {min_keep} "
+			f"(最多过滤 {advantage_filter_max_drop_fraction:.0%}, min_ppo_samples={min_ppo_samples})"
+		)
 
-	local_has_samples = cand_idx.numel() > 0
+	local_has_samples = effective_candidate_count > 0 and eligible_count > 0 and (min_ppo_samples <= 0 or eligible_count >= min_ppo_samples)
 	if not sync_bool_across_ranks(local_has_samples, device, op=dist.ReduceOp.MIN):
 		if is_rank0:
-			print("⚠️ 至少一个rank无可用样本，本轮跳过以避免DDP不同步")
-		stats = make_update_stats("no_samples_after_filter", device)
-		stats['num_candidates'] = int(cand_idx.shape[0])
+			print("⚠️ 至少一个rank eligible样本不足，本轮跳过以避免少样本PPO/DDP不同步")
+		stats = make_update_stats("too_few_eligible_samples", device)
+		stats['num_candidates'] = int(effective_candidate_count)
+		stats['num_eligible'] = int(eligible_count)
+		stats['num_threshold_candidates'] = int(threshold_count)
+		stats['num_min_keep'] = int(min_keep)
+		stats['filter_protection_applied'] = bool(protection_applied)
 		stats['ppo_update_time_s'] = time.time() - update_start_time
 		return a_max_ewma.detach(), stats
 
-	N = cand_idx.shape[0]
+	def sample_mask_indices(mask: torch.Tensor, k: int, mask_count: int) -> torch.Tensor:
+		"""Sample up to k indices from a [T, B, M] boolean mask without materializing huge pools."""
+		if k <= 0 or mask_count <= 0:
+			return torch.empty((0, 3), dtype=torch.long, device=device)
+		if k >= mask_count or mask_count <= 1_000_000:
+			idx = mask.nonzero(as_tuple=False)
+			if idx.shape[0] <= k:
+				return idx
+			rand_pos = torch.randperm(idx.shape[0], device=device)[:k]
+			return idx[rand_pos]
+
+		flat_mask = mask.reshape(-1)
+		total = flat_mask.numel()
+		density = max(mask_count / max(total, 1), 1e-8)
+		chunks = []
+		collected = 0
+		for _ in range(8):
+			need = k - collected
+			if need <= 0:
+				break
+			draw_count = min(total, max(k * 2, int(math.ceil(need / density * 1.5))))
+			flat_idx = torch.randint(total, (draw_count,), device=device)
+			flat_idx = flat_idx[flat_mask[flat_idx]]
+			if flat_idx.numel() == 0:
+				continue
+			chunks.append(flat_idx)
+			collected += int(flat_idx.numel())
+
+		if chunks:
+			flat_selected = torch.unique(torch.cat(chunks))
+			if flat_selected.numel() >= k:
+				flat_selected = flat_selected[torch.randperm(flat_selected.numel(), device=device)[:k]]
+				B = mask.shape[1]
+				M = mask.shape[2]
+				t = flat_selected // (B * M)
+				rem = flat_selected % (B * M)
+				b = rem // M
+				m = rem % M
+				return torch.stack((t, b, m), dim=1)
+
+		idx = mask.nonzero(as_tuple=False)
+		if idx.shape[0] <= k:
+			return idx
+		rand_pos = torch.randperm(idx.shape[0], device=device)[:k]
+		return idx[rand_pos]
+
+	N = int(effective_candidate_count)
 	K_target = batch_size_per_gpu if batch_size_per_gpu > 0 else N
 	K = min(K_target, N)
-	rand_pos = torch.randperm(N, device=device)[:K]
-	selected_idx = cand_idx[rand_pos]
+	selected_from_threshold = 0
+	selected_from_protection = 0
+	if protection_applied:
+		if N <= 1_000_000:
+			pool_pos = torch.randperm(N, device=device)[:K]
+		else:
+			pool_pos = torch.randint(N, (K,), device=device)
+		selected_from_threshold = int((pool_pos < threshold_count).sum().item()) if threshold_count > 0 else 0
+		selected_from_protection = K - selected_from_threshold
+		selected_parts = []
+		if selected_from_threshold > 0:
+			selected_parts.append(sample_mask_indices(threshold_keep_mask, selected_from_threshold, threshold_count))
+		if selected_from_protection > 0:
+			extra_mask = eligible_mask & (~threshold_keep_mask)
+			selected_parts.append(sample_mask_indices(extra_mask, selected_from_protection, eligible_count - threshold_count))
+		selected_idx = torch.cat(selected_parts, dim=0) if selected_parts else torch.empty((0, 3), dtype=torch.long, device=device)
+		if selected_idx.shape[0] > K:
+			selected_idx = selected_idx[torch.randperm(selected_idx.shape[0], device=device)[:K]]
+	elif threshold_count >= K:
+		selected_idx = sample_mask_indices(threshold_keep_mask, K, threshold_count)
+		selected_from_threshold = K
+	else:
+		threshold_idx = threshold_keep_mask.nonzero(as_tuple=False)
+		remaining = K - int(threshold_idx.shape[0])
+		extra_idx = sample_mask_indices(eligible_mask & (~threshold_keep_mask), remaining, eligible_count - threshold_count)
+		selected_idx = torch.cat([threshold_idx, extra_idx], dim=0)
+		if selected_idx.shape[0] > K:
+			selected_idx = selected_idx[torch.randperm(selected_idx.shape[0], device=device)[:K]]
+		selected_from_threshold = int(min(threshold_count, K))
+		selected_from_protection = max(0, K - selected_from_threshold)
+	K = int(selected_idx.shape[0])
+	if K <= 0:
+		if is_rank0:
+			print("⚠️ 过滤保护后仍无可用样本，本轮跳过")
+		stats = make_update_stats("no_samples_after_filter", device)
+		stats['num_candidates'] = int(effective_candidate_count)
+		stats['num_eligible'] = int(eligible_count)
+		stats['num_threshold_candidates'] = int(threshold_count)
+		stats['num_min_keep'] = int(min_keep)
+		stats['filter_protection_applied'] = bool(protection_applied)
+		stats['ppo_update_time_s'] = time.time() - update_start_time
+		return a_max_ewma.detach(), stats
 	selected_t = selected_idx[:, 0]
 	selected_b = selected_idx[:, 1]
 	selected_m = selected_idx[:, 2]
 	if is_rank0:
-		print(f"🎯 随机选取 {K} 个样本用于更新（候选 {N}, 目标 {K_target}）")
+		protection_msg = "，已触发过滤保护" if protection_applied else ""
+		print(
+			f"🎯 随机选取 {K} 个样本用于更新（候选池 {N}, 目标 {K_target}{protection_msg}, "
+			f"阈值样本 {selected_from_threshold}, 保护补样 {selected_from_protection}）"
+		)
 
 	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
 	advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
@@ -2085,6 +2191,12 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		'did_optimizer_step': did_optimizer_step,
 		'num_candidates': int(N),
 		'num_selected': int(K),
+		'num_eligible': int(eligible_count),
+		'num_threshold_candidates': int(threshold_count),
+		'num_min_keep': int(min_keep),
+		'num_selected_threshold': int(selected_from_threshold),
+		'num_selected_protection': int(selected_from_protection),
+		'filter_protection_applied': bool(protection_applied),
 		'num_epochs': int(ppo_epochs),
 		'policy_loss': last_policy_loss,
 		'value_loss': last_value_loss,

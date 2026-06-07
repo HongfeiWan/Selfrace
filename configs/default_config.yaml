@@ -202,6 +202,8 @@ training:
   # 修正advantage filtering
   advantage_filter_threshold: 0.01  # 阈值过滤
   advantage_filter_beta: 0.25       # EWMA衰减参数
+  advantage_filter_max_drop_fraction: 0.8 # 临时保护：最多过滤80%的eligible样本
+  min_ppo_samples: 8192             # 临时保护：候选样本太少时跳过/补足，避免少样本PPO压塌entropy
 
   # 训练参数
   total_timesteps: 1_000_000_000_000 # As per paper
