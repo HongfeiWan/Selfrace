@@ -66,6 +66,7 @@ class RewardCalculator:
         
         # 初始化所有随机参数
         self.sampled_params = self.parameter_sampler.sample_all_parameters(self.B, self.M)
+        self.last_reward_components = {}
         
         # 参数名到sampled_params索引映射
         self._param_name_to_idx = {
@@ -90,6 +91,7 @@ class RewardCalculator:
         """
         # 重新采样所有参数
         self.sampled_params = self.parameter_sampler.sample_all_parameters(self.B, self.M)
+        self.last_reward_components = {}
     
     def calculate_goal_reward(self, 
                              agent_positions: torch.Tensor,
@@ -501,6 +503,19 @@ class RewardCalculator:
         # 计算时间步惩罚 (如果提供了加速度信息)
         timestep_penalty = self.calculate_timestep_penalty(speeds, along, alat, dt)
         reward += timestep_penalty
+
+        self.last_reward_components = {
+            'goal': goal_rewards,
+            'collision': collision_penalty,
+            'offroad': offroad_penalty,
+            'comfort': comfort_penalty,
+            'lane_align': lane_alignment_reward,
+            'lane_center': lane_center_reward,
+            'velocity': new_velocity_reward,
+            'reverse': reverse_penalty,
+            'stop_line': stop_line_penalty,
+            'timestep': timestep_penalty,
+        }
         
         return reward, goal_reached 
 

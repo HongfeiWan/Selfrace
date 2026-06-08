@@ -953,6 +953,13 @@ def make_update_stats(reason: str = "", device: torch.device = None) -> dict:
 		'policy_loss': None,
 		'value_loss': None,
 		'entropy': None,
+		'approx_kl': None,
+		'old_approx_kl': None,
+		'clip_frac': None,
+		'ratio_mean': None,
+		'ratio_min': None,
+		'ratio_max': None,
+		'max_action_prob_mean': None,
 		'ppo_update_time_s': 0.0,
 		'ppo_feature_rebuild_ms': 0.0,
 		'max_memory_allocated_mb': 0.0,
@@ -992,6 +999,308 @@ def format_profile(profile_dict: dict) -> str:
 	if not profile_dict:
 		return ""
 	return ", ".join(f"{key}={value:.2f}ms" for key, value in profile_dict.items())
+
+REWARD_COMPONENT_NAMES = (
+	'goal',
+	'collision',
+	'offroad',
+	'comfort',
+	'lane_align',
+	'lane_center',
+	'velocity',
+	'reverse',
+	'stop_line',
+	'timestep',
+)
+
+REWARD_COMPONENT_LABELS = {
+	'goal': 'goal',
+	'collision': 'coll_r',
+	'offroad': 'off_r',
+	'comfort': 'comfort',
+	'lane_align': 'align',
+	'lane_center': 'center',
+	'velocity': 'vel',
+	'reverse': 'rev',
+	'stop_line': 'stop',
+	'timestep': 'time',
+}
+
+def get_diagnostics_cfg(config):
+	training_cfg = getattr(config, 'training', SimpleNamespace())
+	return getattr(training_cfg, 'diagnostics', SimpleNamespace())
+
+def diagnostics_enabled(config, name: str = None) -> bool:
+	diag_cfg = get_diagnostics_cfg(config)
+	if not bool(getattr(diag_cfg, 'enabled', True)):
+		return False
+	if name is None:
+		return True
+	return bool(getattr(diag_cfg, name, True))
+
+def scalar_item(value, default=0.0):
+	if value is None:
+		return default
+	if torch.is_tensor(value):
+		return float(value.detach().cpu().item())
+	return float(value)
+
+def tensor_stats(tensor: torch.Tensor) -> dict:
+	if tensor is None or tensor.numel() == 0:
+		return {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0}
+	t = tensor.detach().float()
+	return {
+		'mean': scalar_item(t.mean()),
+		'std': scalar_item(t.std(unbiased=False)) if t.numel() > 1 else 0.0,
+		'min': scalar_item(t.min()),
+		'max': scalar_item(t.max()),
+	}
+
+def action_label(action_values: torch.Tensor, action_idx: int) -> str:
+	if torch.is_tensor(action_values) and 0 <= int(action_idx) < int(action_values.shape[0]):
+		val = action_values[int(action_idx)].detach().cpu().tolist()
+		if len(val) >= 2:
+			return f"{int(action_idx)}[{val[0]:.0f},{val[1]:.0f}]"
+	return str(int(action_idx))
+
+def top_action_summary(counts: torch.Tensor, action_values: torch.Tensor = None, limit: int = 6,
+					   numerators: dict = None) -> str:
+	if counts is None or counts.numel() == 0:
+		return "none"
+	counts_cpu = counts.detach().to('cpu', dtype=torch.float64)
+	total = float(counts_cpu.sum().item())
+	if total <= 0:
+		return "none"
+	limit = min(int(limit), int(counts_cpu.numel()))
+	top_vals, top_idx = torch.topk(counts_cpu, k=limit)
+	parts = []
+	for c, idx in zip(top_vals.tolist(), top_idx.tolist()):
+		if c <= 0:
+			continue
+		extras = []
+		if numerators:
+			for name, values in numerators.items():
+				if values is None:
+					continue
+				num = float(values.detach().to('cpu', dtype=torch.float64)[int(idx)].item())
+				extras.append(f"{name}={num / max(c, 1.0):.4f}")
+		extra_text = ("," + ",".join(extras)) if extras else ""
+		parts.append(f"{action_label(action_values, int(idx))}:{int(c)}({100.0*c/total:.1f}%{extra_text})")
+	return "; ".join(parts) if parts else "none"
+
+def reward_component_summary(component_sums: dict, samples: float) -> str:
+	parts = []
+	for name in REWARD_COMPONENT_NAMES:
+		value = component_sums.get(name) if component_sums else None
+		if value is None:
+			continue
+		label = REWARD_COMPONENT_LABELS.get(name, name)
+		parts.append(f"{label}={scalar_item(value) / max(samples, 1.0):.5f}")
+	return ", ".join(parts) if parts else "none"
+
+def top_action_component_summary(counts: torch.Tensor, action_component_sums: dict,
+								 action_values: torch.Tensor = None, limit: int = 3) -> str:
+	if counts is None or counts.numel() == 0 or not action_component_sums:
+		return "none"
+	counts_cpu = counts.detach().to('cpu', dtype=torch.float64)
+	total = float(counts_cpu.sum().item())
+	if total <= 0:
+		return "none"
+	limit = min(int(limit), int(counts_cpu.numel()))
+	top_vals, top_idx = torch.topk(counts_cpu, k=limit)
+	parts = []
+	for c, idx in zip(top_vals.tolist(), top_idx.tolist()):
+		if c <= 0:
+			continue
+		component_parts = []
+		for name in REWARD_COMPONENT_NAMES:
+			values = action_component_sums.get(name)
+			if values is None:
+				continue
+			label = REWARD_COMPONENT_LABELS.get(name, name)
+			num = float(values.detach().to('cpu', dtype=torch.float64)[int(idx)].item())
+			component_parts.append(f"{label}={num / max(c, 1.0):.4f}")
+		parts.append(f"{action_label(action_values, int(idx))}:(" + ",".join(component_parts) + ")")
+	return "; ".join(parts) if parts else "none"
+
+def init_rollout_diagnostics(config, device: torch.device):
+	if not diagnostics_enabled(config, 'rollout'):
+		return None
+	num_actions = int(getattr(getattr(config, 'training').network, 'num_actions', 12))
+	return {
+		'steps': torch.zeros((), device=device, dtype=torch.long),
+		'samples': torch.zeros((), device=device, dtype=torch.long),
+		'reward_sum': torch.zeros((), device=device, dtype=torch.float64),
+		'reward_sq_sum': torch.zeros((), device=device, dtype=torch.float64),
+		'reward_min': torch.full((), float('inf'), device=device, dtype=torch.float32),
+		'reward_max': torch.full((), float('-inf'), device=device, dtype=torch.float32),
+		'negative_rewards': torch.zeros((), device=device, dtype=torch.long),
+		'dones': torch.zeros((), device=device, dtype=torch.long),
+		'collisions': torch.zeros((), device=device, dtype=torch.long),
+		'offroads': torch.zeros((), device=device, dtype=torch.long),
+		'final_goals': torch.zeros((), device=device, dtype=torch.long),
+		'intermediate_goals': torch.zeros((), device=device, dtype=torch.long),
+		'action_counts': torch.zeros((num_actions,), device=device, dtype=torch.long),
+		'action_reward_sum': torch.zeros((num_actions,), device=device, dtype=torch.float64),
+		'action_done_counts': torch.zeros((num_actions,), device=device, dtype=torch.long),
+		'action_collision_counts': torch.zeros((num_actions,), device=device, dtype=torch.long),
+		'action_offroad_counts': torch.zeros((num_actions,), device=device, dtype=torch.long),
+		'reward_component_sums': {
+			name: torch.zeros((), device=device, dtype=torch.float64)
+			for name in REWARD_COMPONENT_NAMES
+		},
+		'action_component_sums': {
+			name: torch.zeros((num_actions,), device=device, dtype=torch.float64)
+			for name in REWARD_COMPONENT_NAMES
+		},
+	}
+
+def update_rollout_diagnostics(diag: dict, simulator, alive_mask: torch.Tensor,
+							   reward: torch.Tensor, done: torch.Tensor, actions: torch.Tensor):
+	if diag is None:
+		return
+	info = getattr(simulator, 'last_step_train_info', None) or {}
+	mask = info.get('effective_mask', alive_mask)
+	mask = mask.to(device=reward.device, dtype=torch.bool)
+	if mask.numel() == 0:
+		return
+	reward_selected = reward[mask].detach()
+	if reward_selected.numel() == 0:
+		return
+	diag['steps'] += 1
+	diag['samples'] += reward_selected.numel()
+	reward_double = reward_selected.to(torch.float64)
+	diag['reward_sum'] += reward_double.sum()
+	diag['reward_sq_sum'] += (reward_double * reward_double).sum()
+	diag['reward_min'] = torch.minimum(diag['reward_min'], reward_selected.min())
+	diag['reward_max'] = torch.maximum(diag['reward_max'], reward_selected.max())
+	diag['negative_rewards'] += (reward_selected < 0).sum()
+
+	def add_mask_count(name: str, fallback: torch.Tensor = None):
+		mask_value = info.get(name, fallback)
+		if mask_value is not None:
+			return (mask_value.to(device=reward.device, dtype=torch.bool) & mask).sum()
+		return torch.zeros((), device=reward.device, dtype=torch.long)
+
+	done_mask = add_mask_count('done_mask', done)
+	collision_mask = add_mask_count('collision_mask')
+	offroad_mask = add_mask_count('offroad_mask')
+	final_goal_mask = add_mask_count('final_goal_mask')
+	intermediate_goal_mask = add_mask_count('intermediate_goal_mask')
+	diag['dones'] += done_mask
+	diag['collisions'] += collision_mask
+	diag['offroads'] += offroad_mask
+	diag['final_goals'] += final_goal_mask
+	diag['intermediate_goals'] += intermediate_goal_mask
+
+	num_actions = int(diag['action_counts'].shape[0])
+	action_selected = actions[mask].detach().to(torch.long).clamp(0, num_actions - 1)
+	counts = torch.bincount(action_selected, minlength=num_actions)
+	diag['action_counts'] += counts
+	diag['action_reward_sum'].scatter_add_(0, action_selected, reward_double)
+	reward_components = info.get('reward_components', {}) or {}
+	for name, component in reward_components.items():
+		if name not in diag['reward_component_sums']:
+			continue
+		component_selected = component.to(device=reward.device)[mask].detach().to(torch.float64)
+		if component_selected.numel() == 0:
+			continue
+		diag['reward_component_sums'][name] += component_selected.sum()
+		diag['action_component_sums'][name].scatter_add_(0, action_selected, component_selected)
+	for name, key in (
+		('action_done_counts', 'done_mask'),
+		('action_collision_counts', 'collision_mask'),
+		('action_offroad_counts', 'offroad_mask'),
+	):
+		event_mask = info.get(key, done if key == 'done_mask' else None)
+		if event_mask is None:
+			continue
+		event_selected = event_mask.to(device=reward.device, dtype=torch.bool)[mask]
+		diag[name] += torch.bincount(action_selected[event_selected], minlength=num_actions)
+
+def print_rollout_diagnostics(diag: dict, action_values: torch.Tensor = None, prefix: str = "📈 rollout诊断"):
+	if diag is None:
+		return
+	samples = max(1.0, scalar_item(diag['samples']))
+	steps = int(scalar_item(diag['steps']))
+	reward_mean = scalar_item(diag['reward_sum']) / samples
+	reward_var = max(0.0, scalar_item(diag['reward_sq_sum']) / samples - reward_mean * reward_mean)
+	reward_std = math.sqrt(reward_var)
+	reward_min = scalar_item(diag['reward_min']) if torch.isfinite(diag['reward_min']) else 0.0
+	reward_max = scalar_item(diag['reward_max']) if torch.isfinite(diag['reward_max']) else 0.0
+	print(
+		f"{prefix}: steps={steps}, samples={int(samples)}, reward_mean={reward_mean:.5f}, "
+		f"reward_std={reward_std:.5f}, reward_min={reward_min:.4f}, reward_max={reward_max:.4f}, "
+		f"neg%={100.0 * scalar_item(diag['negative_rewards']) / samples:.2f}, "
+		f"done%={100.0 * scalar_item(diag['dones']) / samples:.2f}, "
+		f"collision%={100.0 * scalar_item(diag['collisions']) / samples:.2f}, "
+		f"offroad%={100.0 * scalar_item(diag['offroads']) / samples:.2f}, "
+		f"final_goal%={100.0 * scalar_item(diag['final_goals']) / samples:.2f}, "
+		f"waypoint%={100.0 * scalar_item(diag['intermediate_goals']) / samples:.2f}"
+	)
+	print(
+		f"{prefix}动作top: "
+		+ top_action_summary(
+			diag['action_counts'],
+			action_values=action_values,
+			numerators={
+				'r': diag['action_reward_sum'],
+				'done': diag['action_done_counts'].to(torch.float64),
+				'coll': diag['action_collision_counts'].to(torch.float64),
+				'off': diag['action_offroad_counts'].to(torch.float64),
+			},
+		)
+	)
+	print(f"{prefix}奖励拆分: {reward_component_summary(diag.get('reward_component_sums', {}), samples)}")
+	print(
+		f"{prefix}动作奖励拆分: "
+		+ top_action_component_summary(
+			diag['action_counts'],
+			diag.get('action_component_sums', {}),
+			action_values=action_values,
+		)
+	)
+
+def print_selected_batch_diagnostics(actions: torch.Tensor, raw_adv: torch.Tensor,
+									 returns: torch.Tensor, old_logp: torch.Tensor,
+									 num_actions: int, action_values: torch.Tensor = None,
+									 prefix: str = "📊 PPO样本诊断"):
+	if actions.numel() == 0:
+		return
+	actions = actions.detach().to(torch.long).clamp(0, num_actions - 1)
+	raw_adv = raw_adv.detach().float()
+	returns = returns.detach().float()
+	old_logp = old_logp.detach().float()
+	adv_s = tensor_stats(raw_adv)
+	ret_s = tensor_stats(returns)
+	counts = torch.bincount(actions, minlength=num_actions)
+	adv_sum = torch.zeros((num_actions,), device=raw_adv.device, dtype=torch.float64)
+	abs_adv_sum = torch.zeros((num_actions,), device=raw_adv.device, dtype=torch.float64)
+	pos_sum = torch.zeros((num_actions,), device=raw_adv.device, dtype=torch.float64)
+	logp_sum = torch.zeros((num_actions,), device=raw_adv.device, dtype=torch.float64)
+	adv_sum.scatter_add_(0, actions, raw_adv.to(torch.float64))
+	abs_adv_sum.scatter_add_(0, actions, raw_adv.abs().to(torch.float64))
+	pos_sum.scatter_add_(0, actions, (raw_adv > 0).to(torch.float64))
+	logp_sum.scatter_add_(0, actions, old_logp.to(torch.float64))
+	print(
+		f"{prefix}: adv_mean={adv_s['mean']:.5f}, adv_std={adv_s['std']:.5f}, "
+		f"adv_min={adv_s['min']:.5f}, adv_max={adv_s['max']:.5f}, "
+		f"adv_pos%={100.0 * scalar_item((raw_adv > 0).float().mean()):.2f}, "
+		f"ret_mean={ret_s['mean']:.5f}, ret_std={ret_s['std']:.5f}, old_logp_mean={scalar_item(old_logp.mean()):.5f}"
+	)
+	print(
+		f"{prefix}动作top: "
+		+ top_action_summary(
+			counts,
+			action_values=action_values,
+			numerators={
+				'adv': adv_sum,
+				'|adv|': abs_adv_sum,
+				'pos': pos_sum,
+				'oldlp': logp_sum,
+			},
+		)
+	)
 
 def step_schedulers_if_updated(policy_scheduler, value_scheduler, update_stats_accum: dict):
 	if update_stats_accum.get('did_optimizer_step', False):
@@ -2102,10 +2411,25 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		)
 
 	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
-	advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
+	raw_advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
 	returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
 	actions_batch = actions_tensor[selected_t, selected_b, selected_m].view(-1).to(torch.long)
-	advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std(unbiased=False) + 1e-8)
+	if is_rank0 and diagnostics_enabled(config, 'ppo'):
+		action_values = None
+		try:
+			action_values = simulator.dynamics_model.discrete_action_space.get_all_actions()
+		except Exception:
+			action_values = None
+		num_actions = int(getattr(getattr(training_cfg, 'network', SimpleNamespace()), 'num_actions', 12))
+		print_selected_batch_diagnostics(
+			actions_batch,
+			raw_advantages_batch,
+			returns_batch,
+			old_log_probs_batch,
+			num_actions,
+			action_values=action_values,
+		)
+	advantages_batch = (raw_advantages_batch - raw_advantages_batch.mean()) / (raw_advantages_batch.std(unbiased=False) + 1e-8)
 	batch_N = old_log_probs_batch.shape[0]
 
 	route_state_mb = gather_route_state_selected(route_state_tensor, selected_t, selected_b, selected_m)
@@ -2136,6 +2460,13 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	last_policy_loss = None
 	last_value_loss = None
 	last_entropy = None
+	last_approx_kl = None
+	last_old_approx_kl = None
+	last_clip_frac = None
+	last_ratio_mean = None
+	last_ratio_min = None
+	last_ratio_max = None
+	last_max_action_prob_mean = None
 	mb_old_logp = old_log_probs_batch
 	mb_adv = advantages_batch
 	mb_ret = returns_batch
@@ -2148,11 +2479,19 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 			logits_selected = action_logits[:, 0]
 			dist_selected = torch.distributions.Categorical(logits=logits_selected)
 			new_log_probs = dist_selected.log_prob(mb_actions)
-			ratio = torch.exp(new_log_probs - mb_old_logp)
+			log_ratio = new_log_probs - mb_old_logp
+			ratio = torch.exp(log_ratio)
 			surr1 = ratio * mb_adv
 			surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
 			policy_loss = -torch.min(surr1, surr2).mean()
 			entropy = dist_selected.entropy().mean()
+			approx_kl = ((ratio - 1.0) - log_ratio).mean()
+			old_approx_kl = (-log_ratio).mean()
+			clip_frac = ((ratio - 1.0).abs() > clip_ratio).to(torch.float32).mean()
+			ratio_mean = ratio.mean()
+			ratio_min = ratio.min()
+			ratio_max = ratio.max()
+			max_action_prob_mean = dist_selected.probs.max(dim=-1).values.mean()
 			value_pred = value_pred_full[:, 0]
 			value_loss = (value_pred - mb_ret).pow(2).mean()
 			total_loss = policy_loss - entropy_coef * entropy + value_loss_coef * value_loss
@@ -2179,9 +2518,22 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		last_policy_loss = float(policy_loss.detach().item())
 		last_value_loss = float(value_loss.detach().item())
 		last_entropy = float(entropy.detach().item())
+		last_approx_kl = float(approx_kl.detach().item())
+		last_old_approx_kl = float(old_approx_kl.detach().item())
+		last_clip_frac = float(clip_frac.detach().item())
+		last_ratio_mean = float(ratio_mean.detach().item())
+		last_ratio_min = float(ratio_min.detach().item())
+		last_ratio_max = float(ratio_max.detach().item())
+		last_max_action_prob_mean = float(max_action_prob_mean.detach().item())
 
 		if is_rank0:
-			print(f"   Epoch {epoch+1}/{ppo_epochs}: Policy Loss: {last_policy_loss:.6f}, Value Loss: {last_value_loss:.6f}, Entropy: {last_entropy:.6f}")
+			print(
+				f"   Epoch {epoch+1}/{ppo_epochs}: Policy Loss: {last_policy_loss:.6f}, "
+				f"Value Loss: {last_value_loss:.6f}, Entropy: {last_entropy:.6f}, "
+				f"KL: {last_approx_kl:.6f}, oldKL: {last_old_approx_kl:.6f}, "
+				f"clip_frac: {last_clip_frac:.3f}, ratio: {last_ratio_mean:.3f}/"
+				f"{last_ratio_min:.3f}-{last_ratio_max:.3f}, maxp: {last_max_action_prob_mean:.3f}"
+			)
 
 	model.eval()
 	if is_rank0:
@@ -2201,6 +2553,13 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		'policy_loss': last_policy_loss,
 		'value_loss': last_value_loss,
 		'entropy': last_entropy,
+		'approx_kl': last_approx_kl,
+		'old_approx_kl': last_old_approx_kl,
+		'clip_frac': last_clip_frac,
+		'ratio_mean': last_ratio_mean,
+		'ratio_min': last_ratio_min,
+		'ratio_max': last_ratio_max,
+		'max_action_prob_mean': last_max_action_prob_mean,
 		'ppo_update_time_s': time.time() - update_start_time,
 		'ppo_feature_rebuild_ms': ppo_feature_rebuild_ms,
 	})
@@ -2358,6 +2717,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			rollout_buffer = RolloutTensorBuffer(rollout_length)
 			buffer_step_count = 0
 			iteration_update_stats = make_update_stats("no_update", device)
+			rollout_diag = init_rollout_diagnostics(config, device)
+			try:
+				diag_action_values = simulator.dynamics_model.discrete_action_space.get_all_actions()
+			except Exception:
+				diag_action_values = None
 			
 			# 初始化累积done状态（与game.py一致）
 			cumulative_done_all = None
@@ -2368,6 +2732,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				if not bool(alive_mask.any().item()):
 					if buffer_step_count > 0:
 						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
+						print_rollout_diagnostics(
+							rollout_diag,
+							action_values=diag_action_values,
+							prefix=f"📈 rollout诊断(iter {k+1}, len {buffer_step_count})",
+						)
 						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 							model, policy_optimizer, value_optimizer,
 							rollout_buffer, condition_state,
@@ -2376,6 +2745,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
+						rollout_diag = init_rollout_diagnostics(config, device)
 					else:
 						print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
 					break
@@ -2419,6 +2789,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				
 				# 写入训练buffer（与game.py一致）
 				rollout_buffer.write_post_step(reward, done, value_pred, old_log_probs, actions)
+				update_rollout_diagnostics(rollout_diag, simulator, alive_mask, reward, done, actions)
 				buffer_step_count = len(rollout_buffer)
 				
 				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
@@ -2446,6 +2817,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 
 				if no_alive_after_step:
 					print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
+					print_rollout_diagnostics(
+						rollout_diag,
+						action_values=diag_action_values,
+						prefix=f"📈 rollout诊断(iter {k+1}, len {buffer_step_count})",
+					)
 					A_max_ewma, update_stats = perform_ppo_update_single_gpu(
 						model, policy_optimizer, value_optimizer,
 						rollout_buffer, condition_state,
@@ -2454,12 +2830,18 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						feature_workspace=feature_workspace)
 					merge_update_stats(iteration_update_stats, update_stats)
 					clear_rollout_buffers(rollout_buffer)
+					rollout_diag = init_rollout_diagnostics(config, device)
 					break
 				
 				# 检查是否需要PPO更新（与game.py一致）
 				if buffer_step_count >= rollout_length or step_count >= max_episode_length:
 					if step_count >= max_episode_length:
 						print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
+						print_rollout_diagnostics(
+							rollout_diag,
+							action_values=diag_action_values,
+							prefix=f"📈 rollout诊断(iter {k+1}, len {buffer_step_count})",
+						)
 						bootstrap_value = current_rollout_bootstrap_value(
 							model, simulator, config, cumulative_done_all,
 							condition_state, step_count, precision, forward_chunk_agents,
@@ -2472,10 +2854,16 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
+						rollout_diag = init_rollout_diagnostics(config, device)
 						print("🔄 达到最大步数，强制开启新iteration...")
 						break
 					else:
 						print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
+						print_rollout_diagnostics(
+							rollout_diag,
+							action_values=diag_action_values,
+							prefix=f"📈 rollout诊断(iter {k+1}, len {buffer_step_count})",
+						)
 						bootstrap_value = current_rollout_bootstrap_value(
 							model, simulator, config, cumulative_done_all,
 							condition_state, step_count, precision, forward_chunk_agents,
@@ -2492,12 +2880,14 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						if all_worlds_no_alive_agents(simulator, cumulative_done_all):
 							print("🔄 所有世界都没有存活agents，开启新iteration...")
 							clear_rollout_buffers(rollout_buffer)
+							rollout_diag = init_rollout_diagnostics(config, device)
 							break
 						else:
 							print("✅ 仍有世界有存活agents，继续下一个128step...")
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
 							clear_rollout_buffers(rollout_buffer)
 							buffer_step_count = 0
+							rollout_diag = init_rollout_diagnostics(config, device)
 							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 
 
@@ -2626,6 +3016,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 			rollout_buffer = RolloutTensorBuffer(rollout_length)
 			buffer_step_count = 0
 			iteration_update_stats = make_update_stats("no_update", device)
+			rollout_diag = init_rollout_diagnostics(config, device)
+			try:
+				diag_action_values = simulator.dynamics_model.discrete_action_space.get_all_actions()
+			except Exception:
+				diag_action_values = None
 			
 			# 初始化累积done状态（与game.py一致）
 			cumulative_done_all = None
@@ -2638,6 +3033,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					if buffer_step_count > 0:
 						if rank == 0:
 							print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
+							print_rollout_diagnostics(
+								rollout_diag,
+								action_values=diag_action_values,
+								prefix=f"📈 rollout诊断(rank0 iter {k+1}, len {buffer_step_count})",
+							)
 						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 							model, policy_optimizer, value_optimizer,
 								rollout_buffer, condition_state,
@@ -2646,6 +3046,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 								feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
+						rollout_diag = init_rollout_diagnostics(config, device)
 					else:
 						if rank == 0:
 							print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
@@ -2690,6 +3091,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				
 				# 写入训练buffer（与game.py一致）
 				rollout_buffer.write_post_step(reward, done, value_pred, old_log_probs, actions)
+				update_rollout_diagnostics(rollout_diag, simulator, alive_mask, reward, done, actions)
 				buffer_step_count = len(rollout_buffer)
 				
 				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
@@ -2719,6 +3121,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 				if no_alive_after_step:
 					if rank == 0:
 						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
+						print_rollout_diagnostics(
+							rollout_diag,
+							action_values=diag_action_values,
+							prefix=f"📈 rollout诊断(rank0 iter {k+1}, len {buffer_step_count})",
+						)
 					A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
 						model, policy_optimizer, value_optimizer,
 						rollout_buffer, condition_state,
@@ -2727,6 +3134,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 						feature_workspace=feature_workspace)
 					merge_update_stats(iteration_update_stats, update_stats)
 					clear_rollout_buffers(rollout_buffer)
+					rollout_diag = init_rollout_diagnostics(config, device)
 					break
 				
 				# 检查是否需要PPO更新（与game.py一致）
@@ -2734,6 +3142,11 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 					if step_count >= max_episode_length:
 						if rank == 0:
 							print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
+							print_rollout_diagnostics(
+								rollout_diag,
+								action_values=diag_action_values,
+								prefix=f"📈 rollout诊断(rank0 iter {k+1}, len {buffer_step_count})",
+							)
 						bootstrap_value = current_rollout_bootstrap_value(
 							model, simulator, config, cumulative_done_all,
 							condition_state, step_count, precision, forward_chunk_agents,
@@ -2746,12 +3159,18 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							feature_workspace=feature_workspace)
 						merge_update_stats(iteration_update_stats, update_stats)
 						clear_rollout_buffers(rollout_buffer)
+						rollout_diag = init_rollout_diagnostics(config, device)
 						if rank == 0:
 							print("🔄 达到最大步数，强制开启新iteration...")
 						break
 					else:
 						if rank == 0:
 							print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
+							print_rollout_diagnostics(
+								rollout_diag,
+								action_values=diag_action_values,
+								prefix=f"📈 rollout诊断(rank0 iter {k+1}, len {buffer_step_count})",
+							)
 						bootstrap_value = current_rollout_bootstrap_value(
 							model, simulator, config, cumulative_done_all,
 							condition_state, step_count, precision, forward_chunk_agents,
@@ -2770,6 +3189,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							if rank == 0:
 								print("🔄 所有世界都没有存活agents，开启新iteration...")
 							clear_rollout_buffers(rollout_buffer)
+							rollout_diag = init_rollout_diagnostics(config, device)
 							break
 						else:
 							if rank == 0:
@@ -2777,6 +3197,7 @@ def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str,
 							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
 							clear_rollout_buffers(rollout_buffer)
 							buffer_step_count = 0
+							rollout_diag = init_rollout_diagnostics(config, device)
 							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
 
 			# 7) 只有真实完成 optimizer step 后才推进学习率，避免空样本或 AMP skip 时跳过首个LR。

@@ -212,6 +212,11 @@ training:
     enabled: false       # 可选训练链路 profiler，默认关闭
     cuda_sync: false     # 打开后为计时做 CUDA 同步，会降低训练速度
     log_interval: 10     # profiler 日志间隔
+
+  diagnostics:
+    enabled: true         # 训练问题诊断日志：rollout reward/done/action + PPO KL/clip/action/advantage
+    rollout: true
+    ppo: true
   
   # 内存和性能优化
   checkpoint_interval: 100                  # 检查点保存间隔

@@ -462,6 +462,18 @@ class TeraflowSimulator:
 
         # 6. 检查是否结束：中间 waypoint 不终止 episode。
         done = all_collisions | offroad_mask | final_goal_reached
+        reward_components = {}
+        for name, value in getattr(self.reward_calculator, 'last_reward_components', {}).items():
+            reward_components[name] = (value * effective_mask.float()).detach()
+        self.last_step_train_info = {
+            'effective_mask': effective_mask.detach(),
+            'collision_mask': (all_collisions & effective_mask).detach(),
+            'offroad_mask': (offroad_mask & effective_mask).detach(),
+            'final_goal_mask': (final_goal_reached & effective_mask).detach(),
+            'intermediate_goal_mask': (intermediate_goal_reached & effective_mask).detach(),
+            'done_mask': (done & effective_mask).detach(),
+            'reward_components': reward_components,
+        }
 
         # 保存done状态供本次observation和后续step使用（累积done状态，一旦done就保持done）。
         if hasattr(self, 'last_done') and self.last_done is not None:
