@@ -125,9 +125,14 @@ class TeraflowSimulator:
         self.goal_positions: Optional[torch.Tensor] = None
         self.final_goal_positions: Optional[torch.Tensor] = None
         self.route_candidate_samples: int = int(simulator_config.get('route_candidate_samples', 64))
+        self.route_local_candidate_count: int = int(simulator_config.get('route_local_candidate_count', 128))
+        self.route_local_candidate_chunk_quads: int = int(simulator_config.get('route_local_candidate_chunk_quads', 1024))
+        self.route_first_min_goal_distance: float = float(simulator_config.get('route_first_min_goal_distance', 15.0))
+        self.route_first_max_goal_distance: float = float(simulator_config.get('route_first_max_goal_distance', 60.0))
         self.route_min_goal_distance: float = float(simulator_config.get('route_min_goal_distance', 20.0))
         self.route_max_goal_distance: float = float(simulator_config.get('route_max_goal_distance', 200.0))
         self.route_max_heading_delta: float = float(simulator_config.get('route_max_heading_delta_deg', 60.0)) * torch.pi / 180.0
+        self._route_local_candidate_ids: Optional[torch.Tensor] = None
         self.driving_style_params: Optional[torch.Tensor] = None
         self.traffic_light_states: Optional[torch.Tensor] = None
         self.stop_lines: Optional[torch.Tensor] = None
@@ -639,15 +644,21 @@ class TeraflowSimulator:
             return torch.full_like(prev_quad, -1, dtype=torch.int32)
 
         K = max(1, self.route_candidate_samples)
-        sampled_pos = torch.randint(
-            0,
-            int(routable_quad_ids.numel()),
-            (B, M, K),
-            dtype=torch.long,
-            device=self.device,
-        )
-        sampled = routable_quad_ids[sampled_pos]
         safe_prev = torch.clamp(prev_quad.long(), 0, self.road_network.num_quads - 1)
+        local_candidates = self._route_local_candidates()
+        if local_candidates is not None and local_candidates.numel() > 0:
+            pool_size = int(local_candidates.shape[-1])
+            sampled_pos = torch.randint(0, pool_size, (B * M, K), dtype=torch.long, device=self.device)
+            sampled = local_candidates[safe_prev.reshape(-1).unsqueeze(1), sampled_pos].view(B, M, K)
+        else:
+            sampled_pos = torch.randint(
+                0,
+                int(routable_quad_ids.numel()),
+                (B, M, K),
+                dtype=torch.long,
+                device=self.device,
+            )
+            sampled = routable_quad_ids[sampled_pos]
         quad_centers = self.road_network.quad_centerlines.mean(dim=1)
         quad_dirs = self.road_network.quad_directions
 
@@ -686,7 +697,12 @@ class TeraflowSimulator:
 
         strict_choice, has_strict = choose_from(strict_mask)
         relaxed_choice, has_relaxed = choose_from(relaxed_mask)
-        fallback_choice, has_fallback = choose_from(base_mask)
+        fallback_distances = distances.masked_fill(~base_mask, float('inf'))
+        fallback_idx = torch.argmin(fallback_distances, dim=-1)
+        fallback_choice = sampled.gather(2, fallback_idx.unsqueeze(-1)).squeeze(-1).to(torch.int32)
+        has_fallback = torch.isfinite(
+            fallback_distances.gather(2, fallback_idx.unsqueeze(-1)).squeeze(-1)
+        )
 
         chosen = torch.where(has_strict, strict_choice, relaxed_choice)
         chosen = torch.where(has_strict | has_relaxed, chosen, fallback_choice)
@@ -707,6 +723,36 @@ class TeraflowSimulator:
             return project_fn(quad_ids).to(device=self.device, dtype=torch.int32)
         return quad_ids.to(device=self.device, dtype=torch.int32)
 
+    def _route_local_candidates(self) -> Optional[torch.Tensor]:
+        """Nearest routable quad candidates for each quad, built once and reused during reset."""
+        if self._route_local_candidate_ids is not None:
+            return self._route_local_candidate_ids
+
+        routable_quad_ids = self._routable_quad_ids()
+        if routable_quad_ids.numel() == 0:
+            self._route_local_candidate_ids = torch.empty((0, 0), dtype=torch.long, device=self.device)
+            return self._route_local_candidate_ids
+
+        candidate_count = min(
+            max(1, int(self.route_local_candidate_count)),
+            int(routable_quad_ids.numel()),
+        )
+        quad_centers = self.road_network.quad_centerlines.mean(dim=1)
+        routable_centers = quad_centers[routable_quad_ids]
+        num_quads = int(self.road_network.num_quads)
+        out = torch.empty((num_quads, candidate_count), dtype=torch.long, device=self.device)
+        chunk_size = max(1, int(self.route_local_candidate_chunk_quads))
+
+        for start in range(0, num_quads, chunk_size):
+            end = min(start + chunk_size, num_quads)
+            diff = quad_centers[start:end].unsqueeze(1) - routable_centers.unsqueeze(0)
+            dist_sq = diff.pow(2).sum(dim=-1)
+            _, nearest_pos = torch.topk(dist_sq, k=candidate_count, dim=1, largest=False)
+            out[start:end] = routable_quad_ids[nearest_pos]
+
+        self._route_local_candidate_ids = out
+        return self._route_local_candidate_ids
+
     def _sample_route_quad_ids(self, active_mask: torch.Tensor, start_i32: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """采样 final goal 与 N_wp ~ U{0,3} 个中间 waypoint，并构造受距离/朝向约束的目标序列。"""
         B, M = active_mask.shape
@@ -726,31 +772,20 @@ class TeraflowSimulator:
         routable_quad_ids = self._routable_quad_ids()
         if routable_quad_ids.numel() == 0:
             return route_quads, torch.zeros_like(target_count)
-        first_pos = torch.randint(
-            0,
-            int(routable_quad_ids.numel()),
-            (B, M),
-            dtype=torch.long,
-            device=self.device,
+        first_target = self._sample_next_route_quads(
+            start_i32,
+            valid_start & route_mask[..., 0],
+            self.route_first_min_goal_distance,
+            self.route_first_max_goal_distance,
+            self.route_max_heading_delta,
         )
-        first_target = routable_quad_ids[first_pos]
-        if routable_quad_ids.numel() > 1:
-            same_as_start = valid_start & (first_target == start_i32.long())
-            offset = torch.randint(
-                1,
-                int(routable_quad_ids.numel()),
-                (B, M),
-                dtype=torch.long,
-                device=self.device,
-            )
-            alternate_target = routable_quad_ids[(first_pos + offset) % int(routable_quad_ids.numel())]
-            first_target = torch.where(
-                same_as_start,
-                alternate_target,
-                first_target,
-            )
-        first_target = self._project_to_routable_quads(first_target)
         route_quads[..., 0] = torch.where(valid_start & route_mask[..., 0], first_target, route_quads[..., 0])
+        target_count = torch.where(
+            valid_start & route_mask[..., 0] & (route_quads[..., 0] < 0),
+            torch.zeros_like(target_count),
+            target_count,
+        )
+        route_mask = route_slots < target_count.unsqueeze(-1)
 
         for route_idx in range(1, self.max_route_targets):
             valid_next = valid_start & route_mask[..., route_idx]

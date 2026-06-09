@@ -21,6 +21,14 @@ simulator:
   init_distribution_calibration_samples: 65536 # 启动时用于估计每个quad接受率的样本数
   init_distribution_smoothing: 1.0             # 接受率估计平滑，避免低样本quad权重发散
   init_distribution_max_weight: 20.0           # 单个quad的最大反向修正权重
+  route_candidate_samples: 64                  # 每个目标段从局部候选中抽样的数量
+  route_local_candidate_count: 128             # 每个quad缓存最近的routable候选，避免从全图采到很远目标
+  route_local_candidate_chunk_quads: 1024      # 构建局部候选表时的quad分块
+  route_first_min_goal_distance: 15.0          # 起点到第一个目标的短路线窗口，避免初期终点过远
+  route_first_max_goal_distance: 60.0
+  route_min_goal_distance: 15.0                # 后续route段也先保持较短，增加waypoint/goal命中率
+  route_max_goal_distance: 80.0
+  route_max_heading_delta_deg: 60.0
   collision_narrow_chunk_pairs: 524288         # 动态碰撞窄阶段pair分块上限，限制极端拥堵显存峰值
   collision_pair_gen_chunk_pairs: 1048576      # 动态碰撞宽阶段每块生成的候选pair目标上限
 
