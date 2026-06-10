@@ -900,7 +900,7 @@ def associate_quads_to_adjacent_waypoints(quads, waypoints):
     return quad_to_next_wp_map, quad_to_prev_wp_map
 
 # --- 主流程 ---
-def preprocess_map(stage1_data_path, output_path):
+def preprocess_map(stage1_data_path, output_path, compute_wlane_poi_distances=True):
     start_time = time.time()
     print("--- Starting Map Preprocessing (Stage 2) ---")
     
@@ -954,7 +954,10 @@ def preprocess_map(stage1_data_path, output_path):
     print(f"Found {len(cross_quad_set)} cross quads.")
     
     # --- 更新: 使用find_cross返回的路口区域进行计算 ---
-    find_next_and_prev_poi_for_wlanes(enhanced_waypoints, cross_quad_set, graph, quads_by_id, quad_centers_3d, quad_directions)
+    if compute_wlane_poi_distances:
+        find_next_and_prev_poi_for_wlanes(enhanced_waypoints, cross_quad_set, graph, quads_by_id, quad_centers_3d, quad_directions)
+    else:
+        print("Skipping per-W_lane next/previous POI distance calculation.")
     
     global_waypoints = downsample_w_lane_waypoints(
         enhanced_waypoints,

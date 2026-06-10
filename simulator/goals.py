@@ -47,7 +47,11 @@ class PathPlanner:
                 start_road_id = torch.tensor([wp['road_id'] for wp in start_wps], dtype=torch.int32, device=self.device)
                 start_lane_id = torch.tensor([wp['lane_id'] for wp in start_wps], dtype=torch.int32, device=self.device)
             else:
-                start_x = start_y = start_road_id = start_lane_id = torch.empty(0, device=self.device)
+                start_waypoint_ids = torch.empty(0, dtype=torch.int32, device=self.device)
+                start_x = torch.empty(0, dtype=torch.float32, device=self.device)
+                start_y = torch.empty(0, dtype=torch.float32, device=self.device)
+                start_road_id = torch.empty(0, dtype=torch.int32, device=self.device)
+                start_lane_id = torch.empty(0, dtype=torch.int32, device=self.device)
 
             # 处理end_waypoints
             end_wps = value.get('end_waypoints', [])
@@ -58,7 +62,11 @@ class PathPlanner:
                 end_road_id = torch.tensor([wp['road_id'] for wp in end_wps], dtype=torch.int32, device=self.device)
                 end_lane_id = torch.tensor([wp['lane_id'] for wp in end_wps], dtype=torch.int32, device=self.device)
             else:
-                end_x = end_y = end_road_id = end_lane_id = torch.empty(0, device=self.device)
+                end_waypoint_ids = torch.empty(0, dtype=torch.int32, device=self.device)
+                end_x = torch.empty(0, dtype=torch.float32, device=self.device)
+                end_y = torch.empty(0, dtype=torch.float32, device=self.device)
+                end_road_id = torch.empty(0, dtype=torch.int32, device=self.device)
+                end_lane_id = torch.empty(0, dtype=torch.int32, device=self.device)
 
             # 处理paths
             paths = value.get('paths', [])
@@ -1139,11 +1147,21 @@ class PathPlanner:
         goal_valid = goal_valid & (goal_wp >= 0) & (goal_wp < num_waypoints)
         safe_goal_wp = torch.clamp(goal_wp, 0, num_waypoints - 1)
 
-        target_start_group = self.w_lane_start_group[safe_goal_wp].unsqueeze(-1)
         source_end_node = self.w_lane_end_node_idx[safe_w]
+        target_start_group = self.w_lane_start_group[safe_goal_wp]
+        target_goal_valid = goal_valid
+        goal_progress = self.w_lane_progress[safe_goal_wp]
+        goal_road_ids = self.w_lane_road_ids[safe_goal_wp]
+        goal_lane_ids = self.w_lane_lane_ids[safe_goal_wp]
+        while target_start_group.dim() < source_end_node.dim():
+            target_start_group = target_start_group.unsqueeze(-1)
+            target_goal_valid = target_goal_valid.unsqueeze(-1)
+            goal_progress = goal_progress.unsqueeze(-1)
+            goal_road_ids = goal_road_ids.unsqueeze(-1)
+            goal_lane_ids = goal_lane_ids.unsqueeze(-1)
         graph_valid = (
             source_valid
-            & goal_valid.unsqueeze(-1)
+            & target_goal_valid
             & (target_start_group >= 0)
             & (source_end_node >= 0)
         )
@@ -1157,19 +1175,18 @@ class PathPlanner:
 
         source_progress = self.w_lane_progress[safe_w]
         source_remaining = self.w_lane_remaining_to_end[safe_w]
-        goal_progress = self.w_lane_progress[safe_goal_wp].unsqueeze(-1)
         route_dist = source_remaining + route_dist + goal_progress
 
         same_lane = (
             source_valid
-            & goal_valid.unsqueeze(-1)
-            & (self.w_lane_road_ids[safe_w] == self.w_lane_road_ids[safe_goal_wp].unsqueeze(-1))
-            & (self.w_lane_lane_ids[safe_w] == self.w_lane_lane_ids[safe_goal_wp].unsqueeze(-1))
+            & target_goal_valid
+            & (self.w_lane_road_ids[safe_w] == goal_road_ids)
+            & (self.w_lane_lane_ids[safe_w] == goal_lane_ids)
         )
         direct_forward = goal_progress - source_progress
         use_direct = same_lane & (direct_forward >= 0.0)
         route_dist = torch.where(use_direct, direct_forward, route_dist)
-        return torch.where(source_valid & goal_valid.unsqueeze(-1), route_dist, torch.full_like(route_dist, float('inf')))
+        return torch.where(source_valid & target_goal_valid, route_dist, torch.full_like(route_dist, float('inf')))
     
     def get_nearest_neighbor_info_batch(self, quad_ids: torch.Tensor) -> dict:
         """

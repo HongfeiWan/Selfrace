@@ -523,10 +523,14 @@ def print_validation_report(map_name: str, report: Dict) -> None:
         print(f"  - {error}")
 
 
-def run_preprocessor(stage1_path: Path, processed_path: Path) -> None:
+def run_preprocessor(stage1_path: Path, processed_path: Path, compute_wlane_poi_distances: bool = False) -> None:
     from preprocessor import preprocess_map
 
-    preprocess_map(str(stage1_path), str(processed_path))
+    preprocess_map(
+        str(stage1_path),
+        str(processed_path),
+        compute_wlane_poi_distances=compute_wlane_poi_distances,
+    )
 
 
 def run_cross_data_generation(processed_path: Path) -> Path:
@@ -568,6 +572,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--waypoint-step", type=float, default=2.0, help="Raw driving waypoint sampling step in meters.")
     parser.add_argument("--stage1-only", action="store_true", help="Only write carla_map_data_*_stitched.json and skip preprocessing.")
     parser.add_argument("--skip-cross-data", action="store_true", help="Skip cross_data_processed_map_* generation.")
+    parser.add_argument(
+        "--compute-wlane-poi-distances",
+        action="store_true",
+        help="Also compute per-W_lane next/previous POI distances. Slow on large Town maps and not required by training loaders.",
+    )
     parser.add_argument("--validate", action="store_true", default=True, help="Validate generated stage1 JSON against the source xodr. Enabled by default.")
     parser.add_argument("--no-validate", action="store_false", dest="validate", help="Skip stage1 validation.")
     parser.add_argument("--indent", type=int, default=None, help="Optional JSON indentation for the stage1 file.")
@@ -599,7 +608,11 @@ def convert_one(args: argparse.Namespace, xodr_path: Path, map_name: str) -> Pat
     if args.stage1_only:
         return stage1_path
 
-    run_preprocessor(stage1_path, processed_path)
+    run_preprocessor(
+        stage1_path,
+        processed_path,
+        compute_wlane_poi_distances=args.compute_wlane_poi_distances,
+    )
     if not args.skip_cross_data:
         cross_path = run_cross_data_generation(processed_path)
         print(f"Wrote cross data: {cross_path}")
