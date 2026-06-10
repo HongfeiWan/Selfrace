@@ -1,4 +1,5 @@
 import json
+import copy
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -351,7 +352,7 @@ def find_cross(quads, waypoints=None, eps=2.0, distance_threshold=4, min_poly_co
     # 坐标系转换（y取反）- 根据参数决定是否执行
     processed_quads = []
     for q in quads:
-        processed_quad = q.copy()
+        processed_quad = copy.deepcopy(q)
         if convert_coordinates:
             # 坐标系转换（y取反）
             for v in processed_quad['vertices']:
@@ -384,14 +385,14 @@ def find_cross(quads, waypoints=None, eps=2.0, distance_threshold=4, min_poly_co
                 final_bounding_boxes.append(merged_cluster['box'])
         print(f"交叉路口区域(方形)数量: {len(final_bounding_boxes)} ")
         # 获取路口区域的quad_ids
-        cross_quad_ids = find_quads_in_bounding_boxes(quads, final_bounding_boxes)
+        cross_quad_ids = find_quads_in_bounding_boxes(processed_quads, final_bounding_boxes)
 
         
         # 如果提供了waypoints数据，则扩展路口区域
         if waypoints:
             valid_lanes = get_valid_lane_keys(waypoints)
             # 将cross_quad_ids转换为集合
-            cross_quad_ids = extend_cross_quads(quads, set(cross_quad_ids), valid_lanes)
+            cross_quad_ids = extend_cross_quads(processed_quads, set(cross_quad_ids), valid_lanes)
             # 将结果转换回列表
             cross_quad_ids = list(cross_quad_ids)
             
@@ -479,4 +480,3 @@ if __name__ == "__main__":
 
     
     
-

@@ -670,7 +670,15 @@ class TeraflowSimulator:
         distances = torch.norm(cand_centers - prev_centers, dim=-1)
         cos_delta = (cand_dirs * prev_dirs).sum(dim=-1).clamp(-1.0, 1.0)
         not_same = sampled != safe_prev.unsqueeze(-1)
-        base_mask = valid_mask.unsqueeze(-1) & not_same
+        reachable = torch.ones_like(not_same, dtype=torch.bool, device=self.device)
+        reachable_fn = getattr(self.path_planner, 'are_goal_quads_reachable_from_quads', None)
+        if callable(reachable_fn):
+            reachable = reachable_fn(
+                safe_prev.unsqueeze(-1).expand_as(sampled),
+                sampled,
+            )
+        base_mask_raw = valid_mask.unsqueeze(-1) & not_same
+        base_mask = base_mask_raw & reachable
 
         strict_mask = (
             base_mask
@@ -697,7 +705,7 @@ class TeraflowSimulator:
 
         strict_choice, has_strict = choose_from(strict_mask)
         relaxed_choice, has_relaxed = choose_from(relaxed_mask)
-        fallback_distances = distances.masked_fill(~base_mask, float('inf'))
+        fallback_distances = distances.masked_fill(~base_mask_raw, float('inf'))
         fallback_idx = torch.argmin(fallback_distances, dim=-1)
         fallback_choice = sampled.gather(2, fallback_idx.unsqueeze(-1)).squeeze(-1).to(torch.int32)
         has_fallback = torch.isfinite(

@@ -1187,6 +1187,27 @@ class PathPlanner:
         use_direct = same_lane & (direct_forward >= 0.0)
         route_dist = torch.where(use_direct, direct_forward, route_dist)
         return torch.where(source_valid & target_goal_valid, route_dist, torch.full_like(route_dist, float('inf')))
+
+    def are_goal_quads_reachable_from_quads(self, source_quad_ids: torch.Tensor, goal_quad_ids: torch.Tensor) -> torch.Tensor:
+        """Return whether each goal quad is forward-reachable from the corresponding source quad."""
+        if not self._route_distance_ready or self.waypoint_graph_gpu is None:
+            return torch.ones_like(goal_quad_ids, dtype=torch.bool, device=self.device)
+        if not hasattr(self, 'quad_goal_waypoint') or self.quad_goal_waypoint.numel() == 0:
+            return torch.ones_like(goal_quad_ids, dtype=torch.bool, device=self.device)
+
+        source_quad_ids = source_quad_ids.to(device=self.device, dtype=torch.long)
+        goal_quad_ids = goal_quad_ids.to(device=self.device, dtype=torch.long)
+        num_quads = int(self.quad_goal_waypoint.shape[0])
+        if num_quads == 0:
+            return torch.zeros_like(goal_quad_ids, dtype=torch.bool, device=self.device)
+
+        source_valid = (source_quad_ids >= 0) & (source_quad_ids < num_quads)
+        safe_source = torch.clamp(source_quad_ids, 0, num_quads - 1)
+        source_wp = self.quad_goal_waypoint[safe_source]
+        source_valid = source_valid & (source_wp >= 0) & (source_wp < int(self.w_lane_progress.shape[0]))
+        safe_source_wp = torch.clamp(source_wp, 0, max(int(self.w_lane_progress.shape[0]) - 1, 0))
+        route_dist = self.route_distances_from_w_lanes_to_goal_quads(safe_source_wp, goal_quad_ids)
+        return source_valid & torch.isfinite(route_dist)
     
     def get_nearest_neighbor_info_batch(self, quad_ids: torch.Tensor) -> dict:
         """

@@ -7,7 +7,7 @@ import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -402,6 +402,297 @@ def load_json(path: Path) -> Dict:
         return json.load(f)
 
 
+def waypoint_for_cross(wp: Dict) -> Dict:
+    info = wp["carla_waypoint_info"]
+    return {
+        "x": float(wp["x"]),
+        "y": float(wp["y"]),
+        "z": float(wp.get("z", 0.0)),
+        "s": float(info.get("s", 0.0)),
+        "road_id": int(info["road_id"]),
+        "lane_id": int(info["lane_id"]),
+        "waypoint_id": int(wp["waypoint_id"]),
+    }
+
+
+def lane_travel_key(item: Dict) -> float:
+    info = item["carla_waypoint_info"] if "carla_waypoint_info" in item else item
+    road_s = float(info.get("s", item.get("q", 0.0) if isinstance(item, dict) else 0.0))
+    lane_id = int(info.get("lane_id", item.get("lane_id", 0) if isinstance(item, dict) else 0))
+    return road_s if lane_id < 0 else -road_s
+
+
+def group_processed_waypoints_by_lane(processed_data: Dict) -> Dict[Tuple[int, int], List[Dict]]:
+    lanes: Dict[Tuple[int, int], List[Dict]] = {}
+    for wp in processed_data.get("global_w_lane_waypoints", []):
+        info = wp.get("carla_waypoint_info", {})
+        key = (int(info.get("road_id", 0)), int(info.get("lane_id", 0)))
+        lanes.setdefault(key, []).append(wp)
+    for key, waypoints in lanes.items():
+        waypoints.sort(key=lane_travel_key)
+    return lanes
+
+
+def group_processed_quads_by_lane(processed_data: Dict) -> Dict[Tuple[int, int], List[Dict]]:
+    lanes: Dict[Tuple[int, int], List[Dict]] = {}
+    for quad in processed_data.get("quads", []):
+        key = (int(quad.get("road_id", 0)), int(quad.get("lane_id", 0)))
+        lanes.setdefault(key, []).append(quad)
+    for key, quads in lanes.items():
+        quads.sort(key=lane_travel_key)
+    return lanes
+
+
+def quad_center_xy(quad: Dict) -> Tuple[float, float]:
+    vertices = quad.get("vertices", [])
+    if not vertices:
+        return 0.0, 0.0
+    return (
+        sum(float(v["x"]) for v in vertices) / len(vertices),
+        sum(float(v["y"]) for v in vertices) / len(vertices),
+    )
+
+
+def path_length_between_waypoints(from_wp: Dict, path_quads: List[Dict], to_wp: Dict) -> float:
+    coords: List[Tuple[float, float]] = [(float(from_wp["x"]), float(from_wp["y"]))]
+    coords.extend(quad_center_xy(quad) for quad in path_quads)
+    coords.append((float(to_wp["x"]), float(to_wp["y"])))
+    total = 0.0
+    for (x0, y0), (x1, y1) in zip(coords, coords[1:]):
+        total += math.hypot(x1 - x0, y1 - y0)
+    return total
+
+
+def find_lane_elem(road_elem: ET.Element, lane_id: int, endpoint: str) -> Optional[ET.Element]:
+    sections = road_elem.findall("./lanes/laneSection")
+    if not sections:
+        return None
+    section = sections[0] if endpoint == "start" else sections[-1]
+    for side_name in ("left", "right", "center"):
+        side = section.find(side_name)
+        if side is None:
+            continue
+        lane = side.find(f"lane[@id='{lane_id}']")
+        if lane is not None:
+            return lane
+    return None
+
+
+def road_endpoint_link(road_elem: ET.Element, endpoint: str) -> Optional[ET.Element]:
+    link = road_elem.find("link")
+    if link is None:
+        return None
+    return link.find("predecessor" if endpoint == "start" else "successor")
+
+
+def lane_endpoint_link_id(road_elem: ET.Element, lane_id: int, endpoint: str) -> Optional[int]:
+    lane = find_lane_elem(road_elem, lane_id, endpoint)
+    if lane is None:
+        return None
+    link = lane.find("link")
+    if link is None:
+        return lane_id
+    lane_link = link.find("predecessor" if endpoint == "start" else "successor")
+    if lane_link is None:
+        return lane_id
+    return int(lane_link.attrib["id"])
+
+
+def parse_xodr_junction_connectors(xodr_path: Path) -> List[Dict[str, int]]:
+    root = ET.parse(xodr_path).getroot()
+    roads_by_id = {int(road.attrib["id"]): road for road in root.findall("road")}
+    connectors: List[Dict[str, int]] = []
+
+    for junction in root.findall("junction"):
+        junction_id = int(junction.attrib["id"])
+        for connection in junction.findall("connection"):
+            incoming_road = int(connection.attrib["incomingRoad"])
+            connecting_road = int(connection.attrib["connectingRoad"])
+            connecting_elem = roads_by_id.get(connecting_road)
+            if connecting_elem is None:
+                continue
+            for lane_link in connection.findall("laneLink"):
+                incoming_lane = int(lane_link.attrib["from"])
+                connecting_lane = int(lane_link.attrib["to"])
+                travel_start_endpoint = "start" if connecting_lane < 0 else "end"
+                travel_end_endpoint = "end" if connecting_lane < 0 else "start"
+                road_link = road_endpoint_link(connecting_elem, travel_end_endpoint)
+                if road_link is None or road_link.attrib.get("elementType") != "road":
+                    continue
+                outgoing_road = int(road_link.attrib["elementId"])
+                outgoing_lane = lane_endpoint_link_id(connecting_elem, connecting_lane, travel_end_endpoint)
+                if outgoing_lane is None:
+                    continue
+                connectors.append(
+                    {
+                        "junction_id": junction_id,
+                        "incoming_road": incoming_road,
+                        "incoming_lane": incoming_lane,
+                        "connecting_road": connecting_road,
+                        "connecting_lane": connecting_lane,
+                        "outgoing_road": outgoing_road,
+                        "outgoing_lane": outgoing_lane,
+                        "travel_start_endpoint": 0 if travel_start_endpoint == "start" else 1,
+                        "travel_end_endpoint": 0 if travel_end_endpoint == "start" else 1,
+                    }
+                )
+    return connectors
+
+
+def add_unique_waypoint(target: List[Dict], seen: Set[int], waypoint: Dict) -> None:
+    waypoint_id = int(waypoint["waypoint_id"])
+    if waypoint_id in seen:
+        return
+    seen.add(waypoint_id)
+    target.append(waypoint)
+
+
+def waypoint_graph_from_cross_data(cross_data: Dict) -> Dict[str, List[Any]]:
+    nodes: List[List[Any]] = []
+    node_indices: Dict[Tuple[int, int, int, str], int] = {}
+    edges: List[List[Any]] = []
+    edge_pairs: Set[Tuple[int, int]] = set()
+
+    def add_node(cross_id: int, waypoint: Dict, endpoint_type: str) -> int:
+        key = (int(cross_id), int(waypoint["road_id"]), int(waypoint["lane_id"]), endpoint_type)
+        if key not in node_indices:
+            node_indices[key] = len(nodes)
+            nodes.append(
+                [
+                    int(cross_id),
+                    int(waypoint["road_id"]),
+                    int(waypoint["lane_id"]),
+                    float(waypoint["x"]),
+                    float(waypoint["y"]),
+                    endpoint_type,
+                ]
+            )
+        return node_indices[key]
+
+    all_starts: Dict[Tuple[int, int], List[Tuple[int, Dict]]] = {}
+    all_ends: Dict[Tuple[int, int], List[Tuple[int, Dict]]] = {}
+    for key, cross_info in cross_data.items():
+        if not key.startswith("cross_"):
+            continue
+        cross_id = int(cross_info["cross_id"])
+        for waypoint in cross_info.get("start_waypoints", []):
+            add_node(cross_id, waypoint, "start")
+            all_starts.setdefault((int(waypoint["road_id"]), int(waypoint["lane_id"])), []).append((cross_id, waypoint))
+        for waypoint in cross_info.get("end_waypoints", []):
+            add_node(cross_id, waypoint, "end")
+            all_ends.setdefault((int(waypoint["road_id"]), int(waypoint["lane_id"])), []).append((cross_id, waypoint))
+
+    def add_edge(u_idx: int, v_idx: int, weight: float) -> None:
+        pair = (u_idx, v_idx)
+        if pair in edge_pairs:
+            return
+        edge_pairs.add(pair)
+        edges.append([nodes[u_idx], nodes[v_idx], float(weight)])
+
+    for lane_key, starts in all_starts.items():
+        for start_cross_id, start_waypoint in starts:
+            for end_cross_id, end_waypoint in all_ends.get(lane_key, []):
+                if int(start_waypoint["waypoint_id"]) == int(end_waypoint["waypoint_id"]):
+                    continue
+                u_idx = add_node(start_cross_id, start_waypoint, "start")
+                v_idx = add_node(end_cross_id, end_waypoint, "end")
+                add_edge(u_idx, v_idx, abs(float(end_waypoint.get("s", 0.0)) - float(start_waypoint.get("s", 0.0))))
+
+    for key, cross_info in cross_data.items():
+        if not key.startswith("cross_"):
+            continue
+        cross_id = int(cross_info["cross_id"])
+        for path in cross_info.get("paths", []):
+            from_waypoint = path["from_end_waypoint"]
+            to_waypoint = path["to_start_waypoint"]
+            u_idx = add_node(cross_id, from_waypoint, "end")
+            v_idx = add_node(cross_id, to_waypoint, "start")
+            add_edge(u_idx, v_idx, float(path.get("distance", 0.0)))
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def generate_cross_data_from_xodr(processed_path: Path, xodr_path: Path) -> Path:
+    processed_data = load_json(processed_path)
+    lanes = group_processed_waypoints_by_lane(processed_data)
+    quads_by_lane = group_processed_quads_by_lane(processed_data)
+    connectors = parse_xodr_junction_connectors(xodr_path)
+
+    cross_data: Dict[str, Any] = {}
+    path_quad_ids: Set[int] = set()
+    cross_seen_starts: Dict[int, Set[int]] = {}
+    cross_seen_ends: Dict[int, Set[int]] = {}
+    written_paths: Set[Tuple[int, int, int, int, int]] = set()
+    skipped = 0
+
+    for connector in connectors:
+        incoming_key = (connector["incoming_road"], connector["incoming_lane"])
+        outgoing_key = (connector["outgoing_road"], connector["outgoing_lane"])
+        connecting_key = (connector["connecting_road"], connector["connecting_lane"])
+        incoming_lane = lanes.get(incoming_key)
+        outgoing_lane = lanes.get(outgoing_key)
+        connecting_quads = quads_by_lane.get(connecting_key, [])
+        if not incoming_lane or not outgoing_lane or not connecting_quads:
+            skipped += 1
+            continue
+
+        from_waypoint = waypoint_for_cross(incoming_lane[-1])
+        to_waypoint = waypoint_for_cross(outgoing_lane[0])
+        cross_id = int(connector["junction_id"])
+        cross_key = f"cross_{cross_id}"
+        cross_info = cross_data.setdefault(
+            cross_key,
+            {"cross_id": cross_id, "start_waypoints": [], "end_waypoints": [], "paths": []},
+        )
+        cross_seen_starts.setdefault(cross_id, set())
+        cross_seen_ends.setdefault(cross_id, set())
+        add_unique_waypoint(cross_info["end_waypoints"], cross_seen_ends[cross_id], from_waypoint)
+        add_unique_waypoint(cross_info["start_waypoints"], cross_seen_starts[cross_id], to_waypoint)
+
+        connector_quad_ids = [int(quad["polyId"]) for quad in connecting_quads]
+        path_quad_ids.update(connector_quad_ids)
+        path_key = (
+            cross_id,
+            int(from_waypoint["waypoint_id"]),
+            int(to_waypoint["waypoint_id"]),
+            connector["connecting_road"],
+            connector["connecting_lane"],
+        )
+        if path_key in written_paths:
+            continue
+        written_paths.add(path_key)
+        cross_info["paths"].append(
+            {
+                "from_end_waypoint": {
+                    **from_waypoint,
+                    "from_end_waypoint_id": int(from_waypoint["waypoint_id"]),
+                },
+                "to_start_waypoint": {
+                    **to_waypoint,
+                    "to_start_waypoint_id": int(to_waypoint["waypoint_id"]),
+                },
+                "path_quad_ids": connector_quad_ids,
+                "distance": path_length_between_waypoints(from_waypoint, connecting_quads, to_waypoint),
+                "connecting_road_id": int(connector["connecting_road"]),
+                "connecting_lane_id": int(connector["connecting_lane"]),
+            }
+        )
+
+    all_quad_ids = {int(quad["polyId"]) for quad in processed_data.get("quads", [])}
+    cross_data["filtered_quad_indices"] = sorted(all_quad_ids - path_quad_ids)
+    cross_data["waypoint_graph"] = waypoint_graph_from_cross_data(cross_data)
+
+    output_path = processed_path.with_name(f"cross_data_{processed_path.name}")
+    save_json(output_path, cross_data, indent=2)
+    print(
+        f"OpenDRIVE cross data: crosses={sum(1 for key in cross_data if key.startswith('cross_'))}, "
+        f"paths={sum(len(value.get('paths', [])) for key, value in cross_data.items() if key.startswith('cross_'))}, "
+        f"skipped_connectors={skipped}, waypoint_graph={len(cross_data['waypoint_graph']['nodes'])}/"
+        f"{len(cross_data['waypoint_graph']['edges'])}"
+    )
+    return output_path
+
+
 def _max_vertex_delta(left_quads: List[Dict], right_quads: List[Dict]) -> float:
     max_delta = 0.0
     for left, right in zip(left_quads, right_quads):
@@ -573,6 +864,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage1-only", action="store_true", help="Only write carla_map_data_*_stitched.json and skip preprocessing.")
     parser.add_argument("--skip-cross-data", action="store_true", help="Skip cross_data_processed_map_* generation.")
     parser.add_argument(
+        "--legacy-cross-data",
+        action="store_true",
+        help="Use the old visualization/Dijkstra cross_data generator instead of OpenDRIVE junction/laneLink generation.",
+    )
+    parser.add_argument(
         "--compute-wlane-poi-distances",
         action="store_true",
         help="Also compute per-W_lane next/previous POI distances. Slow on large Town maps and not required by training loaders.",
@@ -614,7 +910,10 @@ def convert_one(args: argparse.Namespace, xodr_path: Path, map_name: str) -> Pat
         compute_wlane_poi_distances=args.compute_wlane_poi_distances,
     )
     if not args.skip_cross_data:
-        cross_path = run_cross_data_generation(processed_path)
+        if args.legacy_cross_data:
+            cross_path = run_cross_data_generation(processed_path)
+        else:
+            cross_path = generate_cross_data_from_xodr(processed_path, xodr_path)
         print(f"Wrote cross data: {cross_path}")
 
     print(f"Done. Training map: {processed_path}")
