@@ -12,6 +12,7 @@ matplotlib>=3.5.0
 # Configuration and data handling
 PyYAML>=6.0
 networkx>=2.8.0
+swanlab>=0.4.0
 
 # Multiprocessing and utilities
 multiprocessing-logging>=0.3.0
@@ -23,4 +24,4 @@ multiprocessing-logging>=0.3.0
 # pytest>=7.0.0
 # pytest-cov>=4.0.0
 # black>=22.0.0
-# flake8>=5.0.0 
+# flake8>=5.0.0

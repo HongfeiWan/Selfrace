@@ -1,15 +1,12 @@
 import argparse
 import json
 import math
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
 
 import torch
 import yaml
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SIMULATOR_DIR = PROJECT_ROOT / "simulator"
@@ -19,9 +16,17 @@ if str(SIMULATOR_DIR) not in sys.path:
 if str(TRAINING_DIR) not in sys.path:
     sys.path.insert(0, str(TRAINING_DIR))
 
-from simulator import TeraflowSimulator
 from ddppo import build_features_from_simulator_state
 from network import create_network
+
+from simulator import TeraflowSimulator
+
+try:
+    from .viewer import PygameViewer, RouteVisual, VehicleVisual, ViewerFrame
+except ImportError:
+    # ``python game/game.py`` puts the game directory, rather than the project
+    # root, on sys.path.
+    from viewer import PygameViewer, RouteVisual, VehicleVisual, ViewerFrame
 
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "default_config.yaml"
@@ -40,12 +45,11 @@ def select_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_config(config_path: Path, device: torch.device, num_envs: int, num_agents: int) -> dict:
+def load_config(config_path: Path, num_envs: int, num_agents: int) -> dict:
     with config_path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     simulator_cfg = config.setdefault("simulator", {})
-    simulator_cfg["device"] = str(device)
     simulator_cfg["num_envs"] = int(num_envs)
     simulator_cfg["max_agents_num"] = int(num_agents)
     simulator_cfg["num_npc_vehicles"] = int(num_agents)
@@ -85,10 +89,13 @@ def load_model_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> int:
 
 
 class InferenceGame:
+    CAMERA_POSITION_ALPHA = 0.22
+    CAMERA_HEADING_ALPHA = 0.12
+
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.device = select_device(args.device)
-        self.config = load_config(args.config, self.device, args.envs, args.agents)
+        self.config = load_config(args.config, args.envs, args.agents)
         self.config_ns = dict_to_namespace(self.config)
         self.headless = bool(args.headless)
         self.deterministic = not bool(args.sample)
@@ -106,7 +113,14 @@ class InferenceGame:
         self.last_probs = None
         self.current_observation = None
         self.features_tensor = None
-        self.show_all_waypoints = True
+        self.show_all_waypoints = False
+        self.show_observed_boundaries = True
+        # A north-up view is much easier to watch than rotating the entire
+        # scene with every small steering correction from the observed car.
+        self.camera_follows_heading = False
+        self._smoothed_camera_pose = None
+        self._camera_track_key = None
+        self._road_boundary_segments = None
         self._visible_boundary_cache = None
         self._visible_boundary_key = None
 
@@ -116,12 +130,18 @@ class InferenceGame:
         self.model.eval()
 
         self.simulator = TeraflowSimulator(self.config, self.device)
+        self._road_boundary_segments = self._build_road_boundary_segments()
+        self.action_values = (
+            self.simulator.dynamics_model.discrete_action_space
+            .get_all_actions()
+            .detach()
+            .cpu()
+            .tolist()
+        )
         self.reset_episode()
 
         self.pygame = None
-        self.screen = None
-        self.font = None
-        self.small_font = None
+        self.viewer = None
         self.width = int(args.width)
         self.height = int(args.height)
         self.zoom_m = float(args.zoom)
@@ -142,15 +162,15 @@ class InferenceGame:
         )
 
     def _init_pygame(self):
-        import pygame
-
-        self.pygame = pygame
-        pygame.init()
-        self.screen = pygame.display.set_mode((self.width, self.height))
-        pygame.display.set_caption("Selfrace checkpoint inference")
-        self.clock = pygame.time.Clock()
-        self.font = pygame.font.Font(None, 28)
-        self.small_font = pygame.font.Font(None, 22)
+        self.viewer = PygameViewer(
+            self.width,
+            self.height,
+            PROJECT_ROOT,
+            title="Selfrace observation viewer",
+        )
+        self.pygame = self.viewer.pygame
+        self.clock = self.viewer.clock
+        self.width, self.height = self.viewer.width, self.viewer.height
 
     def reset_episode(self):
         self.simulator.reset(return_observation=False)
@@ -166,6 +186,7 @@ class InferenceGame:
         self.last_probs = torch.zeros((B, M, self.config_ns.training.network.num_actions), dtype=torch.float32, device=self.device)
         self.current_world = min(self.current_world, B - 1)
         self.selected_agent = self._first_alive_agent(self.current_world)
+        self._reset_camera_smoothing()
         self._visible_boundary_cache = None
         self._visible_boundary_key = None
         self.features_tensor = self._build_features()
@@ -177,6 +198,32 @@ class InferenceGame:
             alive_mask=self._alive_mask(),
             dropout_step=self.step_count,
         )
+
+    def _build_road_boundary_segments(self) -> torch.Tensor:
+        """Connect consecutive OOB samples into the continuous road edge."""
+        road = self.simulator.road_network
+        points = road.global_w_boundary_points
+        if points.shape[0] >= 2:
+            deltas = points[1:] - points[:-1]
+            distances = torch.linalg.vector_norm(deltas, dim=-1)
+            usable = distances[torch.isfinite(distances) & (distances > 1e-4)]
+            if usable.numel() > 0:
+                typical_spacing = float(torch.median(usable).item())
+                link_distance = min(8.0, max(1.5, typical_spacing * 2.5))
+                connected = (distances > 1e-4) & (distances <= link_distance)
+                if bool(connected.any().item()):
+                    return torch.stack((points[:-1][connected], points[1:][connected]), dim=1)
+
+        # Older processed maps may not contain ordered OOB samples.  Their quad
+        # sides still provide a useful road outline for the viewer.
+        boundaries = []
+        for name in ("left_boundaries", "right_boundaries"):
+            value = getattr(road, name, None)
+            if value is not None and value.numel() > 0:
+                boundaries.append(value)
+        if boundaries:
+            return torch.cat(boundaries, dim=0)
+        return torch.empty((0, 2, 2), dtype=torch.float32, device=self.device)
 
     def _alive_mask(self) -> torch.Tensor:
         active = self.simulator.agents_state[..., 6] > 0.5
@@ -195,14 +242,17 @@ class InferenceGame:
         candidates = torch.nonzero(alive, as_tuple=False).flatten().tolist()
         if not candidates:
             self.selected_agent = self._first_alive_agent(self.current_world)
+            self._reset_camera_smoothing()
             return
         bigger = [idx for idx in candidates if idx > self.selected_agent]
         self.selected_agent = bigger[0] if bigger else candidates[0]
+        self._reset_camera_smoothing()
 
     def _switch_world(self, delta: int):
         B = self.simulator.agents_state.shape[0]
         self.current_world = (self.current_world + delta) % B
         self.selected_agent = self._first_alive_agent(self.current_world)
+        self._reset_camera_smoothing()
         self._visible_boundary_cache = None
         self._visible_boundary_key = None
 
@@ -251,13 +301,19 @@ class InferenceGame:
                 self.inference_step()
             self.draw()
             self.clock.tick(int(self.args.fps))
-        self.pygame.quit()
+        self.viewer.close()
 
     def _handle_events(self) -> bool:
         pygame = self.pygame
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
+            if event.type == pygame.VIDEORESIZE:
+                self.viewer.resize(event.w, event.h)
+                self.width, self.height = self.viewer.width, self.viewer.height
+                self._visible_boundary_cache = None
+                self._visible_boundary_key = None
+                continue
             if event.type != pygame.KEYDOWN:
                 continue
             if event.key == pygame.K_ESCAPE:
@@ -272,17 +328,25 @@ class InferenceGame:
                 self.deterministic = not self.deterministic
             elif event.key == pygame.K_w:
                 self.show_all_waypoints = not self.show_all_waypoints
+            elif event.key == pygame.K_b:
+                self.show_observed_boundaries = not self.show_observed_boundaries
+            elif event.key == pygame.K_c:
+                self.camera_follows_heading = not self.camera_follows_heading
             elif event.key == pygame.K_LEFTBRACKET:
                 self._switch_world(-1)
             elif event.key == pygame.K_RIGHTBRACKET:
                 self._switch_world(1)
-            elif event.key in (pygame.K_EQUALS, pygame.K_PLUS):
-                self.zoom_m = max(30.0, self.zoom_m * 0.85)
+            elif event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+                self.zoom_m = max(20.0, self.zoom_m * 0.85)
                 self._visible_boundary_cache = None
-            elif event.key == pygame.K_MINUS:
+            elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                 self.zoom_m = min(500.0, self.zoom_m * 1.15)
                 self._visible_boundary_cache = None
         return True
+
+    def _reset_camera_smoothing(self):
+        self._smoothed_camera_pose = None
+        self._camera_track_key = None
 
     def _camera_pose(self):
         states = self.simulator.agents_state
@@ -294,108 +358,89 @@ class InferenceGame:
             m = self._first_alive_agent(b)
             self.selected_agent = m
             state = states[b, m]
-        return float(state[0].item()), float(state[1].item()), float(state[2].item())
 
-    def _world_to_screen(self, x: float, y: float, camera_xy: Optional[tuple[float, float]] = None):
-        if camera_xy is None:
-            camera_xy = self._camera_pose()[:2]
-        scale = min(self.width, self.height) / (2.0 * self.zoom_m)
-        sx = int((x - camera_xy[0]) * scale + self.width * 0.5)
-        sy = int(-(y - camera_xy[1]) * scale + self.height * 0.5)
-        return sx, sy
+        target_x = float(state[0].item())
+        target_y = float(state[1].item())
+        target_yaw = float(state[2].item()) if self.camera_follows_heading else 0.0
+        track_key = (b, m)
+        if self._smoothed_camera_pose is None or self._camera_track_key != track_key:
+            self._smoothed_camera_pose = (target_x, target_y, target_yaw)
+            self._camera_track_key = track_key
+            return self._smoothed_camera_pose
 
-    def _polygon_points(self, x: float, y: float, yaw: float, length: float, width: float, camera_xy):
-        half_l = max(0.1, length * 0.5)
-        half_w = max(0.1, width * 0.5)
-        cos_y = math.cos(yaw)
-        sin_y = math.sin(yaw)
-        local = [(-half_l, -half_w), (half_l, -half_w), (half_l, half_w), (-half_l, half_w)]
-        pts = []
-        for lx, ly in local:
-            wx = x + lx * cos_y - ly * sin_y
-            wy = y + lx * sin_y + ly * cos_y
-            pts.append(self._world_to_screen(wx, wy, camera_xy))
-        return pts
+        camera_x, camera_y, camera_yaw = self._smoothed_camera_pose
+        position_alpha = self.CAMERA_POSITION_ALPHA
+        heading_alpha = self.CAMERA_HEADING_ALPHA
+        camera_x += (target_x - camera_x) * position_alpha
+        camera_y += (target_y - camera_y) * position_alpha
+        yaw_delta = math.atan2(
+            math.sin(target_yaw - camera_yaw),
+            math.cos(target_yaw - camera_yaw),
+        )
+        camera_yaw += yaw_delta * heading_alpha
+        camera_yaw = math.atan2(math.sin(camera_yaw), math.cos(camera_yaw))
+        self._smoothed_camera_pose = (camera_x, camera_y, camera_yaw)
+        return self._smoothed_camera_pose
 
-    def draw(self):
-        pygame = self.pygame
-        self.screen.fill((245, 247, 250))
-        camera_xy = self._camera_pose()[:2]
-        self._draw_road(camera_xy)
-        self._draw_navigation_targets(camera_xy)
-        self._draw_agents(camera_xy)
-        self._draw_action_probs()
-        self._draw_ui()
-        pygame.display.flip()
-
-    def _draw_road(self, camera_xy):
-        pygame = self.pygame
-        points = self._visible_boundary_points(camera_xy)
-        if points.numel() == 0:
-            return
-        pts = points.detach().cpu().tolist()
-        step = max(1, len(pts) // 900)
-        for x, y in pts[::step]:
-            sx, sy = self._world_to_screen(float(x), float(y), camera_xy)
-            if 0 <= sx < self.width and 0 <= sy < self.height:
-                pygame.draw.circle(self.screen, (35, 35, 35), (sx, sy), 1)
-
-    def _visible_boundary_points(self, camera_xy):
-        key = (round(camera_xy[0] / 10.0), round(camera_xy[1] / 10.0), round(self.zoom_m))
+    def _visible_boundary_segments(self, camera_xy):
+        viewport_key = None
+        if self.viewer is not None:
+            viewport_key = (self.viewer.scene_rect.width, self.viewer.scene_rect.height)
+        key = (
+            round(camera_xy[0] / 4.0),
+            round(camera_xy[1] / 4.0),
+            round(self.zoom_m / 2.0),
+            viewport_key,
+        )
         if self._visible_boundary_key == key and self._visible_boundary_cache is not None:
             return self._visible_boundary_cache
-        all_points = self.simulator.road_network.global_w_boundary_points
-        if all_points.numel() == 0:
-            return all_points
-        center = torch.tensor(camera_xy, dtype=all_points.dtype, device=all_points.device)
-        diff = all_points - center
-        visible = (diff.square().sum(dim=-1) <= (self.zoom_m * 1.35) ** 2)
-        self._visible_boundary_cache = all_points[visible]
+
+        segments = self._road_boundary_segments
+        if segments is None or segments.numel() == 0:
+            return []
+        center = torch.tensor(camera_xy, dtype=segments.dtype, device=segments.device)
+        midpoints = segments.mean(dim=1)
+        aspect = self.viewer.scene_aspect if self.viewer is not None else 1.5
+        visible_radius = self.zoom_m * max(1.6, aspect * 1.25)
+        visible = (midpoints - center).square().sum(dim=-1) <= visible_radius ** 2
+        self._visible_boundary_cache = [
+            ((float(start[0]), float(start[1])), (float(end[0]), float(end[1])))
+            for start, end in segments[visible].detach().cpu().tolist()
+        ]
         self._visible_boundary_key = key
         return self._visible_boundary_cache
 
-    def _draw_navigation_targets(self, camera_xy):
-        pygame = self.pygame
+    def _selected_boundary_observations(self):
+        if not self.show_observed_boundaries:
+            return [], int(self.simulator.observation_generator.num_w_boundaries)
+        b = self.current_world
+        m = self.selected_agent
+        state = self.simulator.agents_state[b:b + 1, m:m + 1].contiguous()
+        with torch.inference_mode():
+            points, point_ids, _ = self.simulator.observation_generator.get_w_boundary_observation_for_agents(state)
+        points = points[0, 0]
+        valid = point_ids[0, 0] >= 0
+        visible_points = [
+            (float(x), float(y))
+            for x, y in points[valid].detach().cpu().tolist()
+        ]
+        return visible_points, int(point_ids.shape[-1])
+
+    def _route_visuals(self):
+        routes = []
         b = self.current_world
         if self.show_all_waypoints:
             active = (self.simulator.agents_state[b, :, 6] > 0.5).detach().cpu()
             done = self.cumulative_done[b].detach().cpu()
             for agent_idx in torch.nonzero(active & (~done), as_tuple=False).flatten().tolist():
                 if agent_idx != self.selected_agent:
-                    self._draw_agent_route_targets(camera_xy, b, int(agent_idx), selected=False)
-        self._draw_agent_route_targets(camera_xy, b, self.selected_agent, selected=True)
-
-        if hasattr(self.simulator, "goal_positions") and self.simulator.goal_positions is not None:
-            gx, gy = self.simulator.goal_positions[b, self.selected_agent].detach().cpu().tolist()
-            pygame.draw.circle(self.screen, (250, 188, 40), self._world_to_screen(float(gx), float(gy), camera_xy), 6)
-        if hasattr(self.simulator, "final_goal_positions") and self.simulator.final_goal_positions is not None:
-            gx, gy = self.simulator.final_goal_positions[b, self.selected_agent].detach().cpu().tolist()
-            pygame.draw.circle(self.screen, (230, 90, 60), self._world_to_screen(float(gx), float(gy), camera_xy), 7, width=2)
-
-    def _draw_agent_route_targets(self, camera_xy, world_idx: int, agent_idx: int, selected: bool):
-        pygame = self.pygame
-        route_points = self._remaining_route_points(world_idx, agent_idx)
-        if not route_points:
-            return
-        for idx, (x, y) in enumerate(route_points):
-            sx, sy = self._world_to_screen(x, y, camera_xy)
-            if sx < -20 or sx > self.width + 20 or sy < -20 or sy > self.height + 20:
-                continue
-            is_current = idx == 0
-            is_final = idx == len(route_points) - 1
-            if selected:
-                fill = (35, 115, 210) if not is_final else (230, 90, 60)
-                radius = 6 if is_current else 5
-                border = (245, 247, 250)
-            else:
-                fill = (100, 135, 170) if not is_final else (175, 110, 95)
-                radius = 3 if is_current else 2
-                border = (225, 230, 236)
-            pygame.draw.circle(self.screen, fill, (sx, sy), radius)
-            pygame.draw.circle(self.screen, border, (sx, sy), radius, width=1)
-            if selected:
-                label = self.small_font.render(str(idx + 1), True, (20, 45, 70))
-                self.screen.blit(label, (sx + 6, sy - 6))
+                    points = self._remaining_route_points(b, int(agent_idx))
+                    if points:
+                        routes.append(RouteVisual(points=points, selected=False))
+        selected_points = self._remaining_route_points(b, self.selected_agent)
+        if selected_points:
+            routes.append(RouteVisual(points=selected_points, selected=True))
+        return routes
 
     def _remaining_route_points(self, world_idx: int, agent_idx: int):
         route_quads = getattr(self.simulator, "agents_route_quad_ids", None)
@@ -418,79 +463,87 @@ class InferenceGame:
         centers = self.simulator.path_planner.get_quad_centers(quads).detach().cpu()
         return [(float(x), float(y)) for x, y in centers.tolist()]
 
-    def _draw_agents(self, camera_xy):
-        pygame = self.pygame
+    def _vehicle_visuals(self):
         b = self.current_world
         states = self.simulator.agents_state[b].detach().cpu()
         active = states[:, 6] > 0.5
         done = self.cumulative_done[b].detach().cpu()
+        vehicles = []
         for m, state in enumerate(states):
             if not bool(active[m]):
                 continue
             x, y, yaw, speed, length, width = [float(v) for v in state[:6].tolist()]
-            if m == self.selected_agent:
-                color = (225, 45, 55)
-            elif bool(done[m]):
-                color = (210, 156, 45)
-            else:
-                speed_t = min(1.0, max(0.0, speed / 20.0))
-                color = (45, int(100 + 100 * speed_t), 220)
-            pts = self._polygon_points(x, y, yaw, length, width, camera_xy)
-            pygame.draw.polygon(self.screen, color, pts)
-            cx, cy = self._world_to_screen(x, y, camera_xy)
-            fx, fy = self._world_to_screen(x + math.cos(yaw) * length * 0.6, y + math.sin(yaw) * length * 0.6, camera_xy)
-            pygame.draw.line(self.screen, (255, 245, 120), (cx, cy), (fx, fy), 2)
+            vehicles.append(VehicleVisual(
+                index=m,
+                x=x,
+                y=y,
+                yaw=yaw,
+                speed=speed,
+                length=length,
+                width=width,
+                selected=m == self.selected_agent,
+                done=bool(done[m]),
+            ))
+        return vehicles
 
-    def _draw_action_probs(self):
-        b = self.current_world
-        m = self.selected_agent
-        if self.last_probs is None or b >= self.last_probs.shape[0] or m >= self.last_probs.shape[1]:
-            return
-        pygame = self.pygame
-        probs = self.last_probs[b, m].detach().cpu().tolist()
-        base_x = self.width - 310
-        base_y = self.height - 120
-        bar_w = 20
-        gap = 4
-        max_h = 80
-        for i, prob in enumerate(probs):
-            h = int(max_h * max(0.0, min(1.0, prob)))
-            rect = pygame.Rect(base_x + i * (bar_w + gap), base_y + max_h - h, bar_w, h)
-            color = (225, 45, 55) if self.last_actions is not None and int(self.last_actions[b, m].item()) == i else (90, 140, 210)
-            pygame.draw.rect(self.screen, color, rect)
-            label = self.small_font.render(str(i), True, (40, 40, 40))
-            self.screen.blit(label, (base_x + i * (bar_w + gap) + 4, base_y + max_h + 4))
+    def _goal_point(self, name: str):
+        values = getattr(self.simulator, name, None)
+        if values is None:
+            return None
+        x, y = values[self.current_world, self.selected_agent].detach().cpu().tolist()
+        return float(x), float(y)
 
-    def _draw_ui(self):
+    def _frame_info(self):
         b = self.current_world
         m = self.selected_agent
         states = self.simulator.agents_state[b]
         active = states[:, 6] > 0.5
         alive = self._alive_mask()[b]
-        done = self.cumulative_done[b]
         speed = float(states[m, 3].item()) if m < states.shape[0] else 0.0
         reward = float(self.last_reward[b, m].item()) if self.last_reward is not None else 0.0
         value = float(self.last_values[b, m].item()) if self.last_values is not None else 0.0
-        action = int(self.last_actions[b, m].item()) if self.last_actions is not None else 0
         entropy = 0.0
         if self.last_probs is not None:
             p = self.last_probs[b, m].detach()
             entropy = float((-(p * torch.log(p.clamp_min(1e-8))).sum()).item())
-
-        lines = [
-            f"ckpt step: {self.checkpoint_step}",
-            f"device: {self.device} | {'argmax' if self.deterministic else 'sample'} | {'paused' if self.paused else 'running'}",
-            f"episode: {self.episode_count}  step: {self.step_count}/{self.max_steps}",
-            f"world {b}: alive {int(alive.sum().item())} / active {int(active.sum().item())} / done {int(done.sum().item())}",
-            f"selected car: {m}  action: {action}  speed: {speed:.2f} m/s",
-            f"reward: {reward:.4f}  value: {value:.4f}  entropy: {entropy:.3f}",
-            f"waypoints: {'all' if self.show_all_waypoints else 'selected'}  zoom: {self.zoom_m:.0f} m",
+        rows = [
+            ("checkpoint", f"{self.checkpoint_step:,}"),
+            ("device / mode", f"{self.device} / {'argmax' if self.deterministic else 'sample'}"),
+            ("episode / step", f"{self.episode_count} / {self.step_count}:{self.max_steps}"),
+            ("world / alive-active", f"{b} / {int(alive.sum().item())}:{int(active.sum().item())}"),
+            ("observed car", f"#{m}  {speed:.2f} m/s"),
+            ("reward / value", f"{reward:+.3f} / {value:+.3f}"),
+            ("entropy / zoom", f"{entropy:.3f} / {self.zoom_m:.0f} m"),
         ]
-        x, y = 14, 14
-        for line in lines:
-            surface = self.small_font.render(line, True, (25, 25, 25))
-            self.screen.blit(surface, (x, y))
-            y += 22
+        return rows
+
+    def draw(self):
+        camera_pose = self._camera_pose()
+        observations, observation_capacity = self._selected_boundary_observations()
+        b = self.current_world
+        m = self.selected_agent
+        probabilities = []
+        if self.last_probs is not None and b < self.last_probs.shape[0] and m < self.last_probs.shape[1]:
+            probabilities = [float(value) for value in self.last_probs[b, m].detach().cpu().tolist()]
+        action = int(self.last_actions[b, m].item()) if self.last_actions is not None else 0
+        frame = ViewerFrame(
+            camera_pose=camera_pose,
+            zoom_m=self.zoom_m,
+            road_segments=self._visible_boundary_segments(camera_pose[:2]),
+            boundary_observations=observations,
+            observation_capacity=observation_capacity,
+            vehicles=self._vehicle_visuals(),
+            action_probabilities=probabilities,
+            action_values=self.action_values,
+            selected_action=action,
+            info_rows=self._frame_info(),
+            routes=self._route_visuals(),
+            goal_point=self._goal_point("goal_positions"),
+            final_goal_point=self._goal_point("final_goal_positions"),
+            paused=self.paused,
+            camera_aligned=self.camera_follows_heading,
+        )
+        self.viewer.draw(frame)
 
     def print_summary(self):
         active = self.simulator.agents_state[..., 6] > 0.5
@@ -526,7 +579,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--width", type=int, default=1200)
     parser.add_argument("--height", type=int, default=800)
-    parser.add_argument("--zoom", type=float, default=120.0)
+    parser.add_argument("--zoom", type=float, default=55.0, help="vertical half-span of the road view in metres")
     return parser.parse_args()
 
 

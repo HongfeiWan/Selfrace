@@ -1,8 +1,5 @@
 # Default configuration for the Selfrace project
 simulator:
-  # 设备配置 - 8张显卡的分布式设置
-  device: "cuda:0"  # 主设备，其他设备将在分布式训练中自动分配
-
   # num_envs 是每个 rank/GPU 上的并行环境数；DDP 全局环境数 = num_envs * GPU 数。
   num_envs: 2600
   verbose: false         # 热路径调试日志开关，训练时保持关闭
@@ -22,13 +19,14 @@ simulator:
   init_distribution_smoothing: 1.0             # 接受率估计平滑，避免低样本quad权重发散
   init_distribution_max_weight: 20.0           # 单个quad的最大反向修正权重
   route_candidate_samples: 64                  # 每个目标段从局部候选中抽样的数量
-  route_local_candidate_count: 128             # 每个quad缓存最近的routable候选，避免从全图采到很远目标
+  route_local_candidate_count: 128             # 后续航点使用的每quad近邻routable候选缓存
   route_local_candidate_chunk_quads: 1024      # 构建局部候选表时的quad分块
-  route_first_min_goal_distance: 15.0          # 起点到第一个目标的短路线窗口，避免初期终点过远
-  route_first_max_goal_distance: 60.0
-  route_min_goal_distance: 15.0                # 后续route段也先保持较短，增加waypoint/goal命中率
-  route_max_goal_distance: 80.0
+  # 原文 Appendix A.1/B.4：首目标全图均匀采样；另采 0~3 个航点。
+  # 后续相邻目标优先满足 20~200m 与车道朝向差 <= 60°，无候选时逐步放宽。
+  route_min_goal_distance: 20.0
+  route_max_goal_distance: 200.0
   route_max_heading_delta_deg: 60.0
+  reset_chunk_worlds: 256                      # masked reset 峰值显存过高时会自动减半并记住安全值
   collision_narrow_chunk_pairs: 524288         # 动态碰撞窄阶段pair分块上限，限制极端拥堵显存峰值
   collision_pair_gen_chunk_pairs: 1048576      # 动态碰撞宽阶段每块生成的候选pair目标上限
 
@@ -37,26 +35,13 @@ simulator:
 
   # Dynamics model configuration
   dynamics:
-    # Action space configuration
-    use_discrete_actions: true  # 是否使用离散动作空间 (12个动作)
-    action_space_size: 12
-
     # Vehicle physical parameters
     vehicle_length_min: 0.8 # 车辆长度最小值 (m)
     vehicle_length_max: 7.0 # 车辆长度最大值 (m)
     vehicle_width_min: 0.8 # 车辆宽度最小值 (m)
     vehicle_width_max: 3.0 # 车辆宽度最大值 (m)
 
-    vehicle_length: 4.5 # 车辆长度 (m)
-    vehicle_width: 2.0 # 车辆宽度 (m)
-    vehicle_wheelbase: 2.9  # 车辆轴距 (L)，前后轮轴心之间的距离 (m)
     vehicle_max_steer_angle: 35.0  # 最大前轮转向角 (度)
-
-    # Control coefficients for driving style
-    Cthrottle: 1.0  # 油门控制系数，用于调节加速度响应
-    Csteer: 1.0     # 转向控制系数，用于调节转向响应
-    Cacc: 1.0       # 加速度控制系数，用于调节加速度约束
-    Cvel: 1.0       # 速度控制系数，用于调节速度约束
     
     # Steering control parameters
     max_steering_rate: 0.6  # 最大转向角变化率 (rad/s)
@@ -78,10 +63,8 @@ simulator:
     min_lateral_jerk: -4.0       # 最小横向jerk (m/s³)
     
     # Numerical stability parameters
-    curvature_epsilon: 1e-8      # 曲率计算的数值稳定性参数
     steering_epsilon: 1e-5       # 转向角计算的数值稳定性参数
-    straight_motion_threshold: 1e-5  # 直线运动判断阈值 (rad)
-  
+
   observation:
     # Observation space config
     # 定义观测空间
@@ -99,13 +82,7 @@ simulator:
     
   hash:
     # Spatial hash config - 空间哈希配置
-    # 方法1：直接指定网格单元大小（米）
     hash_cell_size: 5  # 网格单元大小（米），推荐5.0m以获得更好的精度
-    
-    # 方法2：通过网格分辨率计算（可选，如果同时设置会覆盖hash_cell_size）
-    grid_width: 1000     # 网格宽度（单元格数量）
-    grid_height: 1000    # 网格高度（单元格数量）
-    map_extent_m: 10000.0 # 地图范围（米），用于计算网格单元大小
     
 
   # Reward parameters based on Appendix B.3 and Selfrace paper
@@ -161,20 +138,25 @@ simulator:
     stop_line_horizon: 100.0
     red_light_probability: 0.5
 
-  policy:
-    # agent_feature_dim and local_state_dim are now part of simulator config
-    # Further network architecture configs...
-
 training:
-  # 分布式训练配置
-  distributed:
-    backend: "nccl"            # 分布式后端
-    init_method: "tcp://localhost:12355"  # 初始化方法
-
-  # batch_size 是全局目标批量；实际每卡 PPO 抽样量优先使用 batch_size_per_gpu。
+  # 原文 Table A3: 8 GPU × 32,000 = 256,000。单卡仍使用每卡值，避免改变显存需求。
   batch_size: 256000
-  batch_size_per_gpu: 32000  # 每GPU batch size；测试论文 per-GPU batch
-  iteration: 10000
+  batch_size_per_gpu: 32000
+  # 实际反向传播按 microbatch 累积梯度；OOM 后持久减半，稳定后逐步恢复。
+  ppo_microbatch_initial: null  # null 表示从每卡目标 batch 开始
+  ppo_microbatch_max: null      # null 表示不超过每卡目标 batch
+  ppo_min_microbatch_size: 256
+  ppo_microbatch_growth_interval: 20  # 连续成功后尝试恢复更大的 microbatch
+  ppo_feature_build_initial: null      # selected feature cache 的构建分块，OOM 时独立退避
+  ppo_feature_build_min: 256
+  ppo_feature_cache_location: "auto"  # auto 在显存余量不足时改用 pinned CPU cache
+  ddp_gradient_bucket_mb: 25  # 每个 epoch 的梯度规约按此上限合并，避免逐参数 collective
+  memory_adaptation:
+    enabled: true
+    target_fraction: 0.85  # 用当前空闲显存预算 worlds，保留初始化/碰撞/PPO 峰值余量
+    reserve_mb: 1024
+    min_num_envs: 8
+  total_updates: 10000  # 一次 update = 收集一个 rollout + 执行一次 PPO
   
   # 修正其他参数
   rollout_length: 128 # 论文式rollout长度；目标配置 2600 worlds x 150 agents x 128 rollout
@@ -183,7 +165,7 @@ training:
   gamma: 0.999      # 改为0.999 折扣因子
   gae_lambda: 0.95  # 广义优势估计的lambda
 
-  max_episode_length: 1200 # 每个episode的最大步数 (一个episode包含多个rollout)
+  max_episode_length: 1280 # masked reset 在 rollout 边界执行，必须是 rollout_length 的整数倍
 
   clip_ratio: 0.2
   learning_rate: 0.0005  # 5×10⁻⁴
@@ -197,8 +179,9 @@ training:
   lr_schedule: "cosine"  # 改为cosine
   precision: "16-bit"  # 添加16-bit AMP
   network_forward_chunk_agents: 65536 # 用更多显存减少 policy/value forward 分块，提高2600-world训练吞吐
-  feature_build_chunk_agents: 65536   # 用更多显存减少 selected-agent feature build 分块；2600 worlds下仍保留安全余量
-  rollout_dense_alive_fraction: 0.55   # 存活agent比例高时改用dense env-batch rollout，用显存换速度
+  feature_build_chunk_agents: 65536   # 通用特征构建上限，也作为 rollout 自适应分块的默认初值
+  rollout_chunk_initial_agents: 65536  # dense streaming rollout 初始分块，OOM 后自动减半
+  rollout_chunk_growth_interval: 100
   w_lane_dropout_prob: 0.5             # 原文式 W_lane element dropout；确定性重建，不占 rollout buffer
   w_boundary_dropout_prob: 0.4         # 原文式 W_boundary element dropout；被 drop 元素不进 set encoder
 
@@ -213,27 +196,35 @@ training:
   advantage_filter_max_drop_fraction: 0.8 # 临时保护：最多过滤80%的eligible样本
   min_ppo_samples: 8192             # 临时保护：候选样本太少时跳过/补足，避免少样本PPO压塌entropy
 
-  # 训练参数
-  total_timesteps: 1_000_000_000_000 # As per paper
-
   profile:
     enabled: false       # 可选训练链路 profiler，默认关闭
     cuda_sync: false     # 打开后为计时做 CUDA 同步，会降低训练速度
     log_interval: 10     # profiler 日志间隔
 
   diagnostics:
-    enabled: true         # 训练问题诊断日志：rollout reward/done/action + PPO KL/clip/action/advantage
+    enabled: false        # 排障时开启；默认关闭以避免训练热路径上的额外归约
     rollout: true
     ppo: true
   
   # 内存和性能优化
-  checkpoint_interval: 100                  # 检查点保存间隔
+  checkpoint_interval: 100                  # 按 update_step 保存检查点
   checkpoint_dir: "./training/checkpoints"  # 检查点保存目录
   log_interval: 10                          # 日志记录间隔
-  
-  # 经验缓冲区配置
-  experience_buffer_capacity: 50000  # 经验缓冲区容量
-  min_buffer_size_for_training: 800  # 开始训练的最小缓冲区大小
+
+  # 仅 rank 0 创建实验并上传指标；远端长期训练配置中再开启。
+  swanlab:
+    enabled: false
+    project: "Selfrace"
+    workspace: null
+    experiment_name: null
+    description: null
+    group: null
+    tags: ["ppo", "self-play"]
+    logdir: "./training/swanlog"
+    mode: "online"
+    id: null
+    resume: null
+    log_interval: 1
 
   # 模型权重初始化配置
   weight_init:
@@ -244,14 +235,18 @@ training:
   network:
     # 特征编码器配置
     encoder_dim: 64  # 每个编码器的输出维度
-    # 简单特征维度配置 - 用于SimpleFeatureEncoder
-    
-    # S(t), 显式 G(t)=4个remaining route目标(dx,dy), 原文式12维reward conditioning, 车辆风格参数
-    simple_feature_dims: [13, 8, 12, 4]
-    # 排列不变特征维度配置 - 用于PermutationInvariantEncoder
-    # road_boundary, lane_points, stop_lines, other_agents
-    permutation_feature_dims: [160, 560, 20, 200]
-    permutation_element_dims: [2, 7, 2, 10]
+    # 网络输入唯一 schema。顺序由名称固定，builder 与 encoder 共用同一份切片定义。
+    feature_schema:
+      simple:
+        state: 13              # S(t)
+        goal: 8                # 4 个 remaining route 目标 (dx, dy)
+        reward: 12             # C_reward
+        vehicle_style: 4       # C_dynamics
+      sets:
+        road_boundary: {flat_dim: 160, element_dim: 2}
+        lane_points: {flat_dim: 560, element_dim: 7}
+        stop_lines: {flat_dim: 20, element_dim: 2}
+        other_agents: {flat_dim: 200, element_dim: 10, active_channel: -1}
     
     # 网络架构配置
     network_dim: 1024  # MLP隐藏层维度

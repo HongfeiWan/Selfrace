@@ -6,34 +6,19 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/game/game.py",
-            "python": "${workspaceFolder}/.venv/bin/python",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
+            "justMyCode": true,
             "args": [
-                "--device",
-                "cpu",
-                "--agents",
-                "24"
-            ]
-        },
-        {
-            "name": "Selfrace Game Headless Smoke",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/game/game.py",
-            "python": "${workspaceFolder}/.venv/bin/python",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "args": [
-                "--headless",
-                "--steps",
-                "3",
+                "--checkpoint",
+                "${workspaceFolder}/training/checkpoints-paper-goals/ckpt_step_400.pt",
                 "--device",
                 "cpu",
                 "--envs",
                 "1",
                 "--agents",
-                "8"
+                "24"
             ]
         }
     ]

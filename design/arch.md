@@ -173,35 +173,25 @@
     - `def forward`：前向传播，处理集合输入。
 
 ### training/
-- **ppo.py**
-  - `class AdvantageFilteringPPO`：带优势筛选的PPO算法。
-    - `def __init__`：初始化PPO算法，设置超参数。
-    - `def update`：执行PPO更新步骤。
-    - `def compute_loss`：计算PPO损失。
+- **train.py**
+  - `def main`：读取默认配置、检测可见 GPU，并启动统一的单卡/DDP 入口。
 
-- **advantage_filter.py**
-  - `class AdvantageFilter`：GAE优势筛选。
-    - `def __init__`：初始化优势筛选器。
-    - `def filter`：筛选高优势的经验。
-    - `def compute_gae`：计算GAE优势。
+- **ddppo.py**
+  - `class RolloutTensorBuffer`：保存固定 horizon 的 on-policy world state 与动作数据。
+  - `class DistributedContext`：封装 rank、device 与必要的分布式同步。
+  - `def run_training_loop`：单卡和 DDP 共用的 rollout/PPO 主循环。
+  - `def perform_ppo_update`：GAE、优势筛选、一次性特征缓存，以及按显存自适应 microbatch 累积梯度的 PPO 更新。
+  - 每个 `update_step` 固定收集一个 rollout、执行一次 PPO，并在边界按 world mask 局部重置。
 
-- **train_loop.py**
-  - `def main`：训练主循环，协调整个训练过程。
+- **adaptive_batch.py**
+  - `class AdaptiveBatchSizer`：记录可用 microbatch，CUDA OOM 时减半，并在持续稳定后逐步恢复吞吐。
 
-- **test_ppo.py**
-  - `class SharedNetwork`：PPO用共享网络。
-    - `def __init__`：初始化共享网络。
-    - `def forward`：前向传播。
-  - `def compute_gae`：计算广义优势估计。
-  - `def ppo`：PPO主训练循环。
-  - `class RewardNormalizer`：奖励归一化。
-    - `def __init__`：初始化归一化器。
-    - `def normalize`：归一化奖励。
-  - `class CosineAnnealingLR`：余弦退火学习率调度
+- **feature_schema.py**
+  - `class FeatureSchema`：feature builder 与 actor/critic encoder 共用的命名特征布局和校验。
 
-    - `def __init__`：初始化学习率调度器。
-        - `def step`：更新学习率。
-        - `def get_lr`：获取当前学习率。
+- **network.py**
+  - `class IndependentNetwork`：互不共享参数的 actor 与 critic。
+  - `class PermutationInvariantEncoder`：集合输入编码器。
 
 - **training_monitor.py**
   - `class TrainingMonitor`：训练过程监控与可视化。

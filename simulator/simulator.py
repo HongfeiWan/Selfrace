@@ -1,9 +1,7 @@
 import torch
-import yaml
 import os
 import sys
 from typing import Dict, Tuple, Optional
-from types import SimpleNamespace
 import time
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -45,7 +43,7 @@ class TeraflowSimulator:
             config (Dict): 包含所有模拟器配置的字典。
                 - num_envs (int): 并行环境的数量 (batch_size)。
                 - map_path (str): 预处理后的地图文件路径 (.json)。
-                - device (str): 计算设备 ('cpu' 或 'cuda')。
+                计算设备由构造函数的 ``device`` 参数提供，而不是从配置读取。
                 - sim_dt (float): 模拟时间步长 (秒)。
                 - ... 其他配置，如车辆参数等
         """
@@ -70,7 +68,7 @@ class TeraflowSimulator:
         all_verts = self.road_network.quads_vertices.view(-1, 2)
         min_bounds, _ = torch.min(all_verts, dim=0)
         max_bounds, _ = torch.max(all_verts, dim=0)
-        # 使用一个固定的 cell_size, 也可以从 config 读取
+        # 网格范围来自地图边界；分辨率由配置中的 cell_size 控制。
         hash_config = simulator_config['hash']
         cell_size = hash_config['hash_cell_size']
         self.spatial_hash = SpatialHash(cell_size, min_bounds, max_bounds, self.device)
@@ -109,9 +107,8 @@ class TeraflowSimulator:
         self.stop_line_horizon = float(self.traffic_config.get('stop_line_horizon', obs_config.get('horizon', 100.0)))
         self.stop_line_observation_count = int(self.traffic_config.get('stop_line_observation_count', 5))
         self.red_light_probability = float(self.traffic_config.get('red_light_probability', 0.5))
-        network_cfg = config.get('training', {}).get('network', {})
-        permutation_dims = network_cfg.get('permutation_feature_dims', [160, 560, 20, 200])
-        self.stop_line_feature_dim = int(permutation_dims[2])
+        # Each observed stop line contributes two (x, y) endpoints.
+        self.stop_line_feature_dim = self.stop_line_observation_count * 4
         self._prepare_traffic_controls()
 
         # 10. 初始化模拟世界的状态张量
@@ -127,11 +124,10 @@ class TeraflowSimulator:
         self.route_candidate_samples: int = int(simulator_config.get('route_candidate_samples', 64))
         self.route_local_candidate_count: int = int(simulator_config.get('route_local_candidate_count', 128))
         self.route_local_candidate_chunk_quads: int = int(simulator_config.get('route_local_candidate_chunk_quads', 1024))
-        self.route_first_min_goal_distance: float = float(simulator_config.get('route_first_min_goal_distance', 15.0))
-        self.route_first_max_goal_distance: float = float(simulator_config.get('route_first_max_goal_distance', 60.0))
         self.route_min_goal_distance: float = float(simulator_config.get('route_min_goal_distance', 20.0))
         self.route_max_goal_distance: float = float(simulator_config.get('route_max_goal_distance', 200.0))
         self.route_max_heading_delta: float = float(simulator_config.get('route_max_heading_delta_deg', 60.0)) * torch.pi / 180.0
+        self.reset_chunk_worlds: int = max(1, int(simulator_config.get('reset_chunk_worlds', 256)))
         self._route_local_candidate_ids: Optional[torch.Tensor] = None
         self.driving_style_params: Optional[torch.Tensor] = None
         self.traffic_light_states: Optional[torch.Tensor] = None
@@ -368,6 +364,96 @@ class TeraflowSimulator:
         self._log(f"Reset complete. World state shape: {self.agents_state.shape}")
         
         return initial_observation
+
+    def _reset_world_indices(self, world_indices: torch.Tensor):
+        reset_count = int(world_indices.numel())
+        new_state, _, new_start_quad_ids = self.world_initializer.initialize_world(
+            reset_count
+        )
+        new_state = new_state.to(self.device)
+        self.agents_state[world_indices] = new_state
+        self.agents_start_quad_ids[world_indices] = new_start_quad_ids.to(
+            device=self.device, dtype=self.agents_start_quad_ids.dtype
+        )
+
+        self.reward_calculator.reset_worlds(world_indices)
+        active_mask = new_state[..., 6] > 0.5
+        new_style = self.driving_style_sampler.sample_driving_style_params(
+            reset_count, self.world_initializer.max_agents
+        ).to(self.device)
+        new_style = torch.where(
+            active_mask.unsqueeze(-1), new_style, torch.ones_like(new_style)
+        )
+        self.driving_style_params[world_indices] = new_style
+
+        if self.last_done is None:
+            self.last_done = torch.zeros(
+                (self.num_envs, self.world_initializer.max_agents),
+                dtype=torch.bool,
+                device=self.device,
+            )
+        self.last_done[world_indices] = False
+        self.dynamics_model.reset_worlds(
+            world_indices, self.num_envs, self.world_initializer.max_agents
+        )
+
+        route_quads, target_count, current_idx = self._sample_path_planning_state(
+            new_state, new_start_quad_ids
+        )
+        self.agents_route_quad_ids[world_indices] = route_quads
+        self.agents_route_target_count[world_indices] = target_count
+        self.agents_current_route_idx[world_indices] = current_idx
+
+        if self.num_traffic_controls > 0:
+            new_lights = (
+                torch.rand((reset_count, self.num_traffic_controls), device=self.device)
+                < self.red_light_probability
+            )
+            self.traffic_light_states[world_indices] = new_lights
+        self.stop_line_violation[world_indices] = False
+
+    def reset_worlds(self, world_mask: torch.Tensor, return_observation: bool = False):
+        """Reset selected worlds in adaptive chunks and preserve every other world."""
+        if self.agents_state is None:
+            raise RuntimeError("Must call reset() before reset_worlds().")
+        world_mask = world_mask.to(device=self.device, dtype=torch.bool).reshape(-1)
+        if world_mask.shape != (self.num_envs,):
+            raise ValueError(
+                f"world_mask must have shape {(self.num_envs,)}, got {tuple(world_mask.shape)}"
+            )
+        world_indices = torch.where(world_mask)[0]
+        reset_count = int(world_indices.numel())
+        if reset_count == 0:
+            return None
+
+        chunk_size = min(reset_count, self.reset_chunk_worlds)
+        start = 0
+        while start < reset_count:
+            end = min(start + chunk_size, reset_count)
+            try:
+                self._reset_world_indices(world_indices[start:end])
+                start = end
+            except RuntimeError as exc:
+                is_oom = self.device.type == 'cuda' and (
+                    isinstance(exc, getattr(torch.cuda, 'OutOfMemoryError', RuntimeError))
+                    or 'out of memory' in str(exc).lower()
+                )
+                if not is_oom or chunk_size <= 1:
+                    raise
+                chunk_size = max(1, chunk_size // 2)
+                self.reset_chunk_worlds = min(self.reset_chunk_worlds, chunk_size)
+                torch.cuda.empty_cache()
+
+        self._refresh_goal_positions()
+        self._update_stop_line_observation(self.agents_state)
+
+        if not return_observation:
+            return None
+        return self.observation_generator.generate(
+            self.agents_state,
+            control_state=self._current_control_state(),
+            driving_style_params=self.driving_style_params,
+        )
     
     def step(self, actions: torch.Tensor, debug_collision: bool = False,
              return_observation: bool = True):
@@ -623,7 +709,6 @@ class TeraflowSimulator:
         intermediate_goal_reached = goal_reached & current_target_is_waypoint & still_valid_route
         final_goal_reached = goal_reached & (~current_target_is_waypoint)
 
-        self.extend_state = extended_state # 用于传入网络
         return reward, final_goal_reached, intermediate_goal_reached
     
     def _sample_next_route_quads(
@@ -677,21 +762,7 @@ class TeraflowSimulator:
                 safe_prev.unsqueeze(-1).expand_as(sampled),
                 sampled,
             )
-        base_mask_raw = valid_mask.unsqueeze(-1) & not_same
-        base_mask = base_mask_raw & reachable
-
-        strict_mask = (
-            base_mask
-            & (distances >= min_distance)
-            & (distances <= max_distance)
-            & (cos_delta >= torch.cos(torch.as_tensor(max_heading_delta, device=self.device)))
-        )
-        relaxed_mask = (
-            base_mask
-            & (distances >= 0.5 * min_distance)
-            & (distances <= 1.5 * max_distance)
-            & (cos_delta >= torch.cos(torch.as_tensor(max_heading_delta * 2.0, device=self.device)))
-        )
+        base_mask = valid_mask.unsqueeze(-1) & not_same & reachable
 
         def choose_from(mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             counts = mask.sum(dim=-1)
@@ -703,18 +774,44 @@ class TeraflowSimulator:
             chosen = sampled.gather(2, selected_idx.unsqueeze(-1)).squeeze(-1).to(torch.int32)
             return chosen, counts > 0
 
-        strict_choice, has_strict = choose_from(strict_mask)
-        relaxed_choice, has_relaxed = choose_from(relaxed_mask)
-        fallback_distances = distances.masked_fill(~base_mask_raw, float('inf'))
-        fallback_idx = torch.argmin(fallback_distances, dim=-1)
-        fallback_choice = sampled.gather(2, fallback_idx.unsqueeze(-1)).squeeze(-1).to(torch.int32)
-        has_fallback = torch.isfinite(
-            fallback_distances.gather(2, fallback_idx.unsqueeze(-1)).squeeze(-1)
+        # Appendix A.1 says to gradually relax the 20--200 m / 60 degree
+        # constraints when a waypoint cannot be sampled (for example at a
+        # dead end).  Keep reachability mandatory at every stage so a relaxed
+        # sample cannot silently create an impossible route.
+        relaxation_stages = (
+            (1.0, 1.0, 1.0),
+            (0.75, 1.25, 1.5),
+            (0.5, 1.5, 2.0),
         )
+        chosen = torch.full_like(prev_quad, -1, dtype=torch.int32)
+        has_choice = torch.zeros_like(valid_mask, dtype=torch.bool)
+        for min_scale, max_scale, heading_scale in relaxation_stages:
+            stage_mask = (
+                base_mask
+                & (distances >= min_scale * min_distance)
+                & (distances <= max_scale * max_distance)
+                & (
+                    cos_delta
+                    >= torch.cos(
+                        torch.as_tensor(
+                            min(float(torch.pi), heading_scale * max_heading_delta),
+                            device=self.device,
+                        )
+                    )
+                )
+            )
+            stage_choice, stage_has_choice = choose_from(stage_mask)
+            take_stage = (~has_choice) & stage_has_choice
+            chosen = torch.where(take_stage, stage_choice, chosen)
+            has_choice |= stage_has_choice
 
-        chosen = torch.where(has_strict, strict_choice, relaxed_choice)
-        chosen = torch.where(has_strict | has_relaxed, chosen, fallback_choice)
-        return torch.where(valid_mask & (has_strict | has_relaxed | has_fallback), chosen, torch.full_like(chosen, -1))
+        # Last-resort relaxation retains only the reachability and distinct
+        # point constraints, matching the paper's stated intent at dead ends.
+        fallback_choice, has_fallback = choose_from(base_mask)
+        take_fallback = (~has_choice) & has_fallback
+        chosen = torch.where(take_fallback, fallback_choice, chosen)
+        has_choice |= has_fallback
+        return torch.where(valid_mask & has_choice, chosen, torch.full_like(chosen, -1))
 
     def _routable_quad_ids(self) -> torch.Tensor:
         routable = getattr(self.path_planner, 'routable_quad_ids', None)
@@ -730,6 +827,22 @@ class TeraflowSimulator:
         if callable(project_fn):
             return project_fn(quad_ids).to(device=self.device, dtype=torch.int32)
         return quad_ids.to(device=self.device, dtype=torch.int32)
+
+    def _sample_uniform_route_quads(self, valid_mask: torch.Tensor) -> torch.Tensor:
+        """Independently sample each active vehicle's first goal over the map."""
+        routable_quad_ids = self._routable_quad_ids()
+        sampled = torch.full(valid_mask.shape, -1, dtype=torch.int32, device=self.device)
+        if routable_quad_ids.numel() == 0:
+            return sampled
+        positions = torch.randint(
+            0,
+            int(routable_quad_ids.numel()),
+            valid_mask.shape,
+            dtype=torch.long,
+            device=self.device,
+        )
+        uniform_goals = routable_quad_ids[positions].to(torch.int32)
+        return torch.where(valid_mask, uniform_goals, sampled)
 
     def _route_local_candidates(self) -> Optional[torch.Tensor]:
         """Nearest routable quad candidates for each quad, built once and reused during reset."""
@@ -780,13 +893,9 @@ class TeraflowSimulator:
         routable_quad_ids = self._routable_quad_ids()
         if routable_quad_ids.numel() == 0:
             return route_quads, torch.zeros_like(target_count)
-        first_target = self._sample_next_route_quads(
-            start_i32,
-            valid_start & route_mask[..., 0],
-            self.route_first_min_goal_distance,
-            self.route_first_max_goal_distance,
-            self.route_max_heading_delta,
-        )
+        # The first route target is uniform over the map and independent for
+        # every vehicle.  Only subsequent targets use the local constraints.
+        first_target = self._sample_uniform_route_quads(valid_start & route_mask[..., 0])
         route_quads[..., 0] = torch.where(valid_start & route_mask[..., 0], first_target, route_quads[..., 0])
         target_count = torch.where(
             valid_start & route_mask[..., 0] & (route_quads[..., 0] < 0),
@@ -987,13 +1096,22 @@ class TeraflowSimulator:
         if self.agents_current_route_idx is None or self.agents_route_target_count is None:
             return
         advance_mask = intermediate_goal_reached & self._current_target_is_intermediate()
-        if not bool(advance_mask.any().item()):
-            self._refresh_goal_positions()
-            return
         max_idx = torch.clamp(self.agents_route_target_count - 1, min=0)
         next_idx = torch.minimum(self.agents_current_route_idx + advance_mask.long(), max_idx)
         self.agents_current_route_idx = next_idx
         self._refresh_goal_positions()
+
+    def _sample_path_planning_state(
+        self,
+        agents_state: torch.Tensor,
+        start_quad_ids: torch.Tensor,
+    ):
+        B, M = agents_state.shape[:2]
+        active_mask = agents_state[..., 6] > 0.5
+        start_i32 = start_quad_ids.to(dtype=torch.int32, device=self.device)
+        route_quads, target_count = self._sample_route_quad_ids(active_mask, start_i32)
+        current_idx = torch.zeros((B, M), dtype=torch.long, device=self.device)
+        return route_quads, target_count, current_idx
 
     def _initialize_path_planning(self):
         """
@@ -1004,440 +1122,13 @@ class TeraflowSimulator:
         """
         if self.agents_state is None:
             return
-        B, M, _ = self.agents_state.shape
-        active_mask = self.agents_state[..., 6] > 0.5
         if not hasattr(self, 'agents_start_quad_ids') or self.agents_start_quad_ids is None:
             self._log("Warning: No start quad IDs available for path planning")
             return
 
-        start_i32 = self.agents_start_quad_ids.to(dtype=torch.int32, device=self.device)
-        route_quads, target_count = self._sample_route_quad_ids(active_mask, start_i32)
-        self.agents_route_quad_ids = route_quads
-        self.agents_route_target_count = target_count
-        self.agents_current_route_idx = torch.zeros((B, M), dtype=torch.long, device=self.device)
+        (
+            self.agents_route_quad_ids,
+            self.agents_route_target_count,
+            self.agents_current_route_idx,
+        ) = self._sample_path_planning_state(self.agents_state, self.agents_start_quad_ids)
         self._refresh_goal_positions()
-
-if __name__ == '__main__':
-    # 这是一个简单的使用示例，用于测试模拟器的基本功能
-    # 从配置文件读取配置
-    from matplotlib import pyplot as plt
-    from matplotlib.widgets import Button
-    import numpy as np
-    from matplotlib.patches import Polygon, Circle
-    from matplotlib.collections import PatchCollection
-    
-    # 基于文件位置解析项目根目录，避免依赖当前工作目录
-    _this_dir = os.path.dirname(os.path.abspath(__file__))
-    _proj_root = os.path.dirname(_this_dir)
-    config_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-
-    device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-    simulator = TeraflowSimulator(config=config, device=device)
-
-    initial_obs = simulator.reset()
-    print(f"Initial observation batch shape: {initial_obs.shape}")
-
-    # 可视化道路网络和智能体位置（与goals.py绘制风格保持一致）
-    print("\n=== 可视化道路网络和智能体位置 ===")
-    # 获取道路网络的四边形顶点 这里是测试road.py
-    quads_vertices = simulator.road_network.quads_vertices  # (num_quads, 4, 2)
-    quads_vertices_np = quads_vertices.cpu().numpy()
-    # 获取智能体状态 这里已经测试过world_initializer.py
-    agents_state_np = simulator.agents_state.cpu().numpy()  # (B, M, 7)
-
-    # 创建图形
-    fig, ax = plt.subplots(figsize=(10, 10))
-    # 方法1: 使用PatchCollection进行批量绘制（最快）
-    patches = []
-    # 批量创建Polygon对象
-    for i in range(len(quads_vertices_np)):
-        vertices = quads_vertices_np[i]  # (4, 2)
-        polygon = Polygon(vertices, closed=True)
-        patches.append(polygon)
-    p = PatchCollection(patches, alpha=0.2, facecolor='lightblue', edgecolor='black', linewidth=0.1)
-    # 一次性添加所有quads到图形
-    ax.add_collection(p)
-
-    # 构建可更新的智能体绘制（仅显示第一个环境）
-    def build_agent_artists():
-        ax_agents = []
-        agents_state_np_local = simulator.agents_state.cpu().numpy()
-        active_mask_local = agents_state_np_local[0, :, 6] > 0.5
-        active_indices_local = np.where(active_mask_local)[0]
-        if len(active_indices_local) == 0:
-            return ax_agents, active_indices_local
-        colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
-        import math
-        for i, agent_idx in enumerate(active_indices_local):
-            x, y, yaw, speed, length, width, active = agents_state_np_local[0, agent_idx]
-            cos_yaw = math.cos(yaw)
-            sin_yaw = math.sin(yaw)
-            # 智能体矩形的四个角点 (相对于中心)
-            half_length = length / 2.0
-            half_width = width / 2.0
-            corners = np.array([
-                [-half_length, -half_width],
-                [half_length, -half_width],
-                [half_length, half_width],
-                [-half_length, half_width]
-            ])
-            # 旋转矩阵
-            rotation_matrix = np.array([
-                [cos_yaw, -sin_yaw],
-                [sin_yaw, cos_yaw]
-            ])
-            agent_corners = corners @ rotation_matrix.T + np.array([x, y])
-            poly = Polygon(agent_corners, closed=True)
-            color = colors[i % len(colors)]
-            ax.add_patch(poly)
-            poly.set_facecolor(color)
-            poly.set_alpha(0.8)
-            poly.set_edgecolor('black')
-            poly.set_linewidth(2)
-            # 仅为第一个激活agent显示标签与速度文本
-            if i == 0:
-                label = f'Agent {agent_idx}'
-                txt = ax.text(x, y, label, ha='center', va='center', fontsize=10,
-                              bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8),
-                              weight='bold')
-            else:
-                txt = None
-            speed_vec = 3.0
-            arr = ax.arrow(x, y, speed_vec * cos_yaw, speed_vec * sin_yaw,
-                           head_width=0.5, head_length=0.5, fc=color, ec=color,
-                           alpha=0.8, zorder=5, linewidth=2)
-            # 仅第一个激活agent显示速度文本
-            if i == 0:
-                info = ax.text(x, y + half_width + 1, f'v={speed:.1f}m/s', ha='center', va='bottom',
-                               fontsize=8, color=color, weight='bold')
-            else:
-                info = None
-            ax_agents.append((agent_idx, poly, txt, arr, info, color))
-        return ax_agents, active_indices_local
-
-    agent_artists, active_indices = build_agent_artists()
-
-    # 构建策略网络与初始特征（延迟导入避免循环依赖）
-    from ddppo import decompose_observation, build_network_features, current_navigation
-    from network import create_network
-    import json as _json
-
-    config_ns = _json.loads(_json.dumps(config), object_hook=lambda d: SimpleNamespace(**d))
-    model = create_network(config=config_ns, network_type="independent").to(device)
-    model.eval()
-    with torch.no_grad():
-        agents_state_dec, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(initial_obs, config_ns)
-        features_tensor = build_network_features(
-            agents_state_dec,
-            neighbors_local,
-            w_lanes_local,
-            w_boundaries_local,
-            current_navigation(simulator),
-            simulator.stop_lines,
-            simulator.reward_calculator.sampled_params,
-            config_ns,
-        )
-
-    # 在主图上绘制局部要素（第一个环境第一个激活agent）
-    overlay_artists = []
-    def clear_overlays():
-        global overlay_artists
-        for art in overlay_artists:
-            try:
-                art.remove()
-            except Exception:
-                pass
-        overlay_artists = []
-
-    def draw_local_overlays(agents_state_dec_t, neighbors_local_t, w_lanes_local_t, w_boundaries_local_t):
-        global overlay_artists, first_agent_idx
-        try:
-            clear_overlays()
-            import numpy as np
-            import math
-            # 自车位姿
-            ego = simulator.agents_state[0, first_agent_idx]
-            ex = float(ego[0].item()); ey = float(ego[1].item()); eyaw = float(ego[2].item())
-            cos_y = math.cos(eyaw); sin_y = math.sin(eyaw)
-            R = np.array([[cos_y, -sin_y],[sin_y, cos_y]], dtype=float)
-
-            # lanes
-            lanes = w_lanes_local_t[0, first_agent_idx] if w_lanes_local_t is not None else None
-            if lanes is not None:
-                lanes_np = lanes.detach().to('cpu').numpy()
-                if lanes_np.ndim >= 2 and lanes_np.shape[-1] >= 2:
-                    valid = (lanes_np[...,0] != -1) & (lanes_np[...,1] != -1)
-                    pts = lanes_np[valid][..., :2]
-                    if pts.size > 0:
-                        world = pts @ R.T + np.array([ex, ey])
-                        h = ax.scatter(world[:,0], world[:,1], s=5, c='lime', alpha=0.8, label='w_lanes_local')
-                        overlay_artists.append(h)
-
-            # boundaries
-            bounds = w_boundaries_local_t[0, first_agent_idx] if w_boundaries_local_t is not None else None
-            if bounds is not None:
-                bounds_np = bounds.detach().to('cpu').numpy()
-                if bounds_np.ndim >= 2 and bounds_np.shape[-1] >= 2:
-                    valid = (bounds_np[...,0] != -1) & (bounds_np[...,1] != -1)
-                    pts = bounds_np[valid][..., :2]
-                    if pts.size > 0:
-                        world = pts @ R.T + np.array([ex, ey])
-                        h = ax.scatter(world[:,0], world[:,1], s=4, c='k', alpha=0.5, label='w_boundaries_local')
-                        overlay_artists.append(h)
-
-            # neighbors_local: [dx, dy, heading_x, heading_y, dvx, dvy, length, width, z, active]
-            neigh = neighbors_local_t[0, first_agent_idx] if neighbors_local_t is not None else None
-            if neigh is not None:
-                neigh_np = neigh.detach().to('cpu').numpy()
-                if neigh_np.ndim >= 2 and neigh_np.shape[-1] >= 6:
-                    # 有效点：active>0.5 或者 长宽>0
-                    active_mask = neigh_np[..., -1] > 0.5 if neigh_np.shape[-1] >= 7 else np.ones(neigh_np.shape[0], dtype=bool)
-                    valid = active_mask
-                    dxdy = neigh_np[valid][..., :2]
-                    if dxdy.size > 0:
-                        world_pts = dxdy @ R.T + np.array([ex, ey])
-                        # 只为被观察到的邻居绘制标签（一次性标注）
-                        h = ax.scatter(world_pts[:,0], world_pts[:,1], s=20, facecolors='none', edgecolors='red', linewidths=2, label='neighbors_local')
-                        overlay_artists.append(h)
-                        # 标注被观察到的邻居（仅一次图例）
-                        for j, (wx, wy) in enumerate(world_pts):
-                            txtn = ax.text(wx, wy, 'N', fontsize=8, color='red', weight='bold')
-                            overlay_artists.append(txtn)
-                        try:
-                            # 仅处理前N个，避免过多图元
-                            max_draw = min(world_pts.shape[0], 20)
-                            # 取对应的行索引
-                            valid_indices = np.nonzero(valid)[0][:max_draw]
-                            # 计算自车绝对速度（世界坐标）
-                            ego_speed = float(simulator.agents_state[0, first_agent_idx, 3].item())
-                            vx_ego = ego_speed * cos_y
-                            vy_ego = ego_speed * sin_y
-                            for ii in valid_indices:
-                                row = neigh_np[ii]
-                                nx, ny = float(row[0]), float(row[1])
-                                if row.shape[0] >= 10:
-                                    heading_x, heading_y = float(row[2]), float(row[3])
-                                    dvx_local, dvy_local = float(row[4]), float(row[5])
-                                    nlen = float(row[6])
-                                    nwid = float(row[7])
-                                else:
-                                    heading_x = heading_y = None
-                                    dvx_local, dvy_local = float(row[2]), float(row[3])
-                                    nlen = float(row[4])
-                                    nwid = float(row[5])
-                                # 局部中心 -> 世界中心
-                                cx, cy = (R @ np.array([nx, ny])).tolist(); cx += ex; cy += ey
-                                # 相对速度(局部) -> 世界相对速度
-                                rvx_world, rvy_world = (R @ np.array([dvx_local, dvy_local])).tolist()
-                                # 近似邻居绝对速度 = 自车绝对速度 + 相对世界速度
-                                nvx_world = vx_ego + rvx_world
-                                nvy_world = vy_ego + rvy_world
-                                speed_mag = math.hypot(nvx_world, nvy_world)
-                                if heading_x is not None and math.hypot(heading_x, heading_y) > 1e-3:
-                                    nyaw_world = eyaw + math.atan2(heading_y, heading_x)
-                                elif speed_mag > 1e-2:
-                                    nyaw_world = math.atan2(nvy_world, nvx_world)
-                                else:
-                                    nyaw_world = eyaw
-                                c = math.cos(nyaw_world); s = math.sin(nyaw_world)
-                                Rn = np.array([[c, -s], [s, c]], dtype=float)
-                                hl = max(0.1, nlen * 0.5); hw = max(0.1, nwid * 0.5)
-                                rect_local = np.array([
-                                    [-hl, -hw],
-                                    [ hl, -hw],
-                                    [ hl,  hw],
-                                    [-hl,  hw]
-                                ], dtype=float)
-                                rect_world = rect_local @ Rn.T + np.array([cx, cy])
-                                # 邻居整体涂黑 + 金色描边
-                                poly = Polygon(rect_world, closed=True, facecolor='black', edgecolor='gold', linewidth=2.0, alpha=0.9)
-                                ax.add_patch(poly)
-                                overlay_artists.append(poly)
-                                # 绘制邻居世界速度方向（金色箭头，长度按速度幅值裁剪）
-                                if speed_mag > 1e-3:
-                                    ux = nvx_world / speed_mag
-                                    uy = nvy_world / speed_mag
-                                    arrow_len = max(3.0, min(8.0, speed_mag))
-                                    arr_v = ax.arrow(cx, cy, ux * arrow_len, uy * arrow_len,
-                                                     head_width=0.8, head_length=0.8, fc='gold', ec='gold',
-                                                     alpha=0.95, zorder=7, linewidth=2)
-                                    overlay_artists.append(arr_v)
-                        except Exception:
-                            pass
-
-            fig.canvas.draw_idle()
-        except Exception as e:
-            print(f"draw_local_overlays error: {e}")
-
-    # 初始绘制一次
-    try:
-        draw_local_overlays(agents_state_dec, neighbors_local, w_lanes_local, w_boundaries_local)
-    except Exception:
-        pass
-    
-    # 统一图形样式
-    ax.set_aspect('equal', adjustable='box')
-    ax.grid(True, alpha=0.3)
-    ax.set_title('road graph and agent positions')
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    # 绘制观测半径虚线圆（以第一个激活agent为圆心）
-    horizon_circle = None
-    try:
-        horizon = float(config['simulator']['observation']['horizon'])
-        if len(active_indices) > 0:
-            first_idx = int(active_indices[0])
-            cx = float(simulator.agents_state[0, first_idx, 0].item())
-            cy = float(simulator.agents_state[0, first_idx, 1].item())
-            horizon_circle = Circle((cx, cy), radius=horizon, fill=False, edgecolor='gray', linestyle='--', linewidth=1.5, alpha=0.7)
-            ax.add_patch(horizon_circle)
-    except Exception:
-        pass
-    
-    # 添加 Next Step 按钮
-    btn_ax = fig.add_axes([0.82, 0.02, 0.15, 0.05])
-    btn_next = Button(btn_ax, 'Next Step')
-
-    # 第二个figure：动作概率分布（仅第一个环境的第一个agent）
-    num_actions = simulator.dynamics_model.discrete_action_space.num_actions
-    first_agent_idx = 0
-    if len(active_indices) > 0:
-        first_agent_idx = int(active_indices[0])
-    fig_act, ax_act = plt.subplots(figsize=(6, 3))
-    fig_act.canvas.manager.set_window_title('Action Probabilities (Agent 0)')
-    bars = ax_act.bar(np.arange(num_actions), np.zeros(num_actions), color='tab:blue')
-    ax_act.set_xlabel('Action Index')
-    ax_act.set_ylabel('Probability')
-    ax_act.set_title('First Agent Action Probabilities')
-    ax_act.set_xlim(-0.5, num_actions - 0.5)
-    ax_act.set_ylim(0.0, 1.0)
-    fig_act.tight_layout()
-
-    def refresh_agents():
-        global agent_artists, active_indices, horizon_circle
-        agents_state_np_local = simulator.agents_state.cpu().numpy()
-        new_active_mask = agents_state_np_local[0, :, 6] > 0.5
-        new_active_indices = np.where(new_active_mask)[0]
-        if not np.array_equal(new_active_indices, active_indices):
-            for _, poly, txt, arr, info, _ in agent_artists:
-                try:
-                    poly.remove(); txt.remove(); info.remove(); arr.remove()
-                except Exception:
-                    pass
-            agent_artists, active_indices = build_agent_artists()
-            fig.canvas.draw_idle()
-            return
-        import math
-        for (agent_idx, poly, txt, arr, info, color) in agent_artists:
-            x, y, yaw, speed, length, width, active = agents_state_np_local[0, agent_idx]
-            cos_yaw = math.cos(yaw)
-            sin_yaw = math.sin(yaw)
-            half_length = length / 2.0
-            half_width = width / 2.0
-            corners = np.array([
-                [-half_length, -half_width],
-                [half_length, -half_width],
-                [half_length, half_width],
-                [-half_length, half_width]
-            ])
-            rotation_matrix = np.array([
-                [cos_yaw, -sin_yaw],
-                [sin_yaw, cos_yaw]
-            ])
-            agent_corners = corners @ rotation_matrix.T + np.array([x, y])
-            poly.set_xy(agent_corners)
-            if txt is not None:
-                txt.set_position((x, y))
-            try:
-                arr.remove()
-            except Exception:
-                pass
-            speed_vec = 3.0
-            new_arr = ax.arrow(x, y, speed_vec * cos_yaw, speed_vec * sin_yaw,
-                               head_width=0.5, head_length=0.5, fc=color, ec=color,
-                               alpha=0.8, zorder=5, linewidth=2)
-            idx = [i for i, t in enumerate(agent_artists) if t[0] == agent_idx][0]
-            agent_artists[idx] = (agent_idx, poly, txt, new_arr, info, color)
-            if info is not None:
-                info.set_position((x, y + half_width + 1))
-                info.set_text(f'v={speed:.1f}m/s')
-        
-        # 更新虚线圆位置（跟随第一个激活agent）
-        try:
-            if horizon_circle is not None and len(active_indices) > 0:
-                first_idx = int(active_indices[0])
-                new_cx = float(simulator.agents_state[0, first_idx, 0].item())
-                new_cy = float(simulator.agents_state[0, first_idx, 1].item())
-                horizon_circle.center = (new_cx, new_cy)
-        except Exception:
-            pass
-            
-        fig.canvas.draw_idle()
-
-    def on_next_clicked(event):
-        # 使用网络输出的分布采样动作并推进一步
-        global features_tensor, first_agent_idx
-        with torch.no_grad():
-            logits = model.forward(features_tensor, mode="policy")
-            dist = torch.distributions.Categorical(logits=logits)
-            # 先显示当前步的动作概率分布
-            try:
-                probs = dist.probs.detach().to('cpu').numpy()  # (B, M, A)
-                probs_first = probs[0, first_agent_idx]
-                for i, b in enumerate(bars):
-                    b.set_height(float(probs_first[i]))
-                ax_act.set_ylim(0.0, 1.0)
-                fig_act.canvas.draw_idle()
-            except Exception:
-                pass
-            actions = dist.sample()
-        observation, reward, done = simulator.step(actions)
-        # 显示当前观测agent的reward（B=0, M=first_agent_idx）
-        try:
-            cur_r = float(reward[0, first_agent_idx].item())
-            print(f"当前观测agent(B=0, M={first_agent_idx}) reward: {cur_r:.4f}",'done:',done[0, first_agent_idx].item())
-        except Exception:
-            pass
-        # 基于新观测重建特征，供下一步使用
-        try:
-            with torch.no_grad():
-                agents_state_dec, neighbors_local, w_lanes_local, w_boundaries_local = decompose_observation(observation, config_ns)
-                
-                features_tensor = build_network_features(
-                    agents_state_dec,
-                    neighbors_local,
-                    w_lanes_local,
-                    w_boundaries_local,
-                    current_navigation(simulator),
-                    simulator.stop_lines if hasattr(simulator, 'stop_lines') else None,
-                    simulator.reward_calculator.sampled_params,
-                    config_ns, 
-                )
-                # 绘制局部要素，并打印本次 agents_state_dec
-                try:
-                    draw_local_overlays(agents_state_dec, neighbors_local, w_lanes_local, w_boundaries_local)
-                    print('features_tensor:',features_tensor[0, first_agent_idx])
-                    #print('neighbors_local:',neighbors_local[0, first_agent_idx])
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        refresh_agents()
-
-    btn_next.on_clicked(on_next_clicked)
-
-    # 绑定空格键为“下一步”
-    def on_key_press(event):
-        try:
-            if event.key in (' ', 'space'):
-                on_next_clicked(event)
-        except Exception:
-            pass
-
-    fig.canvas.mpl_connect('key_press_event', on_key_press)
-    fig_act.canvas.mpl_connect('key_press_event', on_key_press)
-
-    plt.tight_layout()
-    plt.show()

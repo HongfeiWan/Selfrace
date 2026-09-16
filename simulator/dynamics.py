@@ -1,5 +1,5 @@
 import torch
-from typing import Dict, Tuple
+from typing import Dict
 import math
 
 class DiscreteActionSpace:
@@ -69,10 +69,6 @@ class KinematicBicycleModel:
         max_steer_deg = dynamics_config.get('vehicle_max_steer_angle', 35.0)
         self.max_steer_rad = math.radians(max_steer_deg) # 将角度转换为弧度
         
-        # 添加车辆几何尺寸参数（用于状态表示和碰撞检测）
-        self.vehicle_length = dynamics_config.get('vehicle_length', 4.5)  # 车辆长度, m
-        self.vehicle_width = dynamics_config.get('vehicle_width', 2.0)    # 车辆宽度, m
-        
         # 添加油门、转向、加速度和速度控制系数
         self.Cthrottle = dynamics_config.get('Cthrottle', 1.0)  # 油门控制系数
         self.Csteer = dynamics_config.get('Csteer', 1.0)        # 转向控制系数
@@ -92,16 +88,8 @@ class KinematicBicycleModel:
         self.max_velocity = dynamics_config.get('max_velocity', 20.0)  # 最大速度 (m/s)
         self.min_velocity = dynamics_config.get('min_velocity', -2.0)  # 最小速度 (m/s)
         
-        # Jerk约束参数（用于离散动作空间）
-        self.max_longitudinal_jerk = dynamics_config.get('max_longitudinal_jerk', 15.0)  # 最大纵向jerk (m/s³)
-        self.min_longitudinal_jerk = dynamics_config.get('min_longitudinal_jerk', -15.0) # 最小纵向jerk (m/s³)
-        self.max_lateral_jerk = dynamics_config.get('max_lateral_jerk', 4.0)        # 最大横向jerk (m/s³)
-        self.min_lateral_jerk = dynamics_config.get('min_lateral_jerk', -4.0)       # 最小横向jerk (m/s³)
-        
         # 数值稳定性参数
-        self.curvature_epsilon = float(dynamics_config.get('curvature_epsilon', 1e-8))      # 曲率计算的数值稳定性参数
         self.steering_epsilon = float(dynamics_config.get('steering_epsilon', 1e-5))       # 转向角计算的数值稳定性参数
-        self.straight_motion_threshold = float(dynamics_config.get('straight_motion_threshold', 1e-5))  # 直线运动判断阈值 (rad)
 
         # 使用离散动作空间
         self.discrete_action_space = DiscreteActionSpace(device, dynamics_config)
@@ -285,6 +273,17 @@ class KinematicBicycleModel:
         if hasattr(self, 'prev_along'):
             delattr(self, 'prev_along')
 
+    def reset_worlds(self, world_indices: torch.Tensor, num_worlds: int, max_agents: int):
+        """Zero recurrent control state for selected vector worlds."""
+        world_indices = world_indices.to(device=self.device, dtype=torch.long).reshape(-1)
+        if world_indices.numel() == 0:
+            return
+        expected = int(num_worlds) * int(max_agents)
+        for name in ('current_along', 'current_alat', 'current_steering_angle', 'prev_along'):
+            value = getattr(self, name, None)
+            if value is not None and value.numel() == expected:
+                value.view(int(num_worlds), int(max_agents))[world_indices] = 0
+
     def calculate_steering_angle(self, alat: torch.Tensor, speed: torch.Tensor,
                                  epsilon: float = None, wheelbase: torch.Tensor = None) -> torch.Tensor:
         """
@@ -327,11 +326,3 @@ class KinematicBicycleModel:
     def get_discrete_action_space(self) -> DiscreteActionSpace:
         """获取离散动作空间"""
         return self.discrete_action_space
-
-# 为了让这个文件可以独立测试，添加一个 main block
-if __name__ == '__main__':
-    test=DiscreteActionSpace(torch.device('cuda'), config={})
-    print(test.get_all_actions())
-    print(test.get_action(torch.tensor([0])))
-    
-    

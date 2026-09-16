@@ -3,6 +3,10 @@ import sys
 import json
 import socket
 import math
+import random
+import shutil
+import gc
+from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
 from contextlib import nullcontext
@@ -21,6 +25,9 @@ if simulator_dir not in sys.path:
     sys.path.insert(0, simulator_dir)
 
 from simulator import TeraflowSimulator
+from adaptive_batch import AdaptiveBatchSizer
+from experiment_logging import initialize_swanlab
+from feature_schema import FEATURE_PAD_VALUE, FeatureSchema
 from network import create_network
 
 '''
@@ -48,159 +55,168 @@ def gae_advantages(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Ten
 	return advantages, returns #即返回A(s,a), Q(s,a)
 
 # ============================== 模型检查点保存 ==============================
-def save_checkpoint(model, policy_optimizer, value_optimizer, step: int, checkpoint_dir: str):
-	"""保存模型与优化器状态字典"""
-	try:
-		os.makedirs(checkpoint_dir, exist_ok=True)
-		# 兼容 DDP 包裹
-		save_model = model.module if hasattr(model, 'module') else model
-		state = {
-			'step': step,
-			'model_state_dict': save_model.state_dict(),
-			'policy_state_dict': save_model.policy_network.state_dict(),
-			'value_state_dict': save_model.value_network.state_dict(),
-			'policy_feature_encoder_state_dict': save_model.policy_feature_encoder.state_dict(),
-			'value_feature_encoder_state_dict': save_model.value_feature_encoder.state_dict(),
-			'policy_optim_state_dict': policy_optimizer.state_dict(),
-			'value_optim_state_dict': value_optimizer.state_dict(),
-		}
-		ckpt_path = os.path.join(checkpoint_dir, f'ckpt_step_{step}.pt')
-		torch.save(state, ckpt_path)
-	except Exception as e:
-		print(f"⚠️ 保存检查点失败: {e}")
+CHECKPOINT_FORMAT_VERSION = 3
 
-def adapt_state_dict_for_expanded_inputs(module, loaded_state: dict) -> tuple[dict, bool]:
-	"""Pad old Linear input weights when feature dimensions are expanded."""
-	current_state = module.state_dict()
-	adapted = dict(loaded_state)
-	adapted_keys = []
-	for key, value in list(adapted.items()):
-		if key not in current_state or not torch.is_tensor(value):
-			continue
-		target = current_state[key]
-		if value.shape == target.shape:
-			continue
-		if value.dim() == 2 and target.dim() == 2 and value.shape[0] == target.shape[0] and value.shape[1] < target.shape[1]:
-			padded = torch.zeros_like(target)
-			padded[:, :value.shape[1]].copy_(value.to(device=target.device, dtype=target.dtype))
-			adapted[key] = padded
-			adapted_keys.append((key, tuple(value.shape), tuple(target.shape)))
-	if adapted_keys:
-		for key, old_shape, new_shape in adapted_keys:
-			print(f"ℹ️ checkpoint input weight padded: {key} {old_shape} -> {new_shape}")
-	return adapted, bool(adapted_keys)
 
-def load_checkpoint(model, policy_optimizer, value_optimizer, checkpoint_path: str, device: torch.device) -> int:
-	"""从检查点恢复模型和优化器，返回已完成的 iteration step。"""
-	if not checkpoint_path:
-		return 0
+def capture_rng_state(device: torch.device) -> dict:
+	state = {
+		'python': random.getstate(),
+		'torch_cpu': torch.get_rng_state(),
+	}
+	if device.type == 'cuda':
+		state['torch_cuda'] = torch.cuda.get_rng_state(device).cpu()
+	return state
+
+
+def restore_rng_state(state: dict, device: torch.device):
+	random.setstate(state['python'])
+	torch.set_rng_state(state['torch_cpu'].cpu())
+	if device.type == 'cuda' and 'torch_cuda' in state:
+		torch.cuda.set_rng_state(state['torch_cuda'].cpu(), device)
+
+
+def save_checkpoint(
+	model,
+	policy_optimizer,
+	value_optimizer,
+	policy_scheduler,
+	value_scheduler,
+	amp_scaler,
+	batch_sizers: dict,
+	progress: dict,
+	a_max_ewma,
+	checkpoint_dir: str,
+	device: torch.device,
+	rank: int = 0,
+):
+	"""Atomically save one complete optimizer-update boundary."""
+	rank_runtime = {
+		'rng_state': capture_rng_state(device),
+		'adaptive_batch_state': {
+			name: sizer.state_dict() for name, sizer in batch_sizers.items()
+		},
+		'a_max_ewma': None if a_max_ewma is None else a_max_ewma.detach().cpu(),
+	}
+	if dist.is_available() and dist.is_initialized():
+		gathered_runtime = [None] * dist.get_world_size() if rank == 0 else None
+		dist.gather_object(rank_runtime, gathered_runtime, dst=0)
+	else:
+		gathered_runtime = [rank_runtime]
+	if rank != 0:
+		return None
+
+	os.makedirs(checkpoint_dir, exist_ok=True)
+	save_model = model.module if hasattr(model, 'module') else model
+	update_step = int(progress['update_step'])
+	state = {
+		'format_version': CHECKPOINT_FORMAT_VERSION,
+		'progress': dict(progress),
+		'model_state_dict': save_model.state_dict(),
+		'policy_optimizer_state_dict': policy_optimizer.state_dict(),
+		'value_optimizer_state_dict': value_optimizer.state_dict(),
+		'policy_scheduler_state_dict': policy_scheduler.state_dict(),
+		'value_scheduler_state_dict': value_scheduler.state_dict(),
+		'grad_scaler_state_dict': amp_scaler.state_dict() if amp_scaler is not None else None,
+		'rank_runtime_states': gathered_runtime,
+	}
+	ckpt_path = os.path.join(checkpoint_dir, f'ckpt_update_{update_step}.pt')
+	ckpt_tmp_path = f"{ckpt_path}.tmp"
+	torch.save(state, ckpt_tmp_path)
+	os.replace(ckpt_tmp_path, ckpt_path)
+	latest_path = os.path.join(checkpoint_dir, 'latest.pt')
+	latest_tmp_path = f"{latest_path}.tmp"
+	shutil.copyfile(ckpt_path, latest_tmp_path)
+	os.replace(latest_tmp_path, latest_path)
+	return ckpt_path
+
+
+def load_checkpoint(
+	model,
+	policy_optimizer,
+	value_optimizer,
+	policy_scheduler,
+	value_scheduler,
+	amp_scaler,
+	batch_sizers: dict,
+	checkpoint_path: str,
+	device: torch.device,
+	rank: int = 0,
+) -> dict:
+	"""Restore a versioned optimizer-update checkpoint without legacy migration."""
 	if not os.path.exists(checkpoint_path):
 		raise FileNotFoundError(f"resume checkpoint not found: {checkpoint_path}")
-	state = torch.load(checkpoint_path, map_location=device)
+	state = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+	version = int(state.get('format_version', -1))
+	if version != CHECKPOINT_FORMAT_VERSION:
+		raise ValueError(
+			f"unsupported checkpoint format {version}; expected {CHECKPOINT_FORMAT_VERSION}"
+		)
 	load_model = model.module if hasattr(model, 'module') else model
-	checkpoint_migrated = False
-	if 'model_state_dict' in state:
-		model_state, migrated = adapt_state_dict_for_expanded_inputs(load_model, state['model_state_dict'])
-		checkpoint_migrated = checkpoint_migrated or migrated
-		load_model.load_state_dict(model_state, strict=True)
-	else:
-		if 'policy_feature_encoder_state_dict' in state:
-			policy_encoder_state, migrated = adapt_state_dict_for_expanded_inputs(
-				load_model.policy_feature_encoder,
-				state['policy_feature_encoder_state_dict'],
-			)
-			checkpoint_migrated = checkpoint_migrated or migrated
-			load_model.policy_feature_encoder.load_state_dict(policy_encoder_state, strict=True)
-		if 'value_feature_encoder_state_dict' in state:
-			value_encoder_state, migrated = adapt_state_dict_for_expanded_inputs(
-				load_model.value_feature_encoder,
-				state['value_feature_encoder_state_dict'],
-			)
-			checkpoint_migrated = checkpoint_migrated or migrated
-			load_model.value_feature_encoder.load_state_dict(value_encoder_state, strict=True)
-		load_model.policy_network.load_state_dict(state['policy_state_dict'], strict=True)
-		load_model.value_network.load_state_dict(state['value_state_dict'], strict=True)
-	if checkpoint_migrated:
-		print("ℹ️ checkpoint model was migrated for expanded C_reward; optimizer state skipped to avoid stale Adam tensors.")
-	elif 'policy_optim_state_dict' in state:
-		policy_optimizer.load_state_dict(state['policy_optim_state_dict'])
-	if not checkpoint_migrated and 'value_optim_state_dict' in state:
-		value_optimizer.load_state_dict(state['value_optim_state_dict'])
-	return int(state.get('step', 0))
+	load_model.load_state_dict(state['model_state_dict'], strict=True)
+	policy_optimizer.load_state_dict(state['policy_optimizer_state_dict'])
+	value_optimizer.load_state_dict(state['value_optimizer_state_dict'])
+	policy_scheduler.load_state_dict(state['policy_scheduler_state_dict'])
+	value_scheduler.load_state_dict(state['value_scheduler_state_dict'])
+	if amp_scaler is not None and state['grad_scaler_state_dict'] is not None:
+		amp_scaler.load_state_dict(state['grad_scaler_state_dict'])
+	rank_runtime_states = state['rank_runtime_states']
+	if rank >= len(rank_runtime_states):
+		raise ValueError(
+			f"checkpoint contains {len(rank_runtime_states)} rank states, cannot restore rank {rank}"
+		)
+	rank_runtime = rank_runtime_states[rank]
+	for name, sizer in batch_sizers.items():
+		if name not in rank_runtime['adaptive_batch_state']:
+			raise ValueError(f"checkpoint is missing adaptive batch state: {name}")
+		sizer.load_state_dict(rank_runtime['adaptive_batch_state'][name])
+	restore_rng_state(rank_runtime['rng_state'], device)
+	progress = dict(state['progress'])
+	progress['a_max_ewma'] = (
+		None
+		if rank_runtime['a_max_ewma'] is None
+		else rank_runtime['a_max_ewma'].to(device=device)
+	)
+	return progress
 
-def advance_scheduler_to_iteration(policy_scheduler, value_scheduler, completed_iterations: int):
-	"""旧 checkpoint 未保存 scheduler 状态，这里按已完成 iteration 近似推进余弦调度器。"""
-	completed_iterations = max(0, int(completed_iterations))
-	for scheduler in (policy_scheduler, value_scheduler):
-		if hasattr(scheduler, 'T_max') and hasattr(scheduler, 'eta_min'):
-			scheduler.last_epoch = completed_iterations
-			next_lrs = []
-			for base_lr, param_group in zip(scheduler.base_lrs, scheduler.optimizer.param_groups):
-				lr = scheduler.eta_min + (base_lr - scheduler.eta_min) * (
-					1 + math.cos(math.pi * completed_iterations / scheduler.T_max)
-				) / 2
-				param_group['lr'] = lr
-				next_lrs.append(lr)
-			scheduler._last_lr = next_lrs
-		else:
-			for _ in range(completed_iterations):
-				scheduler.step()
 
-# ============================== 观测数据拆解 ==============================
-def decompose_observation(observation: torch.Tensor, config: SimpleNamespace) -> tuple:
-    """
-    将initial_observation拆解为网络需要的各个组件
-    
-    Args:
-        observation: 形状为 (B, M, total_obs_dim) 的观测张量
-        config: 配置对象
-    
-    Returns:
-        tuple: (agents_state, neighbors_local, w_lanes_local, w_boundaries_local)
-            - agents_state: (B, M, S_dim) - 原文式 S(t) 局部状态
-            - neighbors_local: (B, M, K, neighbor_dim) - 邻居相对状态，active 位于最后一维
-            - w_lanes_local: (B, M, N_lanes, lane_dim) - W_lane raw features
-            - w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标 [dx, dy]
-    """
-    batch_size, max_agents, total_obs_dim = observation.shape
-    
-    # 从配置中获取维度信息
-    simulator_config = config.simulator
-    local_state_dim = simulator_config.observation.local_state_dim
-    neighbor_feature_dim = simulator_config.observation.neighbor_feature_dim
-    waypoint_feature_dim = simulator_config.observation.waypoint_feature_dim
-    boundary_feature_dim = simulator_config.observation.boundary_feature_dim  # 2
-    num_neighbors = simulator_config.observation.num_neighbors  # 20
-    num_w_lanes = simulator_config.observation.num_w_lanes
-    num_w_boundaries = simulator_config.observation.num_w_boundaries
-    
-    # 计算各部分在观测向量中的位置
-    local_state_size = local_state_dim
-    neighbors_size = num_neighbors * neighbor_feature_dim
-    w_lanes_size = num_w_lanes * waypoint_feature_dim
-    w_boundaries_size = num_w_boundaries * boundary_feature_dim
-    
-    # 1. 提取agents_state (前7个维度)
-    agents_state = observation[:, :, :local_state_dim]
-    
-    # 2. 提取neighbors_local
-    neighbors_start = local_state_size
-    neighbors_end = neighbors_start + neighbors_size
-    neighbors_flat = observation[:, :, neighbors_start:neighbors_end]
-    neighbors_local = neighbors_flat.view(batch_size, max_agents, num_neighbors, neighbor_feature_dim)
-    
-    # 3. 提取w_lanes_local
-    w_lanes_start = neighbors_end
-    w_lanes_end = w_lanes_start + w_lanes_size
-    w_lanes_flat = observation[:, :, w_lanes_start:w_lanes_end]  # (B, M, N_lanes*2)
-    w_lanes_local = w_lanes_flat.view(batch_size, max_agents, num_w_lanes, waypoint_feature_dim)  # (B, M, N_lanes, 2)
-    
-    # 4. 提取w_boundaries_local
-    w_boundaries_start = w_lanes_end
-    w_boundaries_flat = observation[:, :, w_boundaries_start:]  # (B, M, N_boundaries*2)
-    w_boundaries_local = w_boundaries_flat.view(batch_size, max_agents, num_w_boundaries, boundary_feature_dim)  # (B, M, N_boundaries, 2)
-    
-    return agents_state, neighbors_local, w_lanes_local, w_boundaries_local
+def create_lr_scheduler(optimizer, training_cfg, total_updates: int):
+	"""Build the paper-configured learning-rate schedule."""
+	schedule = str(getattr(training_cfg, 'lr_schedule', 'cosine')).strip().lower()
+	if schedule == 'cosine':
+		return torch.optim.lr_scheduler.CosineAnnealingLR(
+			optimizer,
+			T_max=int(total_updates),
+			eta_min=0.0,
+		)
+	if schedule in {'constant', 'none'}:
+		return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+	raise ValueError(f"unsupported training.lr_schedule: {schedule!r}")
+
+
+def reconcile_lr_scheduler_horizon(scheduler, total_updates: int):
+	"""Apply a resumed run's final update target to a loaded cosine scheduler."""
+	total_updates = int(total_updates)
+	if total_updates <= 0:
+		raise ValueError("training.total_updates must be positive")
+	if not isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+		return
+	completed_steps = max(0, int(scheduler.last_epoch))
+	if completed_steps > total_updates:
+		raise ValueError(
+			f"scheduler already completed {completed_steps} optimizer steps, "
+			f"which exceeds training.total_updates={total_updates}"
+		)
+	scheduler.T_max = total_updates
+	last_lrs = [
+		scheduler.eta_min
+		+ (base_lr - scheduler.eta_min)
+		* (1.0 + math.cos(math.pi * completed_steps / total_updates))
+		/ 2.0
+		for base_lr in scheduler.base_lrs
+	]
+	for group, learning_rate in zip(scheduler.optimizer.param_groups, last_lrs):
+		group['lr'] = learning_rate
+	scheduler._last_lr = last_lrs
 
 # ============================== 构建网络输入特征 ==============================
 
@@ -234,9 +250,6 @@ def normalize_to_minus1_1(x: torch.Tensor, min_val, max_val) -> torch.Tensor:
     )
     return torch.where(deg_mask, y_degen, y)
 
-FEATURE_PAD_VALUE = -2.0
-
-
 def config_get(container, name: str, default=None):
     if isinstance(container, dict):
         return container.get(name, default)
@@ -268,15 +281,16 @@ class FeatureBuildWorkspace:
             self.configure(config)
 
     def configure(self, config: SimpleNamespace):
-        network_config = config.training.network
-        self.simple_feature_dims = list(network_config.simple_feature_dims)
-        self.permutation_feature_dims = list(network_config.permutation_feature_dims)
-        self.permutation_element_dims = list(getattr(network_config, 'permutation_element_dims', [2, 7, 2, 7]))
-        self.simple_end = sum(self.simple_feature_dims)
-        self.total_input_dim = self.simple_end + sum(self.permutation_feature_dims)
+        self.schema = FeatureSchema.from_config(config)
+        self.total_input_dim = self.schema.total_input_dim
 
     def reset_counters(self):
         self.feature_chunks = 0
+
+    def clear_scratch(self):
+        """Release shape-dependent buffers after a CUDA OOM backoff."""
+        self._scratch.clear()
+        self._arange_cache.clear()
 
     def mark_feature_chunk(self):
         self.feature_chunks += 1
@@ -309,12 +323,15 @@ class FeatureBuildWorkspace:
         return min_t, max_t
 
     def arange(self, n: int, device: torch.device, dtype: torch.dtype = torch.long):
-        key = (int(n), device, dtype)
+        n = int(n)
+        if n < 0:
+            raise ValueError("arange length must be non-negative")
+        key = (device, dtype)
         cached = self._arange_cache.get(key)
-        if cached is None:
-            cached = torch.arange(int(n), device=device, dtype=dtype)
+        if cached is None or cached.numel() < n:
+            cached = torch.arange(n, device=device, dtype=dtype)
             self._arange_cache[key] = cached
-        return cached
+        return cached[:n]
 
     def scratch(self, name: str, shape, device: torch.device, dtype: torch.dtype, fill_value=None) -> torch.Tensor:
         shape = tuple(int(dim) for dim in shape)
@@ -564,7 +581,7 @@ def build_network_features(agents_state: torch.Tensor,
         w_lanes_local: (B, M, N_lanes, lane_dim) - map lane raw feature
         w_boundaries_local: (B, M, N_boundaries, 2) - 边界线相对坐标
         navigation: (B, M, goal_slots + lane_slots, 3) - 显式 G(t) 与 W_lane 图路由距离
-        stop_lines: (B, M, num_stop_lines, 20) - 停止线点
+        stop_lines: (B, M, num_stop_lines * 4) - 每条停止线的两个局部坐标端点
         reward_coef: (B, M, 12) - 原文式 reward conditioning
         config: 配置对象
     Returns:
@@ -582,13 +599,8 @@ def build_network_features(agents_state: torch.Tensor,
         inplace=True,
     )
     
-    # 从配置中获取网络需要的特征维度
-    simple_feature_dims = workspace.simple_feature_dims
-    permutation_feature_dims = workspace.permutation_feature_dims
-    permutation_element_dims = workspace.permutation_element_dims
-    
-    # 计算总输入维度
-    total_input_dim = workspace.total_input_dim
+    schema = workspace.schema
+    total_input_dim = schema.total_input_dim
     
     # 初始化输出张量
     if out is None:
@@ -604,84 +616,74 @@ def build_network_features(agents_state: torch.Tensor,
         features_tensor.zero_()
     
     # 1. 构建简单特征：S(t), 显式 G(t), reward 参数和车辆风格参数。
-    simple_end = sum(simple_feature_dims)
-    has_dense_goal_vector = len(simple_feature_dims) >= 4
     goal_slots = 0
-    simple_offset = 0
     
     # S(t): c, theta, kappa, v, v_lim, phi, a_long, a_lat, Cacc, Cthrottle, Csteer, l, w.
-    s_t_size = simple_feature_dims[simple_offset]
-    s_t_start = 0
-    s_t_end = s_t_start + s_t_size
-    features_tensor[:, :, s_t_start:s_t_end] = normalize_s_features(
+    state_group = schema.group('state')
+    state_slice = schema.flat_slice('state')
+    features_tensor[:, :, state_slice] = normalize_s_features(
         agents_state,
-        s_t_size,
+        state_group.flat_dim,
         vehicle_style=vehicle_style,
         control_state=control_state,
         workspace=workspace,
-        out=features_tensor[:, :, s_t_start:s_t_end],
+        out=features_tensor[:, :, state_slice],
     )
-    simple_offset += 1
-    feature_cursor = s_t_end
     
-    if has_dense_goal_vector:
-        g_t_size = simple_feature_dims[simple_offset]
-        g_t_start = feature_cursor
-        g_t_end = g_t_start + g_t_size
-        if navigation is None:
-            goal_vector = features_tensor[:, :, g_t_start:g_t_end]
-            goal_vector.zero_()
-        elif _is_navigation_packet(navigation):
-            nav = navigation.to(device=agents_state.device, dtype=agents_state.dtype)
-            goal_slots = max(1, g_t_size // 2)
-            goal_rows = nav[:, :, :goal_slots, :]
-            goal_valid = goal_rows[..., 2] > 0.5
-            goal_xy = torch.where(goal_valid.unsqueeze(-1), goal_rows[..., :2], torch.zeros_like(goal_rows[..., :2]))
-            goal_vector = pad_or_truncate_flat(
-                goal_xy.flatten(start_dim=2),
-                g_t_size,
-                pad_value=0.0,
-                out=features_tensor[:, :, g_t_start:g_t_end],
-            )
-        else:
-            goal_vector = features_tensor[:, :, g_t_start:g_t_end]
-            goal_vector.zero_()
-        goal_vector = normalize_to_minus1_1(goal_vector, -200, 200)
-        features_tensor[:, :, g_t_start:g_t_end] = goal_vector
-        simple_offset += 1
-        feature_cursor = g_t_end
+    goal_group = schema.group('goal')
+    goal_slice = schema.flat_slice('goal')
+    if navigation is None:
+        goal_vector = features_tensor[:, :, goal_slice]
+        goal_vector.zero_()
+    elif _is_navigation_packet(navigation):
+        nav = navigation.to(device=agents_state.device, dtype=agents_state.dtype)
+        goal_slots = max(1, goal_group.flat_dim // 2)
+        goal_rows = nav[:, :, :goal_slots, :]
+        goal_valid = goal_rows[..., 2] > 0.5
+        goal_xy = torch.where(goal_valid.unsqueeze(-1), goal_rows[..., :2], torch.zeros_like(goal_rows[..., :2]))
+        goal_vector = pad_or_truncate_flat(
+            goal_xy.flatten(start_dim=2),
+            goal_group.flat_dim,
+            pad_value=0.0,
+            out=features_tensor[:, :, goal_slice],
+        )
+    else:
+        goal_vector = features_tensor[:, :, goal_slice]
+        goal_vector.zero_()
+    features_tensor[:, :, goal_slice] = normalize_to_minus1_1(goal_vector, -200, 200)
 
     # reward系数: 原文式12维 C_reward，顺序对应 RewardParameterSampler.sample_all_parameters。
-    reward_coef_size = simple_feature_dims[simple_offset]
-    reward_coef_start = feature_cursor
-    reward_coef_end = reward_coef_start + reward_coef_size
-
+    reward_group = schema.group('reward')
+    reward_slice = schema.flat_slice('reward')
     reward_coef = reward_coef.to(device=agents_state.device, dtype=agents_state.dtype)
-    reward_out = features_tensor[:, :, reward_coef_start:reward_coef_end]
+    reward_out = features_tensor[:, :, reward_slice]
     reward_out.zero_()
     reward_min, reward_max = workspace.bounds('reward', agents_state.dtype, agents_state.device)
-    copy_reward = min(reward_coef.shape[-1], reward_coef_size, reward_min.numel())
+    copy_reward = min(reward_coef.shape[-1], reward_group.flat_dim, reward_min.numel())
     if copy_reward > 0:
         reward_out[:, :, :copy_reward] = normalize_to_minus1_1(
             reward_coef[:, :, :copy_reward],
             reward_min[:copy_reward],
             reward_max[:copy_reward],
         )
-    simple_offset += 1
-    feature_cursor = reward_coef_end
 
     # 车辆风格参数: 4维 - 从agents_state中提取
-    vehicle_style_size = simple_feature_dims[simple_offset]
-    vehicle_style_start = feature_cursor
-    vehicle_style_end = vehicle_style_start + vehicle_style_size
+    style_group = schema.group('vehicle_style')
+    style_slice = schema.flat_slice('vehicle_style')
     if vehicle_style is None:
-        vehicle_style = torch.ones(batch_size, max_agents, vehicle_style_size, device=agents_state.device, dtype=agents_state.dtype)
+        vehicle_style = torch.ones(
+            batch_size,
+            max_agents,
+            style_group.flat_dim,
+            device=agents_state.device,
+            dtype=agents_state.dtype,
+        )
     else:
         vehicle_style = vehicle_style.to(device=agents_state.device, dtype=agents_state.dtype)
-    style_out = features_tensor[:, :, vehicle_style_start:vehicle_style_end]
+    style_out = features_tensor[:, :, style_slice]
     style_out.zero_()
     style_min, style_max = workspace.bounds('style', agents_state.dtype, agents_state.device)
-    copy_style = min(vehicle_style.shape[-1], vehicle_style_size, style_min.numel())
+    copy_style = min(vehicle_style.shape[-1], style_group.flat_dim, style_min.numel())
     if copy_style > 0:
         style_out[:, :, :copy_style] = normalize_to_minus1_1(
             vehicle_style[:, :, :copy_style],
@@ -689,18 +691,12 @@ def build_network_features(agents_state: torch.Tensor,
             style_max[:copy_style],
         )
     
-    # 2. 构建排列不变特征 (road_boundary, lane_points, stop_lines, other_agents)
-    permutation_start = simple_end
-    
     # road_boundary: 原文使用最近80个boundary coarse features
-    road_boundary_size = permutation_feature_dims[0]
-    road_boundary_start = permutation_start
-    road_boundary_end = road_boundary_start + road_boundary_size
-    
-    boundary_out = features_tensor[:, :, road_boundary_start:road_boundary_end]
+    boundary_group = schema.group('road_boundary')
+    boundary_out = features_tensor[:, :, schema.flat_slice('road_boundary')]
     w_boundaries_flat = normalize_point_set(
         w_boundaries_local,
-        road_boundary_size,
+        boundary_group.flat_dim,
         min_val=-200.0,
         max_val=200.0,
         out=boundary_out,
@@ -709,22 +705,18 @@ def build_network_features(agents_state: torch.Tensor,
         boundary_out.fill_(FEATURE_PAD_VALUE)
     
     # lane_points: 原文式 map lane feature，每个元素包含位置、方向、宽度、目标距离。
-    lane_points_size = permutation_feature_dims[1]
-    lane_points_start = road_boundary_end
-    lane_points_end = lane_points_start + lane_points_size
-    
-    lane_element_dim = permutation_element_dims[1] if len(permutation_element_dims) > 1 else 7
+    lane_group = schema.group('lane_points')
     training_cfg = config_get(config, 'training', SimpleNamespace())
     navigation_cfg = config_get(training_cfg, 'navigation', SimpleNamespace())
     route_distance_norm = config_get(navigation_cfg, 'route_distance_norm', 'log')
     route_abs_distance_max = float(config_get(navigation_cfg, 'route_abs_distance_max', 12000.0))
     route_rel_distance_max = float(config_get(navigation_cfg, 'route_rel_distance_max', 12000.0))
-    lane_out = features_tensor[:, :, lane_points_start:lane_points_end]
+    lane_out = features_tensor[:, :, schema.flat_slice('lane_points')]
     w_lanes_flat = build_lane_map_features(
         w_lanes_local,
         navigation,
-        lane_points_size,
-        lane_element_dim,
+        lane_group.flat_dim,
+        lane_group.element_dim,
         goal_slots=goal_slots,
         route_distance_norm=route_distance_norm,
         route_abs_distance_max=route_abs_distance_max,
@@ -735,15 +727,12 @@ def build_network_features(agents_state: torch.Tensor,
         lane_out.fill_(FEATURE_PAD_VALUE)
     
     # stop_lines: 20维 - 使用停止线信息
-    stop_lines_size = permutation_feature_dims[2]  # 20
-    stop_lines_start = lane_points_end
-    stop_lines_end = stop_lines_start + stop_lines_size
-    
-    stop_out = features_tensor[:, :, stop_lines_start:stop_lines_end]
+    stop_group = schema.group('stop_lines')
+    stop_out = features_tensor[:, :, schema.flat_slice('stop_lines')]
     if stop_lines is not None and stop_lines.numel() > 0:
         stop_lines_flat = normalize_point_set(
             stop_lines.to(device=agents_state.device, dtype=agents_state.dtype),
-            stop_lines_size,
+            stop_group.flat_dim,
             out=stop_out,
         )
         if stop_lines_flat is None:
@@ -752,16 +741,18 @@ def build_network_features(agents_state: torch.Tensor,
         stop_out.fill_(FEATURE_PAD_VALUE)
     
     # other_agents: 使用邻居位置、朝向、速度、尺寸、z 与 active mask
-    other_agents_size = permutation_feature_dims[3]
-    other_agents_start = stop_lines_end
-    other_agents_end = other_agents_start + other_agents_size
-    
+    other_group = schema.group('other_agents')
     # 将邻居信息按通道做归一化后再展平并填充，active=0 的 padding 不参与网络 maxpool。
     neighbors_local = neighbors_local.to(device=agents_state.device, dtype=agents_state.dtype)
     neighbor_dim = neighbors_local.shape[-1]
-    other_out = features_tensor[:, :, other_agents_start:other_agents_end]
+    if neighbor_dim != other_group.element_dim:
+        raise ValueError(
+            f"other_agents source width={neighbor_dim} does not match schema "
+            f"element_dim={other_group.element_dim}"
+        )
+    other_out = features_tensor[:, :, schema.flat_slice('other_agents')]
     other_out.fill_(FEATURE_PAD_VALUE)
-    neighbor_slots = min(neighbors_local.shape[2], other_agents_size // max(1, neighbor_dim))
+    neighbor_slots = min(neighbors_local.shape[2], other_group.flat_dim // max(1, neighbor_dim))
     neighbors_proc = other_out[:, :, :neighbor_slots * neighbor_dim].view(batch_size, max_agents, neighbor_slots, neighbor_dim)
     neighbors_src = neighbors_local[:, :, :neighbor_slots]
     if neighbor_dim >= 10:
@@ -792,21 +783,13 @@ def build_network_features(agents_state: torch.Tensor,
     return features_tensor
 
 # ============================== 检查GPU信息 ==============================
-def check_gpu_info(print_info: bool = True, **kwargs):
+def check_gpu_info(print_info: bool = True):
 	"""
 	检查GPU信息和CUDA支持情况
 
 	Args:
 		print_info: 是否打印函数内部的日志（默认True）。
-		Print: 别名，兼容传入 Print=False 的调用方式。
 	"""
-	# 兼容别名参数 Print=False 的用法
-	if 'Print' in kwargs:
-		try:
-			print_info = bool(kwargs['Print'])
-		except Exception:
-			pass
-
 	def log(*args, **kws):
 		if print_info:
 			print(*args, **kws)
@@ -949,6 +932,10 @@ def make_update_stats(reason: str = "", device: torch.device = None) -> dict:
 		'skip_reason': reason,
 		'num_candidates': 0,
 		'num_selected': 0,
+		'ppo_microbatch_size': 0,
+		'ppo_microbatch_count': 0,
+		'ppo_microbatch_retries': 0,
+		'ppo_memory_adapted': False,
 		'num_epochs': 0,
 		'policy_loss': None,
 		'value_loss': None,
@@ -961,7 +948,11 @@ def make_update_stats(reason: str = "", device: torch.device = None) -> dict:
 		'ratio_max': None,
 		'max_action_prob_mean': None,
 		'ppo_update_time_s': 0.0,
-		'ppo_feature_rebuild_ms': 0.0,
+		'ppo_feature_cache_build_ms': 0.0,
+		'ppo_feature_cache_location': None,
+		'ppo_feature_cache_oom_retries': 0,
+		'ppo_feature_cache_offloads': 0,
+		'ddp_gradient_buckets': 0,
 		'max_memory_allocated_mb': 0.0,
 		'max_memory_reserved_mb': 0.0,
 	}
@@ -1032,7 +1023,7 @@ def get_diagnostics_cfg(config):
 
 def diagnostics_enabled(config, name: str = None) -> bool:
 	diag_cfg = get_diagnostics_cfg(config)
-	if not bool(getattr(diag_cfg, 'enabled', True)):
+	if not bool(getattr(diag_cfg, 'enabled', False)):
 		return False
 	if name is None:
 		return True
@@ -1130,8 +1121,8 @@ def init_rollout_diagnostics(config, device: torch.device):
 	return {
 		'steps': torch.zeros((), device=device, dtype=torch.long),
 		'samples': torch.zeros((), device=device, dtype=torch.long),
-		'reward_sum': torch.zeros((), device=device, dtype=torch.float64),
-		'reward_sq_sum': torch.zeros((), device=device, dtype=torch.float64),
+		'reward_sum': torch.zeros((), device=device, dtype=torch.float32),
+		'reward_sq_sum': torch.zeros((), device=device, dtype=torch.float32),
 		'reward_min': torch.full((), float('inf'), device=device, dtype=torch.float32),
 		'reward_max': torch.full((), float('-inf'), device=device, dtype=torch.float32),
 		'negative_rewards': torch.zeros((), device=device, dtype=torch.long),
@@ -1141,16 +1132,16 @@ def init_rollout_diagnostics(config, device: torch.device):
 		'final_goals': torch.zeros((), device=device, dtype=torch.long),
 		'intermediate_goals': torch.zeros((), device=device, dtype=torch.long),
 		'action_counts': torch.zeros((num_actions,), device=device, dtype=torch.long),
-		'action_reward_sum': torch.zeros((num_actions,), device=device, dtype=torch.float64),
+		'action_reward_sum': torch.zeros((num_actions,), device=device, dtype=torch.float32),
 		'action_done_counts': torch.zeros((num_actions,), device=device, dtype=torch.long),
 		'action_collision_counts': torch.zeros((num_actions,), device=device, dtype=torch.long),
 		'action_offroad_counts': torch.zeros((num_actions,), device=device, dtype=torch.long),
 		'reward_component_sums': {
-			name: torch.zeros((), device=device, dtype=torch.float64)
+			name: torch.zeros((), device=device, dtype=torch.float32)
 			for name in REWARD_COMPONENT_NAMES
 		},
 		'action_component_sums': {
-			name: torch.zeros((num_actions,), device=device, dtype=torch.float64)
+			name: torch.zeros((num_actions,), device=device, dtype=torch.float32)
 			for name in REWARD_COMPONENT_NAMES
 		},
 	}
@@ -1164,17 +1155,20 @@ def update_rollout_diagnostics(diag: dict, simulator, alive_mask: torch.Tensor,
 	mask = mask.to(device=reward.device, dtype=torch.bool)
 	if mask.numel() == 0:
 		return
-	reward_selected = reward[mask].detach()
-	if reward_selected.numel() == 0:
-		return
+	reward_value = reward.detach().float()
+	mask_float = mask.to(dtype=reward_value.dtype)
+	reward_masked = reward_value * mask_float
 	diag['steps'] += 1
-	diag['samples'] += reward_selected.numel()
-	reward_double = reward_selected.to(torch.float64)
-	diag['reward_sum'] += reward_double.sum()
-	diag['reward_sq_sum'] += (reward_double * reward_double).sum()
-	diag['reward_min'] = torch.minimum(diag['reward_min'], reward_selected.min())
-	diag['reward_max'] = torch.maximum(diag['reward_max'], reward_selected.max())
-	diag['negative_rewards'] += (reward_selected < 0).sum()
+	diag['samples'] += mask.sum()
+	diag['reward_sum'] += reward_masked.sum()
+	diag['reward_sq_sum'] += (reward_masked * reward_masked).sum()
+	diag['reward_min'] = torch.minimum(
+		diag['reward_min'], reward_value.masked_fill(~mask, float('inf')).min()
+	)
+	diag['reward_max'] = torch.maximum(
+		diag['reward_max'], reward_value.masked_fill(~mask, float('-inf')).max()
+	)
+	diag['negative_rewards'] += ((reward_value < 0) & mask).sum()
 
 	def add_mask_count(name: str, fallback: torch.Tensor = None):
 		mask_value = info.get(name, fallback)
@@ -1194,19 +1188,21 @@ def update_rollout_diagnostics(diag: dict, simulator, alive_mask: torch.Tensor,
 	diag['intermediate_goals'] += intermediate_goal_mask
 
 	num_actions = int(diag['action_counts'].shape[0])
-	action_selected = actions[mask].detach().to(torch.long).clamp(0, num_actions - 1)
-	counts = torch.bincount(action_selected, minlength=num_actions)
-	diag['action_counts'] += counts
-	diag['action_reward_sum'].scatter_add_(0, action_selected, reward_double)
+	action_flat = actions.detach().to(torch.long).reshape(-1).clamp(0, num_actions - 1)
+	mask_flat = mask.reshape(-1)
+	diag['action_counts'].scatter_add_(0, action_flat, mask_flat.to(torch.long))
+	diag['action_reward_sum'].scatter_add_(0, action_flat, reward_masked.reshape(-1))
 	reward_components = info.get('reward_components', {}) or {}
 	for name, component in reward_components.items():
 		if name not in diag['reward_component_sums']:
 			continue
-		component_selected = component.to(device=reward.device)[mask].detach().to(torch.float64)
-		if component_selected.numel() == 0:
-			continue
-		diag['reward_component_sums'][name] += component_selected.sum()
-		diag['action_component_sums'][name].scatter_add_(0, action_selected, component_selected)
+		component_masked = component.detach().to(
+			device=reward.device, dtype=torch.float32
+		) * mask_float
+		diag['reward_component_sums'][name] += component_masked.sum()
+		diag['action_component_sums'][name].scatter_add_(
+			0, action_flat, component_masked.reshape(-1)
+		)
 	for name, key in (
 		('action_done_counts', 'done_mask'),
 		('action_collision_counts', 'collision_mask'),
@@ -1215,8 +1211,37 @@ def update_rollout_diagnostics(diag: dict, simulator, alive_mask: torch.Tensor,
 		event_mask = info.get(key, done if key == 'done_mask' else None)
 		if event_mask is None:
 			continue
-		event_selected = event_mask.to(device=reward.device, dtype=torch.bool)[mask]
-		diag[name] += torch.bincount(action_selected[event_selected], minlength=num_actions)
+		event_flat = (
+			event_mask.to(device=reward.device, dtype=torch.bool) & mask
+		).reshape(-1)
+		diag[name].scatter_add_(0, action_flat, event_flat.to(torch.long))
+
+def rollout_diagnostic_metrics(diag: dict) -> dict:
+	"""Convert accumulated rollout diagnostics into scalar dashboard metrics."""
+	if diag is None:
+		return {}
+	samples = scalar_item(diag['samples'])
+	if samples <= 0:
+		return {}
+	reward_mean = scalar_item(diag['reward_sum']) / samples
+	reward_var = max(0.0, scalar_item(diag['reward_sq_sum']) / samples - reward_mean * reward_mean)
+	metrics = {
+		'rollout/steps': int(scalar_item(diag['steps'])),
+		'rollout/samples': int(samples),
+		'rollout/reward_mean': reward_mean,
+		'rollout/reward_std': math.sqrt(reward_var),
+		'rollout/reward_min': scalar_item(diag['reward_min']) if torch.isfinite(diag['reward_min']) else 0.0,
+		'rollout/reward_max': scalar_item(diag['reward_max']) if torch.isfinite(diag['reward_max']) else 0.0,
+		'rollout/negative_rate': scalar_item(diag['negative_rewards']) / samples,
+		'rollout/done_rate': scalar_item(diag['dones']) / samples,
+		'rollout/collision_rate': scalar_item(diag['collisions']) / samples,
+		'rollout/offroad_rate': scalar_item(diag['offroads']) / samples,
+		'rollout/final_goal_rate': scalar_item(diag['final_goals']) / samples,
+		'rollout/intermediate_goal_rate': scalar_item(diag['intermediate_goals']) / samples,
+	}
+	for name, value in diag.get('reward_component_sums', {}).items():
+		metrics[f'reward/{name}_mean'] = scalar_item(value) / samples
+	return metrics
 
 def print_rollout_diagnostics(diag: dict, action_values: torch.Tensor = None, prefix: str = "📈 rollout诊断"):
 	if diag is None:
@@ -1360,22 +1385,15 @@ def slice_route_state_env(route_state: dict, start: int, end: int, total_envs: i
 	return out
 
 
-def snapshot_route_state(simulator) -> dict:
-	"""Clone compact route tensors for the rollout buffer."""
-	if not hasattr(simulator, 'get_route_state'):
-		return {}
-	return simulator.get_route_state(clone=True)
-
-
 def snapshot_condition_state(simulator) -> dict:
-	"""Clone rollout-level condition tensors; expanded stop-line features are rebuilt on demand."""
+	"""Hold immutable rollout-level condition views; reset happens only after PPO."""
 	reward_coef = getattr(getattr(simulator, 'reward_calculator', None), 'sampled_params', None)
 	vehicle_style = getattr(simulator, 'driving_style_params', None)
 	traffic_light_states = getattr(simulator, 'traffic_light_states', None)
 	return {
-		'reward_coef': reward_coef.detach().clone() if torch.is_tensor(reward_coef) else None,
-		'vehicle_style': vehicle_style.detach().clone() if torch.is_tensor(vehicle_style) else None,
-		'traffic_light_states': traffic_light_states.detach().clone() if torch.is_tensor(traffic_light_states) else None,
+		'reward_coef': reward_coef.detach() if torch.is_tensor(reward_coef) else None,
+		'vehicle_style': vehicle_style.detach() if torch.is_tensor(vehicle_style) else None,
+		'traffic_light_states': traffic_light_states.detach() if torch.is_tensor(traffic_light_states) else None,
 	}
 
 
@@ -1386,15 +1404,6 @@ def slice_condition_state_env(condition_state: dict, start: int, end: int, total
 		key: slice_env_tensor(value, start, end, total_envs)
 		for key, value in condition_state.items()
 	}
-
-
-def gather_condition_state_env(condition_state: dict, env_idx: torch.Tensor) -> dict:
-	if not condition_state:
-		return {}
-	out = {}
-	for key, value in condition_state.items():
-		out[key] = value[env_idx] if torch.is_tensor(value) and value.dim() > 0 else value
-	return out
 
 
 def stop_lines_from_condition(simulator, agents_state: torch.Tensor, condition_state: dict,
@@ -1507,15 +1516,25 @@ class RolloutTensorBuffer:
 			raise ValueError(f"route_state[{key}] device mismatch: {buffer.device} != {value.device}")
 		return buffer
 
+	def _write_time_index(self, state: torch.Tensor, time_index):
+		B = int(state.shape[0])
+		value = torch.as_tensor(time_index, device=state.device, dtype=torch.long)
+		if value.dim() == 0:
+			value = value.expand(B)
+		else:
+			value = value.reshape(B)
+		storage = self._ensure_tensor_shape(
+			'time_indices', (B,), state.device, torch.long
+		)
+		storage[self.length].copy_(value)
+
 	def write_pre_step(self, state: torch.Tensor, route_state: dict, time_index: int = 0):
 		if self.length >= self.capacity:
 			raise RuntimeError(f"RolloutTensorBuffer full: length={self.length}, capacity={self.capacity}")
 		if self._pre_step_pending:
 			raise RuntimeError("write_pre_step called twice before write_post_step")
 		self._ensure_tensor('states', state)[self.length].copy_(state.detach())
-		if self.time_indices is None:
-			self.time_indices = torch.empty((self.capacity,), device=state.device, dtype=torch.long)
-		self.time_indices[self.length] = int(time_index)
+		self._write_time_index(state, time_index)
 		for key, value in (route_state or {}).items():
 			if torch.is_tensor(value):
 				dst = self._ensure_route_tensor(key, value)[self.length]
@@ -1537,9 +1556,7 @@ class RolloutTensorBuffer:
 		dst[..., 6] = alive_mask.to(device=state.device, dtype=state.dtype)
 		control = current_control_state(simulator).detach()
 		dst[..., 7:10].copy_(control.to(device=state.device, dtype=state.dtype) * dst[..., 6:7])
-		if self.time_indices is None:
-			self.time_indices = torch.empty((self.capacity,), device=state.device, dtype=torch.long)
-		self.time_indices[self.length] = int(time_index)
+		self._write_time_index(state, time_index)
 		for key, value in (route_state or {}).items():
 			if torch.is_tensor(value):
 				route_dst = self._ensure_route_tensor(key, value)[self.length]
@@ -1603,6 +1620,10 @@ class RolloutTensorBuffer:
 				raise ValueError(f"route_state[{key}] leading shape mismatch: {tensor.shape[1:3]} != {(B, M)}")
 		for name, tensor in required.items():
 			if name == 'time_indices':
+				if tensor.shape[1:] != (B,):
+					raise ValueError(
+						f"time_indices shape mismatch: {tensor.shape[1:]} != {(B,)}"
+					)
 				continue
 			if tensor.device != base_device:
 				raise ValueError(f"{name} device mismatch: {tensor.device} != {base_device}")
@@ -1617,17 +1638,6 @@ def gather_route_state_selected(route_state_tensor: dict, t_idx: torch.Tensor,
 	out = {}
 	for key, value in route_state_tensor.items():
 		selected = value[t_idx, b_idx, agent_idx]
-		out[key] = selected.unsqueeze(1)
-	return out
-
-
-def gather_current_route_state_selected(route_state_tensor: dict, env_idx: torch.Tensor,
-										agent_idx: torch.Tensor) -> dict:
-	if not route_state_tensor:
-		return {}
-	out = {}
-	for key, value in route_state_tensor.items():
-		selected = value[env_idx, agent_idx]
 		out[key] = selected.unsqueeze(1)
 	return out
 
@@ -1830,61 +1840,101 @@ def build_features_from_components(agents_state, neighbors_local, w_lanes_local,
 	)
 
 
+def build_features_from_simulator_env_slice(
+	simulator,
+	config,
+	start: int,
+	end: int,
+	alive_mask: torch.Tensor = None,
+	condition_state: dict = None,
+	dropout_step=0,
+	workspace: FeatureBuildWorkspace = None,
+	control_state_all: torch.Tensor = None,
+	route_state_all: dict = None,
+	out: torch.Tensor = None,
+) -> torch.Tensor:
+	B, M = simulator.agents_state.shape[:2]
+	workspace = workspace or _default_workspace(config)
+	condition_state = condition_state if condition_state is not None else snapshot_condition_state(simulator)
+	route_state_all = (
+		route_state_all
+		if route_state_all is not None
+		else (simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {})
+	)
+	control_state_all = (
+		control_state_all if control_state_all is not None else current_control_state(simulator)
+	)
+	lane_count = int(getattr(simulator.observation_generator, 'num_w_lanes', 0))
+	boundary_count = int(getattr(simulator.observation_generator, 'num_w_boundaries', 0))
+	obs_state = _policy_observation_state_chunk(simulator, start, end, alive_mask=alive_mask)
+	control_chunk = slice_env_tensor(control_state_all, start, end, B)
+	condition_chunk = slice_condition_state_env(condition_state, start, end, B)
+	route_chunk = slice_route_state_env(route_state_all, start, end, B)
+	local_state, neighbors_local, w_lanes_local, w_boundaries_local, map_metadata = simulator.observation_generator.generate_components(
+		obs_state,
+		control_state=control_chunk,
+		driving_style_params=condition_chunk.get('vehicle_style'),
+		return_map_ids=True,
+	)
+	env_idx = workspace.arange(B, obs_state.device)[start:end]
+	map_dropout = make_map_dropout_masks(
+		config,
+		end - start,
+		M,
+		lane_count,
+		boundary_count,
+		obs_state.device,
+		time_idx=slice_env_tensor(dropout_step, start, end, B),
+		env_idx=env_idx,
+		workspace=workspace,
+	)
+	return build_features_from_components(
+		local_state,
+		neighbors_local,
+		w_lanes_local,
+		w_boundaries_local,
+		simulator,
+		config,
+		route_chunk,
+		condition_chunk,
+		control_state=control_chunk,
+		map_dropout=map_dropout,
+		world_agents_state=obs_state,
+		map_metadata=map_metadata,
+		workspace=workspace,
+		out=out,
+	)
+
+
 def build_features_from_simulator_state(simulator, config, alive_mask: torch.Tensor = None,
 										condition_state: dict = None, dropout_step=0,
 										workspace: FeatureBuildWorkspace = None) -> torch.Tensor:
 	B, M = simulator.agents_state.shape[:2]
 	workspace = workspace or _default_workspace(config)
-	env_chunk = feature_build_env_chunk_size(config, M)
-	total_input_dim = workspace.total_input_dim
-	features = torch.empty(B, M, total_input_dim, device=simulator.agents_state.device, dtype=simulator.agents_state.dtype)
-	if env_chunk <= 0:
-		env_chunk = B
-
+	env_chunk = feature_build_env_chunk_size(config, M) or B
+	features = torch.empty(
+		B,
+		M,
+		workspace.total_input_dim,
+		device=simulator.agents_state.device,
+		dtype=simulator.agents_state.dtype,
+	)
 	condition_state = condition_state if condition_state is not None else snapshot_condition_state(simulator)
 	route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
 	control_state_all = current_control_state(simulator)
-	lane_count = int(getattr(simulator.observation_generator, 'num_w_lanes', 0))
-	boundary_count = int(getattr(simulator.observation_generator, 'num_w_boundaries', 0))
-
 	for start in range(0, B, env_chunk):
 		end = min(start + env_chunk, B)
-		obs_state = _policy_observation_state_chunk(simulator, start, end, alive_mask=alive_mask)
-		control_chunk = slice_env_tensor(control_state_all, start, end, B)
-		condition_chunk = slice_condition_state_env(condition_state, start, end, B)
-		route_chunk = slice_route_state_env(route_state, start, end, B)
-		local_state, neighbors_local, w_lanes_local, w_boundaries_local, map_metadata = simulator.observation_generator.generate_components(
-			obs_state,
-			control_state=control_chunk,
-			driving_style_params=condition_chunk.get('vehicle_style'),
-			return_map_ids=True,
-		)
-		env_idx = workspace.arange(B, obs_state.device)[start:end]
-		map_dropout = make_map_dropout_masks(
-			config,
-			end - start,
-			M,
-			lane_count,
-			boundary_count,
-			obs_state.device,
-			time_idx=dropout_step,
-			env_idx=env_idx,
-			workspace=workspace,
-		)
-		build_features_from_components(
-			local_state,
-			neighbors_local,
-			w_lanes_local,
-			w_boundaries_local,
+		build_features_from_simulator_env_slice(
 			simulator,
 			config,
-			route_chunk,
-			condition_chunk,
-			control_state=control_chunk,
-			map_dropout=map_dropout,
-			world_agents_state=obs_state,
-			map_metadata=map_metadata,
+			start,
+			end,
+			alive_mask=alive_mask,
+			condition_state=condition_state,
+			dropout_step=dropout_step,
 			workspace=workspace,
+			control_state_all=control_state_all,
+			route_state_all=route_state,
 			out=features[start:end],
 		)
 	return features
@@ -1896,7 +1946,7 @@ def build_features_for_selected_agents(world_states: torch.Tensor, simulator, co
 									   env_indices: torch.Tensor = None,
 									   workspace: FeatureBuildWorkspace = None,
 									   out: torch.Tensor = None) -> torch.Tensor:
-	B, M = world_states.shape[:2]
+	B = world_states.shape[0]
 	workspace = workspace or _default_workspace(config)
 	obs_state = observation_state_from_buffer(world_states)
 	control_state = control_from_buffer_state(world_states)
@@ -1948,6 +1998,82 @@ def sync_bool_across_ranks(value: bool, device: torch.device, op=dist.ReduceOp.M
 	dist.all_reduce(t, op=op)
 	return bool(t.item())
 
+
+def sync_min_int_across_ranks(value: int, device: torch.device) -> int:
+	if not dist.is_available() or not dist.is_initialized():
+		return int(value)
+	tensor = torch.tensor([int(value)], dtype=torch.int32, device=device)
+	dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+	return int(tensor.item())
+
+
+def sum_int_across_ranks(value: int, device: torch.device) -> int:
+	"""Sum a run-level integer once; this is not used in rollout hot paths."""
+	if not dist.is_available() or not dist.is_initialized():
+		return int(value)
+	tensor = torch.tensor([int(value)], dtype=torch.int64, device=device)
+	dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+	return int(tensor.item())
+
+
+def is_cuda_oom_error(exc: RuntimeError, device: torch.device) -> bool:
+	if device.type != 'cuda':
+		return False
+	oom_type = getattr(torch.cuda, 'OutOfMemoryError', ())
+	return (oom_type and isinstance(exc, oom_type)) or 'out of memory' in str(exc).lower()
+
+
+def clear_optimizer_gradients(policy_optimizer, value_optimizer, device: torch.device):
+	policy_optimizer.zero_grad(set_to_none=True)
+	value_optimizer.zero_grad(set_to_none=True)
+	if device.type == 'cuda':
+		torch.cuda.empty_cache()
+
+
+def average_gradients_across_ranks(
+	model,
+	local_samples: int,
+	device: torch.device,
+	bucket_cap_mb: float = 25.0,
+) -> int:
+	"""Sample-weight gradients using one collective per contiguous-size bucket."""
+	if not dist.is_available() or not dist.is_initialized():
+		return 0
+	total_samples = torch.tensor([float(local_samples)], dtype=torch.float32, device=device)
+	dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
+	local_weight = total_samples.new_tensor(float(local_samples)) / total_samples
+	bucket_cap_bytes = max(1, int(float(bucket_cap_mb) * 1024 ** 2))
+	buckets = []
+	current = []
+	current_bytes = 0
+	current_key = None
+	for parameter in unwrap_model(model).parameters():
+		if parameter.grad is None:
+			parameter.grad = torch.zeros_like(parameter)
+		grad = parameter.grad
+		key = (grad.device, grad.dtype)
+		grad_bytes = grad.numel() * grad.element_size()
+		if current and (key != current_key or current_bytes + grad_bytes > bucket_cap_bytes):
+			buckets.append(current)
+			current = []
+			current_bytes = 0
+		current.append(grad)
+		current_bytes += grad_bytes
+		current_key = key
+	if current:
+		buckets.append(current)
+
+	for bucket in buckets:
+		flat = torch.cat([grad.reshape(-1) for grad in bucket])
+		flat.mul_(local_weight)
+		dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+		offset = 0
+		for grad in bucket:
+			numel = grad.numel()
+			grad.copy_(flat[offset:offset + numel].view_as(grad))
+			offset += numel
+	return len(buckets)
+
 def validate_condition_state(condition_state: dict, B: int, M: int, device: torch.device):
 	if not isinstance(condition_state, dict):
 		raise ValueError(f"condition_state expected dict, got {type(condition_state)}")
@@ -1972,40 +2098,6 @@ def validate_rollout_buffer(rollout_buffer: RolloutTensorBuffer, condition_state
 		raise ValueError(f"rollout_buffer expected RolloutTensorBuffer, got {type(rollout_buffer)}")
 	rollout_buffer.validate(condition_state)
 
-def merge_update_stats(accum: dict, update_stats: dict):
-	if update_stats is None:
-		return accum
-	accum['did_optimizer_step'] = accum.get('did_optimizer_step', False) or update_stats.get('did_optimizer_step', False)
-	accum['num_candidates'] = accum.get('num_candidates', 0) + int(update_stats.get('num_candidates', 0) or 0)
-	accum['num_selected'] = accum.get('num_selected', 0) + int(update_stats.get('num_selected', 0) or 0)
-	accum['ppo_update_time_s'] = accum.get('ppo_update_time_s', 0.0) + float(update_stats.get('ppo_update_time_s', 0.0) or 0.0)
-	accum['ppo_feature_rebuild_ms'] = accum.get('ppo_feature_rebuild_ms', 0.0) + float(update_stats.get('ppo_feature_rebuild_ms', 0.0) or 0.0)
-	for key in ('max_memory_allocated_mb', 'max_memory_reserved_mb'):
-		accum[key] = max(float(accum.get(key, 0.0) or 0.0), float(update_stats.get(key, 0.0) or 0.0))
-	accum['last_update'] = update_stats
-	return accum
-
-def clear_rollout_buffers(*buffers):
-	for buf in buffers:
-		buf.clear()
-
-# ============================== 检查是否所有世界无存活agent ==============================
-def all_worlds_no_alive_agents(simulator, cumulative_done_all=None) -> bool:
-	"""
-	检查是否所有世界都没有存活的智能体。
-	与game.py的_check_all_worlds_no_alive_agents逻辑完全一致。
-	"""
-	try:
-		states = simulator.agents_state  # (B, M, S)
-		active_mask = states[..., 6] > 0.5
-		if cumulative_done_all is None:
-			alive_mask = active_mask
-		else:
-			alive_mask = active_mask & (~cumulative_done_all.to(active_mask.device))
-		return not bool(alive_mask.any().item())
-	except Exception:
-		return True
-
 def rollout_alive_mask(simulator, cumulative_done_all=None) -> torch.Tensor:
 	"""返回本 rollout 当前仍应参与采样/训练的 agent mask。"""
 	states = simulator.agents_state
@@ -2018,7 +2110,8 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 								 condition_state: dict, dropout_step: int,
 								 precision: str, forward_chunk_agents: int,
 								 sample_actions: bool = True,
-								 feature_workspace: FeatureBuildWorkspace = None):
+								 feature_workspace: FeatureBuildWorkspace = None,
+								 batch_sizer: AdaptiveBatchSizer = None):
 	"""
 	Online rollout forward for active agents only.
 
@@ -2032,143 +2125,113 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 	actions = torch.zeros((B, M), dtype=torch.long, device=device)
 	old_log_probs = torch.zeros((B, M), dtype=states.dtype, device=device)
 	value_pred = torch.zeros((B, M), dtype=states.dtype, device=device)
-	profile = {'feature_ms': 0.0, 'policy_ms': 0.0, 'num_selected': 0, 'feature_chunks': 0, 'path': 'none'}
+	profile = {
+		'feature_ms': 0.0,
+		'policy_ms': 0.0,
+		'num_selected': B * M,
+		'feature_chunks': 0,
+		'path': 'dense_stream',
+		'oom_retries': 0,
+	}
 	feature_workspace = feature_workspace or _default_workspace(config)
 	feature_workspace.reset_counters()
-
 	alive_mask = alive_mask.to(device=device, dtype=torch.bool)
-	env_idx, agent_idx = alive_mask.nonzero(as_tuple=True)
-	total_selected = int(env_idx.numel())
-	if total_selected <= 0:
-		return actions, old_log_probs, value_pred, profile
-	profile['num_selected'] = total_selected
-	training_cfg = getattr(config, 'training')
-	dense_alive_fraction = float(getattr(training_cfg, 'rollout_dense_alive_fraction', 0.0))
-	if dense_alive_fraction > 0.0 and (total_selected / max(1, B * M)) >= dense_alive_fraction:
-		profile['path'] = 'dense'
-		profile_on = profile_enabled(config)
-		if profile_on:
-			feature_start = profile_timer_start(device, config)
-		features_all = build_features_from_simulator_state(
-			simulator,
-			config,
-			alive_mask=alive_mask,
-			condition_state=condition_state,
-			dropout_step=dropout_step,
-			workspace=feature_workspace,
-		)
-		if profile_on:
-			profile['feature_ms'] += profile_elapsed_ms(feature_start, device, config)
-		profile['feature_chunks'] = feature_workspace.feature_chunks
-
-		if profile_on:
-			policy_start = profile_timer_start(device, config)
-		with torch.inference_mode(), make_autocast_context(device, precision):
-			if sample_actions:
-				action_logits, values_all = forward_model(
-					model,
-					features_all,
-					mode="both",
-					chunk_agents=forward_chunk_agents,
-				)
-				dist_all = torch.distributions.Categorical(logits=action_logits)
-				actions_all = dist_all.sample()
-				log_probs_all = dist_all.log_prob(actions_all).to(old_log_probs.dtype)
-				actions = torch.where(alive_mask, actions_all, actions)
-				old_log_probs = torch.where(alive_mask, log_probs_all, old_log_probs)
-			else:
-				values_all = forward_model(
-					model,
-					features_all,
-					mode="value",
-					chunk_agents=forward_chunk_agents,
-				)
-		if values_all.dim() == 3 and values_all.shape[-1] == 1:
-			values_all = values_all.squeeze(-1)
-		value_pred = torch.where(alive_mask, values_all.to(value_pred.dtype), value_pred)
-		if profile_on:
-			profile['policy_ms'] += profile_elapsed_ms(policy_start, device, config)
-		del features_all
-		return actions, old_log_probs, value_pred, profile
-
-	selected_chunk = feature_build_chunk_agents(config, M)
-	if selected_chunk <= 0:
-		selected_chunk = total_selected
-	profile['path'] = 'selected'
-
+	if batch_sizer is None:
+		maximum = max(M, feature_build_chunk_agents(config, M))
+		batch_sizer = AdaptiveBatchSizer(maximum=maximum, minimum=M)
+	chunk_agents = batch_sizer.choose(B * M)
+	env_chunk_size = max(1, chunk_agents // M)
 	route_state_all = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
 	control_state_all = current_control_state(simulator)
 	profile_on = profile_enabled(config)
-
-	for start in range(0, total_selected, selected_chunk):
-		end = min(start + selected_chunk, total_selected)
-		env_chunk = env_idx[start:end]
-		agent_chunk = agent_idx[start:end]
-
-		if profile_on:
-			feature_start = profile_timer_start(device, config)
-		obs_state_chunk = states[env_chunk].clone()
-		obs_state_chunk[..., 6] = alive_mask[env_chunk].to(dtype=obs_state_chunk.dtype)
-		control_chunk = control_state_all[env_chunk]
-		world_state_chunk = torch.cat([obs_state_chunk, control_chunk], dim=-1)
-		route_chunk = gather_current_route_state_selected(route_state_all, env_chunk, agent_chunk)
-		condition_chunk = gather_condition_state_selected(condition_state, env_chunk, agent_chunk)
-		features_chunk = build_features_for_selected_agents(
-			world_state_chunk,
-			simulator,
-			config,
-			route_chunk,
-			condition_chunk,
-			agent_chunk,
-			time_indices=torch.as_tensor(dropout_step, device=device, dtype=torch.long),
-			env_indices=env_chunk,
-			workspace=feature_workspace,
-		)
-		if profile_on:
-			profile['feature_ms'] += profile_elapsed_ms(feature_start, device, config)
-		profile['feature_chunks'] = feature_workspace.feature_chunks
-
-		if profile_on:
-			policy_start = profile_timer_start(device, config)
-		with torch.inference_mode(), make_autocast_context(device, precision):
-			if sample_actions:
-				action_logits, values_chunk = forward_model(
-					model,
-					features_chunk,
-					mode="both",
-					chunk_agents=forward_chunk_agents,
-				)
-				logits_selected = action_logits[:, 0]
-				dist_selected = torch.distributions.Categorical(logits=logits_selected)
-				actions_chunk = dist_selected.sample()
-				actions[env_chunk, agent_chunk] = actions_chunk
-				old_log_probs[env_chunk, agent_chunk] = dist_selected.log_prob(actions_chunk).to(old_log_probs.dtype)
-			else:
-				values_chunk = forward_model(
-					model,
-					features_chunk,
-					mode="value",
-					chunk_agents=forward_chunk_agents,
-				)
-		if values_chunk.dim() == 3 and values_chunk.shape[-1] == 1:
-			values_chunk = values_chunk.squeeze(-1)
-		if values_chunk.dim() == 2:
-			values_selected = values_chunk[:, 0]
-		else:
-			values_selected = values_chunk.reshape(-1)
-		value_pred[env_chunk, agent_chunk] = values_selected.to(value_pred.dtype)
-		if profile_on:
-			profile['policy_ms'] += profile_elapsed_ms(policy_start, device, config)
-
-		del features_chunk, world_state_chunk, obs_state_chunk
-
+	start = 0
+	while start < B:
+		end = min(start + env_chunk_size, B)
+		features_chunk = None
+		action_logits = None
+		values_chunk = None
+		try:
+			if profile_on:
+				feature_start = profile_timer_start(device, config)
+			features_chunk = build_features_from_simulator_env_slice(
+				simulator,
+				config,
+				start,
+				end,
+				alive_mask=alive_mask,
+				condition_state=condition_state,
+				dropout_step=dropout_step,
+				workspace=feature_workspace,
+				control_state_all=control_state_all,
+				route_state_all=route_state_all,
+			)
+			if profile_on:
+				profile['feature_ms'] += profile_elapsed_ms(feature_start, device, config)
+			if profile_on:
+				policy_start = profile_timer_start(device, config)
+			with torch.inference_mode(), make_autocast_context(device, precision):
+				if sample_actions:
+					action_logits, values_chunk = forward_model(
+						model,
+						features_chunk,
+						mode="both",
+						chunk_agents=forward_chunk_agents,
+					)
+					distribution = torch.distributions.Categorical(logits=action_logits)
+					action_chunk = distribution.sample()
+					log_prob_chunk = distribution.log_prob(action_chunk).to(old_log_probs.dtype)
+					chunk_alive = alive_mask[start:end]
+					actions[start:end] = torch.where(
+						chunk_alive, action_chunk, actions[start:end]
+					)
+					old_log_probs[start:end] = torch.where(
+						chunk_alive, log_prob_chunk, old_log_probs[start:end]
+					)
+				else:
+					values_chunk = forward_model(
+						model,
+						features_chunk,
+						mode="value",
+						chunk_agents=forward_chunk_agents,
+					)
+			if values_chunk.dim() == 3 and values_chunk.shape[-1] == 1:
+				values_chunk = values_chunk.squeeze(-1)
+			value_pred[start:end] = torch.where(
+				alive_mask[start:end],
+				values_chunk.to(value_pred.dtype),
+				value_pred[start:end],
+			)
+			if profile_on:
+				profile['policy_ms'] += profile_elapsed_ms(policy_start, device, config)
+			start = end
+		except RuntimeError as exc:
+			if not is_cuda_oom_error(exc, device):
+				raise
+			profile['oom_retries'] += 1
+			features_chunk = None
+			action_logits = None
+			values_chunk = None
+			feature_workspace.clear_scratch()
+			torch.cuda.empty_cache()
+			attempted_agents = max(M, (end - start) * M)
+			next_agents = batch_sizer.backoff(attempted_agents)
+			if next_agents is None:
+				raise RuntimeError(
+					f"CUDA OOM in rollout at minimum chunk of one world ({M} agents)"
+				) from exc
+			next_agents = max(M, (next_agents // M) * M)
+			batch_sizer.current = next_agents
+			env_chunk_size = max(1, next_agents // M)
+	profile['feature_chunks'] = feature_workspace.feature_chunks
+	batch_sizer.record_success(env_chunk_size * M, B * M)
 	return actions, old_log_probs, value_pred, profile
 
 
 def bootstrap_values_for_alive_agents(model, simulator, config, alive_mask: torch.Tensor,
 									  condition_state: dict, dropout_step: int,
 									  precision: str, forward_chunk_agents: int,
-									  feature_workspace: FeatureBuildWorkspace = None):
+									  feature_workspace: FeatureBuildWorkspace = None,
+									  batch_sizer: AdaptiveBatchSizer = None):
 	_, _, value_pred, _ = rollout_forward_alive_agents(
 		model,
 		simulator,
@@ -2180,6 +2243,7 @@ def bootstrap_values_for_alive_agents(model, simulator, config, alive_mask: torc
 		forward_chunk_agents,
 		sample_actions=False,
 		feature_workspace=feature_workspace,
+		batch_sizer=batch_sizer,
 	)
 	return value_pred
 
@@ -2187,10 +2251,9 @@ def bootstrap_values_for_alive_agents(model, simulator, config, alive_mask: torc
 def current_rollout_bootstrap_value(model, simulator, config, cumulative_done_all,
 									condition_state: dict, dropout_step: int,
 									precision: str, forward_chunk_agents: int,
-									feature_workspace: FeatureBuildWorkspace = None):
+									feature_workspace: FeatureBuildWorkspace = None,
+									batch_sizer: AdaptiveBatchSizer = None):
 	alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
-	if not bool(alive_mask.any().item()):
-		return None
 	return bootstrap_values_for_alive_agents(
 		model,
 		simulator,
@@ -2201,19 +2264,243 @@ def current_rollout_bootstrap_value(model, simulator, config, cumulative_done_al
 		precision,
 		forward_chunk_agents,
 		feature_workspace=feature_workspace,
+		batch_sizer=batch_sizer,
 	)
+
+
+def resolve_ppo_samples_per_rank(training_cfg) -> int:
+	"""Resolve the local sample target from the paper's global/per-GPU batch settings."""
+	world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+	per_rank = getattr(training_cfg, 'batch_size_per_gpu', None)
+	global_batch = getattr(training_cfg, 'batch_size', None)
+	if per_rank is not None:
+		return int(per_rank)
+	if global_batch is not None:
+		return max(1, math.ceil(int(global_batch) / max(1, world_size)))
+	return 2000
+
+
+def create_ppo_batch_sizer(training_cfg) -> AdaptiveBatchSizer:
+	"""Create the persistent OOM-feedback controller for PPO microbatches."""
+	target = resolve_ppo_samples_per_rank(training_cfg)
+	configured_cap = getattr(training_cfg, 'ppo_microbatch_max', None)
+	maximum = target if configured_cap is None else min(target, int(configured_cap))
+	configured_initial = getattr(training_cfg, 'ppo_microbatch_initial', None)
+	initial = maximum if configured_initial is None else min(maximum, int(configured_initial))
+	minimum = int(getattr(training_cfg, 'ppo_min_microbatch_size', 256))
+	growth_interval = int(getattr(training_cfg, 'ppo_microbatch_growth_interval', 20))
+	return AdaptiveBatchSizer(
+		maximum=maximum,
+		minimum=minimum,
+		growth_interval=growth_interval,
+		initial=initial,
+	)
+
+
+def create_feature_batch_sizer(training_cfg) -> AdaptiveBatchSizer:
+	"""Create the persistent controller used while materializing PPO features."""
+	maximum = resolve_ppo_samples_per_rank(training_cfg)
+	configured_initial = getattr(training_cfg, 'ppo_feature_build_initial', None)
+	initial = maximum if configured_initial is None else min(maximum, int(configured_initial))
+	minimum = int(getattr(training_cfg, 'ppo_feature_build_min', 256))
+	growth_interval = int(getattr(training_cfg, 'ppo_microbatch_growth_interval', 20))
+	return AdaptiveBatchSizer(
+		maximum=maximum,
+		minimum=minimum,
+		growth_interval=growth_interval,
+		initial=initial,
+	)
+
+
+def create_rollout_batch_sizer(config) -> AdaptiveBatchSizer:
+	training_cfg = config.training
+	simulator_cfg = config.simulator
+	max_agents = int(simulator_cfg.max_agents_num)
+	maximum = int(simulator_cfg.num_envs) * max_agents
+	configured_initial = getattr(training_cfg, 'rollout_chunk_initial_agents', None)
+	initial = (
+		min(maximum, int(configured_initial))
+		if configured_initial is not None
+		else min(maximum, feature_build_chunk_agents(config, max_agents))
+	)
+	initial = max(max_agents, (initial // max_agents) * max_agents)
+	return AdaptiveBatchSizer(
+		maximum=maximum,
+		minimum=max_agents,
+		growth_interval=int(getattr(training_cfg, 'rollout_chunk_growth_interval', 100)),
+		initial=initial,
+	)
+
+
+class SelectedFeatureCache:
+	"""One immutable feature tensor reused by every PPO epoch."""
+
+	def __init__(self, storage: torch.Tensor, compute_device: torch.device):
+		self.storage = storage
+		self.compute_device = compute_device
+
+	@property
+	def location(self) -> str:
+		return self.storage.device.type
+
+	def get(self, start: int, end: int) -> torch.Tensor:
+		chunk = self.storage[start:end]
+		if chunk.device == self.compute_device:
+			return chunk
+		return chunk.to(self.compute_device, non_blocking=chunk.is_pinned())
+
+	def offload_to_cpu(self) -> bool:
+		if self.storage.device.type != 'cuda':
+			return False
+		try:
+			cpu_storage = torch.empty_like(
+				self.storage, device='cpu', pin_memory=True
+			)
+		except RuntimeError:
+			cpu_storage = torch.empty_like(self.storage, device='cpu')
+		cpu_storage.copy_(self.storage)
+		self.storage = cpu_storage
+		torch.cuda.empty_cache()
+		return True
+
+
+def ppo_feature_cache_dtype(precision: str) -> torch.dtype:
+	precision = str(precision).strip().lower()
+	if precision in {'16', '16-bit', 'fp16', 'float16'}:
+		return torch.float16
+	if precision in {'bf16', 'bfloat16'}:
+		return torch.bfloat16
+	return torch.float32
+
+
+def allocate_selected_feature_cache(
+	count: int,
+	feature_dim: int,
+	device: torch.device,
+	dtype: torch.dtype,
+	training_cfg,
+) -> SelectedFeatureCache:
+	location = str(getattr(training_cfg, 'ppo_feature_cache_location', 'auto')).lower()
+	if location not in {'auto', 'cuda', 'cpu'}:
+		raise ValueError(
+			"training.ppo_feature_cache_location must be one of: auto, cuda, cpu"
+		)
+	shape = (int(count), 1, int(feature_dim))
+	use_cuda = device.type == 'cuda' and location != 'cpu'
+	if use_cuda and location == 'auto':
+		free_bytes, _ = torch.cuda.mem_get_info(device)
+		memory_cfg = getattr(training_cfg, 'memory_adaptation', SimpleNamespace())
+		reserve_mb = float(getattr(memory_cfg, 'reserve_mb', 1024.0))
+		needed_bytes = count * feature_dim * torch.empty((), dtype=dtype).element_size()
+		use_cuda = needed_bytes <= max(0, free_bytes - int(reserve_mb * 1024 ** 2))
+	if use_cuda:
+		try:
+			return SelectedFeatureCache(torch.empty(shape, device=device, dtype=dtype), device)
+		except RuntimeError as exc:
+			if location == 'cuda' or not is_cuda_oom_error(exc, device):
+				raise
+			torch.cuda.empty_cache()
+	try:
+		storage = torch.empty(shape, device='cpu', dtype=dtype, pin_memory=device.type == 'cuda')
+	except RuntimeError:
+		storage = torch.empty(shape, device='cpu', dtype=dtype)
+	return SelectedFeatureCache(storage, device)
+
+
+def build_selected_feature_cache(
+	states_tensor: torch.Tensor,
+	route_state_tensor: dict,
+	condition_state: dict,
+	selected_t: torch.Tensor,
+	selected_b: torch.Tensor,
+	selected_m: torch.Tensor,
+	time_indices_tensor: torch.Tensor,
+	simulator,
+	config,
+	precision: str,
+	workspace: FeatureBuildWorkspace,
+	batch_sizer: AdaptiveBatchSizer,
+) -> tuple[SelectedFeatureCache, int, int]:
+	"""Build selected observations once, with persistent CUDA-OOM backoff."""
+	count = int(selected_t.shape[0])
+	training_cfg = config.training
+	cache = allocate_selected_feature_cache(
+		count,
+		workspace.total_input_dim,
+		states_tensor.device,
+		ppo_feature_cache_dtype(precision),
+		training_cfg,
+	)
+	chunk_size = batch_sizer.choose(count)
+	oom_retries = 0
+	offloads = 0
+	start = 0
+	while start < count:
+		end = min(start + chunk_size, count)
+		try:
+			chunk_t = selected_t[start:end]
+			chunk_b = selected_b[start:end]
+			chunk_m = selected_m[start:end]
+			world_states = states_tensor[chunk_t, chunk_b]
+			route_state = gather_route_state_selected(
+				route_state_tensor, chunk_t, chunk_b, chunk_m
+			)
+			conditions = gather_condition_state_selected(condition_state, chunk_b, chunk_m)
+			features = build_features_for_selected_agents(
+				world_states,
+				simulator,
+				config,
+				route_state,
+				conditions,
+				chunk_m,
+				time_indices=time_indices_tensor[chunk_t, chunk_b],
+				env_indices=chunk_b,
+				workspace=workspace,
+			)
+			cache.storage[start:end].copy_(
+				features.to(dtype=cache.storage.dtype),
+				non_blocking=cache.storage.is_pinned(),
+			)
+			start = end
+		except RuntimeError as exc:
+			if not is_cuda_oom_error(exc, states_tensor.device):
+				raise
+			oom_retries += 1
+			features = None
+			world_states = None
+			route_state = None
+			conditions = None
+			workspace.clear_scratch()
+			torch.cuda.empty_cache()
+			if (
+				str(getattr(training_cfg, 'ppo_feature_cache_location', 'auto')).lower() == 'auto'
+				and cache.offload_to_cpu()
+			):
+				offloads += 1
+				continue
+			next_size = batch_sizer.backoff(chunk_size)
+			if next_size is None:
+				raise RuntimeError(
+					f"CUDA OOM while building PPO feature cache at minimum chunk {chunk_size}"
+				) from exc
+			chunk_size = next_size
+	batch_sizer.record_success(chunk_size, count)
+	return cache, oom_retries, offloads
+
 
 # ============================== PPO更新函数 ==============================
 def perform_ppo_update(model, policy_optimizer, value_optimizer,
 					   rollout_buffer, condition_state,
-					   features_tensor, simulator, config, iteration, rank=None,
+					   simulator, config, update_step, rank=None,
 					   a_max_ewma=None, amp_scaler=None, bootstrap_value=None,
-					   feature_workspace: FeatureBuildWorkspace = None):
+					   feature_workspace: FeatureBuildWorkspace = None,
+					   batch_sizer: AdaptiveBatchSizer = None,
+					   feature_batch_sizer: AdaptiveBatchSizer = None):
 	"""执行 PPO 更新。buffer 保存世界状态/route state，条件特征在 minibatch 内重建。"""
 	is_rank0 = (rank is None or rank == 0)
 	update_start_time = time.time()
 	if len(rollout_buffer) == 0:
-		device = features_tensor.device if isinstance(features_tensor, torch.Tensor) else torch.device('cpu')
+		device = simulator.device
 		if is_rank0:
 			print("⚠️ Buffer为空，无法进行PPO更新")
 		return a_max_ewma, make_update_stats("empty_buffer", device)
@@ -2227,8 +2514,10 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	clip_ratio = float(getattr(training_cfg, 'clip_ratio', 0.2))
 	entropy_coef = float(getattr(training_cfg, 'entropy_coef', 0.01))
 	value_loss_coef = float(getattr(training_cfg, 'value_loss_coef', 0.5))
+	configured_value_clip = getattr(training_cfg, 'value_clip_ratio', None)
+	value_clip_ratio = None if configured_value_clip is None else float(configured_value_clip)
 	max_grad_norm = float(getattr(training_cfg, 'max_grad_norm', 1.0))
-	batch_size_per_gpu = int(getattr(training_cfg, 'batch_size_per_gpu', 2000))
+	batch_size_per_gpu = resolve_ppo_samples_per_rank(training_cfg)
 	advantage_filter_threshold = float(getattr(training_cfg, 'advantage_filter_threshold', 0.01))
 	beta = float(getattr(training_cfg, 'advantage_filter_beta', 0.25))
 	advantage_filter_max_drop_fraction = float(getattr(training_cfg, 'advantage_filter_max_drop_fraction', 1.0))
@@ -2237,6 +2526,8 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	precision = getattr(training_cfg, 'precision', '32-bit')
 	forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
 	feature_workspace = feature_workspace or _default_workspace(config)
+	batch_sizer = batch_sizer or create_ppo_batch_sizer(training_cfg)
+	feature_batch_sizer = feature_batch_sizer or create_feature_batch_sizer(training_cfg)
 	feature_workspace.reset_counters()
 	validate_rollout_buffer(rollout_buffer, condition_state)
 	device = rollout_buffer.states.device
@@ -2256,24 +2547,20 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		last_value_pred = bootstrap_value.to(device=device, dtype=values_tensor.dtype)
 		if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
 			last_value_pred = last_value_pred.squeeze(-1)
-	elif features_tensor is None:
-		last_value_pred = torch.zeros_like(values_tensor[-1])
 	else:
-		with torch.inference_mode(), make_autocast_context(device, precision):
-			_, last_value_pred = forward_model(model, features_tensor, mode="both", chunk_agents=forward_chunk_agents)
-		if last_value_pred.dim() == 3 and last_value_pred.shape[-1] == 1:
-			last_value_pred = last_value_pred.squeeze(-1)
+		last_value_pred = torch.zeros_like(values_tensor[-1])
 	values_tp1 = torch.cat([values_tensor, last_value_pred.unsqueeze(0)], dim=0)
 
-	dones_accum = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
-	advantages, returns = gae_advantages(rewards_tensor, values_tp1, dones_accum, gamma, gae_lambda)
+	seen_done_inclusive = torch.cumsum(dones_tensor, dim=0, dtype=torch.int32) > 0
+	advantages, returns = gae_advantages(
+		rewards_tensor, values_tp1, seen_done_inclusive, gamma, gae_lambda
+	)
 
 	A_max_tensor = torch.max(torch.abs(advantages)).detach()
 	a_max_ewma = A_max_tensor if a_max_ewma is None else (beta * A_max_tensor + (1.0 - beta) * a_max_ewma.to(device))
 	eta = advantage_filter_threshold * a_max_ewma
 	abs_advantages = torch.abs(advantages)
 
-	seen_done_inclusive = (torch.cumsum(dones_tensor.to(torch.int32), dim=0) > 0)
 	seen_done_prev = torch.roll(seen_done_inclusive, shifts=1, dims=0)
 	seen_done_prev[0] = False
 	first_done_step = dones_tensor & (~seen_done_prev)
@@ -2289,7 +2576,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	effective_candidate_count = max(threshold_count, min_keep)
 
 	if is_rank0:
-		print(f"🎯 第 {iteration} 个iteration - 最大|A|: {A_max_tensor.item():.4f}, 阈值: {eta.item():.4f}")
+		print(f"PPO update {update_step}: max |A|={A_max_tensor.item():.4f}, threshold={eta.item():.4f}")
 		print(
 			f"📊 eligible: {eligible_count}, threshold后: {threshold_count}, "
 			f"保护后候选池: {effective_candidate_count}, min_keep: {min_keep} "
@@ -2411,6 +2698,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		)
 
 	old_log_probs_batch = old_log_probs_tensor[selected_t, selected_b, selected_m].view(-1)
+	old_values_batch = values_tensor[selected_t, selected_b, selected_m].view(-1)
 	raw_advantages_batch = advantages[selected_t, selected_b, selected_m].view(-1)
 	returns_batch = returns[selected_t, selected_b, selected_m].view(-1)
 	actions_batch = actions_tensor[selected_t, selected_b, selected_m].view(-1).to(torch.long)
@@ -2430,33 +2718,37 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 			action_values=action_values,
 		)
 	advantages_batch = (raw_advantages_batch - raw_advantages_batch.mean()) / (raw_advantages_batch.std(unbiased=False) + 1e-8)
-	batch_N = old_log_probs_batch.shape[0]
-
-	route_state_mb = gather_route_state_selected(route_state_tensor, selected_t, selected_b, selected_m)
-	condition_state_mb = gather_condition_state_selected(condition_state, selected_b, selected_m)
-	world_states_mb = states_tensor[selected_t, selected_b]
-	ppo_feature_rebuild_ms = 0.0
 	profile_on = profile_enabled(config)
-	if profile_on:
-		feature_rebuild_start = profile_timer_start(device, config)
-	mb_features = build_features_for_selected_agents(
-		world_states_mb,
+	feature_cache_start = profile_timer_start(device, config) if profile_on else time.time()
+	feature_cache, feature_cache_oom_retries, feature_cache_offloads = build_selected_feature_cache(
+		states_tensor,
+		route_state_tensor,
+		condition_state,
+		selected_t,
+		selected_b,
+		selected_m,
+		time_indices_tensor,
 		simulator,
 		config,
-		route_state_mb,
-		condition_state_mb,
-		selected_m,
-		time_indices=time_indices_tensor[selected_t],
-		env_indices=selected_b,
-		workspace=feature_workspace,
+		precision,
+		feature_workspace,
+		feature_batch_sizer,
 	)
-	if profile_on:
-		ppo_feature_rebuild_ms = profile_elapsed_ms(feature_rebuild_start, device, config)
+	ppo_feature_cache_build_ms = (
+		profile_elapsed_ms(feature_cache_start, device, config)
+		if profile_on
+		else (time.time() - feature_cache_start) * 1000.0
+	)
 
 	policy_params = get_policy_parameters(model)
 	value_params = get_value_parameters(model)
 	model.train()
 	did_optimizer_step = False
+	completed_epochs = 0
+	memory_adapted = False
+	microbatch_retries = 0
+	ddp_gradient_buckets = 0
+	abort_reason = ""
 	last_policy_loss = None
 	last_value_loss = None
 	last_entropy = None
@@ -2467,64 +2759,226 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 	last_ratio_min = None
 	last_ratio_max = None
 	last_max_action_prob_mean = None
-	mb_old_logp = old_log_probs_batch
-	mb_adv = advantages_batch
-	mb_ret = returns_batch
-	mb_actions = actions_batch
+	microbatch_size = sync_min_int_across_ranks(batch_sizer.choose(K), device)
+	if is_rank0:
+		print(
+			f"🧠 PPO effective batch={K}, initial microbatch={microbatch_size}, "
+			f"adaptive ceiling={batch_sizer.maximum}"
+		)
+
 	for epoch in range(ppo_epochs):
-		policy_optimizer.zero_grad(set_to_none=True)
-		value_optimizer.zero_grad(set_to_none=True)
-		with make_autocast_context(device, precision):
-			action_logits, value_pred_full = forward_model(model, mb_features, mode="both", chunk_agents=forward_chunk_agents)
-			logits_selected = action_logits[:, 0]
-			dist_selected = torch.distributions.Categorical(logits=logits_selected)
-			new_log_probs = dist_selected.log_prob(mb_actions)
-			log_ratio = new_log_probs - mb_old_logp
-			ratio = torch.exp(log_ratio)
-			surr1 = ratio * mb_adv
-			surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * mb_adv
-			policy_loss = -torch.min(surr1, surr2).mean()
-			entropy = dist_selected.entropy().mean()
-			approx_kl = ((ratio - 1.0) - log_ratio).mean()
-			old_approx_kl = (-log_ratio).mean()
-			clip_frac = ((ratio - 1.0).abs() > clip_ratio).to(torch.float32).mean()
-			ratio_mean = ratio.mean()
-			ratio_min = ratio.min()
-			ratio_max = ratio.max()
-			max_action_prob_mean = dist_selected.probs.max(dim=-1).values.mean()
-			value_pred = value_pred_full[:, 0]
-			value_loss = (value_pred - mb_ret).pow(2).mean()
-			total_loss = policy_loss - entropy_coef * entropy + value_loss_coef * value_loss
+		while True:
+			policy_optimizer.zero_grad(set_to_none=True)
+			value_optimizer.zero_grad(set_to_none=True)
+			epoch_policy_loss = torch.zeros((), device=device, dtype=torch.float32)
+			epoch_value_loss = torch.zeros((), device=device, dtype=torch.float32)
+			epoch_entropy = torch.zeros((), device=device, dtype=torch.float32)
+			epoch_approx_kl = torch.zeros((), device=device, dtype=torch.float32)
+			epoch_old_approx_kl = torch.zeros((), device=device, dtype=torch.float32)
+			epoch_clip_frac = torch.zeros((), device=device, dtype=torch.float32)
+			epoch_ratio_mean = torch.zeros((), device=device, dtype=torch.float32)
+			epoch_max_action_prob = torch.zeros((), device=device, dtype=torch.float32)
+			epoch_ratio_min = None
+			epoch_ratio_max = None
+			local_oom = False
+			oom_detail = ""
+			features_chunk = None
+			action_logits = None
+			value_pred_full = None
+			total_loss = None
 
-		if amp_scaler is not None and getattr(amp_scaler, 'is_enabled', lambda: False)():
-			old_scale = amp_scaler.get_scale()
-			amp_scaler.scale(total_loss).backward()
-			amp_scaler.unscale_(policy_optimizer)
-			amp_scaler.unscale_(value_optimizer)
-			torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
-			torch.nn.utils.clip_grad_norm_(value_params, max_grad_norm)
-			amp_scaler.step(policy_optimizer)
-			amp_scaler.step(value_optimizer)
-			amp_scaler.update()
-			did_optimizer_step = did_optimizer_step or (amp_scaler.get_scale() >= old_scale)
-		else:
-			total_loss.backward()
-			torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
-			torch.nn.utils.clip_grad_norm_(value_params, max_grad_norm)
-			policy_optimizer.step()
-			value_optimizer.step()
-			did_optimizer_step = True
+			# Suppress DDP's per-microbatch reductions.  Gradients are averaged once
+			# after every rank has completed all local chunks, which also makes an
+			# OOM on one rank recoverable without leaving peers in a collective.
+			no_sync_context = model.no_sync() if hasattr(model, 'no_sync') else nullcontext()
+			try:
+				with no_sync_context:
+					for start in range(0, K, microbatch_size):
+						end = min(start + microbatch_size, K)
+						features_chunk = feature_cache.get(start, end)
 
-		last_policy_loss = float(policy_loss.detach().item())
-		last_value_loss = float(value_loss.detach().item())
-		last_entropy = float(entropy.detach().item())
-		last_approx_kl = float(approx_kl.detach().item())
-		last_old_approx_kl = float(old_approx_kl.detach().item())
-		last_clip_frac = float(clip_frac.detach().item())
-		last_ratio_mean = float(ratio_mean.detach().item())
-		last_ratio_min = float(ratio_min.detach().item())
-		last_ratio_max = float(ratio_max.detach().item())
-		last_max_action_prob_mean = float(max_action_prob_mean.detach().item())
+						chunk_old_logp = old_log_probs_batch[start:end]
+						chunk_old_value = old_values_batch[start:end]
+						chunk_adv = advantages_batch[start:end]
+						chunk_ret = returns_batch[start:end]
+						chunk_actions = actions_batch[start:end]
+						chunk_weight = (end - start) / float(K)
+
+						with make_autocast_context(device, precision):
+							action_logits, value_pred_full = forward_model(
+								model,
+								features_chunk,
+								mode="both",
+								chunk_agents=forward_chunk_agents,
+							)
+							logits_selected = action_logits[:, 0]
+							dist_selected = torch.distributions.Categorical(logits=logits_selected)
+							new_log_probs = dist_selected.log_prob(chunk_actions)
+							log_ratio = new_log_probs - chunk_old_logp
+							ratio = torch.exp(log_ratio)
+							surr1 = ratio * chunk_adv
+							surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * chunk_adv
+							policy_loss = -torch.min(surr1, surr2).mean()
+							entropy = dist_selected.entropy().mean()
+							approx_kl = ((ratio - 1.0) - log_ratio).mean()
+							old_approx_kl = (-log_ratio).mean()
+							clip_frac = ((ratio - 1.0).abs() > clip_ratio).to(torch.float32).mean()
+							ratio_mean = ratio.mean()
+							ratio_min = ratio.min()
+							ratio_max = ratio.max()
+							max_action_prob_mean = dist_selected.probs.max(dim=-1).values.mean()
+							value_pred = value_pred_full[:, 0]
+							if value_clip_ratio is None:
+								value_loss = (value_pred - chunk_ret).pow(2).mean()
+							else:
+								value_pred_clipped = chunk_old_value + torch.clamp(
+									value_pred - chunk_old_value,
+									-value_clip_ratio,
+									value_clip_ratio,
+								)
+								value_loss = torch.maximum(
+									(value_pred - chunk_ret).pow(2),
+									(value_pred_clipped - chunk_ret).pow(2),
+								).mean()
+							total_loss = (
+								policy_loss - entropy_coef * entropy + value_loss_coef * value_loss
+							) * chunk_weight
+
+						if amp_scaler is not None and getattr(amp_scaler, 'is_enabled', lambda: False)():
+							amp_scaler.scale(total_loss).backward()
+						else:
+							total_loss.backward()
+
+						epoch_policy_loss += policy_loss.detach().float() * chunk_weight
+						epoch_value_loss += value_loss.detach().float() * chunk_weight
+						epoch_entropy += entropy.detach().float() * chunk_weight
+						epoch_approx_kl += approx_kl.detach().float() * chunk_weight
+						epoch_old_approx_kl += old_approx_kl.detach().float() * chunk_weight
+						epoch_clip_frac += clip_frac.detach().float() * chunk_weight
+						epoch_ratio_mean += ratio_mean.detach().float() * chunk_weight
+						epoch_max_action_prob += max_action_prob_mean.detach().float() * chunk_weight
+						ratio_min_detached = ratio_min.detach().float()
+						ratio_max_detached = ratio_max.detach().float()
+						epoch_ratio_min = (
+							ratio_min_detached
+							if epoch_ratio_min is None
+							else torch.minimum(epoch_ratio_min, ratio_min_detached)
+						)
+						epoch_ratio_max = (
+							ratio_max_detached
+							if epoch_ratio_max is None
+							else torch.maximum(epoch_ratio_max, ratio_max_detached)
+						)
+						features_chunk = None
+						action_logits = None
+						value_pred_full = None
+						total_loss = None
+			except RuntimeError as exc:
+				if not is_cuda_oom_error(exc, device):
+					raise
+				local_oom = True
+				oom_detail = str(exc).splitlines()[0]
+				oom_rank = 0 if rank is None else rank
+				print(
+					f"[Rank {oom_rank}] CUDA OOM at PPO microbatch={microbatch_size}: "
+					f"{oom_detail}",
+					flush=True,
+				)
+				features_chunk = None
+				action_logits = None
+				value_pred_full = None
+				total_loss = None
+				feature_workspace.clear_scratch()
+				clear_optimizer_gradients(policy_optimizer, value_optimizer, device)
+
+			all_ranks_succeeded = sync_bool_across_ranks(not local_oom, device, op=dist.ReduceOp.MIN)
+			if not all_ranks_succeeded:
+				memory_adapted = True
+				microbatch_retries += 1
+				feature_workspace.clear_scratch()
+				clear_optimizer_gradients(policy_optimizer, value_optimizer, device)
+				offloaded_here = False
+				if str(getattr(training_cfg, 'ppo_feature_cache_location', 'auto')).lower() == 'auto':
+					offloaded_here = feature_cache.offload_to_cpu()
+				any_cache_offloaded = sync_bool_across_ranks(
+					offloaded_here, device, op=dist.ReduceOp.MAX
+				)
+				if any_cache_offloaded:
+					feature_cache_offloads += int(offloaded_here)
+					if is_rank0:
+						print("PPO feature cache offloaded to CPU after CUDA OOM")
+					continue
+				next_microbatch = batch_sizer.backoff(microbatch_size)
+				if next_microbatch is None:
+					abort_reason = "cuda_oom_at_min_microbatch"
+					if is_rank0:
+						print(
+							f"⚠️ PPO OOM at minimum microbatch={microbatch_size}; "
+							f"stopping remaining epochs. {oom_detail}"
+						)
+					break
+				microbatch_size = sync_min_int_across_ranks(next_microbatch, device)
+				if is_rank0:
+					print(
+						f"♻️ PPO CUDA OOM; retrying epoch {epoch + 1} "
+						f"with microbatch={microbatch_size}"
+					)
+				continue
+
+			# Gradients are still AMP-scaled here.  Reducing them first propagates
+			# any non-finite value to every rank so GradScaler stays synchronized.
+			ddp_gradient_buckets = average_gradients_across_ranks(
+				model,
+				K,
+				device,
+				bucket_cap_mb=float(getattr(training_cfg, 'ddp_gradient_bucket_mb', 25.0)),
+			)
+			if amp_scaler is not None and getattr(amp_scaler, 'is_enabled', lambda: False)():
+				old_scale = amp_scaler.get_scale()
+				amp_scaler.unscale_(policy_optimizer)
+				amp_scaler.unscale_(value_optimizer)
+				torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
+				torch.nn.utils.clip_grad_norm_(value_params, max_grad_norm)
+				amp_scaler.step(policy_optimizer)
+				amp_scaler.step(value_optimizer)
+				amp_scaler.update()
+				did_optimizer_step = did_optimizer_step or (amp_scaler.get_scale() >= old_scale)
+			else:
+				torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
+				torch.nn.utils.clip_grad_norm_(value_params, max_grad_norm)
+				policy_optimizer.step()
+				value_optimizer.step()
+				did_optimizer_step = True
+
+			completed_epochs += 1
+			epoch_summary = torch.stack((
+				epoch_policy_loss,
+				epoch_value_loss,
+				epoch_entropy,
+				epoch_approx_kl,
+				epoch_old_approx_kl,
+				epoch_clip_frac,
+				epoch_ratio_mean,
+				epoch_ratio_min,
+				epoch_ratio_max,
+				epoch_max_action_prob,
+			)).detach().cpu().tolist()
+			(
+				last_policy_loss,
+				last_value_loss,
+				last_entropy,
+				last_approx_kl,
+				last_old_approx_kl,
+				last_clip_frac,
+				last_ratio_mean,
+				last_ratio_min,
+				last_ratio_max,
+				last_max_action_prob_mean,
+			) = (float(value) for value in epoch_summary)
+			break
+
+		if abort_reason:
+			break
 
 		if is_rank0:
 			print(
@@ -2535,21 +2989,31 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 				f"{last_ratio_min:.3f}-{last_ratio_max:.3f}, maxp: {last_max_action_prob_mean:.3f}"
 			)
 
+	if not abort_reason:
+		batch_sizer.record_success(microbatch_size, K)
+
 	model.eval()
 	if is_rank0:
-		print(f"✅ 第 {iteration} 个iteration - 经验采样训练完成")
-	stats = make_update_stats("", device)
+		if abort_reason:
+			print(f"PPO update {update_step} stopped early: {abort_reason}")
+		else:
+			print(f"PPO update {update_step} complete")
+	stats = make_update_stats(abort_reason, device)
 	stats.update({
 		'did_optimizer_step': did_optimizer_step,
 		'num_candidates': int(N),
 		'num_selected': int(K),
+		'ppo_microbatch_size': int(microbatch_size),
+		'ppo_microbatch_count': int(math.ceil(K / max(1, microbatch_size))),
+		'ppo_microbatch_retries': int(microbatch_retries),
+		'ppo_memory_adapted': bool(memory_adapted),
 		'num_eligible': int(eligible_count),
 		'num_threshold_candidates': int(threshold_count),
 		'num_min_keep': int(min_keep),
 		'num_selected_threshold': int(selected_from_threshold),
 		'num_selected_protection': int(selected_from_protection),
 		'filter_protection_applied': bool(protection_applied),
-		'num_epochs': int(ppo_epochs),
+		'num_epochs': int(completed_epochs),
 		'policy_loss': last_policy_loss,
 		'value_loss': last_value_loss,
 		'entropy': last_entropy,
@@ -2561,7 +3025,11 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		'ratio_max': last_ratio_max,
 		'max_action_prob_mean': last_max_action_prob_mean,
 		'ppo_update_time_s': time.time() - update_start_time,
-		'ppo_feature_rebuild_ms': ppo_feature_rebuild_ms,
+		'ppo_feature_cache_build_ms': ppo_feature_cache_build_ms,
+		'ppo_feature_cache_location': feature_cache.location,
+		'ppo_feature_cache_oom_retries': int(feature_cache_oom_retries),
+		'ppo_feature_cache_offloads': int(feature_cache_offloads),
+		'ddp_gradient_buckets': int(ddp_gradient_buckets),
 	})
 	stats.update(cuda_memory_stats(device))
 	if is_rank0 and device.type == 'cuda':
@@ -2571,712 +3039,666 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		)
 	return a_max_ewma.detach(), stats
 
-def perform_ppo_update_single_gpu(model, policy_optimizer, value_optimizer,
-								 rollout_buffer, condition_state,
-								 features_tensor, simulator, config, iteration, a_max_ewma=None,
-								 amp_scaler=None, bootstrap_value=None,
-								 feature_workspace: FeatureBuildWorkspace = None):
-	return perform_ppo_update(
-		model, policy_optimizer, value_optimizer,
-		rollout_buffer, condition_state,
-		features_tensor, simulator, config, iteration,
-		rank=None, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
-		bootstrap_value=bootstrap_value,
-		feature_workspace=feature_workspace,
-	)
+@dataclass(frozen=True)
+class DistributedContext:
+    rank: int
+    world_size: int
+    device: torch.device
+    store: object = None
 
-def perform_ppo_update_multi_gpu(model, policy_optimizer, value_optimizer,
-								rollout_buffer, condition_state,
-								features_tensor, simulator, config, iteration, rank, a_max_ewma=None,
-								amp_scaler=None, bootstrap_value=None,
-								feature_workspace: FeatureBuildWorkspace = None):
-	return perform_ppo_update(
-		model, policy_optimizer, value_optimizer,
-		rollout_buffer, condition_state,
-		features_tensor, simulator, config, iteration,
-		rank=rank, a_max_ewma=a_max_ewma, amp_scaler=amp_scaler,
-		bootstrap_value=bootstrap_value,
-		feature_workspace=feature_workspace,
-	)
+    @property
+    def is_distributed(self) -> bool:
+        return self.world_size > 1
 		
-# ============================== 寻找空闲端口 ==============================
+    @property
+    def is_primary(self) -> bool:
+        return self.rank == 0
+
+    @property
+    def update_rank(self):
+        return self.rank if self.is_distributed else None
+
+    def all_true(self, value: bool) -> bool:
+        if not self.is_distributed:
+            return value
+        return sync_bool_across_ranks(value, self.device, op=dist.ReduceOp.MIN)
+
+    def log(self, message: str, *, all_ranks: bool = False):
+        if all_ranks or self.is_primary:
+            print(f"[Rank {self.rank}] {message}", flush=True)
+
+
 def _find_free_port() -> int:
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	s.bind(("127.0.0.1", 0))
-	addr, port = s.getsockname()
-	s.close()
-	return port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
-# ============================== 设置DDP环境 ==============================
-def setup_ddp_env(rank: int, gpu_count: int, master_addr: str, master_port: int):
-	os.environ['MASTER_ADDR'] = master_addr
-	os.environ['MASTER_PORT'] = str(master_port)
-	os.environ['gpu_count'] = str(gpu_count)
-	os.environ['RANK'] = str(rank)
-	# Windows/本地优先gloo网卡
-	if os.name == 'nt':
-		# 不设置 lo，避免 Windows 找不到接口
-		os.environ['GLOO_DEVICE_TRANSPORT'] = 'tcp'
-		os.environ.pop('GLOO_SOCKET_IFNAME', None)
+	
+def initialize_distributed_context(
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+) -> DistributedContext:
+    device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+		
+    store = None
+    if world_size > 1:
+        if os.name == 'nt':
+            os.environ['GLOO_DEVICE_TRANSPORT'] = 'tcp'
+            os.environ.pop('GLOO_SOCKET_IFNAME', None)
+        store = dist.TCPStore(
+            master_addr,
+            master_port,
+            world_size,
+            rank == 0,
+            timeout=timedelta(seconds=180),
+        )
+        backend = 'nccl' if (os.name != 'nt' and torch.cuda.is_available()) else 'gloo'
+        dist.init_process_group(
+            backend=backend,
+            world_size=world_size,
+            rank=rank,
+            store=store,
+            timeout=timedelta(seconds=180),
+        )
+    return DistributedContext(rank=rank, world_size=world_size, device=device, store=store)
 
-# ============================== 清理DDP环境 ==============================
+
 def cleanup_ddp():
-	if dist.is_initialized():
-		dist.destroy_process_group()
-
-# ============================== DDPPO训练 ==============================
-def ddppo_worker(rank: int, gpu_count: int, config_dict: dict, master_addr: str, master_port: int, store_port: int):
-	for stream in (sys.stdout, sys.stderr):
-		try:
-			stream.reconfigure(line_buffering=True, write_through=True)
-		except Exception:
-			pass
-
-	def worker_log(message: str):
-		print(f"[Rank {rank}] {message}", flush=True)
-
-	if gpu_count == 1:
-		#TODO:这里写单卡训练代码，用于调试
-		worker_log("worker start: single-gpu path")
-		device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
-		torch.cuda.set_device(device) if device.type == 'cuda' else None
-		config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
-		worker_log("creating network")
-		model = create_network(config=config, network_type="independent")
-		model = model.to(device)
-		worker_log("network ready")
-		worker_log("creating simulator")
-		simulator = TeraflowSimulator(config=config_dict, device=device)
-		worker_log("simulator ready")
-
-		sim_cfg = getattr(config, 'simulator')
-		training_cfg = getattr(config, 'training')
-		learning_rate = getattr(training_cfg, 'learning_rate')
-		num_iterations = getattr(training_cfg, 'iteration')
-		max_episode_length = getattr(training_cfg,'max_episode_length')
-		ppo_epochs = getattr(training_cfg, 'ppo_epochs')
-		gamma = getattr(training_cfg, 'gamma')
-		gae_lambda = getattr(training_cfg, 'gae_lambda')
-		clip_ratio = getattr(training_cfg, 'clip_ratio')
-		entropy_coef = getattr(training_cfg, 'entropy_coef')
-		value_loss_coef = getattr(training_cfg, 'value_loss_coef')
-		max_grad_norm = getattr(training_cfg, 'max_grad_norm')
-		checkpoint_interval = getattr(training_cfg, 'checkpoint_interval')
-		checkpoint_dir = getattr(training_cfg, 'checkpoint_dir')
-		log_interval = getattr(training_cfg, 'log_interval', 10)
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 		
-		# 分别创建策略网络和价值网络的优化器
-		policy_optimizer = optim.Adam(get_policy_parameters(model), lr=learning_rate)
-		value_optimizer = optim.Adam(get_value_parameters(model), lr=learning_rate)
 
-		# 分别创建策略网络和价值网络的调度器
-		policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(policy_optimizer, T_max=num_iterations, eta_min=0.0)
-		value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(value_optimizer, T_max=num_iterations, eta_min=0.0)
-		resume_from = getattr(training_cfg, 'resume_from', None)
-		start_iteration = 0
-		if resume_from:
-			start_iteration = load_checkpoint(model, policy_optimizer, value_optimizer, resume_from, device)
-			advance_scheduler_to_iteration(policy_scheduler, value_scheduler, start_iteration)
-			print(f"✅ 从 checkpoint 恢复: {resume_from}, start_iteration={start_iteration}")
+def validate_runtime_contract(config, simulator, context: DistributedContext):
+    schema = FeatureSchema.from_config(config)
+    configured_actions = int(getattr(config.training.network, 'num_actions', 12))
+    simulator_actions = int(simulator.dynamics_model.discrete_action_space.num_actions)
+    if configured_actions != simulator_actions:
+        raise ValueError(
+            f"network num_actions={configured_actions} does not match simulator action space={simulator_actions}"
+        )
 
-		# 优势过滤参数
-		beta = getattr(training_cfg, 'advantage_filter_beta', 0.25)	# EWMA衰减参数
-		advantage_filter_threshold = getattr(training_cfg, 'advantage_filter_threshold', 0.01)	# 优势过滤阈值
-		A_max_ewma = None 		# EWMA of max absolute advantage
-		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 2000)  # 每GPU的batch size
-		rollout_length = getattr(training_cfg, 'rollout_length', 128)  # rollout长度
-		precision = getattr(training_cfg, 'precision', '32-bit')
-		forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
-		amp_scaler = make_grad_scaler(device, precision)
-		profile_on = profile_enabled(config)
-		feature_workspace = FeatureBuildWorkspace(config)
+    per_rank = resolve_ppo_samples_per_rank(config.training)
+    global_target = getattr(config.training, 'batch_size', None)
+    effective_target = per_rank * context.world_size
+    target_text = f", paper global target={int(global_target)}" if global_target is not None else ""
+    context.log(
+        f"feature width={schema.total_input_dim}, PPO samples/rank={per_rank}, "
+        f"effective target={effective_target}{target_text}"
+    )
+
+
+def adapt_num_envs_to_memory(config_dict: dict, device: torch.device) -> int:
+    """Cap worlds/rank from free VRAM using rollout and PPO working-set bytes."""
+    simulator_cfg = config_dict['simulator']
+    training_cfg = config_dict['training']
+    configured = int(simulator_cfg['num_envs'])
+    if device.type != 'cuda' or not bool(training_cfg.get('memory_adaptation', {}).get('enabled', True)):
+        return configured
+
+    memory_cfg = training_cfg.get('memory_adaptation', {})
+    target_fraction = min(0.98, max(0.1, float(memory_cfg.get('target_fraction', 0.85))))
+    reserve_bytes = int(float(memory_cfg.get('reserve_mb', 1024.0)) * 1024 ** 2)
+    minimum = max(1, int(memory_cfg.get('min_num_envs', 8)))
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    usable_bytes = max(0, int(free_bytes * target_fraction) - reserve_bytes)
+
+    max_agents = int(simulator_cfg['max_agents_num'])
+    rollout_length = int(training_cfg['rollout_length'])
+    route_targets = 4
+    rollout_bytes_per_agent_step = (
+        10 * 4                         # buffered state + control
+        + route_targets * 2 + 2 + 2   # compact route state
+        + 3 * 4                       # reward, value, old log-prob
+        + 1 + 1                       # done and uint8 action
+    )
+    ppo_work_bytes_per_agent_step = 32
+    simulator_bytes_per_agent = 256
+    bytes_per_world = (
+        max_agents
+        * (
+            rollout_length
+            * (rollout_bytes_per_agent_step + ppo_work_bytes_per_agent_step)
+            + simulator_bytes_per_agent
+        )
+        + rollout_length * 8
+    )
+    budget_cap = max(1, usable_bytes // max(1, bytes_per_world))
+    effective = min(configured, max(minimum, int(budget_cap)))
+    simulator_cfg['num_envs'] = effective
+    return effective
+
+
+def preallocate_rollout_buffer(simulator, rollout_length: int) -> RolloutTensorBuffer:
+    """Allocate the complete persistent rollout footprint before training starts."""
+    buffer = RolloutTensorBuffer(rollout_length)
+    state = simulator.agents_state
+    B, M = state.shape[:2]
+    alive_mask = state[..., 6] > 0.5
+    route_state = simulator.get_route_state(clone=False)
+    buffer.write_pre_step_from_simulator(
+        simulator,
+        alive_mask,
+        route_state,
+        time_index=torch.zeros(B, dtype=torch.long, device=state.device),
+    )
+    zeros = torch.zeros((B, M), dtype=state.dtype, device=state.device)
+    buffer.write_post_step(
+        zeros,
+        torch.zeros((B, M), dtype=torch.bool, device=state.device),
+        zeros,
+        zeros,
+        torch.zeros((B, M), dtype=torch.long, device=state.device),
+    )
+    buffer.clear()
+    return buffer
+
+
+def create_simulator_and_rollout_buffer_with_backoff(
+    config_dict: dict,
+    device: torch.device,
+):
+    """Probe real simulator/reset/buffer allocations and halve worlds on CUDA OOM."""
+    memory_cfg = config_dict['training'].get('memory_adaptation', {})
+    minimum = max(1, int(memory_cfg.get('min_num_envs', 8)))
+    rollout_length = int(config_dict['training']['rollout_length'])
+    candidate = int(config_dict['simulator']['num_envs'])
+    while True:
+        simulator = None
+        rollout_buffer = None
+        try:
+            config_dict['simulator']['num_envs'] = candidate
+            simulator = TeraflowSimulator(config=config_dict, device=device)
+            simulator.reset(return_observation=False)
+            rollout_buffer = preallocate_rollout_buffer(simulator, rollout_length)
+            return simulator, rollout_buffer
+        except RuntimeError as exc:
+            if not is_cuda_oom_error(exc, device) or candidate <= minimum:
+                raise
+            next_candidate = max(minimum, candidate // 2)
+            print(
+                f"CUDA OOM during simulator/rollout preflight; "
+                f"retrying num_envs {candidate} -> {next_candidate}",
+                flush=True,
+            )
+            simulator = None
+            rollout_buffer = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            candidate = next_candidate
+
 		
-		for k in range(start_iteration, num_iterations):
-			print(f"🔄 开始第 {k+1}/{num_iterations} 轮迭代")
+def run_training_loop(
+    context: DistributedContext,
+    model,
+    simulator,
+    config,
+    policy_optimizer,
+    value_optimizer,
+    policy_scheduler,
+    value_scheduler,
+    progress: dict,
+    total_updates: int,
+    amp_scaler,
+    batch_sizers: dict,
+    rollout_buffer: RolloutTensorBuffer = None,
+    experiment_tracker=None,
+):
+    training_cfg = config.training
+    max_episode_length = int(training_cfg.max_episode_length)
+    checkpoint_interval = int(getattr(training_cfg, 'checkpoint_interval', 100))
+    checkpoint_dir = getattr(training_cfg, 'checkpoint_dir')
+    log_interval = int(getattr(training_cfg, 'log_interval', 10))
+    rollout_length = int(getattr(training_cfg, 'rollout_length', 128))
+    precision = getattr(training_cfg, 'precision', '32-bit')
+    forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
+    profile_on = profile_enabled(config)
+    feature_workspace = FeatureBuildWorkspace(config)
+    ppo_batch_sizer = batch_sizers['ppo']
+    rollout_batch_sizer = batch_sizers['rollout']
+    a_max_ewma = progress.pop('a_max_ewma', None)
+    progress.setdefault('update_step', 0)
+    progress.setdefault('environment_steps', 0)
+    progress.setdefault('rank0_completed_world_episodes', 0)
+    global_worlds_per_step = sum_int_across_ranks(simulator.num_envs, context.device)
 
-			episode_start_time = time.time()
-			# ============================== 采样（初始化） ==============================
-			if profile_on:
-				reset_profile_start = profile_timer_start(device, config)
-			worker_log(f"iteration {k+1}: reset start")
-			simulator.reset(return_observation=False)
-			worker_log(f"iteration {k+1}: reset done")
-			if profile_on:
-				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
-			condition_state = snapshot_condition_state(simulator)
-			features_tensor = None
-			worker_log(f"iteration {k+1}: rollout feature build deferred to alive-agent chunks")
-			if profile_on:
-				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build=0.00ms")
-			
-			# =========================== 步进式训练：与game.py完全一致 ==============================
-			B, M, S = simulator.agents_state.shape
-			step_count = 0
-			
-			# 初始化全局buffer（与game.py一致）
-			rollout_buffer = RolloutTensorBuffer(rollout_length)
-			buffer_step_count = 0
-			iteration_update_stats = make_update_stats("no_update", device)
-			rollout_diag = init_rollout_diagnostics(config, device)
-			try:
-				diag_action_values = simulator.dynamics_model.discrete_action_space.get_all_actions()
-			except Exception:
-				diag_action_values = None
-			
-			# 初始化累积done状态（与game.py一致）
-			cumulative_done_all = None
+    try:
+        diag_action_values = simulator.dynamics_model.discrete_action_space.get_all_actions()
+    except Exception:
+        diag_action_values = None
 
-			while step_count < max_episode_length:
-				# 全局死亡检测：如果所有世界都没有存活agents，执行PPO更新后开始新iteration
-				alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
-				if not bool(alive_mask.any().item()):
-					if buffer_step_count > 0:
-						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
-						print_rollout_diagnostics(
-							rollout_diag,
-							action_values=diag_action_values,
-							prefix=f"📈 rollout诊断(iter {k+1}, len {buffer_step_count})",
-						)
-						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
-							model, policy_optimizer, value_optimizer,
-							rollout_buffer, condition_state,
-							None, simulator, config, k+1, A_max_ewma, amp_scaler,
-							bootstrap_value=None,
-							feature_workspace=feature_workspace)
-						merge_update_stats(iteration_update_stats, update_stats)
-						clear_rollout_buffers(rollout_buffer)
-						rollout_diag = init_rollout_diagnostics(config, device)
-					else:
-						print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
-					break
+    if int(progress['update_step']) >= total_updates:
+        context.log(
+            f"checkpoint already reached update {progress['update_step']}/{total_updates}"
+        )
+        return progress
+
+    if max_episode_length % rollout_length != 0:
+        raise ValueError(
+            "training.max_episode_length must be divisible by training.rollout_length "
+            "when masked resets occur at rollout boundaries"
+        )
+    if simulator.agents_state is None:
+        if profile_on:
+            reset_profile_start = profile_timer_start(context.device, config)
+        simulator.reset(return_observation=False)
+        if profile_on and context.is_primary:
+            reset_ms = profile_elapsed_ms(reset_profile_start, context.device, config)
+            print(f"reset={reset_ms:.2f}ms, initial_feature_build=0.00ms")
+
+    condition_state = snapshot_condition_state(simulator)
+    rollout_buffer = rollout_buffer or RolloutTensorBuffer(rollout_length)
+    cumulative_done_all = None
+    episode_steps = torch.zeros(
+        simulator.num_envs, dtype=torch.long, device=context.device
+    )
+    last_checkpoint_update = 0
+
+    for update_number in range(int(progress['update_step']) + 1, total_updates + 1):
+        context.log(f"starting update {update_number}/{total_updates}")
+        update_start_time = time.time()
+        rollout_buffer.clear()
+        rollout_diag = init_rollout_diagnostics(config, context.device) if context.is_primary else None
+        rollout_target = rollout_length
+
+        while len(rollout_buffer) < rollout_target:
+            alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
+
+            step_start_time = time.time()
+            actions, old_log_probs, value_pred, rollout_profile = rollout_forward_alive_agents(
+                model,
+                simulator,
+                config,
+                alive_mask,
+                condition_state,
+                dropout_step=episode_steps,
+                precision=precision,
+                forward_chunk_agents=forward_chunk_agents,
+                sample_actions=True,
+                feature_workspace=feature_workspace,
+                batch_sizer=rollout_batch_sizer,
+            )
+            policy_forward_ms = rollout_profile['policy_ms']
+            feature_build_ms = rollout_profile['feature_ms']
 				
-				# 单步训练（与game.py的update_game_state一致）
-				step_start_time = time.time()
-				debug_step = step_count < 3
-				if debug_step:
-					worker_log(f"step {step_count + 1}: policy start")
-				actions, old_log_probs, value_pred, rollout_profile = rollout_forward_alive_agents(
-					model,
-					simulator,
-					config,
-					alive_mask,
-					condition_state,
-					dropout_step=step_count,
-					precision=precision,
-					forward_chunk_agents=forward_chunk_agents,
-					sample_actions=True,
-					feature_workspace=feature_workspace,
-				)
-				policy_forward_ms = rollout_profile['policy_ms']
-				feature_build_ms = rollout_profile['feature_ms']
-				if debug_step:
-					worker_log(f"step {step_count + 1}: policy done")
-				
-				# 在推进环境前缓存当前状态
-				pre_route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
-				rollout_buffer.write_pre_step_from_simulator(simulator, alive_mask, pre_route_state, time_index=step_count)
-				
-				# 环境步进
-				if profile_on:
-					env_profile_start = profile_timer_start(device, config)
-				if debug_step:
-					worker_log(f"step {step_count + 1}: env start")
-				reward, done = simulator.step(actions, return_observation=False)
-				if debug_step:
-					worker_log(f"step {step_count + 1}: env done")
-				if profile_on:
-					env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
-				
-				# 写入训练buffer（与game.py一致）
-				rollout_buffer.write_post_step(reward, done, value_pred, old_log_probs, actions)
-				update_rollout_diagnostics(rollout_diag, simulator, alive_mask, reward, done, actions)
-				buffer_step_count = len(rollout_buffer)
-				
-				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
-				current_done_all = done.detach().bool()  # (B, M)
-				if cumulative_done_all is None:
-					cumulative_done_all = current_done_all.clone()
-				else:
-					cumulative_done_all = cumulative_done_all | current_done_all
-				no_alive_after_step = not bool(rollout_alive_mask(simulator, cumulative_done_all).any().item())
-				
-				# 下一步 feature 不再整批预构造；下个循环会按 alive agent chunk 即时生成。
-				features_tensor = None
-				
-				step_count += 1
-				if step_count % log_interval == 0:
-					print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
-				if profile_on and step_count % profile_log_interval(config) == 0:
-					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
-					rollout_path = rollout_profile.get('path', 'none')
-					rollout_selected = int(rollout_profile.get('num_selected', 0) or 0)
-					rollout_chunks = int(rollout_profile.get('feature_chunks', 0) or 0)
-					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
-						  + f", path={rollout_path}, selected={rollout_selected}, feature_chunks={rollout_chunks}"
-						  + (f", {step_profile}" if step_profile else ""))
+            pre_route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
+            rollout_buffer.write_pre_step_from_simulator(
+                simulator,
+                alive_mask,
+                pre_route_state,
+                time_index=episode_steps,
+            )
 
-				if no_alive_after_step:
-					print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
-					print_rollout_diagnostics(
-						rollout_diag,
-						action_values=diag_action_values,
-						prefix=f"📈 rollout诊断(iter {k+1}, len {buffer_step_count})",
-					)
-					A_max_ewma, update_stats = perform_ppo_update_single_gpu(
-						model, policy_optimizer, value_optimizer,
-						rollout_buffer, condition_state,
-						None, simulator, config, k+1, A_max_ewma, amp_scaler,
-						bootstrap_value=None,
-						feature_workspace=feature_workspace)
-					merge_update_stats(iteration_update_stats, update_stats)
-					clear_rollout_buffers(rollout_buffer)
-					rollout_diag = init_rollout_diagnostics(config, device)
-					break
-				
-				# 检查是否需要PPO更新（与game.py一致）
-				if buffer_step_count >= rollout_length or step_count >= max_episode_length:
-					if step_count >= max_episode_length:
-						print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
-						print_rollout_diagnostics(
-							rollout_diag,
-							action_values=diag_action_values,
-							prefix=f"📈 rollout诊断(iter {k+1}, len {buffer_step_count})",
-						)
-						bootstrap_value = current_rollout_bootstrap_value(
-							model, simulator, config, cumulative_done_all,
-							condition_state, step_count, precision, forward_chunk_agents,
-							feature_workspace=feature_workspace)
-						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
-							model, policy_optimizer, value_optimizer,
-							rollout_buffer, condition_state,
-							None, simulator, config, k+1, A_max_ewma, amp_scaler,
-							bootstrap_value=bootstrap_value,
-							feature_workspace=feature_workspace)
-						merge_update_stats(iteration_update_stats, update_stats)
-						clear_rollout_buffers(rollout_buffer)
-						rollout_diag = init_rollout_diagnostics(config, device)
-						print("🔄 达到最大步数，强制开启新iteration...")
-						break
-					else:
-						print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
-						print_rollout_diagnostics(
-							rollout_diag,
-							action_values=diag_action_values,
-							prefix=f"📈 rollout诊断(iter {k+1}, len {buffer_step_count})",
-						)
-						bootstrap_value = current_rollout_bootstrap_value(
-							model, simulator, config, cumulative_done_all,
-							condition_state, step_count, precision, forward_chunk_agents,
-							feature_workspace=feature_workspace)
-						A_max_ewma, update_stats = perform_ppo_update_single_gpu(
-							model, policy_optimizer, value_optimizer,
-							rollout_buffer, condition_state,
-							None, simulator, config, k+1, A_max_ewma, amp_scaler,
-							bootstrap_value=bootstrap_value,
-							feature_workspace=feature_workspace)
-						merge_update_stats(iteration_update_stats, update_stats)
+            if profile_on:
+                env_profile_start = profile_timer_start(context.device, config)
+            reward, done = simulator.step(actions, return_observation=False)
+            if profile_on:
+                env_step_ms = profile_elapsed_ms(env_profile_start, context.device, config)
 
-						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
-						if all_worlds_no_alive_agents(simulator, cumulative_done_all):
-							print("🔄 所有世界都没有存活agents，开启新iteration...")
-							clear_rollout_buffers(rollout_buffer)
-							rollout_diag = init_rollout_diagnostics(config, device)
-							break
-						else:
-							print("✅ 仍有世界有存活agents，继续下一个128step...")
-							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
-							clear_rollout_buffers(rollout_buffer)
-							buffer_step_count = 0
-							rollout_diag = init_rollout_diagnostics(config, device)
-							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
+            rollout_buffer.write_post_step(reward, done, value_pred, old_log_probs, actions)
+            update_rollout_diagnostics(rollout_diag, simulator, alive_mask, reward, done, actions)
 
+            current_done_all = done.detach().bool()
+            cumulative_done_all = (
+                current_done_all.clone()
+                if cumulative_done_all is None
+                else cumulative_done_all | current_done_all
+            )
+            episode_steps.add_(1)
+            progress['environment_steps'] += global_worlds_per_step
+            if context.is_primary and len(rollout_buffer) % log_interval == 0:
+                print(
+                    f"rollout step {len(rollout_buffer)}/{rollout_target}: "
+                    f"{time.time() - step_start_time:.4f}s"
+                )
+            if (
+                context.is_primary
+                and profile_on
+                and len(rollout_buffer) % profile_log_interval(config) == 0
+            ):
+                step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
+                rollout_path = rollout_profile.get('path', 'none')
+                rollout_selected = int(rollout_profile.get('num_selected', 0) or 0)
+                rollout_chunks = int(rollout_profile.get('feature_chunks', 0) or 0)
+                print(
+                    f"profile step={len(rollout_buffer)}: policy={policy_forward_ms:.2f}ms, "
+                    f"env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms, "
+                    f"path={rollout_path}, selected={rollout_selected}, "
+                    f"feature_chunks={rollout_chunks}"
+                    + (f", {step_profile}" if step_profile else "")
+                )
 
-			# 只有真实完成 optimizer step 后才推进学习率，避免空样本或 AMP skip 时跳过首个LR。
-			scheduler_stepped = step_schedulers_if_updated(policy_scheduler, value_scheduler, iteration_update_stats)
-			if profile_on:
-				last_update = iteration_update_stats.get('last_update', {})
-				print(f"\t⏱️ update profile: scheduler_step={scheduler_stepped}, "
-					  f"samples={iteration_update_stats.get('num_selected', 0)}, "
-					  f"ppo={iteration_update_stats.get('ppo_update_time_s', 0.0):.3f}s, "
-					  f"ppo_feature_rebuild={iteration_update_stats.get('ppo_feature_rebuild_ms', 0.0):.2f}ms, "
-					  f"mem_alloc={iteration_update_stats.get('max_memory_allocated_mb', 0.0):.1f}MB, "
-					  f"skip={last_update.get('skip_reason', '')}")
-			# 保存检查点
-			if (k + 1) % checkpoint_interval == 0:
-				save_checkpoint(model, policy_optimizer, value_optimizer, k + 1, checkpoint_dir)
-			print(f"🎯 本轮总步数耗时: {time.time()-episode_start_time:.4f}秒")
+        bootstrap_value = current_rollout_bootstrap_value(
+            model,
+            simulator,
+            config,
+            cumulative_done_all,
+            condition_state,
+            episode_steps,
+            precision,
+            forward_chunk_agents,
+            feature_workspace=feature_workspace,
+            batch_sizer=rollout_batch_sizer,
+        )
+        if context.is_primary:
+            print_rollout_diagnostics(
+                rollout_diag,
+                action_values=diag_action_values,
+                prefix=f"rollout diagnostics (update {update_number}, len {len(rollout_buffer)})",
+            )
 
-		print('train done!')
-		return 0
-	
-	try:
-		worker_log("worker start: ddp path")
-		device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
-		torch.cuda.set_device(device) if device.type == 'cuda' else None
-		# 调试打印：确认设备映射
-		print(f"[Rank {rank}] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
-		print(f"[Rank {rank}] device={device}")
-		print(f"[Rank {rank}] torch.cuda.current_device()={torch.cuda.current_device()}, name={torch.cuda.get_device_name(torch.cuda.current_device())}")
-		print(f"[Rank {rank}] torch.cuda.device_count()={torch.cuda.device_count()}")
-		# 设置环境变量
-		setup_ddp_env(rank, gpu_count, master_addr, master_port)
-		# TCPStore: rank0为主节点
-		is_master = (rank == 0)
-		
-		store = dist.TCPStore(master_addr, store_port, gpu_count, is_master, timeout=timedelta(seconds=180))
+        a_max_ewma, update_stats = perform_ppo_update(
+            model,
+            policy_optimizer,
+            value_optimizer,
+            rollout_buffer,
+            condition_state,
+            simulator,
+            config,
+            update_number,
+            rank=context.update_rank,
+            a_max_ewma=a_max_ewma,
+            amp_scaler=amp_scaler,
+            bootstrap_value=bootstrap_value,
+            feature_workspace=feature_workspace,
+            batch_sizer=ppo_batch_sizer,
+            feature_batch_sizer=batch_sizers['feature'],
+        )
 
-		# 使用store初始化进程组（按原文示例）
-		backend = 'nccl' if (os.name != 'nt' and torch.cuda.is_available()) else 'gloo'
-		dist.init_process_group(backend=backend, world_size=gpu_count, rank=rank, store=store, timeout=timedelta(seconds=180))
-		# 用PrefixStore追踪完成数量
-		num_workers_done = dist.PrefixStore("num_workers_done", store)
+        progress['update_step'] = update_number
+        scheduler_stepped = step_schedulers_if_updated(
+            policy_scheduler, value_scheduler, update_stats
+        )
+        if context.is_primary and profile_on:
+            print(
+                f"update profile: scheduler_step={scheduler_stepped}, "
+                f"samples={update_stats.get('num_selected', 0)}, "
+                f"ppo={update_stats.get('ppo_update_time_s', 0.0):.3f}s, "
+                f"ppo_feature_cache={update_stats.get('ppo_feature_cache_build_ms', 0.0):.2f}ms, "
+                f"mem_alloc={update_stats.get('max_memory_allocated_mb', 0.0):.1f}MB, "
+                f"oom_retries={update_stats.get('ppo_microbatch_retries', 0)}, "
+                f"skip={update_stats.get('skip_reason', '')}"
+            )
 
-		# 载入配置并建模
-		config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
-		worker_log("creating network")
-		model = create_network(config=config, network_type="independent")
-		model = model.to(device)
-		worker_log("network ready")
-		
-		# 按原文示例的DDP签名（等价于传入本地rank）
-		if device.type == 'cuda':
-			model = DDP(model, device_ids=[rank], output_device=rank)
-		else:
-			model = DDP(model)
+        world_alive = rollout_alive_mask(simulator, cumulative_done_all).any(dim=1)
+        reset_world_mask = (~world_alive) | (episode_steps >= max_episode_length)
+        local_completed = int(reset_world_mask.sum().item())
+        if context.is_primary:
+            progress['rank0_completed_world_episodes'] += local_completed
+        if local_completed > 0:
+            simulator.reset_worlds(reset_world_mask, return_observation=False)
+            episode_steps.masked_fill_(reset_world_mask, 0)
+            cumulative_done_all = cumulative_done_all & (~reset_world_mask.unsqueeze(1))
+            condition_state = snapshot_condition_state(simulator)
 
-		# ==== 与单卡保持一致的模拟器与超参数初始化 ====
-		worker_log("creating simulator")
-		simulator = TeraflowSimulator(config=config_dict, device=device)
-		worker_log("simulator ready")
-		sim_cfg = getattr(config, 'simulator', SimpleNamespace())
-		training_cfg = getattr(config, 'training', SimpleNamespace())
-		learning_rate = getattr(training_cfg, 'learning_rate', 3e-4)
-		num_iterations = getattr(training_cfg, 'iteration')
-		max_episode_length = getattr(training_cfg, 'max_episode_length', 1024)
-		ppo_epochs = getattr(training_cfg, 'ppo_epochs', 2)
-		gamma = getattr(training_cfg, 'gamma', 0.999)
-		gae_lambda = getattr(training_cfg, 'gae_lambda', 0.95)
-		clip_ratio = getattr(training_cfg, 'clip_ratio', 0.2)
-		entropy_coef = getattr(training_cfg, 'entropy_coef', 0.01)
-		value_loss_coef = getattr(training_cfg, 'value_loss_coef', 0.5)
-		max_grad_norm = getattr(training_cfg, 'max_grad_norm', 1.0)
-		checkpoint_interval = getattr(training_cfg, 'checkpoint_interval', 1)
-		checkpoint_dir = getattr(training_cfg, 'checkpoint_dir')
-		log_interval = getattr(training_cfg, 'log_interval', 10)
-		# 优势过滤参数
-		beta = getattr(training_cfg, 'advantage_filter_beta', 0.25)
-		advantage_filter_threshold = getattr(training_cfg, 'advantage_filter_threshold', 0.01)
-		A_max_ewma = None
-		batch_size_per_gpu = getattr(training_cfg, 'batch_size_per_gpu', 2000)
-		rollout_length = getattr(training_cfg, 'rollout_length', 128)
+        if context.is_primary:
+            update_time_s = time.time() - update_start_time
+            print(f"update time: {update_time_s:.4f}s")
+            if experiment_tracker is not None:
+                metrics = {
+                    'training/update_step': update_number,
+                    'training/environment_steps': progress['environment_steps'],
+                    'training/rank0_completed_world_episodes': progress['rank0_completed_world_episodes'],
+                    'training/update_time_s': update_time_s,
+                    'training/policy_learning_rate': policy_optimizer.param_groups[0]['lr'],
+                    'training/value_learning_rate': value_optimizer.param_groups[0]['lr'],
+                    'ppo/optimizer_step': update_stats.get('did_optimizer_step', False),
+                    'ppo/candidates': update_stats.get('num_candidates', 0),
+                    'ppo/selected_samples': update_stats.get('num_selected', 0),
+                    'ppo/update_time_s': update_stats.get('ppo_update_time_s', 0.0),
+                    'ppo/feature_cache_build_ms': update_stats.get('ppo_feature_cache_build_ms', 0.0),
+                    'ppo/feature_cache_location': update_stats.get('ppo_feature_cache_location'),
+                    'ppo/feature_cache_on_gpu': (
+                        update_stats.get('ppo_feature_cache_location') == 'cuda'
+                    ),
+                    'ppo/feature_cache_oom_retries': update_stats.get('ppo_feature_cache_oom_retries', 0),
+                    'ppo/feature_cache_offloads': update_stats.get('ppo_feature_cache_offloads', 0),
+                    'system/ddp_gradient_buckets': update_stats.get('ddp_gradient_buckets', 0),
+                    'ppo/oom_retries': update_stats.get('ppo_microbatch_retries', 0),
+                    'ppo/memory_adapted': update_stats.get('ppo_memory_adapted', False),
+                    'system/max_memory_allocated_mb': update_stats.get('max_memory_allocated_mb', 0.0),
+                    'system/max_memory_reserved_mb': update_stats.get('max_memory_reserved_mb', 0.0),
+                }
+                for key in (
+                    'ppo_microbatch_size',
+                    'ppo_microbatch_count',
+                    'num_epochs',
+                    'policy_loss',
+                    'value_loss',
+                    'entropy',
+                    'approx_kl',
+                    'old_approx_kl',
+                    'clip_frac',
+                    'ratio_mean',
+                    'ratio_min',
+                    'ratio_max',
+                    'max_action_prob_mean',
+                ):
+                    metrics[f"ppo/{key}"] = update_stats.get(key)
+                metrics.update(rollout_diagnostic_metrics(rollout_diag))
+                experiment_tracker.log(metrics, update_number)
 
-		precision = getattr(training_cfg, 'precision', '32-bit')
-		forward_chunk_agents = int(getattr(training_cfg, 'network_forward_chunk_agents', 32768))
-		amp_scaler = make_grad_scaler(device, precision)
-		profile_on = profile_enabled(config)
-		feature_workspace = FeatureBuildWorkspace(config)
+        if update_number % checkpoint_interval == 0:
+            save_checkpoint(
+                model,
+                policy_optimizer,
+                value_optimizer,
+                policy_scheduler,
+                value_scheduler,
+                amp_scaler,
+                batch_sizers,
+                progress,
+                a_max_ewma,
+                checkpoint_dir,
+                context.device,
+				rank=context.rank,
+            )
+            last_checkpoint_update = update_number
 
-		# 分别创建策略网络和价值网络的优化器，包含 encoder + head
-		policy_optimizer = optim.Adam(get_policy_parameters(model), lr=learning_rate)
-		value_optimizer = optim.Adam(get_value_parameters(model), lr=learning_rate)
-		policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(policy_optimizer, T_max=num_iterations, eta_min=0.0)
-		value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(value_optimizer, T_max=num_iterations, eta_min=0.0)
-		resume_from = getattr(training_cfg, 'resume_from', None)
-		start_iteration = 0
-		if resume_from:
-			start_iteration = load_checkpoint(model, policy_optimizer, value_optimizer, resume_from, device)
-			advance_scheduler_to_iteration(policy_scheduler, value_scheduler, start_iteration)
-			if rank == 0:
-				print(f"✅ 从 checkpoint 恢复: {resume_from}, start_iteration={start_iteration}")
-		
-		# 每一轮迭代（步进式训练：与game.py完全一致）
-		for k in range(start_iteration, num_iterations):
-			# 2) 本轮开始：重置完成计数（保持与原多卡同步逻辑一致）
-			num_workers_done.set("done", b"0")
+    if int(progress['update_step']) != last_checkpoint_update:
+        save_checkpoint(
+            model,
+            policy_optimizer,
+            value_optimizer,
+            policy_scheduler,
+            value_scheduler,
+            amp_scaler,
+            batch_sizers,
+            progress,
+            a_max_ewma,
+            checkpoint_dir,
+            context.device,
+			rank=context.rank,
+        )
 
-			# 采样初始化
-			if profile_on:
-				reset_profile_start = profile_timer_start(device, config)
-			worker_log(f"iteration {k+1}: reset start")
-			simulator.reset(return_observation=False)
-			worker_log(f"iteration {k+1}: reset done")
-			if profile_on:
-				reset_ms = profile_elapsed_ms(reset_profile_start, device, config)
-			condition_state = snapshot_condition_state(simulator)
-			features_tensor = None
-			worker_log(f"iteration {k+1}: rollout feature build deferred to alive-agent chunks")
-			if rank == 0 and profile_on:
-				print(f"\t⏱️ reset={reset_ms:.2f}ms, initial_feature_build=0.00ms")
+    context.log("training complete")
+    return progress
 
-			# =========================== 步进式训练：与game.py完全一致 ==============================
-			B, M, S = simulator.agents_state.shape
-			step_count = 0
-			
-			# 初始化全局buffer（与game.py一致）
-			rollout_buffer = RolloutTensorBuffer(rollout_length)
-			buffer_step_count = 0
-			iteration_update_stats = make_update_stats("no_update", device)
-			rollout_diag = init_rollout_diagnostics(config, device)
-			try:
-				diag_action_values = simulator.dynamics_model.discrete_action_space.get_all_actions()
-			except Exception:
-				diag_action_values = None
-			
-			# 初始化累积done状态（与game.py一致）
-			cumulative_done_all = None
-
-			while step_count < max_episode_length:
-				# 全局死亡检测：如果所有世界都没有存活agents，执行PPO更新后开始新iteration
-				alive_mask = rollout_alive_mask(simulator, cumulative_done_all)
-				local_no_alive = not bool(alive_mask.any().item())
-				if sync_bool_across_ranks(local_no_alive, device, op=dist.ReduceOp.MIN):
-					if buffer_step_count > 0:
-						if rank == 0:
-							print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
-							print_rollout_diagnostics(
-								rollout_diag,
-								action_values=diag_action_values,
-								prefix=f"📈 rollout诊断(rank0 iter {k+1}, len {buffer_step_count})",
-							)
-						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
-							model, policy_optimizer, value_optimizer,
-								rollout_buffer, condition_state,
-								None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
-								bootstrap_value=None,
-								feature_workspace=feature_workspace)
-						merge_update_stats(iteration_update_stats, update_stats)
-						clear_rollout_buffers(rollout_buffer)
-						rollout_diag = init_rollout_diagnostics(config, device)
-					else:
-						if rank == 0:
-							print(f"🔄 所有agents死亡，无buffer数据，直接开始新iteration")
-					break
-				
-				# 单步训练（与game.py的update_game_state一致）
-				step_start_time = time.time()
-				debug_step = step_count < 3
-				if debug_step:
-					worker_log(f"step {step_count + 1}: policy start")
-				actions, old_log_probs, value_pred, rollout_profile = rollout_forward_alive_agents(
-					model,
-					simulator,
-					config,
-					alive_mask,
-					condition_state,
-					dropout_step=step_count,
-					precision=precision,
-					forward_chunk_agents=forward_chunk_agents,
-					sample_actions=True,
-					feature_workspace=feature_workspace,
-				)
-				policy_forward_ms = rollout_profile['policy_ms']
-				feature_build_ms = rollout_profile['feature_ms']
-				if debug_step:
-					worker_log(f"step {step_count + 1}: policy done")
-				
-				# 在推进环境前缓存当前状态
-				pre_route_state = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
-				rollout_buffer.write_pre_step_from_simulator(simulator, alive_mask, pre_route_state, time_index=step_count)
-				
-				# 环境步进
-				if profile_on:
-					env_profile_start = profile_timer_start(device, config)
-				if debug_step:
-					worker_log(f"step {step_count + 1}: env start")
-				reward, done = simulator.step(actions, return_observation=False)
-				if debug_step:
-					worker_log(f"step {step_count + 1}: env done")
-				if profile_on:
-					env_step_ms = profile_elapsed_ms(env_profile_start, device, config)
-				
-				# 写入训练buffer（与game.py一致）
-				rollout_buffer.write_post_step(reward, done, value_pred, old_log_probs, actions)
-				update_rollout_diagnostics(rollout_diag, simulator, alive_mask, reward, done, actions)
-				buffer_step_count = len(rollout_buffer)
-				
-				# 累积done状态，记录这一轮iteration中done过的车辆（与game.py一致）
-				current_done_all = done.detach().bool()  # (B, M)
-				if cumulative_done_all is None:
-					cumulative_done_all = current_done_all.clone()
-				else:
-					cumulative_done_all = cumulative_done_all | current_done_all
-				local_no_alive_after_step = not bool(rollout_alive_mask(simulator, cumulative_done_all).any().item())
-				no_alive_after_step = sync_bool_across_ranks(local_no_alive_after_step, device, op=dist.ReduceOp.MIN)
-				
-				# 下一步 feature 不再整批预构造；下个循环会按 alive agent chunk 即时生成。
-				features_tensor = None
-				
-				step_count += 1
-				if rank == 0 and step_count % log_interval == 0:
-					print(f"\t📍 第 {step_count}/{max_episode_length} 步耗时: {time.time()-step_start_time:.4f}秒")
-				if rank == 0 and profile_on and step_count % profile_log_interval(config) == 0:
-					step_profile = format_profile(getattr(simulator, 'last_step_profile', {}))
-					rollout_path = rollout_profile.get('path', 'none')
-					rollout_selected = int(rollout_profile.get('num_selected', 0) or 0)
-					rollout_chunks = int(rollout_profile.get('feature_chunks', 0) or 0)
-					print(f"\t⏱️ profile step={step_count}: policy={policy_forward_ms:.2f}ms, env={env_step_ms:.2f}ms, feature={feature_build_ms:.2f}ms"
-						  + f", path={rollout_path}, selected={rollout_selected}, feature_chunks={rollout_chunks}"
-						  + (f", {step_profile}" if step_profile else ""))
-
-				if no_alive_after_step:
-					if rank == 0:
-						print(f"🔄 所有agents死亡，执行PPO更新后开始新iteration")
-						print_rollout_diagnostics(
-							rollout_diag,
-							action_values=diag_action_values,
-							prefix=f"📈 rollout诊断(rank0 iter {k+1}, len {buffer_step_count})",
-						)
-					A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
-						model, policy_optimizer, value_optimizer,
-						rollout_buffer, condition_state,
-						None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
-						bootstrap_value=None,
-						feature_workspace=feature_workspace)
-					merge_update_stats(iteration_update_stats, update_stats)
-					clear_rollout_buffers(rollout_buffer)
-					rollout_diag = init_rollout_diagnostics(config, device)
-					break
-				
-				# 检查是否需要PPO更新（与game.py一致）
-				if buffer_step_count >= rollout_length or step_count >= max_episode_length:
-					if step_count >= max_episode_length:
-						if rank == 0:
-							print(f"🎯 第 {k+1} 个iteration - 达到最大步数 {max_episode_length}，强制开始PPO更新...")
-							print_rollout_diagnostics(
-								rollout_diag,
-								action_values=diag_action_values,
-								prefix=f"📈 rollout诊断(rank0 iter {k+1}, len {buffer_step_count})",
-							)
-						bootstrap_value = current_rollout_bootstrap_value(
-							model, simulator, config, cumulative_done_all,
-							condition_state, step_count, precision, forward_chunk_agents,
-							feature_workspace=feature_workspace)
-						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
-							model, policy_optimizer, value_optimizer,
-							rollout_buffer, condition_state,
-							None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
-							bootstrap_value=bootstrap_value,
-							feature_workspace=feature_workspace)
-						merge_update_stats(iteration_update_stats, update_stats)
-						clear_rollout_buffers(rollout_buffer)
-						rollout_diag = init_rollout_diagnostics(config, device)
-						if rank == 0:
-							print("🔄 达到最大步数，强制开启新iteration...")
-						break
-					else:
-						if rank == 0:
-							print(f"🎯 第 {k+1} 个iteration - 达到rollout长度 {rollout_length}，开始PPO更新...")
-							print_rollout_diagnostics(
-								rollout_diag,
-								action_values=diag_action_values,
-								prefix=f"📈 rollout诊断(rank0 iter {k+1}, len {buffer_step_count})",
-							)
-						bootstrap_value = current_rollout_bootstrap_value(
-							model, simulator, config, cumulative_done_all,
-							condition_state, step_count, precision, forward_chunk_agents,
-							feature_workspace=feature_workspace)
-						A_max_ewma, update_stats = perform_ppo_update_multi_gpu(
-							model, policy_optimizer, value_optimizer,
-							rollout_buffer, condition_state,
-							None, simulator, config, k+1, rank, A_max_ewma, amp_scaler,
-							bootstrap_value=bootstrap_value,
-							feature_workspace=feature_workspace)
-						merge_update_stats(iteration_update_stats, update_stats)
-
-						# 检查是否所有世界都没有存活agents，如果是则开启新iteration
-						local_no_alive = all_worlds_no_alive_agents(simulator, cumulative_done_all)
-						if sync_bool_across_ranks(local_no_alive, device, op=dist.ReduceOp.MIN):
-							if rank == 0:
-								print("🔄 所有世界都没有存活agents，开启新iteration...")
-							clear_rollout_buffers(rollout_buffer)
-							rollout_diag = init_rollout_diagnostics(config, device)
-							break
-						else:
-							if rank == 0:
-								print("✅ 仍有世界有存活agents，继续下一个128step...")
-							# 仅清空采样buffer，保留累积的dones用于可视化与死亡着色（与game.py一致）
-							clear_rollout_buffers(rollout_buffer)
-							buffer_step_count = 0
-							rollout_diag = init_rollout_diagnostics(config, device)
-							# 注意：不重置cumulative_done_all，保持跨rollout的一致性
-
-			# 7) 只有真实完成 optimizer step 后才推进学习率，避免空样本或 AMP skip 时跳过首个LR。
-			scheduler_stepped = step_schedulers_if_updated(policy_scheduler, value_scheduler, iteration_update_stats)
-			if rank == 0 and profile_on:
-				last_update = iteration_update_stats.get('last_update', {})
-				print(f"\t⏱️ update profile: scheduler_step={scheduler_stepped}, "
-					  f"samples={iteration_update_stats.get('num_selected', 0)}, "
-					  f"ppo={iteration_update_stats.get('ppo_update_time_s', 0.0):.3f}s, "
-					  f"ppo_feature_rebuild={iteration_update_stats.get('ppo_feature_rebuild_ms', 0.0):.2f}ms, "
-					  f"mem_alloc={iteration_update_stats.get('max_memory_allocated_mb', 0.0):.1f}MB, "
-					  f"skip={last_update.get('skip_reason', '')}")
-
-			# 标记本worker完成（保留原计数器结构）
-			try:
-				if hasattr(num_workers_done, 'add'):
-					num_workers_done.add("done", 1)
-				else:
-					curr = int(num_workers_done.get("done").decode())
-					num_workers_done.set("done", str(curr + 1).encode())
-			except Exception:
-				pass
-
-			# 仅在主进程保存检查点并打印轮次进度
-			if is_master:
-				try:
-					num_done = int(num_workers_done.get("done").decode())
-				except Exception:
-					num_done = -1
-				print(f"[Round {k}] finished={num_done}/{gpu_count}")
-				if (k + 1) % checkpoint_interval == 0:
-					try:
-						save_checkpoint(model, policy_optimizer, value_optimizer, k + 1, checkpoint_dir)
-					except Exception:
-						pass
 					
-	except Exception as e:
-		print(f"[Rank {rank}] 训练异常: {e}")
-	finally:
-		cleanup_ddp()
+def ddppo_worker(
+    rank: int,
+    gpu_count: int,
+    config_dict: dict,
+    master_addr: str,
+    master_port: int,
+):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(
+                encoding='utf-8',
+                errors='replace',
+                line_buffering=True,
+                write_through=True,
+            )
+        except Exception:
+            pass
 
-# ============================== 运行分布式DDPPO ==============================
+    context = None
+    experiment_tracker = None
+    try:
+        context = initialize_distributed_context(
+            rank,
+            gpu_count,
+            master_addr,
+            master_port,
+        )
+        context.log(
+            f"worker start: {'DDP' if context.is_distributed else 'single GPU'} on {context.device}",
+            all_ranks=context.is_distributed,
+        )
+        local_config_dict = json.loads(json.dumps(config_dict))
+        config = json.loads(
+            json.dumps(local_config_dict), object_hook=lambda value: SimpleNamespace(**value)
+        )
+        model = create_network(config=config, network_type="independent").to(context.device)
+        if context.is_distributed:
+            if context.device.type == 'cuda':
+                model = DDP(
+                    model,
+                    device_ids=[rank],
+                    output_device=rank,
+                    broadcast_buffers=False,
+                )
+            else:
+                model = DDP(model, broadcast_buffers=False)
+
+        training_cfg = config.training
+        learning_rate = float(getattr(training_cfg, 'learning_rate', 5e-4))
+        total_updates = int(getattr(training_cfg, 'total_updates'))
+        policy_optimizer = optim.Adam(get_policy_parameters(model), lr=learning_rate)
+        value_optimizer = optim.Adam(get_value_parameters(model), lr=learning_rate)
+        policy_scheduler = create_lr_scheduler(policy_optimizer, training_cfg, total_updates)
+        value_scheduler = create_lr_scheduler(value_optimizer, training_cfg, total_updates)
+        amp_scaler = make_grad_scaler(context.device, getattr(training_cfg, 'precision', '32-bit'))
+        batch_sizers = {
+            'ppo': create_ppo_batch_sizer(training_cfg),
+            'feature': create_feature_batch_sizer(training_cfg),
+            'rollout': create_rollout_batch_sizer(config),
+        }
+
+        progress = {
+            'update_step': 0,
+            'environment_steps': 0,
+            'rank0_completed_world_episodes': 0,
+        }
+        resume_from = getattr(training_cfg, 'resume_from', None)
+        if resume_from:
+            progress = load_checkpoint(
+                model,
+                policy_optimizer,
+                value_optimizer,
+                policy_scheduler,
+                value_scheduler,
+                amp_scaler,
+                batch_sizers,
+                resume_from,
+                context.device,
+                rank=context.rank,
+            )
+            context.log(
+                f"resumed checkpoint {resume_from}, update_step={progress['update_step']}"
+            )
+            if int(progress['update_step']) > total_updates:
+                raise ValueError(
+                    f"checkpoint update_step={progress['update_step']} exceeds "
+                    f"training.total_updates={total_updates}"
+                )
+            reconcile_lr_scheduler_horizon(policy_scheduler, total_updates)
+            reconcile_lr_scheduler_horizon(value_scheduler, total_updates)
+
+        configured_envs = int(local_config_dict['simulator']['num_envs'])
+        effective_envs = adapt_num_envs_to_memory(local_config_dict, context.device)
+        if effective_envs != configured_envs:
+            context.log(
+                f"memory budget adjusted num_envs/rank {configured_envs} -> {effective_envs}",
+                all_ranks=context.is_distributed,
+            )
+        config = json.loads(
+            json.dumps(local_config_dict), object_hook=lambda value: SimpleNamespace(**value)
+        )
+        rollout_sizer_state = batch_sizers['rollout'].state_dict()
+        batch_sizers['rollout'] = create_rollout_batch_sizer(config)
+        batch_sizers['rollout'].load_state_dict(rollout_sizer_state)
+
+        simulator, rollout_buffer = create_simulator_and_rollout_buffer_with_backoff(
+            local_config_dict, context.device
+        )
+        if int(config.simulator.num_envs) != int(local_config_dict['simulator']['num_envs']):
+            config = json.loads(
+                json.dumps(local_config_dict), object_hook=lambda value: SimpleNamespace(**value)
+            )
+            rollout_sizer_state = batch_sizers['rollout'].state_dict()
+            batch_sizers['rollout'] = create_rollout_batch_sizer(config)
+            batch_sizers['rollout'].load_state_dict(rollout_sizer_state)
+
+        validate_runtime_contract(config, simulator, context)
+
+        tracker_error = None
+        if context.is_primary:
+            try:
+                experiment_tracker = initialize_swanlab(local_config_dict)
+            except Exception as exc:
+                tracker_error = exc
+        if not context.all_true(tracker_error is None):
+            if tracker_error is not None:
+                raise tracker_error
+            raise RuntimeError("rank 0 failed to initialize SwanLab")
+
+        run_training_loop(
+            context,
+            model,
+            simulator,
+            config,
+            policy_optimizer,
+            value_optimizer,
+            policy_scheduler,
+            value_scheduler,
+            progress,
+            total_updates,
+            amp_scaler,
+            batch_sizers,
+            rollout_buffer=rollout_buffer,
+            experiment_tracker=experiment_tracker,
+        )
+    except Exception as exc:
+        print(f"[Rank {rank}] training failed: {exc}", flush=True)
+        raise
+    finally:
+        if experiment_tracker is not None:
+            experiment_tracker.finish()
+        cleanup_ddp()
+
+
 def run_distributed_ddppo(config_dict: dict, cuda_ranks: list[int]):
-	if not cuda_ranks:
-		raise RuntimeError("没有可用的CUDA设备")
+    if not cuda_ranks:
+        raise RuntimeError("no CUDA device is available")
 	
-	gpu_count = len(cuda_ranks)
-	master_addr = '127.0.0.1'
-	master_port = _find_free_port()
-	store_port = _find_free_port()
+    gpu_count = len(cuda_ranks)
+    master_addr = '127.0.0.1'
+    master_port = _find_free_port()
 
-	# Windows需要spawn
-	mp.set_start_method('spawn', force=True)
+    mp.set_start_method('spawn', force=True)
+    os.environ['CUDA_VISIBLE_DEVICES'] = ",".join(str(rank) for rank in cuda_ranks)
+    context = mp.get_context('spawn')
+    processes = [
+        context.Process(
+            target=ddppo_worker,
+            args=(rank, gpu_count, config_dict, master_addr, master_port),
+        )
+        for rank in range(gpu_count)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join()
 
-	# 将rank映射到CUDA设备
-	os.environ['CUDA_VISIBLE_DEVICES'] = ",".join(str(r) for r in cuda_ranks)
-	ctx = mp.get_context('spawn')
-
-	processes = []
-	for rank in range(gpu_count):
-		p = ctx.Process(target=ddppo_worker, args=(rank, gpu_count, config_dict, master_addr, master_port, store_port))
-		p.start()
-		processes.append(p)
-	for p in processes:
-		p.join()
-
-if __name__ == "__main__":
-	# 读取配置并运行一个简化示例
-	import yaml
-	# 静默检测GPU
-	ok, ranks = check_gpu_info(print_info=False)
-	print(f"CUDA可用: {ok}, Ranks: {ranks}")
-	if not ok or not ranks:
-		raise SystemExit("无可用GPU，退出")
-	# 默认使用全部可用卡
-	# 基于文件位置解析项目根目录，避免依赖当前工作目录
-	_this_dir = os.path.dirname(os.path.abspath(__file__))
-	_proj_root = os.path.dirname(_this_dir)
-	_config_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
-	with open(_config_path, 'r', encoding='utf-8') as f:
-		cfg = yaml.safe_load(f)
-	run_distributed_ddppo(cfg, ranks)
+    failed = [
+        (rank, process.exitcode)
+        for rank, process in enumerate(processes)
+        if process.exitcode != 0
+    ]
+    if failed:
+        raise RuntimeError(f"training workers failed: {failed}")

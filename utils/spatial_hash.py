@@ -26,7 +26,7 @@ class SpatialHash:
         self.grid_size = torch.max(grid_dim, torch.tensor([1, 1], device=device, dtype=torch.long))
         self.grid_total_cells = self.grid_size[0] * self.grid_size[1]
         self.grid_total_cells_int = int(self.grid_total_cells.item())
-        self._arange_cache: Dict[int, torch.Tensor] = {}
+        self._arange_cache = torch.empty((0,), dtype=torch.long, device=self.device)
         # 用于静态几何体索引的属性
         self.static_sorted_items = torch.empty((0,), dtype=torch.long, device=self.device)
         self.static_cell_starts = torch.empty((0,), dtype=torch.long, device=self.device)
@@ -37,11 +37,11 @@ class SpatialHash:
 
     def _cached_arange(self, size: int) -> torch.Tensor:
         size = int(size)
-        cached = self._arange_cache.get(size)
-        if cached is None:
-            cached = torch.arange(size, device=self.device)
-            self._arange_cache[size] = cached
-        return cached
+        if size < 0:
+            raise ValueError("arange size must be non-negative")
+        if self._arange_cache.numel() < size:
+            self._arange_cache = torch.arange(size, device=self.device)
+        return self._arange_cache[:size]
 
     def _profile_now(self, cuda_sync: bool = False) -> float:
         if cuda_sync and self.device.type == 'cuda':

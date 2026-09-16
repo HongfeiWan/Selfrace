@@ -1,17 +1,47 @@
 # 神经网络模块
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-FEATURE_PAD_VALUE = -2.0
+from feature_schema import FEATURE_PAD_VALUE, FeatureSchema
+
+
+DEFAULT_WEIGHT_INIT = {"type": "orthogonal", "gain": 1.0, "bias_zero": True}
+
+
+def _config_value(container, name, default=None):
+    if isinstance(container, dict):
+        return container.get(name, default)
+    return getattr(container, name, default)
+
+
+def resolve_weight_init(config):
+    training_config = _config_value(config, "training")
+    configured = _config_value(training_config, "weight_init", {})
+    options = {
+        "type": str(_config_value(configured, "type", DEFAULT_WEIGHT_INIT["type"])).lower(),
+        "gain": float(_config_value(configured, "gain", DEFAULT_WEIGHT_INIT["gain"])),
+        "bias_zero": bool(_config_value(configured, "bias_zero", DEFAULT_WEIGHT_INIT["bias_zero"])),
+    }
+    if options["type"] != "orthogonal":
+        raise ValueError(f"unsupported weight initialization: {options['type']!r}")
+    return options
+
+
+def initialize_linear(module, options):
+    if not isinstance(module, nn.Linear):
+        return
+    torch.nn.init.orthogonal_(module.weight, gain=options["gain"])
+    if options["bias_zero"] and module.bias is not None:
+        torch.nn.init.constant_(module.bias, 0)
 
 class SimpleFeatureEncoder(nn.Module):
     """
     简单特征编码器 - 用于简单特征向量 (S(t), reward系数,车辆风格系数等)
     完全向量化，支持批量处理
     """
-    def __init__(self, input_dim, output_dim=64):
+    def __init__(self, input_dim, output_dim=64, weight_init=None):
         super(SimpleFeatureEncoder, self).__init__()
+        self._weight_init = weight_init or DEFAULT_WEIGHT_INIT
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, output_dim),
             nn.ReLU(),
@@ -21,9 +51,7 @@ class SimpleFeatureEncoder(nn.Module):
         self.apply(self._init_weights)
     def _init_weights(self, module):
         """初始化网络权重 - 使用Orthogonal初始化且bias为0"""
-        if isinstance(module, nn.Linear):
-            torch.nn.init.orthogonal_(module.weight, gain=1.0)
-            torch.nn.init.constant_(module.bias, 0)
+        initialize_linear(module, self._weight_init)
     def forward(self, x):
         """
         完全向量化的前向传播
@@ -48,11 +76,11 @@ class PermutationInvariantEncoder(nn.Module):
     - 也可为 [B, M, N] 的扁平向量，但需在初始化时指定 element_dim（单元素维度 d），
       以便自动重塑为 [B, M, K=N//d, d] 并沿 K 维进行聚合（置换不变）。
     """
-    def __init__(self, feature_dim, output_dim=64, element_dim=None):
+    def __init__(self, feature_dim, output_dim=64, element_dim=None, weight_init=None):
         super(PermutationInvariantEncoder, self).__init__()
-        self.flat_total_dim = feature_dim
         self.element_dim = element_dim  # 若提供，则 K = feature_dim // element_dim
         self.output_dim = output_dim
+        self._weight_init = weight_init or DEFAULT_WEIGHT_INIT
 
         element_input_dim = self.element_dim if self.element_dim is not None else feature_dim
         self.element_encoder = nn.Sequential(
@@ -65,9 +93,7 @@ class PermutationInvariantEncoder(nn.Module):
     
     def _init_weights(self, module):
         """初始化网络权重 - 使用Orthogonal初始化且bias为0"""
-        if isinstance(module, nn.Linear):
-            torch.nn.init.orthogonal_(module.weight, gain=1.0)
-            torch.nn.init.constant_(module.bias, 0)
+        initialize_linear(module, self._weight_init)
     
     def forward(self, x, mask: torch.Tensor = None):
         """
@@ -94,33 +120,22 @@ class PermutationInvariantEncoder(nn.Module):
         if mask is not None:
             flat_mask = mask.reshape(-1)
             flat_x = x.reshape(-1, d)
-            encoded_flat = None
-            if bool(flat_mask.any().item()):
-                valid_x = flat_x[flat_mask]
-                encoded_valid = self.element_encoder(valid_x)
-                neg_inf = torch.finfo(encoded_valid.dtype).min
-                encoded_flat = torch.full(
-                    (B * M, self.output_dim),
-                    neg_inf,
-                    device=x.device,
-                    dtype=encoded_valid.dtype,
-                )
-                group_ids = torch.arange(B * M, device=x.device, dtype=torch.long).repeat_interleave(K)[flat_mask]
-                scatter_index = group_ids.unsqueeze(-1).expand(-1, self.output_dim)
-                if hasattr(encoded_flat, 'scatter_reduce_'):
-                    encoded_flat.scatter_reduce_(0, scatter_index, encoded_valid, reduce='amax', include_self=True)
-                else:
-                    encoded_elements = self.element_encoder(flat_x).reshape(B, M, K, self.output_dim)
-                    encoded_elements = encoded_elements.masked_fill(~mask.unsqueeze(-1), neg_inf)
-                    encoded_flat = torch.max(encoded_elements, dim=2)[0].reshape(B * M, self.output_dim)
-            else:
-                neg_inf = torch.finfo(x.dtype).min
-                encoded_flat = torch.full(
-                    (B * M, self.output_dim),
-                    neg_inf,
-                    device=x.device,
-                    dtype=x.dtype,
-                )
+            valid_x = flat_x[flat_mask]
+            encoded_valid = self.element_encoder(valid_x)
+            neg_inf = torch.finfo(encoded_valid.dtype).min
+            encoded_flat = torch.full(
+                (B * M, self.output_dim),
+                neg_inf,
+                device=x.device,
+                dtype=encoded_valid.dtype,
+            )
+            group_ids = torch.arange(
+                B * M, device=x.device, dtype=torch.long
+            ).repeat_interleave(K)[flat_mask]
+            scatter_index = group_ids.unsqueeze(-1).expand(-1, self.output_dim)
+            encoded_flat.scatter_reduce_(
+                0, scatter_index, encoded_valid, reduce='amax', include_self=True
+            )
             encoded = encoded_flat.view(B, M, self.output_dim)
             all_invalid = ~mask.any(dim=2)
             return torch.where(all_invalid.unsqueeze(-1), torch.zeros_like(encoded), encoded)
@@ -136,25 +151,24 @@ class FeatureEncoder(nn.Module):
     """
     def __init__(self, config):
         super(FeatureEncoder, self).__init__()
-        # 从配置文件读取所有参数
         network_config = config.training.network
         self.encoder_dim = network_config.encoder_dim
-        self.simple_feature_dims = network_config.simple_feature_dims
-        self.permutation_feature_dims = network_config.permutation_feature_dims
-        self.permutation_element_dims = getattr(network_config, 'permutation_element_dims', [2, 7, 2, 7])
-        # 计算总输入维度
-        self.total_input_dim = sum(self.simple_feature_dims) + sum(self.permutation_feature_dims)
+        self._weight_init = resolve_weight_init(config)
+        self.feature_schema = FeatureSchema.from_config(config)
+        self.total_input_dim = self.feature_schema.total_input_dim
         self.simple_encoders = nn.ModuleList([
-            SimpleFeatureEncoder(dim, self.encoder_dim) for dim in self.simple_feature_dims
+            SimpleFeatureEncoder(group.flat_dim, self.encoder_dim, weight_init=self._weight_init)
+            for group in self.feature_schema.simple_groups
         ])
-        # 创建排列不变特征编码器 - 直接创建4个
         self.permutation_encoders = nn.ModuleList([
-            PermutationInvariantEncoder(self.permutation_feature_dims[0], self.encoder_dim, element_dim=self.permutation_element_dims[0]),
-            PermutationInvariantEncoder(self.permutation_feature_dims[1], self.encoder_dim, element_dim=self.permutation_element_dims[1]),
-            PermutationInvariantEncoder(self.permutation_feature_dims[2], self.encoder_dim, element_dim=self.permutation_element_dims[2]),
-            PermutationInvariantEncoder(self.permutation_feature_dims[3], self.encoder_dim, element_dim=self.permutation_element_dims[3])
+            PermutationInvariantEncoder(
+                group.flat_dim,
+                self.encoder_dim,
+                element_dim=group.element_dim,
+                weight_init=self._weight_init,
+            )
+            for group in self.feature_schema.set_groups
         ])
-        # 计算总输出维度 - 固定8个编码器
         self.total_output_dim = (len(self.simple_encoders) + len(self.permutation_encoders)) * self.encoder_dim
 
     @staticmethod
@@ -175,104 +189,30 @@ class FeatureEncoder(nn.Module):
         Returns:
             output: [B, M, total_output_dim] 编码后的特征张量
         """
-        B, M, _ = features_tensor.shape
+        B, M, width = features_tensor.shape
+        self.feature_schema.validate_tensor_width(width)
         features_tensor = torch.nan_to_num(features_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
 
         # 预分配输出张量 [B, M, total_output_dim]
         output = torch.zeros(B, M, self.total_output_dim, device=features_tensor.device, dtype=features_tensor.dtype)
         
-        input_offset = 0
         output_offset = 0
-        for dim, encoder in zip(self.simple_feature_dims, self.simple_encoders):
-            simple_feature = features_tensor[:, :, input_offset:input_offset + dim]
+        for group, encoder in zip(self.feature_schema.simple_groups, self.simple_encoders):
+            simple_feature = features_tensor[:, :, self.feature_schema.flat_slice(group.name)]
             output[:, :, output_offset:output_offset + self.encoder_dim] = encoder(simple_feature)
-            input_offset += dim
             output_offset += self.encoder_dim
         
-        # 编码排列不变特征 - 直接使用固定索引
-        simple_end = sum(self.simple_feature_dims)
-        permutation_output_start = len(self.simple_encoders) * self.encoder_dim
-        
-        # road_boundary
-        road_boundary = features_tensor[:, :, simple_end:simple_end + self.permutation_feature_dims[0]]
-        road_boundary_mask = self._flat_set_mask(road_boundary, element_dim=self.permutation_element_dims[0])
-        output[:, :, permutation_output_start:permutation_output_start + self.encoder_dim] = self.permutation_encoders[0](road_boundary, mask=road_boundary_mask)
-
-        # lane_points
-        lane_points = features_tensor[:, :, simple_end + self.permutation_feature_dims[0]:simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1]]
-        lane_points_mask = self._flat_set_mask(lane_points, element_dim=self.permutation_element_dims[1])
-        output[:, :, permutation_output_start + self.encoder_dim:permutation_output_start + 2*self.encoder_dim] = self.permutation_encoders[1](lane_points, mask=lane_points_mask)
-
-        # stop_lines: 20维
-        stop_lines = features_tensor[:, :, simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1]:simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1] + self.permutation_feature_dims[2]]
-        stop_lines_mask = self._flat_set_mask(stop_lines, element_dim=self.permutation_element_dims[2])
-        output[:, :, permutation_output_start + 2*self.encoder_dim:permutation_output_start + 3*self.encoder_dim] = self.permutation_encoders[2](stop_lines, mask=stop_lines_mask)
-
-        # other_agents
-        other_agents = features_tensor[:, :, simple_end + self.permutation_feature_dims[0] + self.permutation_feature_dims[1] + self.permutation_feature_dims[2]:self.total_input_dim]
-        other_agents_active_channel = self.permutation_element_dims[3] - 1
-        other_agents_mask = self._flat_set_mask(
-            other_agents,
-            element_dim=self.permutation_element_dims[3],
-            active_channel=other_agents_active_channel,
-        )
-        output[:, :, permutation_output_start + 3*self.encoder_dim:permutation_output_start + 4*self.encoder_dim] = self.permutation_encoders[3](other_agents, mask=other_agents_mask)
+        for group, encoder in zip(self.feature_schema.set_groups, self.permutation_encoders):
+            set_features = features_tensor[:, :, self.feature_schema.flat_slice(group.name)]
+            set_mask = self._flat_set_mask(
+                set_features,
+                element_dim=group.element_dim,
+                active_channel=group.resolved_active_channel,
+            )
+            output[:, :, output_offset:output_offset + self.encoder_dim] = encoder(set_features, mask=set_mask)
+            output_offset += self.encoder_dim
         
         return output
-
-class SharedNetwork(nn.Module):
-    """
-    共享网络（同时输出策略和值函数）
-    完全向量化，支持批量处理和多GPU分布式训练
-    符合论文描述的MLP架构：[1024 × 1024 × 1024]
-    """
-    def __init__(self, config):
-        super(SharedNetwork, self).__init__()
-        # 从配置文件读取所有参数
-        network_config = config.training.network
-        self.num_actions = network_config.num_actions
-        self.network_dim = network_config.network_dim
-        # 特征编码器 - 完全依赖配置文件
-        self.feature_encoder = FeatureEncoder(config=config)
-        # 从特征编码器获取总输出维度
-        total_encoded_dim = self.feature_encoder.total_output_dim
-        # 符合论文描述的MLP骨干网络：[1024 × 1024 × 1024]
-        self.fc1 = nn.Linear(total_encoded_dim, self.network_dim)
-        self.fc2 = nn.Linear(self.network_dim, self.network_dim)
-        self.fc3 = nn.Linear(self.network_dim, self.network_dim)
-        # 策略头（输出动作logits）
-        self.action_head = nn.Linear(self.network_dim, self.num_actions)
-        # 值函数头（输出状态值）
-        self.value_head = nn.Linear(self.network_dim, 1)
-        # 初始化权重
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        """初始化网络权重 - 使用Orthogonal初始化且bias为0"""
-        if isinstance(module, nn.Linear):
-            torch.nn.init.orthogonal_(module.weight, gain=1.0)
-            torch.nn.init.constant_(module.bias, 0)
-
-    def forward(self, features_tensor):
-        """
-        完全向量化的前向传播，支持批量处理
-        Args:
-            features_tensor: [B, M, total_input_dim] 所有特征拼接的大张量
-        Returns:
-            action_logits: 动作logits [B, M, num_actions]
-            value: 状态值 [B, M]
-        """
-        # 编码各种特征
-        encoded_features = self.feature_encoder(features_tensor)
-        encoded_features = torch.nan_to_num(encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
-        # 符合论文描述的MLP骨干网络：[1024 × 1024 × 1024]
-        x = F.relu(self.fc1(encoded_features))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        # 分别输出策略和值函数
-        action_logits = self.action_head(x)
-        value = self.value_head(x).squeeze(-1)
-        return action_logits, value
 
 class IndependentNetwork(nn.Module):
     """
@@ -281,6 +221,7 @@ class IndependentNetwork(nn.Module):
     """
     def __init__(self, config):
         super(IndependentNetwork, self).__init__()
+        self._weight_init = resolve_weight_init(config)
         
         # 从配置文件读取参数
         network_config = config.training.network
@@ -324,9 +265,7 @@ class IndependentNetwork(nn.Module):
     
     def _init_weights(self, module):
         """初始化网络权重 - 使用Orthogonal初始化且bias为0"""
-        if isinstance(module, nn.Linear):
-            torch.nn.init.orthogonal_(module.weight, gain=1.0)
-            torch.nn.init.constant_(module.bias, 0)
+        initialize_linear(module, self._weight_init)
 
     def policy_parameters(self):
         yield from self.policy_feature_encoder.parameters()
@@ -397,114 +336,15 @@ class IndependentNetwork(nn.Module):
         value = self.forward_value(features_tensor)
         return action_logits, value
     
-def create_network(config, network_type="shared"):
+def create_network(config, network_type="independent"):
     """
     创建网络实例的工厂函数
     Args:
         config: 配置文件对象（必需）
-        network_type: 网络类型 ("shared" 或 "independent")
+        network_type: 仅支持原文采用的独立 actor/critic 网络
     Returns:
         网络实例
     """
-    if network_type == "shared":
-        return SharedNetwork(config=config)
-    elif network_type == "independent":
+    if network_type == "independent":
         return IndependentNetwork(config=config)
-    else:
-        raise ValueError(f"Unknown network type: {network_type}")
-
-def count_parameters(model):
-    """计算模型参数数量"""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-if __name__ == "__main__":
-    # 测试网络 - 使用配置文件
-    print("🧪 测试神经网络（使用配置文件）...")
-    try:
-        import yaml
-        from types import SimpleNamespace
-        import json
-        # 设置设备为 cuda:0
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        print(f"🔧 使用设备: {device}")
-        # 读取配置文件（基于文件位置解析项目根目录）
-        import os
-        _this_dir = os.path.dirname(os.path.abspath(__file__))
-        _proj_root = os.path.dirname(_this_dir)
-        _cfg_path = os.path.join(_proj_root, 'configs', 'default_config.yaml')
-        with open(_cfg_path, 'r', encoding='utf-8') as f:
-            config_dict = yaml.safe_load(f)
-        # 转换为对象
-        config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
-        
-        # 测试共享网络
-        print("\n🔍 测试共享网络 (SharedNetwork)...")
-        shared_model = create_network(config=config, network_type="shared")
-        shared_model = shared_model.to(device)
-        print(f"🔍 共享网络参数数量: {count_parameters(shared_model)}")
-        
-        # 测试独立网络
-        print("\n🔍 测试独立网络 (IndependentNetwork)...")
-        independent_model = create_network(config=config, network_type="independent")
-        independent_model = independent_model.to(device)
-        print(f"🔍 独立网络参数数量: {count_parameters(independent_model)}")
-        
-        # 创建示例输入用于测试
-        B = 2000
-        M = 150
-        features_tensor = torch.randn(B, M, shared_model.feature_encoder.total_input_dim, device=device)
-        
-        # 测试共享网络前向传播
-        print("\n🧪 测试共享网络前向传播...")
-        action_logits_shared, value_shared = shared_model(features_tensor)
-        print(f"✅ 共享网络前向传播成功")
-        print(f"Action logits shape: {action_logits_shared.shape}")
-        print(f"Value shape: {value_shared.shape}")
-        
-        # 测试独立网络前向传播
-        print("\n🧪 测试独立网络前向传播...")
-        
-        # 测试同时使用两个网络
-        action_logits_indep, value_indep = independent_model(features_tensor, mode="both")
-        print(f"✅ 独立网络双网络前向传播成功")
-        print(f"Action logits shape: {action_logits_indep.shape}")
-        print(f"Value shape: {value_indep.shape}")
-        
-        # 测试仅策略网络
-        action_logits_policy = independent_model(features_tensor, mode="policy")
-        print(f"✅ 独立网络仅策略网络前向传播成功")
-        print(f"Policy Action logits shape: {action_logits_policy.shape}")
-        
-        # 测试仅值函数网络
-        value_only = independent_model(features_tensor, mode="value")
-        print(f"✅ 独立网络仅值函数网络前向传播成功")
-        print(f"Value only shape: {value_only.shape}")
-        
-        # 测试反向传播
-        print("\n🧪 测试反向传播...")
-        loss_shared = action_logits_shared.sum() + value_shared.sum()
-        loss_shared.backward()
-        print(f"✅ 共享网络反向传播成功")
-        
-        # 测试独立网络的反向传播
-        loss_indep_both = action_logits_indep.sum() + value_indep.sum()
-        loss_indep_both.backward()
-        print(f"✅ 独立网络双网络反向传播成功")
-        
-        # 测试仅策略网络的反向传播
-        loss_policy = action_logits_policy.sum()
-        loss_policy.backward()
-        print(f"✅ 独立网络仅策略网络反向传播成功")
-        
-        # 测试仅值函数网络的反向传播
-        loss_value = value_only.sum()
-        loss_value.backward()
-        print(f"✅ 独立网络仅值函数网络反向传播成功")
-        
-        print(f"共享网络参数数量: {count_parameters(shared_model)}, 独立网络参数数量: {count_parameters(independent_model)}")
-
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-
+    raise ValueError(f"Unknown network type: {network_type}; expected 'independent'")
