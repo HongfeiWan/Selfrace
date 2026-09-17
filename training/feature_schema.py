@@ -7,7 +7,7 @@ silently drift apart.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -70,6 +70,8 @@ class FeatureGroup:
 class FeatureSchema:
     simple_groups: tuple[FeatureGroup, ...]
     set_groups: tuple[FeatureGroup, ...]
+    _groups_by_name: dict[str, FeatureGroup] = field(init=False, repr=False, compare=False)
+    _slices_by_name: dict[str, slice] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         simple_names = tuple(group.name for group in self.simple_groups)
@@ -78,6 +80,14 @@ class FeatureSchema:
             raise ValueError(f"simple feature order must be {SIMPLE_GROUP_NAMES}, got {simple_names}")
         if set_names != SET_GROUP_NAMES:
             raise ValueError(f"set feature order must be {SET_GROUP_NAMES}, got {set_names}")
+        groups = self.simple_groups + self.set_groups
+        object.__setattr__(self, "_groups_by_name", {group.name: group for group in groups})
+        offset = 0
+        slices = {}
+        for group in groups:
+            slices[group.name] = slice(offset, offset + group.flat_dim)
+            offset += group.flat_dim
+        object.__setattr__(self, "_slices_by_name", slices)
 
     @classmethod
     def from_config(cls, config: Any) -> "FeatureSchema":
@@ -142,19 +152,16 @@ class FeatureSchema:
         return sum(group.flat_dim for group in self.groups)
 
     def group(self, name: str) -> FeatureGroup:
-        for group in self.groups:
-            if group.name == name:
-                return group
-        raise KeyError(f"unknown feature group: {name}")
+        try:
+            return self._groups_by_name[name]
+        except KeyError as exc:
+            raise KeyError(f"unknown feature group: {name}") from exc
 
     def flat_slice(self, name: str) -> slice:
-        offset = 0
-        for group in self.groups:
-            end = offset + group.flat_dim
-            if group.name == name:
-                return slice(offset, end)
-            offset = end
-        raise KeyError(f"unknown feature group: {name}")
+        try:
+            return self._slices_by_name[name]
+        except KeyError as exc:
+            raise KeyError(f"unknown feature group: {name}") from exc
 
     def validate_tensor_width(self, width: int) -> None:
         if int(width) != self.total_input_dim:

@@ -118,12 +118,10 @@
     - `def get_discrete_action_space`：获取离散动作空间。
 
 - **collision.py**
-  - `class CollisionChecker`：批量化碰撞检测。
-    - `def __init__`：初始化碰撞检测器，设置参数。
-    - `def check`：执行碰撞检测，返回碰撞信息。
-    - `def _broad_phase_vectorized`：宽阶段碰撞检测，使用空间哈希快速筛选。
-    - `def _narrow_phase_vectorized`：窄阶段精确碰撞检测。
-    - `def _continuous_collision_detection`：连续碰撞检测。
+  - `class CollisionChecker`：按固定 pair 预算执行有界流式连续碰撞检测。
+    - `def check`：计算扫掠顶点，流式检测动态碰撞并合并静态碰撞。
+    - `def _streaming_dynamic_collisions`：仅按张量形状切分 world/pair 块，不读取 GPU 候选计数。
+    - Linux CUDA 使用受控 `torch.compile` 保留稀疏窄阶段；CUDA eager 兜底使用定长块，仍不产生 host 同步。
 
 - **road.py**
   - `class RoadNetwork`：道路网络加载与定位。

@@ -1642,6 +1642,20 @@ def gather_route_state_selected(route_state_tensor: dict, t_idx: torch.Tensor,
 	return out
 
 
+def gather_current_route_state_selected(route_state: dict, env_idx: torch.Tensor,
+									agent_idx: torch.Tensor) -> dict:
+	"""Gather current route state for one packed ego per selected row."""
+	if not route_state:
+		return {}
+	out = {}
+	for key, value in route_state.items():
+		if torch.is_tensor(value) and value.dim() >= 2:
+			out[key] = value[env_idx, agent_idx].unsqueeze(1)
+		else:
+			out[key] = value
+	return out
+
+
 def gather_condition_state_selected(condition_state: dict, env_idx: torch.Tensor,
 									agent_idx: torch.Tensor) -> dict:
 	if not condition_state:
@@ -2125,45 +2139,80 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 	actions = torch.zeros((B, M), dtype=torch.long, device=device)
 	old_log_probs = torch.zeros((B, M), dtype=states.dtype, device=device)
 	value_pred = torch.zeros((B, M), dtype=states.dtype, device=device)
-	profile = {
-		'feature_ms': 0.0,
-		'policy_ms': 0.0,
-		'num_selected': B * M,
-		'feature_chunks': 0,
-		'path': 'dense_stream',
-		'oom_retries': 0,
-	}
 	feature_workspace = feature_workspace or _default_workspace(config)
 	feature_workspace.reset_counters()
 	alive_mask = alive_mask.to(device=device, dtype=torch.bool)
+	selected = alive_mask.nonzero(as_tuple=False)
+	num_selected = int(selected.shape[0])
+	profile = {
+		'feature_ms': 0.0,
+		'policy_ms': 0.0,
+		'num_selected': num_selected,
+		'feature_chunks': 0,
+		'path': 'packed_alive',
+		'oom_retries': 0,
+	}
+	if num_selected == 0:
+		return actions, old_log_probs, value_pred, profile
+
+	selected_b = selected[:, 0]
+	selected_m = selected[:, 1]
 	if batch_sizer is None:
-		maximum = max(M, feature_build_chunk_agents(config, M))
-		batch_sizer = AdaptiveBatchSizer(maximum=maximum, minimum=M)
-	chunk_agents = batch_sizer.choose(B * M)
-	env_chunk_size = max(1, chunk_agents // M)
-	route_state_all = simulator.get_route_state(clone=False) if hasattr(simulator, 'get_route_state') else {}
+		maximum = max(1, feature_build_chunk_agents(config, M))
+		batch_sizer = AdaptiveBatchSizer(
+			maximum=maximum,
+			minimum=min(256, maximum),
+		)
+	chunk_size = batch_sizer.choose(num_selected)
+	route_state_all = (
+		simulator.get_route_state(clone=False)
+		if hasattr(simulator, 'get_route_state')
+		else {}
+	)
 	control_state_all = current_control_state(simulator)
+	# Agents that already terminated in this rollout must not appear as neighbors.
+	observation_states = states.clone()
+	observation_states[..., 6] = alive_mask.to(dtype=states.dtype)
 	profile_on = profile_enabled(config)
 	start = 0
-	while start < B:
-		end = min(start + env_chunk_size, B)
+	while start < num_selected:
+		end = min(start + chunk_size, num_selected)
 		features_chunk = None
 		action_logits = None
 		values_chunk = None
+		world_states = None
+		distribution = None
+		action_chunk = None
+		log_prob_chunk = None
 		try:
+			chunk_b = selected_b[start:end]
+			chunk_m = selected_m[start:end]
+			world_states = torch.cat(
+				(observation_states[chunk_b], control_state_all[chunk_b]), dim=-1
+			)
+			route_chunk = gather_current_route_state_selected(
+				route_state_all, chunk_b, chunk_m
+			)
+			condition_chunk = gather_condition_state_selected(
+				condition_state, chunk_b, chunk_m
+			)
+			time_chunk = (
+				dropout_step[chunk_b]
+				if torch.is_tensor(dropout_step) and dropout_step.dim() > 0
+				else dropout_step
+			)
 			if profile_on:
 				feature_start = profile_timer_start(device, config)
-			features_chunk = build_features_from_simulator_env_slice(
+			features_chunk = build_features_for_selected_agents(
+				world_states,
 				simulator,
 				config,
-				start,
-				end,
-				alive_mask=alive_mask,
-				condition_state=condition_state,
-				dropout_step=dropout_step,
+				route_chunk,
+				condition_chunk,
+				chunk_m,
+				time_indices=time_chunk,
+				env_indices=chunk_b,
 				workspace=feature_workspace,
-				control_state_all=control_state_all,
-				route_state_all=route_state_all,
 			)
 			if profile_on:
 				profile['feature_ms'] += profile_elapsed_ms(feature_start, device, config)
@@ -2177,16 +2226,11 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 						mode="both",
 						chunk_agents=forward_chunk_agents,
 					)
-					distribution = torch.distributions.Categorical(logits=action_logits)
+					distribution = torch.distributions.Categorical(logits=action_logits[:, 0])
 					action_chunk = distribution.sample()
-					log_prob_chunk = distribution.log_prob(action_chunk).to(old_log_probs.dtype)
-					chunk_alive = alive_mask[start:end]
-					actions[start:end] = torch.where(
-						chunk_alive, action_chunk, actions[start:end]
-					)
-					old_log_probs[start:end] = torch.where(
-						chunk_alive, log_prob_chunk, old_log_probs[start:end]
-					)
+					log_prob_chunk = distribution.log_prob(action_chunk)
+					actions[chunk_b, chunk_m] = action_chunk
+					old_log_probs[chunk_b, chunk_m] = log_prob_chunk.to(old_log_probs.dtype)
 				else:
 					values_chunk = forward_model(
 						model,
@@ -2196,11 +2240,7 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 					)
 			if values_chunk.dim() == 3 and values_chunk.shape[-1] == 1:
 				values_chunk = values_chunk.squeeze(-1)
-			value_pred[start:end] = torch.where(
-				alive_mask[start:end],
-				values_chunk.to(value_pred.dtype),
-				value_pred[start:end],
-			)
+			value_pred[chunk_b, chunk_m] = values_chunk[:, 0].to(value_pred.dtype)
 			if profile_on:
 				profile['policy_ms'] += profile_elapsed_ms(policy_start, device, config)
 			start = end
@@ -2211,19 +2251,20 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 			features_chunk = None
 			action_logits = None
 			values_chunk = None
+			world_states = None
+			distribution = None
+			action_chunk = None
+			log_prob_chunk = None
 			feature_workspace.clear_scratch()
 			torch.cuda.empty_cache()
-			attempted_agents = max(M, (end - start) * M)
-			next_agents = batch_sizer.backoff(attempted_agents)
-			if next_agents is None:
+			next_size = batch_sizer.backoff(end - start)
+			if next_size is None:
 				raise RuntimeError(
-					f"CUDA OOM in rollout at minimum chunk of one world ({M} agents)"
+					f"CUDA OOM in packed rollout at minimum chunk {end - start}"
 				) from exc
-			next_agents = max(M, (next_agents // M) * M)
-			batch_sizer.current = next_agents
-			env_chunk_size = max(1, next_agents // M)
+			chunk_size = next_size
 	profile['feature_chunks'] = feature_workspace.feature_chunks
-	batch_sizer.record_success(env_chunk_size * M, B * M)
+	batch_sizer.record_success(chunk_size, num_selected)
 	return actions, old_log_probs, value_pred, profile
 
 
@@ -2317,16 +2358,20 @@ def create_rollout_batch_sizer(config) -> AdaptiveBatchSizer:
 	simulator_cfg = config.simulator
 	max_agents = int(simulator_cfg.max_agents_num)
 	maximum = int(simulator_cfg.num_envs) * max_agents
+	minimum = min(
+		maximum,
+		max(1, int(getattr(training_cfg, 'rollout_min_chunk_agents', 256))),
+	)
 	configured_initial = getattr(training_cfg, 'rollout_chunk_initial_agents', None)
 	initial = (
 		min(maximum, int(configured_initial))
 		if configured_initial is not None
 		else min(maximum, feature_build_chunk_agents(config, max_agents))
 	)
-	initial = max(max_agents, (initial // max_agents) * max_agents)
+	initial = max(minimum, initial)
 	return AdaptiveBatchSizer(
 		maximum=maximum,
-		minimum=max_agents,
+		minimum=minimum,
 		growth_interval=int(getattr(training_cfg, 'rollout_chunk_growth_interval', 100)),
 		initial=initial,
 	)
@@ -2742,6 +2787,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 
 	policy_params = get_policy_parameters(model)
 	value_params = get_value_parameters(model)
+	base_model = unwrap_model(model)
 	model.train()
 	did_optimizer_step = False
 	completed_epochs = 0
@@ -2783,9 +2829,13 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 			local_oom = False
 			oom_detail = ""
 			features_chunk = None
+			prepared_chunk = None
 			action_logits = None
 			value_pred_full = None
-			total_loss = None
+			actor_loss = None
+			critic_loss = None
+			value_pred = None
+			value_pred_clipped = None
 
 			# Suppress DDP's per-microbatch reductions.  Gradients are averaged once
 			# after every rank has completed all local chunks, which also makes an
@@ -2793,9 +2843,14 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 			no_sync_context = model.no_sync() if hasattr(model, 'no_sync') else nullcontext()
 			try:
 				with no_sync_context:
-					for start in range(0, K, microbatch_size):
-						end = min(start + microbatch_size, K)
+					execution_batch_size = min(
+						microbatch_size,
+						forward_chunk_agents if forward_chunk_agents > 0 else microbatch_size,
+					)
+					for start in range(0, K, execution_batch_size):
+						end = min(start + execution_batch_size, K)
 						features_chunk = feature_cache.get(start, end)
+						prepared_chunk = base_model.prepare_features(features_chunk)
 
 						chunk_old_logp = old_log_probs_batch[start:end]
 						chunk_old_value = old_values_batch[start:end]
@@ -2805,12 +2860,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 						chunk_weight = (end - start) / float(K)
 
 						with make_autocast_context(device, precision):
-							action_logits, value_pred_full = forward_model(
-								model,
-								features_chunk,
-								mode="both",
-								chunk_agents=forward_chunk_agents,
-							)
+							action_logits = base_model.forward_prepared_policy(prepared_chunk)
 							logits_selected = action_logits[:, 0]
 							dist_selected = torch.distributions.Categorical(logits=logits_selected)
 							new_log_probs = dist_selected.log_prob(chunk_actions)
@@ -2827,7 +2877,36 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 							ratio_min = ratio.min()
 							ratio_max = ratio.max()
 							max_action_prob_mean = dist_selected.probs.max(dim=-1).values.mean()
+							actor_loss = (
+								policy_loss - entropy_coef * entropy
+							) * chunk_weight
+
+						if amp_scaler is not None and getattr(amp_scaler, 'is_enabled', lambda: False)():
+							amp_scaler.scale(actor_loss).backward()
+						else:
+							actor_loss.backward()
+
+						# Actor and critic parameters are disjoint.  Releasing the actor
+						# graph before building the critic graph lowers the peak while the
+						# prepared feature tensor and set masks remain shared.
+						policy_loss = policy_loss.detach()
+						entropy = entropy.detach()
+						approx_kl = approx_kl.detach()
+						old_approx_kl = old_approx_kl.detach()
+						clip_frac = clip_frac.detach()
+						ratio_mean = ratio_mean.detach()
+						ratio_min = ratio_min.detach()
+						ratio_max = ratio_max.detach()
+						max_action_prob_mean = max_action_prob_mean.detach()
+						action_logits = None
+						actor_loss = None
+						del logits_selected, dist_selected, new_log_probs, log_ratio
+						del ratio, surr1, surr2
+
+						with make_autocast_context(device, precision):
+							value_pred_full = base_model.forward_prepared_value(prepared_chunk)
 							value_pred = value_pred_full[:, 0]
+							value_pred_clipped = None
 							if value_clip_ratio is None:
 								value_loss = (value_pred - chunk_ret).pow(2).mean()
 							else:
@@ -2840,14 +2919,17 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 									(value_pred - chunk_ret).pow(2),
 									(value_pred_clipped - chunk_ret).pow(2),
 								).mean()
-							total_loss = (
-								policy_loss - entropy_coef * entropy + value_loss_coef * value_loss
-							) * chunk_weight
+							critic_loss = value_loss_coef * value_loss * chunk_weight
 
 						if amp_scaler is not None and getattr(amp_scaler, 'is_enabled', lambda: False)():
-							amp_scaler.scale(total_loss).backward()
+							amp_scaler.scale(critic_loss).backward()
 						else:
-							total_loss.backward()
+							critic_loss.backward()
+						value_loss = value_loss.detach()
+						critic_loss = None
+						value_pred_full = None
+						value_pred = None
+						value_pred_clipped = None
 
 						epoch_policy_loss += policy_loss.detach().float() * chunk_weight
 						epoch_value_loss += value_loss.detach().float() * chunk_weight
@@ -2870,9 +2952,9 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 							else torch.maximum(epoch_ratio_max, ratio_max_detached)
 						)
 						features_chunk = None
+						prepared_chunk = None
 						action_logits = None
 						value_pred_full = None
-						total_loss = None
 			except RuntimeError as exc:
 				if not is_cuda_oom_error(exc, device):
 					raise
@@ -2885,9 +2967,22 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 					flush=True,
 				)
 				features_chunk = None
+				prepared_chunk = None
 				action_logits = None
 				value_pred_full = None
-				total_loss = None
+				actor_loss = None
+				critic_loss = None
+				value_pred = None
+				value_pred_clipped = None
+				policy_loss = None
+				value_loss = None
+				logits_selected = None
+				dist_selected = None
+				new_log_probs = None
+				log_ratio = None
+				ratio = None
+				surr1 = None
+				surr2 = None
 				feature_workspace.clear_scratch()
 				clear_optimizer_gradients(policy_optimizer, value_optimizer, device)
 

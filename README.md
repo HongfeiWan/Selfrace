@@ -85,6 +85,7 @@ map directly to this implementation:
 | `entropy_coef` / `value_loss_coef` / `max_grad_norm` | 0.01 / 0.5 / 0.5 | PPO loss coefficients and gradient clipping. |
 | `advantage_filter_threshold` / `advantage_filter_beta` | 0.01 / 0.25 | Advantage threshold and EWMA coefficient. |
 | `precision` | `16-bit` | CUDA automatic mixed precision. |
+| `network.compile` | enabled (`default`, dynamic) | Controlled actor/critic compilation on Linux CUDA with Triton. CPU, Windows, small chunks, and a failed backend automatically use eager execution. |
 | `w_lane_dropout_prob` / `w_boundary_dropout_prob` | 0.5 / 0.4 | Element dropout applied while observations are rebuilt from world state. |
 | `weight_init` | orthogonal, zero bias | Initialization applied to the actor and critic linear layers. |
 
@@ -112,6 +113,15 @@ sizes are remembered and checkpointed. DDP reduces flattened gradient buckets
 after every rank succeeds instead of issuing one collective per parameter.
 Checkpoint format v3 intentionally has no legacy migration path; incompatible
 checkpoints fail before training rather than silently dropping optimizer state.
+
+The rollout path compacts alive vehicles and builds only their ego features.
+Within each packed chunk, sanitized features, schema slices, set-validity masks,
+and compact set indices are shared by the independent actor and critic; the
+actor graph is released before the critic runs. Dynamic vehicle collision checking streams a
+bounded number of unordered pairs per block. `collision_stream_pair_budget`
+is a hard upper bound for a block's pair-shaped temporary tensors, and the
+compiled Linux/CUDA path keeps candidate counts on-device instead of reading
+them into Python.
 
 SwanLab tracking is optional and initialized only by rank 0. Set
 `training.swanlab.enabled: true` and provide a project/experiment name in the

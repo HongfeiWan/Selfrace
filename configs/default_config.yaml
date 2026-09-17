@@ -27,8 +27,9 @@ simulator:
   route_max_goal_distance: 200.0
   route_max_heading_delta_deg: 60.0
   reset_chunk_worlds: 256                      # masked reset 峰值显存过高时会自动减半并记住安全值
-  collision_narrow_chunk_pairs: 524288         # 动态碰撞窄阶段pair分块上限，限制极端拥堵显存峰值
-  collision_pair_gen_chunk_pairs: 1048576      # 动态碰撞宽阶段每块生成的候选pair目标上限
+  collision_stream_pair_budget: 524288         # 每个流式碰撞块允许的最大候选 pair 数，硬限制临时显存
+  collision_stream_compile: true               # Linux/CUDA 上编译单块，避免动态候选读取触发 CPU 同步
+  collision_stream_compile_mode: "default"
 
   # 地图配置  
   map_path: "./maps/processed_map_Town01_stitched.json" # 地图路径
@@ -180,7 +181,8 @@ training:
   precision: "16-bit"  # 添加16-bit AMP
   network_forward_chunk_agents: 65536 # 用更多显存减少 policy/value forward 分块，提高2600-world训练吞吐
   feature_build_chunk_agents: 65536   # 通用特征构建上限，也作为 rollout 自适应分块的默认初值
-  rollout_chunk_initial_agents: 65536  # dense streaming rollout 初始分块，OOM 后自动减半
+  rollout_chunk_initial_agents: 65536  # packed-alive rollout 初始车辆数，OOM 后自动减半
+  rollout_min_chunk_agents: 256        # packed rollout 显存退避下限
   rollout_chunk_growth_interval: 100
   w_lane_dropout_prob: 0.5             # 原文式 W_lane element dropout；确定性重建，不占 rollout buffer
   w_boundary_dropout_prob: 0.4         # 原文式 W_boundary element dropout；被 drop 元素不进 set encoder
@@ -251,3 +253,9 @@ training:
     # 网络架构配置
     network_dim: 1024  # MLP隐藏层维度
     num_actions: 12    # 输出动作数量
+    compile:
+      enabled: true      # Linux/CUDA+Triton 启用；Windows/CPU 自动保持 eager
+      mode: "default"
+      dynamic: true
+      fullgraph: false
+      min_agents: 2048   # 小批次不编译，避免启动成本超过收益

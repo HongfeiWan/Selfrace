@@ -1,4 +1,9 @@
 # 神经网络模块
+import importlib.util
+import os
+import warnings
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 
@@ -6,6 +11,17 @@ from feature_schema import FEATURE_PAD_VALUE, FeatureSchema
 
 
 DEFAULT_WEIGHT_INIT = {"type": "orthogonal", "gain": 1.0, "bias_zero": True}
+
+
+@dataclass(frozen=True)
+class PreparedFeatureBatch:
+    """Sanitized observations and reusable set-compaction metadata."""
+
+    features: torch.Tensor
+    set_masks: tuple[torch.Tensor, ...]
+    set_valid_indices: tuple[torch.Tensor, ...]
+    set_group_indices: tuple[torch.Tensor, ...]
+    set_nonempty: tuple[torch.Tensor, ...]
 
 
 def _config_value(container, name, default=None):
@@ -49,6 +65,7 @@ class SimpleFeatureEncoder(nn.Module):
         )
         # 应用Orthogonal初始化
         self.apply(self._init_weights)
+
     def _init_weights(self, module):
         """初始化网络权重 - 使用Orthogonal初始化且bias为0"""
         initialize_linear(module, self._weight_init)
@@ -95,7 +112,14 @@ class PermutationInvariantEncoder(nn.Module):
         """初始化网络权重 - 使用Orthogonal初始化且bias为0"""
         initialize_linear(module, self._weight_init)
     
-    def forward(self, x, mask: torch.Tensor = None):
+    def forward(
+        self,
+        x,
+        mask: torch.Tensor = None,
+        valid_indices: torch.Tensor = None,
+        group_indices: torch.Tensor = None,
+        nonempty: torch.Tensor = None,
+    ):
         """
         排列不变前向传播（对 K 维做 max 池化）
         Args:
@@ -117,11 +141,13 @@ class PermutationInvariantEncoder(nn.Module):
             raise ValueError(f"x 期望为 3D 或 4D 张量，得到 {x.dim()}D")
 
         B, M, K, d = x.shape
-        if mask is not None:
-            flat_mask = mask.reshape(-1)
+        if valid_indices is not None:
+            if group_indices is None:
+                raise ValueError("group_indices are required with valid_indices")
             flat_x = x.reshape(-1, d)
-            valid_x = flat_x[flat_mask]
-            encoded_valid = self.element_encoder(valid_x)
+            encoded_valid = self.element_encoder(
+                flat_x.index_select(0, valid_indices)
+            )
             neg_inf = torch.finfo(encoded_valid.dtype).min
             encoded_flat = torch.full(
                 (B * M, self.output_dim),
@@ -129,19 +155,38 @@ class PermutationInvariantEncoder(nn.Module):
                 device=x.device,
                 dtype=encoded_valid.dtype,
             )
-            group_ids = torch.arange(
-                B * M, device=x.device, dtype=torch.long
-            ).repeat_interleave(K)[flat_mask]
-            scatter_index = group_ids.unsqueeze(-1).expand(-1, self.output_dim)
+            scatter_index = group_indices.unsqueeze(-1).expand(
+                -1, self.output_dim
+            )
             encoded_flat.scatter_reduce_(
-                0, scatter_index, encoded_valid, reduce='amax', include_self=True
+                0,
+                scatter_index,
+                encoded_valid,
+                reduce="amax",
+                include_self=True,
             )
             encoded = encoded_flat.view(B, M, self.output_dim)
-            all_invalid = ~mask.any(dim=2)
-            return torch.where(all_invalid.unsqueeze(-1), torch.zeros_like(encoded), encoded)
+            nonempty = mask.any(dim=2) if nonempty is None else nonempty
+            return torch.where(
+                nonempty.unsqueeze(-1), encoded, torch.zeros_like(encoded)
+            )
 
-        encoded_elements = self.element_encoder(x.reshape(-1, d))  # [(B*M*K), output_dim]
+        encoded_elements = self.element_encoder(
+            x.reshape(-1, d)
+        )  # [(B*M*K), output_dim]
         encoded_elements = encoded_elements.reshape(B, M, K, self.output_dim)
+        if mask is not None:
+            # Stable-shape masked pooling avoids the CUDA-synchronizing dynamic
+            # nonzero/gather path and lets actor/critic reuse the same mask.
+            neg_inf = torch.finfo(encoded_elements.dtype).min
+            encoded_elements = encoded_elements.masked_fill(
+                ~mask.unsqueeze(-1), neg_inf
+            )
+            encoded = torch.max(encoded_elements, dim=2)[0]
+            all_invalid = ~mask.any(dim=2)
+            return torch.where(
+                all_invalid.unsqueeze(-1), torch.zeros_like(encoded), encoded
+            )
         return torch.max(encoded_elements, dim=2)[0]  # [B, M, output_dim]
 
 class FeatureEncoder(nn.Module):
@@ -156,6 +201,24 @@ class FeatureEncoder(nn.Module):
         self._weight_init = resolve_weight_init(config)
         self.feature_schema = FeatureSchema.from_config(config)
         self.total_input_dim = self.feature_schema.total_input_dim
+        self.simple_slices = tuple(
+            self.feature_schema.flat_slice(group.name)
+            for group in self.feature_schema.simple_groups
+        )
+        self.set_slices = tuple(
+            self.feature_schema.flat_slice(group.name)
+            for group in self.feature_schema.set_groups
+        )
+        self.set_element_dims = tuple(
+            int(group.element_dim) for group in self.feature_schema.set_groups
+        )
+        self.set_element_counts = tuple(
+            int(group.flat_dim // group.element_dim)
+            for group in self.feature_schema.set_groups
+        )
+        self.set_active_channels = tuple(
+            group.resolved_active_channel for group in self.feature_schema.set_groups
+        )
         self.simple_encoders = nn.ModuleList([
             SimpleFeatureEncoder(group.flat_dim, self.encoder_dim, weight_init=self._weight_init)
             for group in self.feature_schema.simple_groups
@@ -181,38 +244,105 @@ class FeatureEncoder(nn.Module):
             return elements[..., active_channel] > 0.5
         return torch.isfinite(elements).all(dim=-1) & (elements > FEATURE_PAD_VALUE + 0.5).all(dim=-1)
 
-    def forward(self, features_tensor):
-        """
-        完全向量化的特征编码 - 直接使用两个编码器列表
-        Args:
-            features_tensor: [B, M, total_input_dim] 所有特征拼接的大张量
-        Returns:
-            output: [B, M, total_output_dim] 编码后的特征张量
-        """
+    def prepare(self, features_tensor: torch.Tensor) -> PreparedFeatureBatch:
+        """Sanitize features and derive parameter-free masks exactly once."""
+        self.feature_schema.validate_tensor_width(features_tensor.shape[-1])
+        features_tensor = torch.nan_to_num(
+            features_tensor, nan=0.0, posinf=1.0, neginf=-1.0
+        )
+        masks = []
+        valid_indices = []
+        group_indices = []
+        nonempty = []
+        for feature_slice, element_dim, element_count, active_channel in zip(
+            self.set_slices,
+            self.set_element_dims,
+            self.set_element_counts,
+            self.set_active_channels,
+        ):
+            mask = self._flat_set_mask(
+                features_tensor[:, :, feature_slice],
+                element_dim=element_dim,
+                active_channel=active_channel,
+            )
+            valid = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
+            masks.append(mask)
+            valid_indices.append(valid)
+            group_indices.append(
+                torch.div(valid, element_count, rounding_mode="floor")
+            )
+            nonempty.append(mask.any(dim=2))
+        return PreparedFeatureBatch(
+            features=features_tensor,
+            set_masks=tuple(masks),
+            set_valid_indices=tuple(valid_indices),
+            set_group_indices=tuple(group_indices),
+            set_nonempty=tuple(nonempty),
+        )
+
+    def forward_prepared(
+        self,
+        features_tensor: torch.Tensor,
+        set_masks: tuple[torch.Tensor, ...],
+        set_valid_indices: tuple[torch.Tensor, ...],
+        set_group_indices: tuple[torch.Tensor, ...],
+        set_nonempty: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        """Encode a prepared batch without rescanning the set features."""
         B, M, width = features_tensor.shape
         self.feature_schema.validate_tensor_width(width)
-        features_tensor = torch.nan_to_num(features_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+        if len(set_masks) != len(self.permutation_encoders):
+            raise ValueError(
+                f"expected {len(self.permutation_encoders)} set masks, got {len(set_masks)}"
+            )
 
-        # 预分配输出张量 [B, M, total_output_dim]
-        output = torch.zeros(B, M, self.total_output_dim, device=features_tensor.device, dtype=features_tensor.dtype)
-        
+        output = torch.empty(
+            B,
+            M,
+            self.total_output_dim,
+            device=features_tensor.device,
+            dtype=features_tensor.dtype,
+        )
         output_offset = 0
-        for group, encoder in zip(self.feature_schema.simple_groups, self.simple_encoders):
-            simple_feature = features_tensor[:, :, self.feature_schema.flat_slice(group.name)]
+        for feature_slice, encoder in zip(self.simple_slices, self.simple_encoders):
+            simple_feature = features_tensor[:, :, feature_slice]
             output[:, :, output_offset:output_offset + self.encoder_dim] = encoder(simple_feature)
             output_offset += self.encoder_dim
-        
-        for group, encoder in zip(self.feature_schema.set_groups, self.permutation_encoders):
-            set_features = features_tensor[:, :, self.feature_schema.flat_slice(group.name)]
-            set_mask = self._flat_set_mask(
+
+        for feature_slice, set_mask, valid, groups, has_values, encoder in zip(
+            self.set_slices,
+            set_masks,
+            set_valid_indices,
+            set_group_indices,
+            set_nonempty,
+            self.permutation_encoders,
+        ):
+            set_features = features_tensor[:, :, feature_slice]
+            output[:, :, output_offset:output_offset + self.encoder_dim] = encoder(
                 set_features,
-                element_dim=group.element_dim,
-                active_channel=group.resolved_active_channel,
+                mask=set_mask,
+                valid_indices=valid,
+                group_indices=groups,
+                nonempty=has_values,
             )
-            output[:, :, output_offset:output_offset + self.encoder_dim] = encoder(set_features, mask=set_mask)
             output_offset += self.encoder_dim
-        
         return output
+
+    def forward(self, features_tensor):
+        """Encode a raw or already prepared ``[B, M, D]`` feature batch."""
+        prepared = (
+            features_tensor
+            if isinstance(features_tensor, PreparedFeatureBatch)
+            else self.prepare(features_tensor)
+        )
+        return self.forward_prepared(
+            prepared.features,
+            prepared.set_masks,
+            prepared.set_valid_indices,
+            prepared.set_group_indices,
+            prepared.set_nonempty,
+        )
+
 
 class IndependentNetwork(nn.Module):
     """
@@ -262,6 +392,24 @@ class IndependentNetwork(nn.Module):
         
         # 初始化权重
         self.apply(self._init_weights)
+
+        compile_config = _config_value(network_config, "compile", None)
+        self._compile_requested = bool(_config_value(compile_config, "enabled", False))
+        self._compile_mode = str(_config_value(compile_config, "mode", "default"))
+        self._compile_dynamic = bool(_config_value(compile_config, "dynamic", True))
+        self._compile_fullgraph = bool(_config_value(compile_config, "fullgraph", False))
+        self._compile_min_agents = max(
+            1, int(_config_value(compile_config, "min_agents", 2048))
+        )
+        self._compile_backend_available = (
+            os.name != "nt"
+            and hasattr(torch, "compile")
+            and importlib.util.find_spec("triton") is not None
+        )
+        self._compile_failed = False
+        self._compile_warning_emitted = False
+        self._compiled_policy_impl = None
+        self._compiled_value_impl = None
     
     def _init_weights(self, module):
         """初始化网络权重 - 使用Orthogonal初始化且bias为0"""
@@ -274,6 +422,98 @@ class IndependentNetwork(nn.Module):
     def value_parameters(self):
         yield from self.value_feature_encoder.parameters()
         yield from self.value_network.parameters()
+
+    def prepare_features(self, features_tensor) -> PreparedFeatureBatch:
+        if isinstance(features_tensor, PreparedFeatureBatch):
+            return features_tensor
+        return self.policy_feature_encoder.prepare(features_tensor)
+
+    def _policy_impl(
+        self,
+        features_tensor,
+        set_masks,
+        set_valid_indices,
+        set_group_indices,
+        set_nonempty,
+    ):
+        encoded = self.policy_feature_encoder.forward_prepared(
+            features_tensor,
+            set_masks,
+            set_valid_indices,
+            set_group_indices,
+            set_nonempty,
+        )
+        encoded = torch.nan_to_num(encoded, nan=0.0, posinf=1.0, neginf=-1.0)
+        return self.policy_network(encoded)
+
+    def _value_impl(
+        self,
+        features_tensor,
+        set_masks,
+        set_valid_indices,
+        set_group_indices,
+        set_nonempty,
+    ):
+        encoded = self.value_feature_encoder.forward_prepared(
+            features_tensor,
+            set_masks,
+            set_valid_indices,
+            set_group_indices,
+            set_nonempty,
+        )
+        encoded = torch.nan_to_num(encoded, nan=0.0, posinf=1.0, neginf=-1.0)
+        return self.value_network(encoded).squeeze(-1)
+
+    def _compile_available(self, prepared: PreparedFeatureBatch) -> bool:
+        if not self._compile_requested or self._compile_failed:
+            return False
+        if prepared.features.device.type != "cuda":
+            return False
+        if prepared.features.shape[0] * prepared.features.shape[1] < self._compile_min_agents:
+            return False
+        return self._compile_backend_available
+
+    def _compiled_or_eager(self, kind: str, prepared: PreparedFeatureBatch):
+        eager = self._policy_impl if kind == "policy" else self._value_impl
+        prepared_args = (
+            prepared.features,
+            prepared.set_masks,
+            prepared.set_valid_indices,
+            prepared.set_group_indices,
+            prepared.set_nonempty,
+        )
+        if not self._compile_available(prepared):
+            return eager(*prepared_args)
+
+        compiled_name = f"_compiled_{kind}_impl"
+        compiled = getattr(self, compiled_name)
+        try:
+            if compiled is None:
+                compiled = torch.compile(
+                    eager,
+                    mode=self._compile_mode,
+                    dynamic=self._compile_dynamic,
+                    fullgraph=self._compile_fullgraph,
+                )
+                setattr(self, compiled_name, compiled)
+            return compiled(*prepared_args)
+        except Exception as exc:
+            if "out of memory" in str(exc).lower():
+                raise
+            self._compile_failed = True
+            if not self._compile_warning_emitted:
+                warnings.warn(
+                    f"network torch.compile disabled after backend failure: {exc}",
+                    RuntimeWarning,
+                )
+                self._compile_warning_emitted = True
+            return eager(*prepared_args)
+
+    def forward_prepared_policy(self, prepared: PreparedFeatureBatch):
+        return self._compiled_or_eager("policy", prepared)
+
+    def forward_prepared_value(self, prepared: PreparedFeatureBatch):
+        return self._compiled_or_eager("value", prepared)
     
     def forward(self, features_tensor, mode="both"):
         """
@@ -302,11 +542,9 @@ class IndependentNetwork(nn.Module):
             action_logits: 动作logits [B, M, num_actions]
         """
         # 策略网络特征编码
-        policy_encoded_features = self.policy_feature_encoder(features_tensor)
-        policy_encoded_features = torch.nan_to_num(policy_encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        prepared = self.prepare_features(features_tensor)
         # 策略网络前向传播
-        action_logits = self.policy_network(policy_encoded_features)
-        return action_logits
+        return self.forward_prepared_policy(prepared)
     
     def forward_value(self, features_tensor):
         """
@@ -317,11 +555,9 @@ class IndependentNetwork(nn.Module):
             value: 状态值 [B, M]
         """
         # 值函数网络特征编码
-        value_encoded_features = self.value_feature_encoder(features_tensor)
-        value_encoded_features = torch.nan_to_num(value_encoded_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        prepared = self.prepare_features(features_tensor)
         # 值函数网络前向传播
-        value = self.value_network(value_encoded_features).squeeze(-1)
-        return value
+        return self.forward_prepared_value(prepared)
     
     def forward_both(self, features_tensor):
         """
@@ -332,8 +568,10 @@ class IndependentNetwork(nn.Module):
             action_logits: 动作logits [B, M, num_actions]
             value: 状态值 [B, M]
         """
-        action_logits = self.forward_policy(features_tensor)
-        value = self.forward_value(features_tensor)
+        prepared = self.prepare_features(features_tensor)
+        # Keep actor/critic weights independent and execute them sequentially.
+        action_logits = self.forward_prepared_policy(prepared)
+        value = self.forward_prepared_value(prepared)
         return action_logits, value
     
 def create_network(config, network_type="independent"):

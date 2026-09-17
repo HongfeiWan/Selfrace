@@ -59,6 +59,8 @@ class FeatureSchemaTests(unittest.TestCase):
         self.assertEqual(schema.flat_slice("lane_points"), slice(197, 757))
         self.assertEqual(schema.flat_slice("stop_lines"), slice(757, 777))
         self.assertEqual(schema.flat_slice("other_agents"), slice(777, 977))
+        self.assertIs(schema.flat_slice("other_agents"), schema.flat_slice("other_agents"))
+        self.assertIs(schema.group("other_agents"), schema.group("other_agents"))
         self.assertEqual(schema.group("other_agents").resolved_active_channel, 9)
         self.assertEqual(FEATURE_PAD_VALUE, -2.0)
 

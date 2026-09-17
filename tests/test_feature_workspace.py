@@ -10,7 +10,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "training"))
 sys.path.insert(0, str(PROJECT_ROOT / "utils"))
 
 from ddppo import FeatureBuildWorkspace
-from spatial_hash import SpatialHash
 
 
 class FeatureBuildWorkspaceTests(unittest.TestCase):
@@ -37,19 +36,6 @@ class FeatureBuildWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(workspace._arange_cache, {})
         self.assertEqual(workspace._scratch, {})
-
-    def test_spatial_hash_arange_keeps_only_largest_capacity(self):
-        spatial_hash = SpatialHash.__new__(SpatialHash)
-        spatial_hash.device = torch.device("cpu")
-        spatial_hash._arange_cache = torch.empty(0, dtype=torch.long)
-
-        spatial_hash._cached_arange(64)
-        short = spatial_hash._cached_arange(5)
-        spatial_hash._cached_arange(96)
-
-        self.assertEqual(short.tolist(), list(range(5)))
-        self.assertEqual(spatial_hash._arange_cache.numel(), 96)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,16 @@ def call_count(tree: ast.AST, name: str) -> int:
     )
 
 
+def attribute_call_count(tree: ast.AST, name: str) -> int:
+    return sum(
+        1
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == name
+    )
+
+
 def is_main_guard(node: ast.AST) -> bool:
     if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
         return False
@@ -87,6 +97,30 @@ class TrainingStructureTests(unittest.TestCase):
         ]
 
         self.assertEqual(all_true_calls, [])
+
+    def test_rollout_builds_only_packed_alive_ego_features(self):
+        tree = parsed("training/ddppo.py")
+        rollout = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "rollout_forward_alive_agents"
+        )
+
+        self.assertEqual(call_count(rollout, "build_features_for_selected_agents"), 1)
+        self.assertEqual(call_count(rollout, "build_features_from_simulator_env_slice"), 0)
+
+    def test_ppo_reuses_one_prepared_chunk_for_independent_networks(self):
+        tree = parsed("training/ddppo.py")
+        update = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "perform_ppo_update"
+        )
+
+        self.assertEqual(attribute_call_count(update, "prepare_features"), 1)
+        self.assertEqual(attribute_call_count(update, "forward_prepared_policy"), 1)
+        self.assertEqual(attribute_call_count(update, "forward_prepared_value"), 1)
 
     def test_production_modules_do_not_embed_manual_main_blocks(self):
         production_files = [
