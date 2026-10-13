@@ -1115,7 +1115,11 @@ class PathPlanner:
         for start in range(0, int(flat_needs.numel()), int(chunk_size)):
             idx = flat_needs[start:start + int(chunk_size)]
             query = quad_centers[flat_safe[idx]]
-            nearest = torch.cdist(query, routable_centers).argmin(dim=1)
+            from tensor_budget import nearest_indices
+            nearest = nearest_indices(
+                query, routable_centers, 1,
+                getattr(self, 'workspace_bytes', 64 * 1024**2),
+            ).squeeze(1)
             flat_out[idx] = routable_long[nearest]
 
         return out.to(torch.int32)

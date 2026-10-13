@@ -171,6 +171,12 @@ class RoadNetwork:
 
     def _load_traffic_controls(self, map_data):
         """加载交通灯位置和停止线中心点/朝向。"""
+        # Optional map contract: center=[x,y], heading_rad, length, width (metres).
+        crosswalks = map_data.get('crosswalks', [])
+        self.crosswalks = torch.tensor([
+            [*entry['center'], entry['heading_rad'], entry['length'], entry['width']]
+            for entry in crosswalks
+        ], dtype=torch.float32, device=self.device).reshape(-1, 5)
         traffic_controls = map_data.get('traffic_controls', [])
         if not traffic_controls:
             self.traffic_light_locations = torch.empty((0, 2), dtype=torch.float32, device=self.device)
@@ -220,55 +226,48 @@ class RoadNetwork:
         return self.quad_centerlines
 
     def find_nearest_lanes(self, points: torch.Tensor, k: int = 1, spatial_hash=None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        为一批输入点找到最近的 k 个车道 (quads)。
-        Args:
-            points (torch.Tensor): 形状为 (N, 2) 的点坐标张量。
-            k (int): 需要为每个点找到的最近车道的数量。
-            spatial_hash (SpatialHash, optional): 空间哈希对象，用于加速查询。如果提供，将使用空间哈希；否则使用暴力搜索。
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-            - distances: 形状为 (N, k) 的距离张量。
-            - indices: 形状为 (N, k) 的最近车道 (quads) 的索引张量。
-        """
-        if points.ndim == 1:
-            points = points.unsqueeze(0)
-        N = points.shape[0]
-        if spatial_hash is not None:
-            candidate_ids, valid_mask = spatial_hash.query_points_padded(points)
-            max_candidates = candidate_ids.shape[1]
-            distances = torch.full((N, k), float('inf'), device=self.device)
-            indices = torch.full((N, k), -1, dtype=torch.long, device=self.device)
-            if max_candidates <= 0 or self.num_quads == 0:
-                return distances, indices
+        """Bound scratch independently of both vehicle and map size."""
+        from tensor_budget import nearest_indices, is_cuda_oom
+        points = points.reshape(-1, 2)
+        budget = getattr(self, 'workspace_bytes', 64 * 1024**2)
+        if spatial_hash is None:
+            ids = nearest_indices(points, self.quad_centers, k, budget)
+            valid = ids >= 0
+            if self.num_quads == 0:
+                return points.new_full(ids.shape, float('inf')), ids
+            distances = (points[:, None] - self.quad_centers[ids.clamp_min(0)]).norm(dim=-1)
+            return distances.masked_fill(~valid, float('inf')), ids
+        distances = points.new_full((points.shape[0], k), float('inf'))
+        indices = torch.full((points.shape[0], k), -1, dtype=torch.long, device=points.device)
+        columns = max(1, min(64, budget // 128 - 2 * k))
+        rows = max(1, budget // (64 * (columns + 2 * k)))
+        start = 0
+        while start < points.shape[0]:
+            end = min(start + rows, points.shape[0])
+            try:
+                d, idx = self._nearest_lane_chunk(points[start:end], k, spatial_hash, columns)
+                distances[start:end], indices[start:end] = d, idx
+                start = end
+            except RuntimeError as exc:
+                if points.device.type != 'cuda' or not is_cuda_oom(exc) or rows == 1:
+                    raise
+                rows = max(1, rows // 2)
+        return distances, indices
 
-            safe_candidate_ids = torch.clamp(candidate_ids, 0, self.num_quads - 1)
-            candidate_centers = self.quad_centers[safe_candidate_ids]
-            diff = points.unsqueeze(1) - candidate_centers
-            candidate_dist_sq = torch.sum(diff ** 2, dim=-1).masked_fill(~valid_mask, float('inf'))
-
-            k_eff = min(k, max_candidates)
-            topk_dist_sq, topk_pos = torch.topk(candidate_dist_sq, k=k_eff, dim=1, largest=False)
-            topk_indices = torch.gather(candidate_ids, 1, topk_pos)
-            valid_topk = torch.isfinite(topk_dist_sq)
-
-            distances[:, :k_eff] = torch.sqrt(topk_dist_sq)
-            indices[:, :k_eff] = torch.where(
-                valid_topk,
-                topk_indices,
-                torch.full_like(topk_indices, -1)
-            )
-            return distances, indices
-        else:
-            # 使用原始暴力搜索方法
-            quad_centers = self.quad_centers # (num_quads, 2)
-            # 使用广播计算欧氏距离的平方
-            # (N, 1, 2) - (1, num_quads, 2) -> (N, num_quads, 2)
-            diff = points.unsqueeze(1) - quad_centers.unsqueeze(0)
-            dist_sq = torch.sum(diff ** 2, dim=-1) # (N, num_quads)
-            # 找到最近的 k 个
-            distances, indices = torch.topk(dist_sq, k=k, dim=1, largest=False)
-            return torch.sqrt(distances), indices
+    def _nearest_lane_chunk(self, points, k, spatial_hash, columns):
+        best_d = points.new_full((points.shape[0], k), float('inf'))
+        best_i = torch.full(best_d.shape, -1, device=points.device, dtype=torch.long)
+        if self.num_quads == 0:
+            return best_d, best_i
+        for left in range(0, spatial_hash.static_max_candidates_per_cell, columns):
+            ids, valid = spatial_hash.query_points_padded(points, left, columns)
+            diff = points[:, None, :] - self.quad_centers[ids.clamp_min(0)]
+            d = diff.square().sum(-1).masked_fill(~valid, float('inf'))
+            combined_d = torch.cat((best_d, d), dim=1)
+            combined_i = torch.cat((best_i, ids), dim=1)
+            best_d, positions = combined_d.topk(k, largest=False, dim=1)
+            best_i = combined_i.gather(1, positions)
+        return best_d.sqrt(), best_i.masked_fill(~best_d.isfinite(), -1)
 
     def calculate_frenet_coordinates(self, vehicle_positions: torch.Tensor, vehicle_headings: torch.Tensor, spatial_hash=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -292,46 +291,21 @@ class RoadNetwork:
         vehicle_positions_flat = vehicle_positions.view(-1, 2)  # (B*M, 2)
         distances, nearest_indices = self.find_nearest_lanes(vehicle_positions_flat, k=1, spatial_hash=spatial_hash)
         
-        # 重塑回原始形状。空间哈希可能找不到候选车道，不能让 -1 静默索引最后一条路。
-        nearest_indices = nearest_indices.view(B, M)  # (B, M)
-        valid_nearest = nearest_indices >= 0
-        safe_nearest_indices = torch.where(
-            valid_nearest,
-            nearest_indices,
-            torch.zeros_like(nearest_indices)
-        )
-        # 获取最近道路段的方向向量
-        road_directions = self.quad_directions[safe_nearest_indices]  # (B, M, 2)
-        
-        # 计算车辆朝向向量
-        vehicle_directions = torch.stack([
-            torch.cos(vehicle_headings),
-            torch.sin(vehicle_headings)
-        ], dim=-1)  # (B, M, 2)
-        
-        # 获取最近道路段的起点
-        nearest_centerlines = self.quad_centerlines[safe_nearest_indices]  # (B, M, 2, 2)
-        road_starts = nearest_centerlines[:, :, 0, :]  # (B, M, 2) - 道路起点
-        # 计算从道路起点到车辆位置的向量 AP = P - A
-        AP = vehicle_positions - road_starts  # (B, M, 2)
-        # 计算二维叉积 cross = (Px - Ax) * dy - (Py - Ay) * dx
-        # 这等价于 AP × road_directions 的z分量
-        cross = (AP[:, :, 0] * road_directions[:, :, 1] - 
-                AP[:, :, 1] * road_directions[:, :, 0])  # (B, M)
-        # 计算角度误差 theta_f
-        # 使用叉积的符号来确定角度方向
-        # 注意：这里计算的是 vehicle_directions 相对于 road_directions 的角度
-        cross_product = (vehicle_directions[:, :, 0] * road_directions[:, :, 1] - 
-                        vehicle_directions[:, :, 1] * road_directions[:, :, 0])
-        dot_product = torch.sum(road_directions * vehicle_directions, dim=-1)
-        theta_f = torch.atan2(cross_product, dot_product)  # (B, M)
-        # 横向距离就是叉积值（带符号）
-        # cross > 0: 车辆在道路左侧
-        # cross < 0: 车辆在道路右侧  
-        # cross = 0: 车辆在道路中心线上
-        d = torch.where(valid_nearest, cross, torch.zeros_like(cross))  # (B, M)
-        theta_f = torch.where(valid_nearest, theta_f, torch.zeros_like(theta_f))
-        return d, theta_f
-    
+        return self.frenet_from_indices(vehicle_positions, vehicle_headings, nearest_indices.reshape(B, M))
 
-# 为了让这个文件可以独立测试，添加一个 main block
+    def frenet_from_indices(self, vehicle_positions, vehicle_headings, nearest_indices):
+        """Right-positive reward geometry; observation explicitly flips its sign."""
+        shape = vehicle_headings.shape
+        vehicle_positions = vehicle_positions.reshape(-1, 2)
+        vehicle_headings = vehicle_headings.reshape(-1)
+        nearest_indices = nearest_indices.reshape(-1)
+        valid = nearest_indices >= 0
+        safe = nearest_indices.clamp_min(0)
+        directions = self.quad_directions[safe]
+        offset = vehicle_positions - self.quad_centerlines[safe, 0]
+        vehicle_dir = torch.stack((vehicle_headings.cos(), vehicle_headings.sin()), dim=-1)
+        d = offset[:, 0] * directions[:, 1] - offset[:, 1] * directions[:, 0]
+        cross = vehicle_dir[:, 0] * directions[:, 1] - vehicle_dir[:, 1] * directions[:, 0]
+        angle = torch.atan2(cross, (vehicle_dir * directions).sum(-1))
+        return (d.masked_fill(~valid, 0).reshape(shape),
+                angle.masked_fill(~valid, 0).reshape(shape))

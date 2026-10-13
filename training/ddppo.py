@@ -118,6 +118,8 @@ def save_checkpoint(
 		'value_scheduler_state_dict': value_scheduler.state_dict(),
 		'grad_scaler_state_dict': amp_scaler.state_dict() if amp_scaler is not None else None,
 		'rank_runtime_states': gathered_runtime,
+		'feature_schema': (save_model.policy_feature_encoder.feature_schema.signature()
+			if hasattr(save_model, 'policy_feature_encoder') else None),
 	}
 	ckpt_path = os.path.join(checkpoint_dir, f'ckpt_update_{update_step}.pt')
 	ckpt_tmp_path = f"{ckpt_path}.tmp"
@@ -152,6 +154,9 @@ def load_checkpoint(
 			f"unsupported checkpoint format {version}; expected {CHECKPOINT_FORMAT_VERSION}"
 		)
 	load_model = model.module if hasattr(model, 'module') else model
+	if state.get('feature_schema') is not None and hasattr(load_model, 'policy_feature_encoder'):
+		if tuple(state['feature_schema']) != load_model.policy_feature_encoder.feature_schema.signature():
+			raise ValueError('checkpoint feature schema differs from configured network inputs')
 	load_model.load_state_dict(state['model_state_dict'], strict=True)
 	policy_optimizer.load_state_dict(state['policy_optimizer_state_dict'])
 	value_optimizer.load_state_dict(state['value_optimizer_state_dict'])
@@ -572,7 +577,7 @@ def build_network_features(agents_state: torch.Tensor,
                            control_state: torch.Tensor = None,
                            map_dropout: dict = None,
                            workspace: FeatureBuildWorkspace = None,
-                           out: torch.Tensor = None) -> torch.Tensor:
+                           out: torch.Tensor = None, traffic_sets: dict = None) -> torch.Tensor:
     """
     将拆解后的观测组件构建为网络输入的特征张量
     Args:
@@ -780,6 +785,15 @@ def build_network_features(agents_state: torch.Tensor,
         if neighbor_dim > 6:
             neighbors_proc[:, :, :, 6] = neighbors_src[:, :, :, 6]
     
+    for group in schema.set_groups[4:]:
+        target = features_tensor[..., schema.flat_slice(group.name)]
+        source = (traffic_sets or {}).get(group.name)
+        if source is None:
+            target.zero_()
+        else:
+            if source.shape != (batch_size, max_agents, group.element_count, group.element_dim):
+                raise ValueError(f"{group.name} input shape does not match its schema")
+            target.copy_(source.flatten(2))
     return features_tensor
 
 # ============================== 检查GPU信息 ==============================
@@ -1426,12 +1440,14 @@ class RolloutTensorBuffer:
 		self.length = 0
 		self.states = None
 		self.route_state = {}
+		self.route_id_dtype = None
 		self.rewards = None
 		self.dones = None
 		self.values = None
 		self.old_log_probs = None
 		self.actions = None
 		self.time_indices = None
+		self.traffic_light_states = None
 		self._pre_step_pending = False
 
 	def __len__(self):
@@ -1489,13 +1505,9 @@ class RolloutTensorBuffer:
 
 	def _route_storage_dtype(self, key: str, value: torch.Tensor) -> torch.dtype:
 		if key == 'route_quad_ids':
-			if value.numel() == 0:
-				return torch.int16
-			min_id = int(value.min().item())
-			max_id = int(value.max().item())
-			if -32768 <= min_id and max_id <= 32767:
-				return torch.int16
-			return torch.int32
+			# Map capacity, not the random goals in the first frame, determines
+			# whether later route IDs fit (Town04 exceeds int16's positive range).
+			return self.route_id_dtype or value.dtype
 		if key in ('target_count', 'current_idx'):
 			return torch.int16
 		return value.dtype
@@ -1547,6 +1559,7 @@ class RolloutTensorBuffer:
 		if self._pre_step_pending:
 			raise RuntimeError("write_pre_step_from_simulator called twice before write_post_step")
 		state = simulator.agents_state.detach()
+		self.route_id_dtype = (torch.int16 if simulator.road_network.num_quads <= 32768 else torch.int32)
 		B, M = state.shape[:2]
 		dst = self._ensure_tensor_shape('states', (B, M, 10), state.device, state.dtype)[self.length]
 		dst.zero_()
@@ -1556,6 +1569,13 @@ class RolloutTensorBuffer:
 		dst[..., 6] = alive_mask.to(device=state.device, dtype=state.dtype)
 		control = current_control_state(simulator).detach()
 		dst[..., 7:10].copy_(control.to(device=state.device, dtype=state.dtype) * dst[..., 6:7])
+		lights = getattr(simulator, 'traffic_light_states', None)
+		if lights is not None and lights.numel() > 0:
+			if lights.dtype == torch.bool:
+				lights = torch.where(lights, 1, 3).to(torch.int8)
+			else:
+				lights = lights.to(torch.int8)
+			self._ensure_tensor('traffic_light_states', lights)[self.length].copy_(lights.detach())
 		self._write_time_index(state, time_index)
 		for key, value in (route_state or {}).items():
 			if torch.is_tensor(value):
@@ -1836,6 +1856,10 @@ def build_features_from_components(agents_state, neighbors_local, w_lanes_local,
 		world_agents_state.dtype,
 	)
 	stop_lines = stop_lines_from_condition(simulator, world_agents_state, condition_state, out=stop_out)
+	optional_groups = workspace.schema.set_groups[4:]
+	traffic_sets = (simulator.traffic_input_sets(
+		world_agents_state, condition_state.get('traffic_light_states'), optional_groups,
+	) if optional_groups else None)
 	workspace.mark_feature_chunk()
 	return build_network_features(
 		agents_state,
@@ -1851,6 +1875,7 @@ def build_features_from_components(agents_state, neighbors_local, w_lanes_local,
 		map_dropout=map_dropout,
 		workspace=workspace,
 		out=out,
+		traffic_sets=traffic_sets,
 	)
 
 
@@ -1959,20 +1984,26 @@ def build_features_for_selected_agents(world_states: torch.Tensor, simulator, co
 									   agent_indices: torch.Tensor, time_indices: torch.Tensor = None,
 									   env_indices: torch.Tensor = None,
 									   workspace: FeatureBuildWorkspace = None,
-									   out: torch.Tensor = None) -> torch.Tensor:
-	B = world_states.shape[0]
+									   out: torch.Tensor = None, world_indices=None,
+									   control_state=None, alive_mask=None, geometry=None) -> torch.Tensor:
+	B = agent_indices.numel()
 	workspace = workspace or _default_workspace(config)
 	obs_state = observation_state_from_buffer(world_states)
-	control_state = control_from_buffer_state(world_states)
+	control_state = control_from_buffer_state(world_states) if control_state is None else control_state
 	agent_indices = agent_indices.to(device=world_states.device, dtype=torch.long).view(B)
-	batch_idx = workspace.arange(B, world_states.device)
+	batch_idx = workspace.arange(B, world_states.device) if world_indices is None else world_indices
 	ego_obs_state = obs_state[batch_idx, agent_indices].unsqueeze(1)
+	control_selected = control_state[batch_idx, agent_indices].unsqueeze(1)
 	local_state, neighbors_local, w_lanes_local, w_boundaries_local, map_metadata = simulator.observation_generator.generate_selected_components(
 		obs_state,
 		agent_indices,
-		control_state=control_state,
+		control_state=control_selected,
 		driving_style_params=condition_state.get('vehicle_style'),
 		return_map_ids=True,
+		world_indices=batch_idx,
+		alive_mask=alive_mask,
+		quad_indices=None if geometry is None else geometry[0],
+		frenet=None if geometry is None else geometry[1:],
 	)
 	lane_count = int(w_lanes_local.shape[2]) if w_lanes_local is not None else 0
 	boundary_count = int(w_boundaries_local.shape[2]) if w_boundaries_local is not None else 0
@@ -1997,7 +2028,7 @@ def build_features_for_selected_agents(world_states: torch.Tensor, simulator, co
 		config,
 		route_state,
 		condition_state,
-		control_state=control_state.gather(1, agent_indices.view(B, 1, 1).expand(-1, -1, control_state.shape[-1])),
+		control_state=control_selected,
 		map_dropout=map_dropout,
 		world_agents_state=ego_obs_state,
 		map_metadata=map_metadata,
@@ -2142,8 +2173,8 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 	feature_workspace = feature_workspace or _default_workspace(config)
 	feature_workspace.reset_counters()
 	alive_mask = alive_mask.to(device=device, dtype=torch.bool)
-	selected = alive_mask.nonzero(as_tuple=False)
-	num_selected = int(selected.shape[0])
+	selected_flat, selected_b, selected_m, _ = simulator.active_selection(alive_mask)
+	num_selected = selected_flat.numel()
 	profile = {
 		'feature_ms': 0.0,
 		'policy_ms': 0.0,
@@ -2155,8 +2186,6 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 	if num_selected == 0:
 		return actions, old_log_probs, value_pred, profile
 
-	selected_b = selected[:, 0]
-	selected_m = selected[:, 1]
 	if batch_sizer is None:
 		maximum = max(1, feature_build_chunk_agents(config, M))
 		batch_sizer = AdaptiveBatchSizer(
@@ -2170,9 +2199,6 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 		else {}
 	)
 	control_state_all = current_control_state(simulator)
-	# Agents that already terminated in this rollout must not appear as neighbors.
-	observation_states = states.clone()
-	observation_states[..., 6] = alive_mask.to(dtype=states.dtype)
 	profile_on = profile_enabled(config)
 	start = 0
 	while start < num_selected:
@@ -2187,15 +2213,14 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 		try:
 			chunk_b = selected_b[start:end]
 			chunk_m = selected_m[start:end]
-			world_states = torch.cat(
-				(observation_states[chunk_b], control_state_all[chunk_b]), dim=-1
-			)
 			route_chunk = gather_current_route_state_selected(
 				route_state_all, chunk_b, chunk_m
 			)
 			condition_chunk = gather_condition_state_selected(
 				condition_state, chunk_b, chunk_m
 			)
+			# Lights may change within a rollout; never use its boundary snapshot.
+			condition_chunk['traffic_light_states'] = simulator.traffic_light_states[chunk_b]
 			time_chunk = (
 				dropout_step[chunk_b]
 				if torch.is_tensor(dropout_step) and dropout_step.dim() > 0
@@ -2204,7 +2229,7 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 			if profile_on:
 				feature_start = profile_timer_start(device, config)
 			features_chunk = build_features_for_selected_agents(
-				world_states,
+				states,
 				simulator,
 				config,
 				route_chunk,
@@ -2213,6 +2238,10 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 				time_indices=time_chunk,
 				env_indices=chunk_b,
 				workspace=feature_workspace,
+				world_indices=chunk_b,
+				control_state=control_state_all,
+				alive_mask=alive_mask,
+				geometry=simulator.selected_geometry(chunk_b, chunk_m),
 			)
 			if profile_on:
 				profile['feature_ms'] += profile_elapsed_ms(feature_start, device, config)
@@ -2226,7 +2255,7 @@ def rollout_forward_alive_agents(model, simulator, config, alive_mask: torch.Ten
 						mode="both",
 						chunk_agents=forward_chunk_agents,
 					)
-					distribution = torch.distributions.Categorical(logits=action_logits[:, 0])
+					distribution = torch.distributions.Categorical(logits=action_logits[:, 0], validate_args=False)
 					action_chunk = distribution.sample()
 					log_prob_chunk = distribution.log_prob(action_chunk)
 					actions[chunk_b, chunk_m] = action_chunk
@@ -2465,6 +2494,7 @@ def build_selected_feature_cache(
 	precision: str,
 	workspace: FeatureBuildWorkspace,
 	batch_sizer: AdaptiveBatchSizer,
+	traffic_states_tensor: torch.Tensor = None,
 ) -> tuple[SelectedFeatureCache, int, int]:
 	"""Build selected observations once, with persistent CUDA-OOM backoff."""
 	count = int(selected_t.shape[0])
@@ -2486,11 +2516,14 @@ def build_selected_feature_cache(
 			chunk_t = selected_t[start:end]
 			chunk_b = selected_b[start:end]
 			chunk_m = selected_m[start:end]
-			world_states = states_tensor[chunk_t, chunk_b]
+			# Flatten time/world as a view, then gather only ego and neighbor slots.
+			world_states = states_tensor.flatten(0, 1)
 			route_state = gather_route_state_selected(
 				route_state_tensor, chunk_t, chunk_b, chunk_m
 			)
 			conditions = gather_condition_state_selected(condition_state, chunk_b, chunk_m)
+			if traffic_states_tensor is not None:
+				conditions['traffic_light_states'] = traffic_states_tensor[chunk_t, chunk_b]
 			features = build_features_for_selected_agents(
 				world_states,
 				simulator,
@@ -2501,6 +2534,7 @@ def build_selected_feature_cache(
 				time_indices=time_indices_tensor[chunk_t, chunk_b],
 				env_indices=chunk_b,
 				workspace=workspace,
+				world_indices=chunk_t * states_tensor.shape[1] + chunk_b,
 			)
 			cache.storage[start:end].copy_(
 				features.to(dtype=cache.storage.dtype),
@@ -2778,6 +2812,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 		precision,
 		feature_workspace,
 		feature_batch_sizer,
+		traffic_states_tensor=rollout_buffer.view(rollout_buffer.traffic_light_states),
 	)
 	ppo_feature_cache_build_ms = (
 		profile_elapsed_ms(feature_cache_start, device, config)
@@ -2862,7 +2897,7 @@ def perform_ppo_update(model, policy_optimizer, value_optimizer,
 						with make_autocast_context(device, precision):
 							action_logits = base_model.forward_prepared_policy(prepared_chunk)
 							logits_selected = action_logits[:, 0]
-							dist_selected = torch.distributions.Categorical(logits=logits_selected)
+							dist_selected = torch.distributions.Categorical(logits=logits_selected, validate_args=False)
 							new_log_probs = dist_selected.log_prob(chunk_actions)
 							log_ratio = new_log_probs - chunk_old_logp
 							ratio = torch.exp(log_ratio)
@@ -3385,7 +3420,10 @@ def run_training_loop(
             print(f"reset={reset_ms:.2f}ms, initial_feature_build=0.00ms")
 
     condition_state = snapshot_condition_state(simulator)
-    rollout_buffer = rollout_buffer or RolloutTensorBuffer(rollout_length)
+    # An allocated, cleared buffer has len == 0; truthiness would allocate a
+    # second full rollout while the caller still owns the first one.
+    if rollout_buffer is None:
+        rollout_buffer = RolloutTensorBuffer(rollout_length)
     cumulative_done_all = None
     episode_steps = torch.zeros(
         simulator.num_envs, dtype=torch.long, device=context.device

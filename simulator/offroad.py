@@ -10,6 +10,16 @@ utils_dir = os.path.join(parent_dir, 'utils')
 if utils_dir not in sys.path:
     sys.path.insert(0, utils_dir)
 from spatial_hash import SpatialHash
+from tensor_budget import is_cuda_oom, workspace_bytes
+from execution import CompiledStage
+
+
+def _points_inside_quads(points, ids, valid, poly_verts, poly_edges, poly_sign):
+    safe_ids = ids.clamp_min(0)
+    verts, edges = poly_verts[safe_ids], poly_edges[safe_ids]
+    pv = points[:, None, None, :] - verts
+    cross = edges[..., 0] * pv[..., 1] - edges[..., 1] * pv[..., 0]
+    return (((poly_sign[safe_ids, None] * cross >= -1e-10).all(dim=-1) & valid).any(dim=1))
 
 class OffroadChecker:
     """
@@ -24,6 +34,8 @@ class OffroadChecker:
         spatial_hash: SpatialHash,
         points_per_vehicle_edge: int = 3,
         offroad_point_chunk_size: int = DEFAULT_POINT_CHUNK_SIZE,
+        workspace_mb: float = 64.0,
+        compile_enabled: bool = False,
     ):
         """
         初始化离路检测器。
@@ -38,6 +50,9 @@ class OffroadChecker:
             raise ValueError("points_per_vehicle_edge must be at least 2.")
         self.points_per_vehicle_edge = points_per_vehicle_edge
         self.offroad_point_chunk_size = max(1, int(offroad_point_chunk_size))
+        self.workspace_bytes = workspace_bytes(self.device, workspace_mb)
+        self.candidate_chunk_size = min(64, max(1, self.workspace_bytes // 256))
+        self._inside_stage = CompiledStage(_points_inside_quads, compile_enabled)
         self.road_polygons = map_data.quads_vertices.to(self.device)
 
         self.spatial_hash = spatial_hash
@@ -101,7 +116,8 @@ class OffroadChecker:
             torch.stack([cos_h, -sin_h], dim=1),
             torch.stack([sin_h, cos_h], dim=1)
         ], dim=1)
-        rotated_points = torch.bmm(scaled_points, rot_matrix)
+        # Points are row vectors; transpose the column-vector rotation.
+        rotated_points = torch.bmm(scaled_points, rot_matrix.transpose(1, 2))
         world_points = rotated_points + states[:, :2].unsqueeze(1)
         return world_points
     
@@ -125,25 +141,34 @@ class OffroadChecker:
         if self.poly_verts.shape[0] == 0:
             return flat_on_road_mask
 
-        chunk_size = self.offroad_point_chunk_size
-        for start in range(0, M, chunk_size):
+        columns = min(self.candidate_chunk_size, self.spatial_hash.static_max_candidates_per_cell)
+        # Conservative accounting: IDs, masks, verts, edges, pv, cross and
+        # arithmetic temporaries. Never size from the point count alone.
+        chunk_size = min(self.offroad_point_chunk_size, max(1, self.workspace_bytes // (256 * max(1, columns))))
+        start = 0
+        while start < M:
             end = min(start + chunk_size, M)
-            chunk_points = points[start:end]
-            candidate_ids, valid_mask = self.spatial_hash.query_points_padded(chunk_points)
-            if candidate_ids.shape[1] == 0:
-                continue
-
-            safe_candidate_ids = torch.clamp(candidate_ids, 0, self.poly_verts.shape[0] - 1)
-            verts = self.poly_verts[safe_candidate_ids]
-            edges = self.poly_edges[safe_candidate_ids]
-            sign = self.poly_sign[safe_candidate_ids]
-
-            pv = chunk_points[:, None, None, :] - verts
-            cross = edges[..., 0] * pv[..., 1] - edges[..., 1] * pv[..., 0]
-            inside = (sign.unsqueeze(-1) * cross >= -1e-10).all(dim=-1) & valid_mask
-            flat_on_road_mask[start:end] = inside.any(dim=1)
+            try:
+                flat_on_road_mask[start:end] = self._query_point_chunk(points[start:end], max(1, columns))
+                start = end
+            except RuntimeError as exc:
+                if torch.device(self.device).type != 'cuda' or not is_cuda_oom(exc) or (chunk_size == 1 and columns <= 1):
+                    raise
+                if chunk_size > 1:
+                    chunk_size = max(1, chunk_size // 2)
+                    self.offroad_point_chunk_size = min(self.offroad_point_chunk_size, chunk_size)
+                else:
+                    columns = max(1, columns // 2)
+                    self.candidate_chunk_size = columns
 
         return flat_on_road_mask
+
+    def _query_point_chunk(self, points, columns):
+        on_road = torch.zeros(points.shape[0], dtype=torch.bool, device=points.device)
+        for left in range(0, self.spatial_hash.static_max_candidates_per_cell, columns):
+            ids, valid = self.spatial_hash.query_points_padded(points, left, columns)
+            on_road |= self._inside_stage(points, ids, valid, self.poly_verts, self.poly_edges, self.poly_sign)
+        return on_road
 
     def check_on_road(self, states: Tensor) -> Tensor:
         """
@@ -152,10 +177,25 @@ class OffroadChecker:
         N = states.shape[0]
         if N == 0:
             return torch.empty(0, dtype=torch.bool, device=self.device)
-        world_points = self._get_discretized_bounding_boxes(states)
-        num_points_per_box = world_points.shape[1]
-        flat_points = world_points.view(-1, 2)
-        flat_on_road_mask = self._batch_point_in_polygon_test(flat_points)
-        on_road_mask_per_point = flat_on_road_mask.view(N, num_points_per_box)
-        is_on_road = torch.all(on_road_mask_per_point, dim=1)
+        # Bound box-point materialization as well as polygon-query scratch.
+        num_points_per_box = self.local_bbox_points.shape[0]
+        rows = max(1, min(self.offroad_point_chunk_size, self.workspace_bytes // 256) // num_points_per_box)
+        is_on_road = torch.empty(N, dtype=torch.bool, device=states.device)
+        start = 0
+        while start < N:
+            end = min(start + rows, N)
+            try:
+                is_on_road[start:end] = self._check_vehicle_chunk(states[start:end])
+                start = end
+            except RuntimeError as exc:
+                if states.device.type != 'cuda' or not is_cuda_oom(exc) or rows == 1:
+                    raise
+                rows = max(1, rows // 2)
+                self.offroad_point_chunk_size = min(self.offroad_point_chunk_size, rows * num_points_per_box)
         return is_on_road
+
+    def _check_vehicle_chunk(self, states):
+        # Release failed box/point scratch before retrying a smaller car tile.
+        points = self._get_discretized_bounding_boxes(states)
+        on_road = self._batch_point_in_polygon_test(points.reshape(-1, 2))
+        return on_road.view(states.shape[0], self.local_bbox_points.shape[0]).all(dim=1)

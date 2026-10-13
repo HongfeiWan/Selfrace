@@ -47,6 +47,20 @@ def make_config(*, boundary_dim=160, neighbor_element_dim=10, goal_dim=8, active
 
 
 class FeatureSchemaTests(unittest.TestCase):
+    def test_optional_traffic_inputs_append_without_moving_trained_slices(self):
+        config = make_config()
+        baseline = FeatureSchema.from_config(config)
+        config.training.network.feature_schema.optional_sets = namespace(
+            traffic_lights=namespace(flat_dim=40, element_dim=8, active_channel=-1),
+            crosswalks=namespace(flat_dim=35, element_dim=7, active_channel=-1),
+        )
+        extended = FeatureSchema.from_config(config)
+        self.assertEqual(extended.total_input_dim, 1052)
+        for group in baseline.groups:
+            self.assertEqual(extended.flat_slice(group.name), baseline.flat_slice(group.name))
+        self.assertEqual(extended.flat_slice('traffic_lights'), slice(977, 1017))
+        self.assertEqual(extended.group('crosswalks').resolved_active_channel, 6)
+
     def test_named_schema_has_stable_offsets(self):
         schema = FeatureSchema.from_config(make_config())
 

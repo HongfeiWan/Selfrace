@@ -15,6 +15,7 @@ utils_dir = os.path.join(parent_dir, 'utils')
 if utils_dir not in sys.path:
     sys.path.insert(0, utils_dir)
 from spatial_hash import SpatialHash
+from tensor_budget import workspace_bytes, is_cuda_oom
 
 
 def _stream_transform_points(points: torch.Tensor, ref_state: torch.Tensor) -> torch.Tensor:
@@ -61,6 +62,23 @@ def _stream_one_way_collision(ref_t0, ref_t1, moving_verts_t0, moving_verts_t1):
     return intersections.any(dim=-1)
 
 
+def _obb_overlap(a, b):
+    """Endpoint SAT covers edge-edge overlaps with no corner inside either box."""
+    delta = b[..., :2] - a[..., :2]
+    ca, sa = a[..., 2].cos(), a[..., 2].sin()
+    cb, sb = b[..., 2].cos(), b[..., 2].sin()
+    c = (ca * cb + sa * sb).abs()
+    s = (sa * cb - ca * sb).abs()
+    la, wa = a[..., 4] * .5, a[..., 5] * .5
+    lb, wb = b[..., 4] * .5, b[..., 5] * .5
+    return (
+        ((delta[..., 0] * ca + delta[..., 1] * sa).abs() < la + lb * c + wb * s)
+        & ((-delta[..., 0] * sa + delta[..., 1] * ca).abs() < wa + lb * s + wb * c)
+        & ((delta[..., 0] * cb + delta[..., 1] * sb).abs() < lb + la * c + wa * s)
+        & ((-delta[..., 0] * sb + delta[..., 1] * cb).abs() < wb + la * s + wa * c)
+    )
+
+
 def _bounded_collision_world_chunk(
     states_t0: torch.Tensor,
     states_t1: torch.Tensor,
@@ -72,10 +90,8 @@ def _bounded_collision_world_chunk(
 ) -> torch.Tensor:
     """Broad phase, exact narrow phase, and scatter for a bounded world chunk.
 
-    The data-dependent tensor is bounded by ``worlds * len(pair_i)``, which the
-    caller caps with ``collision_stream_pair_budget``. Under ``torch.compile``
-    its nonzero and consumers stay in the device graph, so Python never reads a
-    candidate count.
+    CPU/reference implementation. CUDA must not use this nonzero path: compiling
+    nonzero does not in itself remove its host/device synchronization.
     """
     worlds, max_agents = active_mask.shape
     swept_min = torch.minimum(verts_t0.amin(dim=-2), verts_t1.amin(dim=-2))
@@ -95,7 +111,7 @@ def _bounded_collision_world_chunk(
     agent_i = pair_i[pair_idx]
     agent_j = pair_j[pair_idx]
 
-    pair_collisions = _stream_one_way_collision(
+    pair_collisions = _obb_overlap(states_t0[world_idx, agent_i], states_t0[world_idx, agent_j]) | _obb_overlap(states_t1[world_idx, agent_i], states_t1[world_idx, agent_j]) | _stream_one_way_collision(
         states_t0[world_idx, agent_i],
         states_t1[world_idx, agent_i],
         verts_t0[world_idx, agent_j],
@@ -152,6 +168,9 @@ def _bounded_collision_world_chunk_dense(
         & active_mask[:, pair_j]
     )
     pair_collisions = broad & (
+        _obb_overlap(states_t0[:, pair_i], states_t0[:, pair_j])
+        | _obb_overlap(states_t1[:, pair_i], states_t1[:, pair_j])
+        |
         _stream_one_way_collision(
             states_t0[:, pair_i],
             states_t1[:, pair_i],
@@ -193,10 +212,8 @@ def _bounded_collision_world_chunk_dense(
 class CollisionChecker:
     """Continuous collision checking with a hard-bounded pair stream.
 
-    Python only iterates over shape-derived world/pair ranges. Candidate counts
-    remain on-device, so the CUDA hot path never calls ``item()`` or branches on
-    a tensor value. Linux CUDA compiles the sparse narrow phase; the eager CUDA
-    fallback evaluates a fixed dense pair block to preserve that guarantee.
+    Linux CUDA uses sorted dynamic cells and device-side occupancy loops.
+    CPU/unsupported backends retain the bounded pair-stream reference.
     """
 
     def __init__(self, config: Dict, spatial_hash: SpatialHash):
@@ -218,6 +235,12 @@ class CollisionChecker:
             and hasattr(torch, 'compile')
             and importlib.util.find_spec('triton') is not None
         )
+        self.workspace_bytes = workspace_bytes(self.device, simulator_config.get('geometry_workspace_mb', 64))
+        self.stream_pair_budget = min(self.stream_pair_budget, max(1, self.workspace_bytes // 768))
+        self.dynamic_cells = bool(simulator_config.get('collision_dynamic_cells', True))
+        self.dynamic_cell_size = max(0.1, float(simulator_config.get('collision_dynamic_cell_size', 16.0)))
+        self._cell_failed = False
+        self._cell_world_limit = None
         self._pair_index_cache = {}
         self._compiled_stream_chunk = None
         self._stream_compile_failed = False
@@ -274,21 +297,11 @@ class CollisionChecker:
         try:
             if self._compiled_stream_chunk is None:
                 self._compiled_stream_chunk = torch.compile(
-                    _bounded_collision_world_chunk,
+                    _bounded_collision_world_chunk_dense,
                     mode=self.stream_compile_mode,
                     dynamic=True,
                     fullgraph=True,
                 )
-            dynamo = getattr(torch, '_dynamo', None)
-            patch_values = {}
-            if dynamo is not None:
-                if hasattr(dynamo.config, 'capture_dynamic_output_shape_ops'):
-                    patch_values['capture_dynamic_output_shape_ops'] = True
-                if hasattr(dynamo.config, 'capture_scalar_outputs'):
-                    patch_values['capture_scalar_outputs'] = True
-            if patch_values:
-                with dynamo.config.patch(**patch_values):
-                    return self._compiled_stream_chunk(*args)
             return self._compiled_stream_chunk(*args)
         except Exception as exc:
             if 'out of memory' in str(exc).lower():
@@ -320,6 +333,27 @@ class CollisionChecker:
         if batch_size == 0 or max_agents <= 1:
             return collisions
 
+        if (self.dynamic_cells and not self._cell_failed and self.device.type == 'cuda'
+                and self._compile_backend_available):
+            try:
+                return self._cell_dynamic_collisions(states_t0, states_t1, active_mask, verts_t0, verts_t1)
+            except Exception as exc:
+                if is_cuda_oom(exc):
+                    raise
+                self._cell_failed = True
+                warnings.warn(f"dynamic collision cells disabled after backend failure: {exc}", RuntimeWarning)
+
+        while True:
+            try:
+                return self._pair_stream_once(states_t0, states_t1, active_mask, verts_t0, verts_t1, profile)
+            except RuntimeError as exc:
+                if self.device.type != 'cuda' or not is_cuda_oom(exc) or self.stream_pair_budget == 1:
+                    raise
+                self.stream_pair_budget = max(1, self.stream_pair_budget // 2)
+
+    def _pair_stream_once(self, states_t0, states_t1, active_mask, verts_t0, verts_t1, profile):
+        batch_size, max_agents = active_mask.shape
+        collisions = torch.zeros_like(active_mask)
         pair_i, pair_j = self._pair_indices(max_agents)
         pairs_per_world = int(pair_i.numel())
         stream_start = self._profile_now() if profile is not None else 0.0
@@ -346,6 +380,29 @@ class CollisionChecker:
         self._profile_record(profile, 'collision_stream_ms', stream_start)
         return collisions
 
+    def _cell_dynamic_collisions(self, states_t0, states_t1, active, verts_t0, verts_t1):
+        from collision_cuda import cell_collisions
+        worlds, agents = active.shape
+        # Includes sort/search workspaces, 9 cell ranges and staged poses/verts.
+        ceiling = max(1, self.workspace_bytes // max(1, agents * 1024))
+        rows = min(worlds, ceiling if self._cell_world_limit is None else self._cell_world_limit)
+        result = torch.zeros_like(active)
+        start = 0
+        while start < worlds:
+            end = min(start + rows, worlds)
+            try:
+                result[start:end] = cell_collisions(
+                    states_t0[start:end], states_t1[start:end], active[start:end],
+                    verts_t0[start:end], verts_t1[start:end], self.dynamic_cell_size,
+                )
+                start = end
+            except RuntimeError as exc:
+                if not is_cuda_oom(exc) or rows == 1:
+                    raise
+                rows = max(1, rows // 2)
+                self._cell_world_limit = rows
+        return result
+
     def check(
         self,
         states_t0: torch.Tensor,
@@ -362,7 +419,7 @@ class CollisionChecker:
         逻辑:
         1.  从 t1 时刻的状态中提取出当前处于激活状态的智能体。
         2.  计算所有智能体在 t0 和 t1 时刻的边界框顶点。
-        3.  按固定 pair 预算流式执行宽阶段和连续窄阶段检测。
+        3.  CUDA/Triton 使用动态 cell 候选；其他后端按固定 pair 预算流式检测。
         4.  每个块立刻散播回最终结果，不保留全局候选列表。
         5.  如果提供了静态障碍物，则调用静态碰撞检测方法。
         6.  合并动态和静态碰撞结果，并用激活掩码过滤，返回最终结果。
@@ -403,7 +460,8 @@ class CollisionChecker:
         if debug:
             debug_data = {
                 'broad_phase': {
-                    'algorithm': 'bounded_pair_stream',
+                    'algorithm': ('dynamic_cells' if self.dynamic_cells and self.device.type == 'cuda'
+                                  and self._compile_backend_available and not self._cell_failed else 'bounded_pair_stream'),
                     'pair_budget': self.stream_pair_budget,
                 }
             }
@@ -433,32 +491,32 @@ class CollisionChecker:
         v4 = center + half_l * vec_x - half_w * vec_y
         return torch.stack([v1, v2, v3, v4], dim=-2)
 
-    def _check_static_collisions(
-        self,
-        states_t0: torch.Tensor,
-        states_t1: torch.Tensor,
-        static_obstacles: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        目的: 批量检测所有动态智能体与所有静态障碍物之间的碰撞。
-
-        逻辑:
-        - 将静态障碍物视为一种特殊的智能体，其在 t0 和 t1 时刻的状态完全相同。
-        - 利用广播机制，将动态智能体（作为移动方）与所有静态障碍物（作为参考方）进行配对。
-        - 调用向量化的连续单向检测，一次性完成所有动态-静态对的碰撞检测。
-        - 如果一个智能体与任何一个障碍物发生碰撞，则将其标记为碰撞。
-        """
-        O, _, _ = static_obstacles.shape
-        all_verts_t0 = self._get_world_vertices(states_t0)
-        all_verts_t1 = self._get_world_vertices(states_t1)
-        obs_centers = torch.mean(static_obstacles, dim=1)
-        obs_states = torch.zeros(O, 7, device=self.device)
-        obs_states[:, :2] = obs_centers
-        obs_states[:, 6] = 1.0
-        mov_verts_t0 = all_verts_t0.unsqueeze(2)
-        mov_verts_t1 = all_verts_t1.unsqueeze(2)
-        ref_states = obs_states.view(1, 1, O, 7)
-        collisions = _stream_one_way_collision(
-            ref_states, ref_states, mov_verts_t0, mov_verts_t1
-        )
-        return collisions.any(dim=-1)
+    def _check_static_collisions(self, states_t0, states_t1, static_obstacles):
+        """Rectangle obstacles, bounded in both vehicle and obstacle dimensions."""
+        count = static_obstacles.shape[0]
+        result = torch.zeros(states_t0.shape[:2], device=self.device, dtype=torch.bool)
+        if count == 0:
+            return result
+        edges = static_obstacles[:, 1:] - static_obstacles[:, :-1]
+        obstacle_states = states_t0.new_zeros((count, 7))
+        obstacle_states[:, :2] = static_obstacles.mean(1)
+        obstacle_states[:, 2] = torch.atan2(edges[:, 0, 1], edges[:, 0, 0])
+        obstacle_states[:, 4] = edges[:, 0].norm(dim=-1)
+        obstacle_states[:, 5] = edges[:, 1].norm(dim=-1)
+        obstacle_states[:, 6] = 1
+        flat0, flat1 = states_t0.reshape(-1, 7), states_t1.reshape(-1, 7)
+        columns = min(count, 32, self.stream_pair_budget)
+        rows = max(1, self.stream_pair_budget // columns)
+        for left in range(0, flat0.shape[0], rows):
+            a0, a1 = flat0[left:left + rows, None], flat1[left:left + rows, None]
+            va0, va1 = self._get_world_vertices(a0), self._get_world_vertices(a1)
+            hit = torch.zeros(a0.shape[0], dtype=torch.bool, device=self.device)
+            for start in range(0, count, columns):
+                b = obstacle_states[None, start:start + columns]
+                vb = static_obstacles[None, start:start + columns]
+                hits = (_obb_overlap(a0, b) | _obb_overlap(a1, b)
+                        | _stream_one_way_collision(a0, a1, vb, vb)
+                        | _stream_one_way_collision(b, b, va0, va1))
+                hit |= hits.any(-1)
+            result.view(-1)[left:left + rows] = hit
+        return result

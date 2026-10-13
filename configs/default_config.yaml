@@ -27,8 +27,17 @@ simulator:
   route_max_goal_distance: 200.0
   route_max_heading_delta_deg: 60.0
   reset_chunk_worlds: 256                      # masked reset 峰值显存过高时会自动减半并记住安全值
+  geometry_workspace_mb: 64                   # offroad / 地图 kNN 临时张量预算；持久地图与输出另计
+  execution:
+    compile: true                            # 只编译纯动力学/offroad 分段，不编译带 reset/缓存写入的整个 step
+    chunk_agents: 8192                       # 固定容量上限；纯分段 OOM 时自动退避
+    cuda_graph:
+      enabled: false                         # 短基准确认收益后显式开启，最多保留一个固定 bucket 图
+      max_private_mb: 64
   collision_stream_pair_budget: 524288         # 每个流式碰撞块允许的最大候选 pair 数，硬限制临时显存
-  collision_stream_compile: true               # Linux/CUDA 上编译单块，避免动态候选读取触发 CPU 同步
+  collision_dynamic_cells: true               # Linux/CUDA+Triton: 动态 cell + 设备端有界候选流
+  collision_dynamic_cell_size: 16.0            # 大车/高速跨格走设备端精确回退，不截断拥挤格
+  collision_stream_compile: true               # 不支持 dynamic cells 时编译固定容量 pair 回退块
   collision_stream_compile_mode: "default"
 
   # 地图配置  
@@ -239,6 +248,12 @@ training:
     encoder_dim: 64  # 每个编码器的输出维度
     # 网络输入唯一 schema。顺序由名称固定，builder 与 encoder 共用同一份切片定义。
     feature_schema:
+      # 默认不增加输入维度，现有 977 维 checkpoint 保持可用。
+      # 启用扩展需训练对应新 schema 的模型；两个 set 都用最后一维作有效位。
+      # optional_sets:
+      #   traffic_lights: {flat_dim: 40, element_dim: 8, active_channel: -1}
+      #   crosswalks: {flat_dim: 35, element_dim: 7, active_channel: -1}
+      optional_sets: {}
       simple:
         state: 13              # S(t)
         goal: 8                # 4 个 remaining route 目标 (dx, dy)
@@ -253,6 +268,10 @@ training:
     # 网络架构配置
     network_dim: 1024  # MLP隐藏层维度
     num_actions: 12    # 输出动作数量
+    cuda_graph:
+      enabled: false                     # 仅 rollout 推理；PPO backward 与随机采样不入图
+      bucket_agents: 1024                 # 不能直接把 65536 ego × 所有 set 元素全部展开
+      max_private_mb: 128                 # 单个图私有池预算，形状变化不新增缓存图
     compile:
       enabled: true      # Linux/CUDA+Triton 启用；Windows/CPU 自动保持 eager
       mode: "default"

@@ -14,6 +14,7 @@ if utils_dir not in sys.path:
     sys.path.insert(0, utils_dir)
 from road import RoadNetwork
 from spatial_hash import SpatialHash
+from tensor_budget import nearest_indices, workspace_bytes
     
 class ObservationGenerator:
     """
@@ -22,13 +23,14 @@ class ObservationGenerator:
     通过完全向量化的操作，该模块可以一次性为所有环境中的所有智能体高效地计算观测，
     避免了在 Python 中进行循环，从而最大限度地利用 GPU 并行能力。
     """
-    def __init__(self, road_network: RoadNetwork, config: Dict, device: torch.device, spatial_hash: SpatialHash = None):
+    def __init__(self, road_network: RoadNetwork, config: Dict, device: torch.device, spatial_hash: SpatialHash = None, workspace_mb: float = 64.0):
         """
         初始化观测生成器。
         """
         self.road_network = road_network
         self.config = config
         self.device = device
+        self.workspace_bytes = workspace_bytes(device, workspace_mb)
         self.num_neighbors = config.get('num_neighbors', 1) # 邻居数量
         self.num_w_lanes = config.get('num_w_lanes', 80) # 原文 W_lane 使用 80 个 coarse map features
         self.num_w_boundaries = config.get('num_w_boundaries', 80) # 原文 W_boundary 使用 80 个 coarse map features
@@ -110,20 +112,9 @@ class ObservationGenerator:
         if waypoints.numel() == 0 or num_nearest == 0:
             return torch.full((query_points.shape[0], num_nearest), -1, dtype=torch.long, device=self.device)
         
-        # 计算所有查询点到所有waypoints的距离
-        distances = torch.cdist(query_points, waypoints, p=2)  # (N, M)
-        
-        # 找到最近的num_nearest个点
-        _, nearest_indices = torch.topk(distances, k=min(num_nearest, waypoints.shape[0]), dim=1, largest=False)
-        
-        # 如果waypoints数量不足，用-1填充，避免把真实第0个点误当padding。
-        if waypoints.shape[0] < num_nearest:
-            padding = torch.full((query_points.shape[0], num_nearest - waypoints.shape[0]), -1, dtype=torch.long, device=self.device)
-            nearest_indices = torch.cat([nearest_indices, padding], dim=1)
-        
-        return nearest_indices
+        return nearest_indices(query_points, waypoints, num_nearest, self.workspace_bytes)
 
-    def _get_precomputed_waypoints(self, agents_state: torch.Tensor, return_ids: bool = False) -> tuple:
+    def _get_precomputed_waypoints(self, agents_state: torch.Tensor, return_ids: bool = False, quad_indices=None) -> tuple:
         """
         使用预计算的数据获取w_lanes和w_boundaries。
         Args:
@@ -138,7 +129,9 @@ class ObservationGenerator:
         agent_positions_flat = agent_positions.view(-1, 2)  # (B*M, 2)
         
         # 找到每个agent最近的quad索引
-        distances, quad_indices = self.road_network.find_nearest_lanes(agent_positions_flat, k=1, spatial_hash=self.spatial_hash)
+        if quad_indices is None:
+            _, quad_indices = self.road_network.find_nearest_lanes(agent_positions_flat, k=1, spatial_hash=self.spatial_hash)
+        quad_indices = quad_indices.reshape(-1)
         quad_indices = quad_indices.squeeze(-1)  # (B*M,)
         valid_quad = quad_indices >= 0
         safe_quad_indices = torch.where(valid_quad, quad_indices, torch.zeros_like(quad_indices))
@@ -323,28 +316,39 @@ class ObservationGenerator:
         })
 
     def _get_selected_neighbors(self, agents_state: torch.Tensor, agent_indices: torch.Tensor,
-                                ego_states: torch.Tensor) -> torch.Tensor:
-        """Nearest-neighbor states for one selected ego per batch row."""
-        batch_size, max_agents, _ = agents_state.shape
+                                ego_states: torch.Tensor, world_indices=None,
+                                alive_mask=None) -> torch.Tensor:
+        """Query shared worlds in slot tiles; gather full states only for top K.
+
+        No [selected_egos, all_world_agents, state_dim] world copies. Historical
+        PPO worlds may be views of [T*B,M,D]; current worlds need no concatenation.
+        """
+        batch_size, max_agents = agent_indices.numel(), agents_state.shape[1]
+        if world_indices is None:
+            world_indices = torch.arange(batch_size, device=agents_state.device)
         if self.num_neighbors == 0:
             return torch.zeros(batch_size, 1, 0, 7, device=self.device, dtype=agents_state.dtype)
 
-        query_pos = agents_state[..., :2]
         ego_pos = ego_states[:, 0, :2]
-        dist_sq = (query_pos - ego_pos.unsqueeze(1)).pow(2).sum(dim=-1)
-
-        agent_range = torch.arange(max_agents, device=self.device).view(1, max_agents)
-        self_mask = agent_range == agent_indices.view(batch_size, 1)
-        inactive_mask = agents_state[..., 6] < 0.5
-        dist_sq = dist_sq.masked_fill(self_mask | inactive_mask, float('inf'))
-        dist_sq = dist_sq.masked_fill(dist_sq > self.horizon ** 2, float('inf'))
-
         k_eff = min(self.num_neighbors, max_agents)
-        _, topk_indices = torch.topk(dist_sq, k=k_eff, dim=-1, largest=False)
-        batch_idx = torch.arange(batch_size, device=self.device).view(batch_size, 1)
-        neighbor_states = agents_state[batch_idx, topk_indices].unsqueeze(1)
-        valid_neighbor_dists = dist_sq[batch_idx, topk_indices].unsqueeze(1)
-        is_valid_neighbor = torch.isfinite(valid_neighbor_dists)
+        best_d = ego_pos.new_full((batch_size, k_eff), float('inf'))
+        best_i = agent_indices.new_zeros((batch_size, k_eff))
+        # The caller bounds selected rows with its adaptive feature chunk.
+        columns = max(1, min(32, self.workspace_bytes // max(1, batch_size * 48)))
+        for start in range(0, max_agents, columns):
+            slots = torch.arange(start, min(start + columns, max_agents), device=self.device)
+            positions = agents_state[world_indices[:, None], slots[None, :], :2]
+            active = (agents_state[world_indices[:, None], slots[None, :], 6] > 0.5
+                      if alive_mask is None else alive_mask[world_indices[:, None], slots[None, :]])
+            distance = (positions - ego_pos[:, None, :]).square().sum(-1)
+            valid = active & (slots[None, :] != agent_indices[:, None]) & (distance <= self.horizon ** 2)
+            distance = distance.masked_fill(~valid, float('inf'))
+            merged_d = torch.cat((best_d, distance), dim=1)
+            merged_i = torch.cat((best_i, slots.expand(batch_size, -1)), dim=1)
+            best_d, chosen = merged_d.topk(k_eff, dim=1, largest=False)
+            best_i = merged_i.gather(1, chosen)
+        neighbor_states = agents_state[world_indices[:, None], best_i, :7].unsqueeze(1)
+        is_valid_neighbor = torch.isfinite(best_d).unsqueeze(1)
 
         replacement = ego_states.unsqueeze(2).expand(-1, -1, k_eff, -1).clone()
         replacement[..., 4] = 0.0
@@ -359,16 +363,18 @@ class ObservationGenerator:
     def generate_selected_components(self, agents_state: torch.Tensor, agent_indices: torch.Tensor,
                                      control_state: torch.Tensor = None,
                                      driving_style_params: torch.Tensor = None,
-                                     return_map_ids: bool = False):
+                                     return_map_ids: bool = False, world_indices=None,
+                                     alive_mask=None, quad_indices=None, frenet=None):
         """Return observation components for one selected agent per batch row."""
-        batch_size, max_agents, _ = agents_state.shape
+        batch_size, max_agents = agent_indices.numel(), agents_state.shape[1]
         agent_indices = agent_indices.to(device=self.device, dtype=torch.long).view(batch_size)
         safe_indices = torch.clamp(agent_indices, 0, max_agents - 1)
-        batch_idx = torch.arange(batch_size, device=self.device)
+        batch_idx = (torch.arange(batch_size, device=self.device)
+                     if world_indices is None else world_indices)
 
         ego_states = agents_state[batch_idx, safe_indices].unsqueeze(1)
-        neighbor_states_world = self._get_selected_neighbors(agents_state, safe_indices, ego_states)
-        waypoint_data = self._get_precomputed_waypoints(ego_states, return_ids=return_map_ids)
+        neighbor_states_world = self._get_selected_neighbors(agents_state, safe_indices, ego_states, batch_idx, alive_mask)
+        waypoint_data = self._get_precomputed_waypoints(ego_states, return_ids=return_map_ids, quad_indices=quad_indices)
         w_lanes_world, w_lane_dirs_world, w_lane_widths, w_boundaries_world, quad_indices = waypoint_data[:5]
 
         control_selected = None
@@ -394,6 +400,7 @@ class ObservationGenerator:
             quad_indices,
             control_selected,
             style_selected,
+            frenet=frenet,
         )
         if not return_map_ids:
             return components
@@ -451,7 +458,7 @@ class ObservationGenerator:
     
     def _world_to_ego_centric(self, ego_states, neighbor_states, w_lanes_world, w_lane_dirs_world,
                               w_lane_widths, w_boundaries_world, quad_indices,
-                              control_state=None, driving_style_params=None):
+                              control_state=None, driving_style_params=None, frenet=None):
         """将世界坐标系下的状态转换为以每个 agent 为中心的坐标系。"""
         B, M, _ = ego_states.shape
         K_neighbors = neighbor_states.shape[2]
@@ -540,19 +547,11 @@ class ObservationGenerator:
         # --- 创建每个 Agent 自身的原文式 S(t) ---
         local_state = torch.zeros(B, M, self.local_state_dim, device=self.device, dtype=ego_states.dtype)
         safe_quad_indices = torch.where(quad_indices >= 0, quad_indices, torch.zeros_like(quad_indices))
-        road_directions = self.road_network.quad_directions[safe_quad_indices]
-        nearest_centerlines = self.road_network.quad_centerlines[safe_quad_indices]
-        road_starts = nearest_centerlines[:, :, 0, :]
-        ap = ego_pos - road_starts
-        # 与局部坐标系保持一致：x 为车道前向，y 为车道左侧，c/theta 左正右负。
-        lane_center_dist = road_directions[..., 0] * ap[..., 1] - road_directions[..., 1] * ap[..., 0]
-        vehicle_directions = torch.stack([torch.cos(ego_yaw), torch.sin(ego_yaw)], dim=-1)
-        cross_heading = road_directions[..., 0] * vehicle_directions[..., 1] - road_directions[..., 1] * vehicle_directions[..., 0]
-        dot_heading = (road_directions * vehicle_directions).sum(dim=-1)
-        theta = torch.atan2(cross_heading, dot_heading)
-        valid_quad = quad_indices >= 0
-        lane_center_dist = torch.where(valid_quad, lane_center_dist, torch.zeros_like(lane_center_dist))
-        theta = torch.where(valid_quad, theta, torch.zeros_like(theta))
+        if frenet is None:
+            frenet = self.road_network.frenet_from_indices(ego_pos, ego_yaw, quad_indices)
+        # Reward uses right-positive Frenet; trained network inputs are left-positive.
+        # Explicit conversion preserves both contracts while sharing geometry.
+        lane_center_dist, theta = -frenet[0], -frenet[1]
 
         control = torch.zeros(B, M, 3, device=self.device, dtype=ego_states.dtype) if control_state is None else control_state.to(self.device, dtype=ego_states.dtype)
         style = torch.ones(B, M, 4, device=self.device, dtype=ego_states.dtype) if driving_style_params is None else driving_style_params.to(self.device, dtype=ego_states.dtype)

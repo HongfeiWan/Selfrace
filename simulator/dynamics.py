@@ -1,6 +1,8 @@
 import torch
 from typing import Dict
 import math
+from execution import CompiledStage, SingleCudaGraph
+from tensor_budget import is_cuda_oom, workspace_bytes
 
 class DiscreteActionSpace:
     # 离散动作空间定义，支持jerk控制
@@ -98,10 +100,80 @@ class KinematicBicycleModel:
         self.current_along = None
         self.current_alat = None
         self.current_steering_angle = None  # 当前有效转向角
+        execution = simulator_config.get('execution', {})
+        graph = execution.get('cuda_graph', {})
+        self.dt = float(simulator_config.get('sim_dt', .3))
+        self.chunk_agents = min(max(1, int(execution.get('chunk_agents', 8192))),
+                                max(1, workspace_bytes(device, simulator_config.get('geometry_workspace_mb', 64)) // 1024))
+        compiled = CompiledStage(self._selected_kernel, execution.get('compile', False), dynamic=True)
+        self._selected_stage = SingleCudaGraph(
+            compiled, graph.get('enabled', False), self.chunk_agents,
+            graph.get('max_private_mb', 64), estimated_bytes_per_row=1024,
+        )
 
-    def step(self, states: torch.Tensor, actions: torch.Tensor, dt: float,
+    def _selected_kernel(self, states, actions, style, lengths, controls):
+        return self._integrate(states, actions, self.dt, style, None, lengths, controls)
+
+    def _ensure_control_storage(self, slots, dtype):
+        if self.current_along is None or self.current_along.numel() != slots:
+            self.current_along = torch.zeros(slots, device=self.device, dtype=dtype)
+            self.current_alat = torch.zeros_like(self.current_along)
+            self.current_steering_angle = torch.zeros_like(self.current_along)
+
+    def propose_selected(self, states, actions, dt, flat_indices, style_params=None):
+        """Pure proposal: recurrent control is indexed by ORIGINAL world slots."""
+        flat = states.reshape(-1, states.shape[-1])
+        self._ensure_control_storage(flat.shape[0], states.dtype)
+        controls = torch.stack((
+            self.current_steering_angle[flat_indices],
+            self.current_along[flat_indices],
+            self.current_alat[flat_indices],
+        ), dim=-1)
+        count = flat_indices.numel()
+        poses_out, controls_out = states.new_empty((count, 4)), states.new_empty((count, 3))
+        rows = self.chunk_agents
+        start = 0
+        while start < count:
+            end = min(start + rows, count)
+            idx = flat_indices[start:end]
+            style = (states.new_tensor([self.Cthrottle, self.Csteer, self.Cacc, self.Cvel]).expand(end - start, -1)
+                     if style_params is None else style_params.reshape(-1, 4)[idx])
+            try:
+                with torch.no_grad():
+                    args = (flat[idx, :4], actions.reshape(-1)[idx], style, flat[idx, 4], controls[start:end])
+                    if dt == self.dt:
+                        pose, control = self._selected_stage(*args)
+                    else:
+                        pose, control = self._integrate(args[0], args[1], dt, args[2], None, args[3], args[4])
+                poses_out[start:end], controls_out[start:end] = pose, control
+                start = end
+            except RuntimeError as exc:
+                if states.device.type != 'cuda' or not is_cuda_oom(exc) or rows == 1:
+                    raise
+                rows = max(1, rows // 2)
+                self.chunk_agents = rows
+                self._selected_stage.clear()
+        return poses_out, controls_out
+
+    def commit_selected(self, flat_indices, controls):
+        # Zero inactive slots just as the former dense masked dynamics did.
+        self.current_steering_angle.zero_()
+        self.current_along.zero_()
+        self.current_alat.zero_()
+        self.current_steering_angle[flat_indices] = controls[:, 0]
+        self.current_along[flat_indices] = controls[:, 1]
+        self.current_alat[flat_indices] = controls[:, 2]
+
+    def step(self, states, actions, dt, style_params=None, active_mask=None, vehicle_length=None):
+        self._ensure_control_storage(states.shape[0], states.dtype)
+        controls = torch.stack((self.current_steering_angle, self.current_along, self.current_alat), dim=-1)
+        result, controls = self._integrate(states, actions, dt, style_params, active_mask, vehicle_length, controls)
+        self.current_steering_angle, self.current_along, self.current_alat = controls.unbind(-1)
+        return result
+
+    def _integrate(self, states: torch.Tensor, actions: torch.Tensor, dt: float,
              style_params: torch.Tensor = None, active_mask: torch.Tensor = None,
-             vehicle_length: torch.Tensor = None) -> torch.Tensor:
+             vehicle_length: torch.Tensor = None, controls=None):
         """
         对一批车辆状态进行一步精确更新。
         Args:
@@ -122,15 +194,8 @@ class KinematicBicycleModel:
         # 离散动作空间：actions是动作索引
         assert actions.ndim == 1, f"Discrete actions shape must be (N,), but got {actions.shape}"
         
-        # 检查并初始化控制状态（确保batch_size正确）
-        if (self.current_along is None or self.current_along.shape[0] != batch_size or
-            self.current_alat is None or self.current_alat.shape[0] != batch_size):
-            self.current_along = torch.zeros(batch_size, device=self.device, dtype=states.dtype)
-            self.current_alat = torch.zeros(batch_size, device=self.device, dtype=states.dtype)
-            # 同时重置prev_along以确保一致性
-            if hasattr(self, 'prev_along'):
-                self.prev_along = torch.zeros(batch_size, device=self.device, dtype=states.dtype)
-        
+        current_steering, current_along, current_alat = controls.unbind(-1)
+
         # 获取实际的jerk动作
         jerk_actions = self.discrete_action_space.get_action(actions)  # (N, 2) [along_jerk, alat_jerk]
         if style_params is not None:
@@ -157,11 +222,11 @@ class KinematicBicycleModel:
         alat_jerk = jerk_actions[:, 1]   # 横向jerk
         
         # 更新加速度和转向角（应用控制系数）
-        new_along = self.current_along + along_jerk * dt * Cthrottle
-        new_alat = self.current_alat + alat_jerk * dt * Csteer
+        new_along = current_along + along_jerk * dt * Cthrottle
+        new_alat = current_alat + alat_jerk * dt * Csteer
         
         # 检测纵向加速度符号变化：a(t-1)_long * a(t)_long < 0
-        accel_sign_change = (self.current_along * new_along) < 0
+        accel_sign_change = (current_along * new_along) < 0
         
         # 如果纵向加速度改变符号，将横向加速度和纵向加速度置零。
         new_alat = torch.where(accel_sign_change, torch.zeros_like(new_alat), new_alat)
@@ -177,11 +242,9 @@ class KinematicBicycleModel:
         x, y, yaw, speed = states.T
         # 使用梯形法则更新速度：v(t) = v(t-1) + 0.5 * (a(t)_long + a(t-1)_long) * dt
         # 需要保存前一步的纵向加速度用于梯形积分
-        if not hasattr(self, 'prev_along'):
-            self.prev_along = torch.zeros_like(self.current_along)
         
         # 梯形法则：v(t) = v(t-1) + 0.5 * (a(t)_long + a(t-1)_long) * dt
-        new_speed = speed + 0.5 * (along + self.prev_along) * dt
+        new_speed = speed + 0.5 * (along + current_along) * dt
         
         # 检测速度符号变化：v(t-1) * v(t) < 0
         speed_sign_change = (speed * new_speed) < 0
@@ -201,18 +264,16 @@ class KinematicBicycleModel:
         target_steering_angle = self.calculate_steering_angle(alat, avg_speed, wheelbase=wheelbase)
         
         # 初始化当前转向角（如果还没有初始化）
-        if self.current_steering_angle is None or self.current_steering_angle.shape[0] != batch_size:
-            self.current_steering_angle = torch.zeros(batch_size, device=self.device, dtype=states.dtype)
         
         # 计算转向角变化：δφ = φ_target - φ(t-1)
-        steering_change = target_steering_angle - self.current_steering_angle
+        steering_change = target_steering_angle - current_steering
         
         # 限制转向角变化率：δφ = clip(δφ, -δmax*dt, δmax*dt)
         max_change = self.max_steering_rate * dt
         limited_steering_change = torch.clamp(steering_change, -max_change, max_change)
         
         # 更新有效转向角：φ(t) = clip(φ(t-1) + δφ, -φmax, φmax)
-        new_steering_angle = self.current_steering_angle + limited_steering_change
+        new_steering_angle = current_steering + limited_steering_change
         steering_angle = torch.clamp(new_steering_angle, -self.max_steer_rad, self.max_steer_rad)
         
         # 根据有效转向角更新曲率和横向加速度
@@ -228,10 +289,6 @@ class KinematicBicycleModel:
             along = torch.where(active_mask, along, torch.zeros_like(along))
             effective_alat = torch.where(active_mask, effective_alat, torch.zeros_like(effective_alat))
             steering_angle = torch.where(active_mask, steering_angle, torch.zeros_like(steering_angle))
-        self.current_along = along
-        self.current_alat = effective_alat
-        self.current_steering_angle = steering_angle
-        self.prev_along = along.clone()
         
         # 使用自行车动力学模型更新车辆位置
         # 计算位移：d = 0.5(v(t) + v(t-1)) * Δt
@@ -261,7 +318,7 @@ class KinematicBicycleModel:
         
         # 将新状态组合成一个张量返回
         new_states = torch.stack([new_x, new_y, new_yaw, new_speed], dim=1)
-        return new_states
+        return new_states, torch.stack((steering_angle, along, effective_alat), dim=-1)
     
     def reset_control_state(self):
         """重置控制状态（加速度和转向角）"""
@@ -269,9 +326,6 @@ class KinematicBicycleModel:
         self.current_along = None
         self.current_alat = None
         self.current_steering_angle = None
-        # 清除前一步的纵向加速度，让step方法重新创建
-        if hasattr(self, 'prev_along'):
-            delattr(self, 'prev_along')
 
     def reset_worlds(self, world_indices: torch.Tensor, num_worlds: int, max_agents: int):
         """Zero recurrent control state for selected vector worlds."""
@@ -279,7 +333,7 @@ class KinematicBicycleModel:
         if world_indices.numel() == 0:
             return
         expected = int(num_worlds) * int(max_agents)
-        for name in ('current_along', 'current_alat', 'current_steering_angle', 'prev_along'):
+        for name in ('current_along', 'current_alat', 'current_steering_angle'):
             value = getattr(self, name, None)
             if value is not None and value.numel() == expected:
                 value.view(int(num_worlds), int(max_agents))[world_indices] = 0

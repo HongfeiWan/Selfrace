@@ -94,7 +94,7 @@ python -m pip install -r requirements.txt
 3. 确认 `.venv` 已按上节创建并安装依赖。
 4. 选择 **Selfrace Game Inference**，按 `F5`。
 
-项目内的 [`.vscode/launch.json`](./.vscode/launch.json) 已指定 `.venv`、示例 checkpoint、CPU 和 24 辆车。
+项目内的 [`.vscode/launch.json`](./.vscode/launch.json) 已指定 `.venv`、示例 checkpoint、CPU 和 150 辆车。
 
 ### 命令行启动
 
@@ -103,7 +103,7 @@ python .\game\game.py `
   --checkpoint .\training\checkpoints-paper-goals\ckpt_step_400.pt `
   --device cpu `
   --envs 1 `
-  --agents 24
+  --agents 150
 ```
 
 使用 CUDA 推理时，将 `--device cpu` 改为 `--device cuda:0`。无窗口检查可以使用：
@@ -113,7 +113,7 @@ python .\game\game.py `
   --checkpoint .\training\checkpoints-paper-goals\ckpt_step_400.pt `
   --device cpu `
   --envs 1 `
-  --agents 24 `
+  --agents 150 `
   --headless `
   --steps 120
 ```
@@ -258,8 +258,28 @@ python training/train.py \
 - 使用 GAE、PPO clipping、优势筛选和多 epoch 更新。
 - 选中的 PPO 特征每次 update 只构建一次；显存不足时可缓存到 pinned CPU 内存。
 - PPO 通过 microbatch 累积保持有效样本目标，而不是因为显存不足直接缩小优化 batch。
-- 碰撞检测按 `collision_stream_pair_budget` 有界分块，限制 pair 临时张量峰值。
-- Linux CUDA 可对网络和碰撞块使用受控 `torch.compile`；Windows、CPU 或编译失败时自动回退 eager。
+- rollout/PPO 使用共享世界状态和选中的 world/slot 索引，不为每个 ego 复制整个世界。每帧一份活动索引复用于动力学、offroad、Frenet 和奖励；下一帧观测复用几何结果。
+- 地图 kNN 双向分块、静态哈希采用 CSR；`geometry_workspace_mb`（默认 64 MiB）控制几何临时工作区估算上限，持久地图、最终输出和图私有池另计。纯查询/动力学/奖励段 OOM 时局部退避，不重放已推进的世界。
+- Linux CUDA + Triton 默认使用动态 cell 碰撞候选；拥挤格在 GPU 内流式遍历，大车/高速跨格车辆走完整候选回退，不截断漏碰。其他后端保留按 `collision_stream_pair_budget` 限制的 pair 实现。
+- `simulator.execution.compile` 控制纯动力学/offroad 分段编译，网络仍独立配置。Windows、CPU 或编译不可用时保持 eager，不捕获 reset、随机采样及状态提交。
+
+### CUDA Graph 与交通输入扩展
+
+- `simulator.execution.cuda_graph.enabled` 和 `training.network.cuda_graph.enabled` 默认关闭，可分别开启动力学和顺序 Actor/Critic 推理图。每个入口只保留一个固定容量图；网络默认 1024 ego、私有池预算 128 MiB，动力学预算 64 MiB。超预算/显存不足不捕获；捕获过程本身失败时必须关闭该开关后重启，不能在可能损坏的 CUDA 状态中继续训练。
+- 活动车辆压紧仍在图外进行；这不是“整个 simulator.step 已进入 CUDA Graph”。PPO backward 不入图，保持独立权重和原有 microbatch 自适应。
+- 默认 schema 仍为 **977 维**，现有模型参数布局不变。`feature_schema.optional_sets` 可显式追加 `traffic_lights`（每元素 8 维：停止线两端点、红/黄/绿、有效位）与 `crosswalks`（7 维：中心、方向、半长/半宽、有效位）。配置示例见默认 YAML；启用扩展必须训练对应 schema 的网络，不会静默改变旧 checkpoint。
+- 新输入在 ego 坐标系中，坐标除以 200 m，斑马线半尺寸除以 20 m；缺失/未知数据的有效位为 0。地图可增加 `crosswalks: [{center: [x,y], heading_rad: 0, length: 4, width: 2}]`。灯相支持 `0=未知, 1=红, 2=黄, 3=绿`，当前二值控制器仍可用。灯相按 **每步、每世界**保存到 rollout，PPO 不读取未来灯相；本次不引入行人或完整信号灯时序控制器。
+- 本次纠正 offroad 车身旋转、停止线法向及矩形端点相交检测；网络/奖励的原有 Frenet 符号约定分别保留。几何修正可能改变旧策略的终止事件分布，应重新做策略评估。
+
+短基准（不训练、不写 checkpoint、不上传日志）：
+
+```bash
+python scripts/benchmark_hotpaths.py --worlds 128 --agents 150 --repeats 10 --network
+```
+
+2026-10-13 在 RTX A5000 / PyTorch 2.8.0+cu128 的合成输入测得：碰撞固定 pair 对照 15.76 ms → 动态 cell 2.40 ms；2048 ego 推理 7.53 ms → Graph 2.12 ms，图新增保留池约 42 MiB。均为热启动模块时间，**不是整步吞吐或长期显存保证**。
+
+同机将碰撞基准设为 `--worlds 2600 --agents 150 --repeats 5`，固定 pair 对照 264.52 ms → 动态 cell 8.38 ms，结果逐元素一致；动态路径峰值已分配显存约 73 MiB（包括基准输入与输出，不是完整训练占用）。
 
 ## 关键配置
 

@@ -571,7 +571,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--device", default="auto", help="auto, cpu, mps, cuda:0 ...")
     parser.add_argument("--envs", type=int, default=1)
-    parser.add_argument("--agents", type=int, default=24)
+    parser.add_argument("--agents", type=int, default=150)
     parser.add_argument("--max-steps", type=int, default=1200)
     parser.add_argument("--sample", action="store_true", help="sample actions instead of argmax")
     parser.add_argument("--headless", action="store_true")

@@ -1,6 +1,7 @@
 # 神经网络模块
 import importlib.util
 import os
+import sys
 import warnings
 from dataclasses import dataclass
 
@@ -8,6 +9,8 @@ import torch
 import torch.nn as nn
 
 from feature_schema import FEATURE_PAD_VALUE, FeatureSchema
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'utils'))
+from execution import CompiledStage, SingleCudaGraph
 
 
 DEFAULT_WEIGHT_INIT = {"type": "orthogonal", "gain": 1.0, "bias_zero": True}
@@ -244,7 +247,7 @@ class FeatureEncoder(nn.Module):
             return elements[..., active_channel] > 0.5
         return torch.isfinite(elements).all(dim=-1) & (elements > FEATURE_PAD_VALUE + 0.5).all(dim=-1)
 
-    def prepare(self, features_tensor: torch.Tensor) -> PreparedFeatureBatch:
+    def prepare(self, features_tensor: torch.Tensor, compact: bool = True) -> PreparedFeatureBatch:
         """Sanitize features and derive parameter-free masks exactly once."""
         self.feature_schema.validate_tensor_width(features_tensor.shape[-1])
         features_tensor = torch.nan_to_num(
@@ -265,11 +268,11 @@ class FeatureEncoder(nn.Module):
                 element_dim=element_dim,
                 active_channel=active_channel,
             )
-            valid = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
+            valid = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1) if compact else None
             masks.append(mask)
             valid_indices.append(valid)
             group_indices.append(
-                torch.div(valid, element_count, rounding_mode="floor")
+                torch.div(valid, element_count, rounding_mode="floor") if compact else None
             )
             nonempty.append(mask.any(dim=2))
         return PreparedFeatureBatch(
@@ -408,6 +411,15 @@ class IndependentNetwork(nn.Module):
         )
         self._compile_failed = False
         self._compile_warning_emitted = False
+        graph_config = _config_value(network_config, 'cuda_graph', {})
+        static_forward = CompiledStage(self._static_inference, self._compile_requested, self._compile_mode, dynamic=True)
+        self._inference_graph = SingleCudaGraph(
+            static_forward,
+            enabled=_config_value(graph_config, 'enabled', False),
+            capacity=_config_value(graph_config, 'bucket_agents', 1024),
+            max_private_mb=_config_value(graph_config, 'max_private_mb', 128),
+            estimated_bytes_per_row=max(65536, self.policy_feature_encoder.total_input_dim * 128),
+        )
         self._compiled_policy_impl = None
         self._compiled_value_impl = None
     
@@ -568,11 +580,30 @@ class IndependentNetwork(nn.Module):
             action_logits: 动作logits [B, M, num_actions]
             value: 状态值 [B, M]
         """
+        if (self._inference_graph.enabled and torch.is_tensor(features_tensor)
+                and features_tensor.is_cuda and not torch.is_grad_enabled()):
+            B, M, D = features_tensor.shape
+            flat = features_tensor.reshape(-1, 1, D)
+            logits, values = [], []
+            for left in range(0, flat.shape[0], self._inference_graph.capacity):
+                action, value = self._inference_graph(flat[left:left + self._inference_graph.capacity])
+                logits.append(action)
+                values.append(value)
+            if logits:
+                return torch.cat(logits).view(B, M, -1), torch.cat(values).view(B, M)
         prepared = self.prepare_features(features_tensor)
         # Keep actor/critic weights independent and execute them sequentially.
         action_logits = self.forward_prepared_policy(prepared)
         value = self.forward_prepared_value(prepared)
         return action_logits, value
+
+    def _static_inference(self, features):
+        # Dense set pooling is allowed only in this small bounded bucket, never
+        # across the 65k-agent rollout chunk. Actor and critic stay sequential.
+        prepared = self.policy_feature_encoder.prepare(features, compact=False)
+        args = (prepared.features, prepared.set_masks, prepared.set_valid_indices,
+                prepared.set_group_indices, prepared.set_nonempty)
+        return self._policy_impl(*args), self._value_impl(*args)
     
 def create_network(config, network_type="independent"):
     """

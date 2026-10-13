@@ -15,6 +15,7 @@ FEATURE_PAD_VALUE = -2.0
 
 SIMPLE_GROUP_NAMES = ("state", "goal", "reward", "vehicle_style")
 SET_GROUP_NAMES = ("road_boundary", "lane_points", "stop_lines", "other_agents")
+OPTIONAL_SET_DIMS = {"traffic_lights": 8, "crosswalks": 7}
 
 
 def _get(container: Any, name: str, default: Any = None) -> Any:
@@ -78,8 +79,12 @@ class FeatureSchema:
         set_names = tuple(group.name for group in self.set_groups)
         if simple_names != SIMPLE_GROUP_NAMES:
             raise ValueError(f"simple feature order must be {SIMPLE_GROUP_NAMES}, got {simple_names}")
-        if set_names != SET_GROUP_NAMES:
-            raise ValueError(f"set feature order must be {SET_GROUP_NAMES}, got {set_names}")
+        expected_names = SET_GROUP_NAMES + tuple(name for name in OPTIONAL_SET_DIMS if name in set_names)
+        if set_names != expected_names:
+            raise ValueError(f"set feature order must be {expected_names}, got {set_names}")
+        for group in self.set_groups[len(SET_GROUP_NAMES):]:
+            if group.element_dim != OPTIONAL_SET_DIMS[group.name] or group.resolved_active_channel != group.element_dim - 1:
+                raise ValueError(f"{group.name} requires element_dim={OPTIONAL_SET_DIMS[group.name]} and final-channel validity")
         groups = self.simple_groups + self.set_groups
         object.__setattr__(self, "_groups_by_name", {group.name: group for group in groups})
         offset = 0
@@ -111,6 +116,12 @@ class FeatureSchema:
             cls._set_group_from_config(name, _get(set_cfg, name))
             for name in SET_GROUP_NAMES
         )
+        optional = _get(configured, 'optional_sets', {})
+        optional_names = set(optional if isinstance(optional, dict) else vars(optional))
+        if optional_names.difference(OPTIONAL_SET_DIMS):
+            raise ValueError(f"unknown optional feature sets: {sorted(optional_names.difference(OPTIONAL_SET_DIMS))}")
+        set_groups += tuple(cls._set_group_from_config(name, _get(optional, name))
+                            for name in OPTIONAL_SET_DIMS if name in optional_names)
         schema = cls(simple_groups=simple_groups, set_groups=set_groups)
         schema.validate_simulator_config(config)
         return schema
@@ -156,6 +167,9 @@ class FeatureSchema:
             return self._groups_by_name[name]
         except KeyError as exc:
             raise KeyError(f"unknown feature group: {name}") from exc
+
+    def signature(self):
+        return tuple((group.name, group.flat_dim, group.element_dim, group.active_channel) for group in self.groups)
 
     def flat_slice(self, name: str) -> slice:
         try:

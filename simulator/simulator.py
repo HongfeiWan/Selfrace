@@ -19,6 +19,7 @@ training_dir = os.path.join(parent_dir, 'training')
 if training_dir not in sys.path:
     sys.path.insert(0, training_dir)
 from spatial_hash import SpatialHash
+from tensor_budget import nearest_indices, workspace_bytes
 from road import RoadNetwork
 from offroad import OffroadChecker
 from collision import CollisionChecker
@@ -58,10 +59,13 @@ class TeraflowSimulator:
         self.num_envs = simulator_config['num_envs']
         self.dt = simulator_config['sim_dt']
         self.map_path = simulator_config['map_path']
+        self.geometry_workspace_mb = float(simulator_config.get('geometry_workspace_mb', 64.0))
+        self.geometry_workspace_bytes = workspace_bytes(device, self.geometry_workspace_mb)
 
         # 1. 加载地图网络
         # road.py 中的 RoadNetwork 类负责解析地图文件并提供查询接口
         self.road_network = RoadNetwork(self.map_path, self.device)
+        self.road_network.workspace_bytes = self.geometry_workspace_bytes
 
         # 2. 初始化共享的空间哈希
         # 使用地图边界来定义哈希网格的范围
@@ -79,7 +83,10 @@ class TeraflowSimulator:
         self.driving_style_sampler = DrivingStyleSampler(self.device)
 
         # 4. 初始化离路检测器 (传入共享的哈希对象)
-        self.offroad_checker = OffroadChecker(self.road_network, self.spatial_hash)
+        self.offroad_checker = OffroadChecker(
+            self.road_network, self.spatial_hash, workspace_mb=self.geometry_workspace_mb,
+            compile_enabled=simulator_config.get('execution', {}).get('compile', False),
+        )
 
         # 5. 初始化碰撞检测器 (传入共享的哈希对象)
         # collision.py 负责检测智能体之间的碰撞
@@ -92,7 +99,7 @@ class TeraflowSimulator:
         # 7. 初始化观测生成器
         # observation.py 负责为每个自车生成局部观测
         obs_config = simulator_config['observation']
-        self.observation_generator = ObservationGenerator(self.road_network, obs_config, self.device, self.spatial_hash)
+        self.observation_generator = ObservationGenerator(self.road_network, obs_config, self.device, self.spatial_hash, self.geometry_workspace_mb)
 
         # 8. 初始化奖励计算器
         self.reward_calculator = RewardCalculator(self.config, self.device)
@@ -100,6 +107,7 @@ class TeraflowSimulator:
         # 9. 初始化路径规划器
         # PathPlanner现在会自动加载所需的数据
         self.path_planner = PathPlanner(map_path=self.map_path, device=self.device, verbose=self.verbose)
+        self.path_planner.workspace_bytes = self.geometry_workspace_bytes
 
         # 10. 初始化交通灯/停止线观测与奖励所需的静态几何
         self.traffic_config = simulator_config.get('traffic') or {}
@@ -133,6 +141,28 @@ class TeraflowSimulator:
         self.traffic_light_states: Optional[torch.Tensor] = None
         self.stop_lines: Optional[torch.Tensor] = None
         self.stop_line_violation: Optional[torch.Tensor] = None
+        self._active_selection = None
+        self._geometry = None
+
+    def active_selection(self, mask=None):
+        """Compact once per frame and reuse slots across rollout and simulation."""
+        if self._active_selection is None:
+            if mask is None:
+                mask = self.agents_state[..., 6] > 0.5
+                if self.last_done is not None:
+                    mask = mask & ~self.last_done
+            slots = mask.reshape(-1).nonzero(as_tuple=False).flatten()
+            width = self.agents_state.shape[1]
+            self._active_selection = (slots, slots // width, slots % width, mask)
+        return self._active_selection
+
+    def selected_geometry(self, world_indices, agent_indices):
+        if self._geometry is None:
+            states = self.agents_state[world_indices, agent_indices]
+            _, quads = self.road_network.find_nearest_lanes(states[:, :2], spatial_hash=self.spatial_hash)
+            d, theta = self.road_network.frenet_from_indices(states[:, :2], states[:, 2], quads[:, 0])
+            return quads, d[:, None], theta[:, None]
+        return tuple(value[world_indices, agent_indices, None] for value in self._geometry)
 
     def _log(self, *args, **kwargs):
         if self.verbose:
@@ -183,7 +213,7 @@ class TeraflowSimulator:
             self.num_traffic_controls = int(getattr(self.road_network, 'traffic_light_locations', torch.empty((0, 2))).shape[0])
             return
 
-        perp = torch.stack([torch.sin(yaws), torch.cos(yaws)], dim=-1)
+        perp = torch.stack([-torch.sin(yaws), torch.cos(yaws)], dim=-1)
         half_width = 0.5 * self.stop_line_width
         p0 = centers - perp * half_width
         p1 = centers + perp * half_width
@@ -211,9 +241,68 @@ class TeraflowSimulator:
         traffic_light_states = self.traffic_light_states if traffic_light_states is None else traffic_light_states
         if traffic_light_states is None or traffic_light_states.numel() == 0:
             return torch.zeros((batch_size, S), dtype=torch.bool, device=self.device)
-        traffic_light_states = traffic_light_states.to(device=self.device, dtype=torch.bool)
+        traffic_light_states = traffic_light_states.to(device=self.device)
         control_idx = torch.clamp(self.stop_line_control_indices, 0, traffic_light_states.shape[1] - 1)
-        return traffic_light_states[:batch_size, control_idx]
+        states = traffic_light_states[:batch_size, control_idx]
+        # bool is the current binary controller; integer phases reserve yellow
+        # and unknown without silently treating either one as green.
+        red = states if states.dtype == torch.bool else states == 1
+        valid_control = (self.stop_line_control_indices >= 0) & (self.stop_line_control_indices < traffic_light_states.shape[1])
+        return red & valid_control[None]
+
+    def traffic_input_sets(self, agents_state, traffic_states, groups):
+        """Bounded optional network inputs, in the ego frame, with explicit masks.
+
+        Lights: stop-line endpoints / 200m, red/yellow/green, valid.
+        Crosswalks: center / 200m, heading unit vector, half extents / 20m, valid.
+        Integer light phases: 0 unknown, 1 red, 2 yellow, 3 green.
+        """
+        result = {}
+        B, M = agents_state.shape[:2]
+        ego = agents_state.reshape(-1, agents_state.shape[-1])
+        def local(points):
+            delta = points - ego[:, None, :2]
+            c, s = ego[:, 2].cos()[:, None], ego[:, 2].sin()[:, None]
+            return torch.stack((delta[..., 0] * c + delta[..., 1] * s,
+                                -delta[..., 0] * s + delta[..., 1] * c), dim=-1)
+        for group in groups:
+            count = group.element_count
+            out = agents_state.new_zeros((B * M, count, group.element_dim))
+            if group.name == 'traffic_lights':
+                centers = self.stop_line_segments.mean(1)
+            else:
+                centers = self.road_network.crosswalks[:, :2]
+            ids = nearest_indices(ego[:, :2], centers, count, self.geometry_workspace_bytes)
+            if centers.shape[0] > 0:
+                safe = ids.clamp_min(0)
+                valid = (ids >= 0) & ((ego[:, None, :2] - centers[safe]).square().sum(-1) <= self.stop_line_horizon ** 2)
+                if group.name == 'traffic_lights':
+                    points = self.stop_line_segments[safe]
+                    out[..., :2] = (local(points[:, :, 0]) / 200.).clamp(-1, 1)
+                    out[..., 2:4] = (local(points[:, :, 1]) / 200.).clamp(-1, 1)
+                    controls = self.stop_line_control_indices[safe]
+                    if traffic_states is None or traffic_states.shape[-1] == 0:
+                        valid &= False
+                    else:
+                        worlds = torch.arange(B, device=ego.device).repeat_interleave(M)
+                        phases = traffic_states[worlds[:, None], controls.clamp(0, traffic_states.shape[-1] - 1)]
+                        valid &= (controls >= 0) & (controls < traffic_states.shape[-1])
+                        if phases.dtype == torch.bool:
+                            out[..., 4], out[..., 6] = phases, ~phases
+                        else:
+                            for channel, phase in enumerate((1, 2, 3), start=4):
+                                out[..., channel] = phases == phase
+                            valid &= (phases >= 1) & (phases <= 3)
+                else:
+                    rectangles = self.road_network.crosswalks[safe]
+                    out[..., :2] = (local(rectangles[..., :2]) / 200.).clamp(-1, 1)
+                    yaw = rectangles[..., 2] - ego[:, None, 2]
+                    out[..., 2], out[..., 3] = yaw.cos(), yaw.sin()
+                    out[..., 4:6] = (rectangles[..., 3:5] / 40.).clamp(0, 1)
+                out[..., -1] = valid & (ego[:, None, 6] > .5)
+                out *= out[..., -1:]
+            result[group.name] = out.view(B, M, count, group.element_dim)
+        return result
 
     def _compute_stop_line_observation(
         self,
@@ -236,14 +325,31 @@ class TeraflowSimulator:
         red_mask = self._red_stop_line_mask(B, traffic_light_states=traffic_light_states)
         centers = self.stop_line_segments.mean(dim=1)
         ego_pos = agents_state[..., :2]
-        dist_sq = (ego_pos.unsqueeze(2) - centers.view(1, 1, S, 2)).pow(2).sum(dim=-1)
-        active_mask = agents_state[..., 6] > 0.5
-        dist_sq = dist_sq.masked_fill(~red_mask.unsqueeze(1), float('inf'))
-        dist_sq = dist_sq.masked_fill(~active_mask.unsqueeze(-1), float('inf'))
-        dist_sq = dist_sq.masked_fill(dist_sq > self.stop_line_horizon ** 2, float('inf'))
-
         k_eff = min(max_lines, S)
-        nearest_dist_sq, nearest_idx = torch.topk(dist_sq, k=k_eff, dim=-1, largest=False)
+        # Keep the original nearest-RED-line contract without an ego-by-all-
+        # signals expansion, including when future maps contain many signals.
+        flat = agents_state.reshape(-1, agents_state.shape[-1])
+        nearest_dist_sq = flat.new_full((B * M, k_eff), float('inf'))
+        nearest_idx = torch.zeros((B * M, k_eff), dtype=torch.long, device=self.device)
+        columns = min(S, 64)
+        rows = max(1, self.geometry_workspace_bytes // (64 * (columns + 2 * k_eff)))
+        for start in range(0, B * M, rows):
+            end = min(start + rows, B * M)
+            worlds = torch.arange(start, end, device=self.device) // M
+            best_d, best_i = nearest_dist_sq[start:end], nearest_idx[start:end]
+            for left in range(0, S, columns):
+                right = min(left + columns, S)
+                distance = (flat[start:end, None, :2] - centers[None, left:right]).square().sum(-1)
+                valid = red_mask[worlds, left:right] & (flat[start:end, None, 6] > .5)
+                valid &= distance <= self.stop_line_horizon ** 2
+                distance = distance.masked_fill(~valid, float('inf'))
+                ids = torch.arange(left, right, device=self.device).expand(end - start, -1)
+                candidates = torch.cat((best_i, ids), dim=1)
+                best_d, chosen = torch.cat((best_d, distance), dim=1).topk(k_eff, dim=1, largest=False)
+                best_i = candidates.gather(1, chosen)
+            nearest_dist_sq[start:end], nearest_idx[start:end] = best_d, best_i
+        nearest_dist_sq = nearest_dist_sq.view(B, M, k_eff)
+        nearest_idx = nearest_idx.view(B, M, k_eff)
         valid_lines = torch.isfinite(nearest_dist_sq)
         selected_segments = self.stop_line_segments[nearest_idx.clamp_min(0)]
         endpoints_world = selected_segments.reshape(B, M, k_eff * 2, 2)
@@ -273,43 +379,38 @@ class TeraflowSimulator:
     def _cross2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
-    def _compute_stop_line_violation(self, states_t0: torch.Tensor, states_t1: torch.Tensor,
-                                     effective_mask: torch.Tensor) -> torch.Tensor:
-        """检测车辆一步内是否穿越红灯停止线。"""
-        B, M, _ = states_t1.shape
-        S = self.stop_line_segments.shape[0]
-        if S == 0:
-            return torch.zeros((B, M), dtype=torch.bool, device=self.device)
-
-        red_mask = self._red_stop_line_mask(B)
-        if red_mask.numel() == 0:
-            return torch.zeros((B, M), dtype=torch.bool, device=self.device)
-
-        p0 = states_t0[..., :2].unsqueeze(2)
-        p1 = states_t1[..., :2].unsqueeze(2)
-        q0 = self.stop_line_segments[:, 0, :].view(1, 1, S, 2)
-        q1 = self.stop_line_segments[:, 1, :].view(1, 1, S, 2)
-
-        ego_motion = p1 - p0
-        line_vec = q1 - q0
-        o1 = self._cross2d(ego_motion, q0 - p0)
-        o2 = self._cross2d(ego_motion, q1 - p0)
-        o3 = self._cross2d(line_vec, p0 - q0)
-        o4 = self._cross2d(line_vec, p1 - q0)
-        eps = 1e-6
-        intersects = (o1 * o2 <= eps) & (o3 * o4 <= eps)
-
-        moved = ego_motion.squeeze(2).norm(dim=-1) > 0.05
-        heading = torch.stack([torch.cos(states_t1[..., 2]), torch.sin(states_t1[..., 2])], dim=-1)
-        forward_motion = (ego_motion.squeeze(2) * heading).sum(dim=-1) > 0.0
-        violation = (
-            intersects
-            & red_mask.unsqueeze(1)
-            & effective_mask.unsqueeze(-1)
-            & moved.unsqueeze(-1)
-            & forward_motion.unsqueeze(-1)
-        )
-        return violation.any(dim=-1)
+    def _compute_stop_line_violation(self, states_t0, states_t1, effective_mask):
+        """Bounded active-agent/line stream, including correct segment bounds."""
+        B, M = effective_mask.shape
+        result = torch.zeros_like(effective_mask)
+        lines = self.stop_line_segments.shape[0]
+        if lines == 0:
+            return result
+        _, worlds, agents, _ = self.active_selection(effective_mask)
+        red = self._red_stop_line_mask(B)
+        columns = min(64, lines)
+        rows = max(1, self.geometry_workspace_bytes // (128 * columns))
+        for left in range(0, worlds.numel(), rows):
+            w, a = worlds[left:left + rows], agents[left:left + rows]
+            p0, p1 = states_t0[w, a, :2][:, None], states_t1[w, a, :2][:, None]
+            motion = p1 - p0
+            yaw = states_t1[w, a, 2]
+            forward = (motion[:, 0] * torch.stack((yaw.cos(), yaw.sin()), -1)).sum(-1) > 0
+            moving = motion[:, 0].norm(dim=-1) > .05
+            hit = torch.zeros_like(forward)
+            for start in range(0, lines, columns):
+                segments = self.stop_line_segments[start:start + columns]
+                q0, q1 = segments[None, :, 0], segments[None, :, 1]
+                line = q1 - q0
+                o1, o2 = self._cross2d(motion, q0 - p0), self._cross2d(motion, q1 - p0)
+                o3, o4 = self._cross2d(line, p0 - q0), self._cross2d(line, p1 - q0)
+                # Orientation tests alone incorrectly intersect disjoint collinear segments.
+                bounds = ((torch.minimum(p0, p1) <= torch.maximum(q0, q1) + 1e-6)
+                          & (torch.minimum(q0, q1) <= torch.maximum(p0, p1) + 1e-6)).all(-1)
+                hit |= ((o1 * o2 <= 1e-6) & (o3 * o4 <= 1e-6) & bounds
+                        & red[w, start:start + columns]).any(-1)
+            result[w, a] = hit & moving & forward
+        return result
 
     def reset(self, return_observation: bool = True):
         """
@@ -342,6 +443,8 @@ class TeraflowSimulator:
         
         # 重置done状态
         self.last_done = None
+        self._active_selection = None
+        self._geometry = None
 
         # 初始化路径规划器 - 为所有智能体分配目标和生成路径规划
         self._initialize_path_planning()
@@ -409,6 +512,8 @@ class TeraflowSimulator:
                 torch.rand((reset_count, self.num_traffic_controls), device=self.device)
                 < self.red_light_probability
             )
+            if self.traffic_light_states.dtype != torch.bool:
+                new_lights = torch.where(new_lights, 1, 3).to(self.traffic_light_states.dtype)
             self.traffic_light_states[world_indices] = new_lights
         self.stop_line_violation[world_indices] = False
 
@@ -425,6 +530,9 @@ class TeraflowSimulator:
         reset_count = int(world_indices.numel())
         if reset_count == 0:
             return None
+
+        self._active_selection = None
+        self._geometry = None
 
         chunk_size = min(reset_count, self.reset_chunk_worlds)
         start = 0
@@ -474,81 +582,53 @@ class TeraflowSimulator:
         profile_start = self._profile_now() if profile is not None else 0.0
         profile_cursor = profile_start
         
-        actions = actions.to(self.device)     #action挪到当前显卡上
-        states_t0 = self.agents_state.clone() #这一时刻的状态
-
-        # 1. 基于收到的所有动作，更新：采用全批次恒定大小（B*M），并用mask混合回写
-        active_mask = self.agents_state[..., 6] > 0.5
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            not_done_mask = ~self.last_done
-        else:
-            not_done_mask = torch.ones_like(active_mask, dtype=torch.bool)
-        effective_mask = active_mask & not_done_mask  # 仅这些需要物理更新
-        
-        # 构造全批次输入 (B*M, 4) 和 (B*M,) 的动作索引
-        Bsz, Msz, _S = self.agents_state.shape
-        states_flat = self.agents_state[..., :4].contiguous().view(Bsz * Msz, 4)
-        # 规整actions为 (B, M)
-        if actions.ndim == 3 and actions.shape[-1] == 1:
-            actions_idx = actions.squeeze(-1).long()
-        elif actions.ndim == 2:
-            actions_idx = actions.long()
-        else:
-            actions_idx = actions.view(Bsz, Msz).long()
-
-        actions_flat = actions_idx.contiguous().view(Bsz * Msz)
-        style_flat = None
-        if self.driving_style_params is not None:
-            style_flat = self.driving_style_params.contiguous().view(Bsz * Msz, 4)
-        effective_flat = effective_mask.contiguous().view(Bsz * Msz)
-        # 调用动力学（全批次大小恒定），再把无效位置用旧状态覆盖
-        new_states_flat = self.dynamics_model.step(
-            states_flat, actions_flat, self.dt,
-            style_params=style_flat,
-            active_mask=effective_flat,
-            vehicle_length=self.agents_state[..., 4].contiguous().view(Bsz * Msz),
-        )  # (B*M, 4)
-        new_states = new_states_flat.view(Bsz, Msz, 4)
-        keep_old = ~effective_mask
-        self.agents_state[..., :4] = torch.where(keep_old.unsqueeze(-1), self.agents_state[..., :4], new_states)
-        self.stop_line_violation = self._compute_stop_line_violation(states_t0, self.agents_state, effective_mask)
+        actions = actions.to(self.device).reshape(self.agents_state.shape[:2]).long()
+        slots, world_idx, agent_idx, effective_mask = self.active_selection()
+        states_t0 = self.agents_state
+        # Stage the next world. No recurrent state is committed until every
+        # geometric check and the reward calculation have succeeded.
+        next_pose, next_controls = self.dynamics_model.propose_selected(
+            states_t0, actions, self.dt, slots, self.driving_style_params
+        )
+        states_t1 = states_t0.clone()
+        states_t1[world_idx, agent_idx, :4] = next_pose
+        stop_violation = self._compute_stop_line_violation(states_t0, states_t1, effective_mask)
         profile_cursor = self._profile_record(profile, 'dynamics_ms', profile_cursor)
 
-        # 2. 离路检测
-        is_on_road = torch.ones_like(active_mask) # 默认在路上
-        check_mask = effective_mask
-        active_states = self.agents_state[check_mask]
-        # OffroadChecker 需要 [x, y, yaw, length, width]
-        states_for_checker = active_states[:, [0, 1, 2, 4, 5]]
-        active_is_on_road = self.offroad_checker.check_on_road(states_for_checker)
-        is_on_road[check_mask] = active_is_on_road
-        offroad_mask = (~is_on_road) & check_mask # (B, M)
+        selected_states = states_t1[world_idx, agent_idx]
+        selected_on_road = self.offroad_checker.check_on_road(selected_states[:, [0, 1, 2, 4, 5]])
+        offroad_mask = torch.zeros_like(effective_mask)
+        offroad_mask[world_idx, agent_idx] = ~selected_on_road
         profile_cursor = self._profile_record(profile, 'offroad_ms', profile_cursor)
 
-        # 3. 动态碰撞检测：排除上一帧已done和本帧刚离路的车辆。
-        # 离路本身已经是终止事件，不能再让它在同一帧把其他车撞成done。
-        collision_exclude_mask = offroad_mask
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            collision_exclude_mask = collision_exclude_mask | self.last_done
-        collision_active_mask = active_mask & (~collision_exclude_mask)
-        
         collision_check_result = self.collision_checker.check(
-            states_t0, self.agents_state, debug=debug_collision, debug_env_idx=0,
-            active_mask_override=collision_active_mask, profile=profile
+            states_t0, states_t1, debug=debug_collision, debug_env_idx=0,
+            active_mask_override=effective_mask & ~offroad_mask, profile=profile,
         )
         all_collisions = collision_check_result[0] if isinstance(collision_check_result, tuple) else collision_check_result
         profile_cursor = self._profile_record(profile, 'collision_ms', profile_cursor)
 
-        # 4. 计算Frenet坐标信息
-        vehicle_positions = self.agents_state[..., :2]  # (B, M, 2) - x, y
-        vehicle_headings = self.agents_state[..., 2]    # (B, M) - heading
-        d, theta_f = self.road_network.calculate_frenet_coordinates(vehicle_positions, vehicle_headings, self.spatial_hash)
+        _, quads = self.road_network.find_nearest_lanes(selected_states[:, :2], spatial_hash=self.spatial_hash)
+        packed_d, packed_theta = self.road_network.frenet_from_indices(
+            selected_states[:, :2], selected_states[:, 2], quads[:, 0]
+        )
+        geometry_quads = torch.full_like(actions, -1)
+        d = torch.zeros_like(states_t0[..., 0])
+        theta_f = torch.zeros_like(d)
+        geometry_quads[world_idx, agent_idx] = quads[:, 0]
+        d[world_idx, agent_idx] = packed_d
+        theta_f[world_idx, agent_idx] = packed_theta
         profile_cursor = self._profile_record(profile, 'frenet_ms', profile_cursor)
 
-        # 5. 计算奖励。中间 waypoint 到达会给 R_goal，但只有最终目标到达才 done。
-        reward, final_goal_reached, intermediate_goal_reached = self._calculate_reward(
-            all_collisions, offroad_mask, d, theta_f, actions
+        reward, final_goal_reached, intermediate_goal_reached = self._calculate_reward_selected(
+            states_t1, slots, world_idx, agent_idx, next_controls, all_collisions,
+            offroad_mask, packed_d, packed_theta, actions, stop_violation,
         )
+        self.agents_state = states_t1
+        self.dynamics_model.commit_selected(slots, next_controls)
+        self.stop_line_violation = stop_violation
+        self._geometry = (geometry_quads, d, theta_f)
+        self._active_selection = None
         profile_cursor = self._profile_record(profile, 'reward_ms', profile_cursor)
 
         # 6. 检查是否结束：中间 waypoint 不终止 episode。
@@ -601,115 +681,55 @@ class TeraflowSimulator:
             return observation, reward, done
         return reward, done
     
-    def _calculate_reward(self, all_collisions: torch.Tensor, offroad_mask: torch.Tensor, d: torch.Tensor, theta_f: torch.Tensor, actions: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        为所有智能体计算奖励。
-        Args:
-            all_collisions (torch.Tensor): 碰撞状态 (B, M)
-            offroad_mask (torch.Tensor): 离路状态 (B, M)
-            d (torch.Tensor): Frenet横向距离 (B, M)
-            theta_f (torch.Tensor): Frenet角度误差 (B, M)
-            actions (torch.Tensor): 动作索引 (B, M)，用于直接获取jerk值
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                reward, final_goal_reached, intermediate_goal_reached
-        """
-
-        # 构建扩展的状态张量，包含加速度信息
-        B, M, _ = self.agents_state.shape
-        # 创建扩展的状态张量 (B, M, 10)
-        # [0]: x, [1]: y, [2]: heading, [3]: speed, [4]: along, [5]: alat, 
-        # [6]: along_jerk, [7]: alat_jerk, [8]: theta_f, [9]: d
-        extended_state = torch.zeros((B, M, 10), device=self.device)
-        # 复制原始状态信息
-        extended_state[..., :4] = self.agents_state[..., :4]  # x, y, heading, speed
-        
-        # 从动力学模型与动作空间获取批量化的 (B,M) 张量
-        if hasattr(self.dynamics_model, 'current_along') and hasattr(self.dynamics_model, 'current_alat'):
-            # 激活掩码（与step阶段保持一致：仅激活且未done的为有效位置）
-            active_mask = self.agents_state[..., 6] > 0.5  # (B, M)
-            if hasattr(self, 'last_done') and self.last_done is not None:
-                not_done_mask = ~self.last_done
-            else:
-                not_done_mask = torch.ones_like(active_mask, dtype=torch.bool)
-            effective_mask = active_mask & not_done_mask
-            
-            # 1) 动力学控制状态始终保持 B*M 顺序，reshape 后按有效掩码置零。
-            along_all = self.dynamics_model.current_along
-            alat_all = self.dynamics_model.current_alat
-            if along_all is None:
-                full_along = torch.zeros((B, M), device=self.device)
-            else:
-                full_along = along_all.view(B, M) * effective_mask.float()
-            if alat_all is None:
-                full_alat = torch.zeros((B, M), device=self.device)
-            else:
-                full_alat = alat_all.view(B, M) * effective_mask.float()
-
-            # 2) 从动作空间一次性映射出所有智能体的 jerk (B,M,2)，未激活位置后续用掩码置零
-            if actions is not None:
-                # 规整为 (B, M) 的索引
-                if actions.ndim == 3 and actions.shape[-1] == 1:
-                    actions_idx = actions.squeeze(-1).long()
-                elif actions.ndim == 2:
-                    actions_idx = actions.long()
-                else:
-                    # 兜底：兼容 (N,1) after masking 的情况
-                    actions_idx = actions.view(B, M).long()
-                jerk_all = self.dynamics_model.discrete_action_space.get_action(actions_idx.view(-1))  # (B*M,2)
-                jerk_all = jerk_all.view(B, M, 2)
-                full_along_jerk = jerk_all[..., 0]  # (B, M)
-                full_alat_jerk  = jerk_all[..., 1]  # (B, M)
-                # 仅对有效（激活且未done）体保留数值
-                mask_f = effective_mask.float()
-                full_along_jerk = full_along_jerk * mask_f
-                full_alat_jerk  = full_alat_jerk  * mask_f
-            else:
-                full_along_jerk = torch.zeros((B, M), device=self.device)
-                full_alat_jerk  = torch.zeros((B, M), device=self.device)
-
-            # 3) 写入扩展状态（数值构造已完成，无需布尔掩码赋值）
-            extended_state[..., 4] = full_along      # along
-            extended_state[..., 5] = full_alat       # alat
-            extended_state[..., 6] = full_along_jerk # along_jerk
-            extended_state[..., 7] = full_alat_jerk  # alat_jerk
-
-        # 直接使用传入的Frenet坐标信息，避免重复计算
-        extended_state[..., 8] = theta_f  # theta_f - Frenet角度误差
-        extended_state[..., 9] = d        # d - Frenet横向距离
-        # 准备目标奖励计算的参数
-
-        goal_positions = self.goal_positions
-        if goal_positions is None:
-            goal_positions = self.agents_state[..., :2]
-        current_target_is_waypoint = self._current_target_is_intermediate()
-
-        # 调用奖励计算器，这个速度很快
-        reward, goal_reached = self.reward_calculator.calculate(
-            extended_state,
-            all_collisions,
-            offroad_mask,
-            dt=self.dt,
-            goal_positions=goal_positions,
-            waypoint_reached=current_target_is_waypoint,
-            stop_line_violation=self.stop_line_violation,
+    def _reward_chunk(self, states, slots, world_idx, agent_idx, controls,
+                      collisions, offroad, d, theta, actions, stop_violation, intermediate):
+        selected = states[world_idx, agent_idx]
+        jerk = self.dynamics_model.discrete_action_space.get_action(actions[world_idx, agent_idx])
+        extended = torch.cat((selected[:, :4], controls[:, 1:3], jerk, theta[:, None], d[:, None]), dim=-1)
+        goals = selected[:, :2] if self.goal_positions is None else self.goal_positions[world_idx, agent_idx]
+        return self.reward_calculator.calculate_selected(
+            extended, slots, collisions[world_idx, agent_idx], offroad[world_idx, agent_idx],
+            self.dt, goals, intermediate, stop_violation[world_idx, agent_idx],
         )
-        
-        # 过滤掉非active或已done车辆的奖励（与动力学一致的有效掩码）
-        active_mask = self.agents_state[..., 6] > 0.5  # (B, M)
-        if hasattr(self, 'last_done') and self.last_done is not None:
-            not_done_mask = ~self.last_done
-        else:
-            not_done_mask = torch.ones_like(active_mask, dtype=torch.bool)
-        effective_mask = active_mask & not_done_mask
-        reward = reward * effective_mask.float()  # 非有效车辆的奖励设为0，等价于“done后奖励不再更新”
-        goal_reached = goal_reached & effective_mask
-        # 碰撞/离路终止的同一步即便碰巧进入中间 waypoint 半径，也不再推进 route。
-        still_valid_route = ~(all_collisions | offroad_mask)
-        intermediate_goal_reached = goal_reached & current_target_is_waypoint & still_valid_route
-        final_goal_reached = goal_reached & (~current_target_is_waypoint)
 
-        return reward, final_goal_reached, intermediate_goal_reached
+    def _calculate_reward_selected(self, states, slots, world_idx, agent_idx, controls,
+                                   collisions, offroad, d, theta, actions, stop_violation):
+        from tensor_budget import is_cuda_oom
+        reward = states.new_zeros(states.shape[:2])
+        final = torch.zeros_like(collisions)
+        waypoint = torch.zeros_like(collisions)
+        dense_components = {}
+        diagnostics = self.config.get('training', {}).get('diagnostics', {}).get('enabled', False)
+        intermediate = self._current_target_is_intermediate()[world_idx, agent_idx]
+        ceiling = max(1, self.geometry_workspace_bytes // 1024)
+        rows = min(ceiling, getattr(self, '_reward_chunk_limit', ceiling))
+        start = 0
+        while start < slots.numel():
+            end = min(start + rows, slots.numel())
+            w, a = world_idx[start:end], agent_idx[start:end]
+            components = None
+            try:
+                packed_reward, reached, components = self._reward_chunk(
+                    states, slots[start:end], w, a, controls[start:end],
+                    collisions, offroad, d[start:end], theta[start:end],
+                    actions, stop_violation, intermediate[start:end],
+                )
+                reward[w, a] = packed_reward
+                final[w, a] = reached & ~intermediate[start:end]
+                waypoint[w, a] = reached & intermediate[start:end] & ~(collisions | offroad)[w, a]
+                if diagnostics:
+                    for name, value in components.items():
+                        if name not in dense_components:
+                            dense_components[name] = torch.zeros_like(reward)
+                        dense_components[name][w, a] = value
+                start = end
+            except RuntimeError as exc:
+                if states.device.type != 'cuda' or not is_cuda_oom(exc) or rows == 1:
+                    raise
+                rows = max(1, rows // 2)
+                self._reward_chunk_limit = rows
+        self.reward_calculator.last_reward_components = dense_components
+        return reward, final, waypoint
     
     def _sample_next_route_quads(
         self,
@@ -860,18 +880,11 @@ class TeraflowSimulator:
         )
         quad_centers = self.road_network.quad_centerlines.mean(dim=1)
         routable_centers = quad_centers[routable_quad_ids]
-        num_quads = int(self.road_network.num_quads)
-        out = torch.empty((num_quads, candidate_count), dtype=torch.long, device=self.device)
-        chunk_size = max(1, int(self.route_local_candidate_chunk_quads))
-
-        for start in range(0, num_quads, chunk_size):
-            end = min(start + chunk_size, num_quads)
-            diff = quad_centers[start:end].unsqueeze(1) - routable_centers.unsqueeze(0)
-            dist_sq = diff.pow(2).sum(dim=-1)
-            _, nearest_pos = torch.topk(dist_sq, k=candidate_count, dim=1, largest=False)
-            out[start:end] = routable_quad_ids[nearest_pos]
-
-        self._route_local_candidate_ids = out
+        positions = nearest_indices(
+            quad_centers, routable_centers, candidate_count,
+            self.geometry_workspace_bytes, self.route_local_candidate_chunk_quads,
+        )
+        self._route_local_candidate_ids = routable_quad_ids[positions]
         return self._route_local_candidate_ids
 
     def _sample_route_quad_ids(self, active_mask: torch.Tensor, start_i32: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

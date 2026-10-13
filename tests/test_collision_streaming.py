@@ -120,6 +120,52 @@ class CollisionStreamingTests(unittest.TestCase):
         ]
         self.assertEqual(calls, [])
 
+    def test_stationary_crossing_rectangles_without_inside_corners(self):
+        import torch
+        checker = self.make_checker(64)
+        states = torch.tensor([[[0., 0., 0., 0., 6., 1., 1.],
+                                [0., 0., torch.pi / 2, 0., 6., 1., 1.]]])
+        self.assertTrue(checker.check(states, states).all())
+
+    def test_static_rectangles_have_real_dimensions_and_bounded_tiles(self):
+        import torch
+        checker = self.make_checker(2)
+        states = torch.tensor([[[0., 0., 0., 0., 4., 2., 1.],
+                                [20., 0., 0., 0., 4., 2., 1.]]])
+        obstacle_states = torch.tensor([[[0., 0., torch.pi / 4, 0., 4., 2., 1.],
+                                         [40., 0., 0., 0., 4., 2., 1.]]])
+        obstacles = checker._get_world_vertices(obstacle_states)[0]
+        self.assertEqual(checker.check(states, states, static_obstacles=obstacles).tolist(), [[True, False]])
+
+    def test_cuda_dynamic_cells_match_reference_with_overflow_and_crowding(self):
+        import torch
+        if not torch.cuda.is_available() or not importlib.util.find_spec('triton'):
+            self.skipTest('CUDA and Triton are required')
+        from collision_cuda import cell_collisions
+        from collision import _bounded_collision_world_chunk_dense
+        checker = self.make_checker(128)
+        torch.manual_seed(927)
+        start = torch.zeros(12, 31, 7, device='cuda')
+        start[..., :2] = torch.randn(12, 31, 2, device='cuda') * 30
+        start[..., 2] = torch.randn(12, 31, device='cuda') * 3
+        start[..., 4:6] = torch.rand(12, 31, 2, device='cuda') * 6 + 1
+        start[..., 6] = 1
+        # Dense overflow, large vehicle, negative/out-of-encoding coordinates.
+        start[0, :, :2] = 0
+        start[1, 0, 4] = 90
+        start[2, :, :2] += 30_000_000
+        end = start.clone()
+        end[..., :2] += torch.randn_like(end[..., :2]) * 4
+        end[3, 0, 0] += 150
+        end[4, 0, 6] = 0
+        active = end[..., 6] > .5
+        v0, v1 = checker._get_world_vertices(start), checker._get_world_vertices(end)
+        pairs = torch.triu_indices(31, 31, 1, device='cuda')
+        expected = _bounded_collision_world_chunk_dense(start, end, active, v0, v1, *pairs)
+        for cell_size in (5., 16., 32.):
+            actual = cell_collisions(start, end, active, v0, v1, cell_size)
+            self.assertTrue(torch.equal(expected, actual), f'cell_size={cell_size}, mismatches={(expected != actual).nonzero().tolist()}')
+
 
 if __name__ == "__main__":
     unittest.main()

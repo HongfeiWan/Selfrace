@@ -1,4 +1,5 @@
 import torch
+import copy
 from typing import Dict
 from randomize_components import RewardParameterSampler
 
@@ -89,6 +90,21 @@ class RewardCalculator:
         self.sampled_params = self.parameter_sampler.sample_all_parameters(self.B, self.M)
         self.last_reward_components = {}
 
+    def calculate_selected(self, states, flat_indices, collisions, offroad, dt,
+                           goals, intermediate, stop_violation):
+        """Reuse the exact reward formula with selected per-slot parameters.
+
+        The lightweight view owns no world-sized buffers and never mutates the
+        live parameter table. Returned components remain packed until scatter.
+        """
+        view = copy.copy(self)
+        view.sampled_params = self.sampled_params.flatten(0, 1)[flat_indices].unsqueeze(0)
+        reward, reached = view.calculate(
+            states.unsqueeze(0), collisions.unsqueeze(0), offroad.unsqueeze(0), dt,
+            goals.unsqueeze(0), intermediate.unsqueeze(0), stop_violation.unsqueeze(0),
+        )
+        return reward[0], reached[0], {key: value[0] for key, value in view.last_reward_components.items()}
+
     def reset_worlds(self, world_indices: torch.Tensor):
         """Resample reward conditioning only for the selected vector worlds."""
         world_indices = world_indices.to(device=self.device, dtype=torch.long).reshape(-1)
@@ -172,11 +188,7 @@ class RewardCalculator:
             collision_penalty = torch.zeros((B, M), device=self.device)
             alpha_collision = self.sampled_params[..., self._param_name_to_idx['collision_alpha']]
             # 只对发生碰撞的智能体计算惩罚
-            collision_penalty[all_collisions] = -(
-                alpha_collision[all_collisions] + 
-                self.collision_speed_mult * torch.abs(speeds[all_collisions])
-            )
-            return collision_penalty
+            return torch.where(all_collisions, -(alpha_collision + self.collision_speed_mult * speeds.abs()), collision_penalty)
 
     def calculate_offroad_penalty(self, 
                                  offroad_mask: torch.Tensor) -> torch.Tensor:
@@ -194,9 +206,7 @@ class RewardCalculator:
         offroad_penalty = torch.zeros_like(offroad_mask, dtype=torch.float32, device=self.device)
         alpha_boundary = self.sampled_params[..., self._param_name_to_idx['boundary_alpha']]
         # 只对离路的智能体计算惩罚
-        offroad_penalty[offroad_mask] = -alpha_boundary[offroad_mask]
-        
-        return offroad_penalty
+        return torch.where(offroad_mask, -alpha_boundary, offroad_penalty)
 
     def calculate_comfort_penalty(self, 
                                  along: torch.Tensor,

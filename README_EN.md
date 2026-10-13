@@ -94,7 +94,7 @@ The repository includes a viewer-only checkpoint at `training/checkpoints-paper-
 3. Create `.venv` and install the requirements as described above.
 4. Select **Selfrace Game Inference** and press `F5`.
 
-The committed [`.vscode/launch.json`](./.vscode/launch.json) selects `.venv`, the example checkpoint, CPU inference, and 24 vehicles.
+The committed [`.vscode/launch.json`](./.vscode/launch.json) selects `.venv`, the example checkpoint, CPU inference, and 150 vehicles.
 
 ### Start from a terminal
 
@@ -103,7 +103,7 @@ python .\game\game.py `
   --checkpoint .\training\checkpoints-paper-goals\ckpt_step_400.pt `
   --device cpu `
   --envs 1 `
-  --agents 24
+  --agents 150
 ```
 
 Change `--device cpu` to `--device cuda:0` for CUDA inference. For a windowless check:
@@ -113,7 +113,7 @@ python .\game\game.py `
   --checkpoint .\training\checkpoints-paper-goals\ckpt_step_400.pt `
   --device cpu `
   --envs 1 `
-  --agents 24 `
+  --agents 150 `
   --headless `
   --steps 120
 ```
@@ -258,8 +258,28 @@ The feature builder, actor, and critic use the same layout validation from [`tra
 - Training uses GAE, PPO clipping, advantage filtering, and multiple optimization epochs.
 - Selected PPO features are built once per update and can move to pinned CPU memory when GPU headroom is insufficient.
 - Microbatch accumulation preserves the effective PPO sample target instead of silently shrinking it after an OOM.
-- Collision detection uses bounded blocks controlled by `collision_stream_pair_budget` to cap pair-shaped temporary tensors.
-- Linux CUDA can use controlled `torch.compile` for network and collision blocks; Windows, CPU, small batches, or compilation failures fall back to eager execution.
+- Rollout/PPO query shared world storage by world/slot indices instead of copying a world per ego. One active selection feeds dynamics, offroad, Frenet and reward; the next observation reuses geometry.
+- Map kNN tiles both dimensions and the static hash uses CSR. `geometry_workspace_mb` (64 MiB by default) budgets estimated geometry scratch, excluding persistent maps, outputs and graph-private pools. Pure stages back off locally on OOM, without replaying an already-advanced world.
+- Linux CUDA + Triton uses dynamic cell candidates. Crowded cells stream on-device; oversized/fast vehicles use a complete fallback with no dropped candidates. Other backends retain the bounded `collision_stream_pair_budget` implementation.
+- `simulator.execution.compile` controls pure dynamics/offroad compilation. Network compilation is configured separately. Unsupported backends use eager; resets, RNG and state commits stay outside these regions.
+
+### CUDA Graph and optional traffic inputs
+
+- `simulator.execution.cuda_graph.enabled` and `training.network.cuda_graph.enabled` default to false. They enable dynamics and sequential actor/critic inference graphs independently. Each entry retains at most one fixed-capacity graph: network defaults to 1024 egos / 128 MiB private-pool budget; dynamics uses 64 MiB. Insufficient headroom/budget skips capture. A failure during capture itself requires restarting with that flag disabled, rather than continuing in potentially invalid CUDA state.
+- Active compaction remains outside capture: the entire simulator step is **not** graphed. PPO backward keeps independent weights and adaptive microbatches.
+- The default schema remains **977 dimensions**, with unchanged parameter layout. `feature_schema.optional_sets` can append `traffic_lights` (8 channels: stop-line endpoints, red/yellow/green, validity) and `crosswalks` (7: center, direction, half extents, validity). See YAML examples; enabling extensions requires a matching model schema, not silent checkpoint reinterpretation.
+- Inputs use ego coordinates divided by 200 m and crosswalk half extents divided by 20 m. Missing/unknown items have validity 0. Maps may add `crosswalks: [{center: [x,y], heading_rad: 0, length: 4, width: 2}]`. Light phases support `0=unknown, 1=red, 2=yellow, 3=green`; the current binary controller still works. Rollouts store light phase **per step and world**, so PPO cannot read future phases. Pedestrians and a complete phase scheduler are not added.
+- Offroad rotation, stop-line normals and endpoint rectangle overlap were corrected. The existing observation/reward Frenet sign conventions are preserved separately. Geometry fixes can change termination distributions for an old policy; reevaluate it.
+
+Short benchmark (no training, checkpoint writes or external logging):
+
+```bash
+python scripts/benchmark_hotpaths.py --worlds 128 --agents 150 --repeats 10 --network
+```
+
+On 2026-10-13, RTX A5000 / PyTorch 2.8.0+cu128 synthetic inputs measured 15.76 → 2.40 ms for fixed-pair vs dynamic-cell collision and 7.53 → 2.12 ms for 2048-ego inference with Graph, retaining about 42 MiB of extra graph pool. These are warm **module benchmarks**, not end-to-end throughput or long-run memory guarantees.
+
+With `--worlds 2600 --agents 150 --repeats 5` on the same device, fixed-pair collision took 264.52 ms versus 8.38 ms for dynamic cells, with elementwise-identical results. The dynamic path peaked at about 73 MiB allocated, including benchmark inputs and outputs—not the full training footprint.
 
 ## Key configuration
 
